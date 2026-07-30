@@ -1,5 +1,6 @@
 import { revalidatePath } from "next/cache";
 
+import { queueRemoteExecutionUndo } from "@/lib/bridge/remote-undo";
 import { executeExecutionUndo, BridgeUndoError } from "@/lib/bridge/undo";
 import {
   getNotebookArchiveRoute,
@@ -45,7 +46,28 @@ export async function POST(
   }
 
   try {
-    const result = await executeExecutionUndo(executionRunId, body.confirmation);
+    const queued = await queueRemoteExecutionUndo(
+      executionRunId,
+      body.confirmation,
+    );
+
+    if (queued) {
+      revalidatePath(getOrganizationPlanRoute(queued.scanSessionId));
+      revalidatePath(getScanSessionRoute(queued.scanSessionId));
+      revalidatePath("/admin/library");
+
+      return Response.json({
+        message:
+          "The Undo plan was sent to the paired Mac Bridge. The Bridge will independently verify every current file and original destination before restoring anything.",
+        ok: true,
+        ...queued,
+      });
+    }
+
+    const result = await executeExecutionUndo(
+      executionRunId,
+      body.confirmation,
+    );
 
     revalidatePath(getOrganizationPlanRoute(result.scanSessionId));
     revalidatePath(getScanSessionRoute(result.scanSessionId));
