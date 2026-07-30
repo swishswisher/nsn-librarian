@@ -245,7 +245,9 @@ function initialReadingStatus(file: BridgeScannedFileDraft) {
     return "NOT_READ" as const;
   }
 
-  return file.readStatus === "UNSUPPORTED" ? "UNSUPPORTED" as const : "FAILED" as const;
+  return file.readStatus === "UNSUPPORTED"
+    ? ("UNSUPPORTED" as const)
+    : ("FAILED" as const);
 }
 
 function initialExtractionStatus(file: BridgeScannedFileDraft) {
@@ -253,7 +255,9 @@ function initialExtractionStatus(file: BridgeScannedFileDraft) {
     return "PENDING" as const;
   }
 
-  return file.readStatus === "UNSUPPORTED" ? "UNSUPPORTED" as const : "FAILED" as const;
+  return file.readStatus === "UNSUPPORTED"
+    ? ("UNSUPPORTED" as const)
+    : ("FAILED" as const);
 }
 
 function initialProcessingStage(file: BridgeScannedFileDraft) {
@@ -261,7 +265,9 @@ function initialProcessingStage(file: BridgeScannedFileDraft) {
     return "DISCOVERED" as const;
   }
 
-  return file.readStatus === "UNSUPPORTED" ? "UNSUPPORTED" as const : "FAILED" as const;
+  return file.readStatus === "UNSUPPORTED"
+    ? ("UNSUPPORTED" as const)
+    : ("FAILED" as const);
 }
 
 function scannedFileCreateData(
@@ -556,7 +562,8 @@ export async function queueRemoteBridgeScan(connectedLibraryId: string) {
     await createBridgeCloudCommand({
       authorizationContext: {
         initiatedBy: "Deanne",
-        purpose: "Scan the selected connected folder without uploading the folder itself.",
+        purpose:
+          "Scan the selected connected folder without uploading the folder itself.",
       },
       bridgeDeviceId: library.bridgeDeviceId,
       bridgeRootId: library.bridgeRootId,
@@ -603,7 +610,7 @@ export async function importRemoteBridgeScanReport(input: {
   connectedLibraryId: string;
   bridgeRootId: string;
   report: BridgeCommandReport;
-}) {
+}): Promise<BridgeJson | null> {
   const payload = objectValue(input.commandPayload);
   const scanSessionId = stringValue(payload?.scanSessionId, 100);
 
@@ -626,7 +633,7 @@ export async function importRemoteBridgeScanReport(input: {
     );
   }
 
-  if (report.status !== "COMPLETED") {
+  if (input.report.status !== "COMPLETED") {
     await prisma.scanSession.update({
       data: {
         completedAt: new Date(),
@@ -638,11 +645,12 @@ export async function importRemoteBridgeScanReport(input: {
 
     return {
       cloudScanSessionId: scanSessionId,
-      safeErrorCategory: report.safeErrorCategory ?? "BRIDGE_SCAN_FAILED",
-    } satisfies BridgeJson;
+      safeErrorCategory:
+        input.report.safeErrorCategory ?? "BRIDGE_SCAN_FAILED",
+    };
   }
 
-  const scan = scanResultFromReport(report.result, input.bridgeRootId);
+  const scan = scanResultFromReport(input.report.result, input.bridgeRootId);
   const existingFileCount = await prisma.scannedFile.count({
     where: { sessionId: scanSessionId },
   });
@@ -695,5 +703,5 @@ export async function importRemoteBridgeScanReport(input: {
     supportedFiles: scan.supportedFiles,
     totalFiles: scan.totalFiles,
     unsupportedFiles: scan.unsupportedFiles,
-  } satisfies BridgeJson;
+  };
 }
