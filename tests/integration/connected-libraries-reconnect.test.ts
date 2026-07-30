@@ -206,23 +206,32 @@ test("concurrent duplicate connection attempts leave one canonical record", asyn
 });
 
 test("duplicate reconciliation is idempotent and relinks history", async () => {
-  const fingerprint = "root_reconcile_duplicate";
+  const basePath = path.join(process.cwd(), "NSN-Full-System-Test-Library");
+  const variantPath = `${basePath}${path.sep}`;
   const first = await prisma.connectedLibrary.create({
     data: {
       displayName: "Canonical raw path",
-      folderFingerprint: fingerprint,
-      localPath: "D:\\NSN-Full-System-Test-Library",
-      platform: "WINDOWS",
+      localPath: basePath,
+      platform:
+        process.platform === "win32"
+          ? "WINDOWS"
+          : process.platform === "darwin"
+            ? "MACOS"
+            : "LINUX",
       status: "CONNECTED",
     },
   });
   const duplicate = await prisma.connectedLibrary.create({
     data: {
-      canonicalConnectedLibraryId: null,
       displayName: "Duplicate raw path",
       isEnabled: false,
-      localPath: "D:/NSN-Full-System-Test-Library/",
-      platform: "WINDOWS",
+      localPath: variantPath,
+      platform:
+        process.platform === "win32"
+          ? "WINDOWS"
+          : process.platform === "darwin"
+            ? "MACOS"
+            : "LINUX",
       status: "DISCONNECTED",
     },
   });
@@ -233,10 +242,6 @@ test("duplicate reconciliation is idempotent and relinks history", async () => {
       filesScanned: 2,
       status: "COMPLETED",
     },
-  });
-  await prisma.connectedLibrary.update({
-    data: { folderFingerprint: fingerprint },
-    where: { id: duplicate.id },
   });
 
   const firstRun = await reconcileDuplicateConnectedLibraries();
