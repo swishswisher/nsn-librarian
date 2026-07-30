@@ -1,12 +1,13 @@
 {
   "version": "0.1.0",
-  "releaseDate": "2026-07-24",
+  "releaseDate": "2026-07-30",
   "minimumMacOSVersion": "13.0",
   "systemRequirements": [
     "macOS 13 Ventura or newer",
     "Apple Silicon Mac for the arm64 build",
     "Intel Mac for the x64 build",
-    "Outbound HTTPS access to the NSN Librarian web app"
+    "Outbound HTTPS access to the NSN Librarian web app",
+    "Manual approval in macOS Privacy & Security for this unsigned development build"
   ],
   "privacySummary": [
     "The Bridge works only with folders Deanne explicitly chooses.",
@@ -16,15 +17,16 @@
     "Folder access can be revoked at any time."
   ],
   "releaseNotes": [
+    "Unsigned development release for internal testing on Deanne's MacBook.",
+    "macOS may block the first launch until Deanne chooses Open Anyway in Privacy & Security.",
     "Production Bridge architecture for macOS pairing, folder selection, command polling, and safe execution authorization.",
-    "Installer assets are published through GitHub Releases, not committed into the repository.",
-    "Unsigned development builds must be labeled before testing."
+    "Installer assets are published through GitHub Releases or GitHub Actions artifacts, not committed into the repository."
   ],
   "assets": [
     {
       "architecture": "arm64",
       "available": false,
-      "fileName": "NSN-Bridge-v0.1.0-mac-arm64.dmg",
+      "fileName": "NSN-Bridge-v0.1.0-mac-arm64-unsigned.dmg",
       "kind": "dmg",
       "sha256": "pending-release-asset",
       "sizeBytes": null,
@@ -33,7 +35,7 @@
     {
       "architecture": "x64",
       "available": false,
-      "fileName": "NSN-Bridge-v0.1.0-mac-x64.dmg",
+      "fileName": "NSN-Bridge-v0.1.0-mac-x64-unsigned.dmg",
       "kind": "dmg",
       "sha256": "pending-release-asset",
       "sizeBytes": null,
