@@ -6,6 +6,8 @@ import {
 } from "@/lib/bridge/cloud-coordinator";
 import { prepareBridgeCommandReportForPersistence } from "@/lib/bridge/cloud-command-results";
 import { authenticateBridgeDeviceRequest } from "@/lib/bridge/device-request-auth";
+import { importRemoteBridgeScanReport } from "@/lib/bridge/remote-scan-queue";
+import { getPrismaClient } from "@/lib/db/prisma";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -51,10 +53,39 @@ export async function POST(
           : null,
       status,
     };
-    const report = await prepareBridgeCommandReportForPersistence(
-      deviceId,
-      submittedReport,
-    );
+    const command = await getPrismaClient().bridgeCommand.findUnique({
+      where: { commandId },
+    });
+
+    if (!command || command.bridgeDeviceId !== deviceId) {
+      throw new BridgeCloudError("That Bridge command could not be found.", 404);
+    }
+
+    let report: BridgeCommandReport;
+
+    if (
+      (command.commandType === "SCAN_LIBRARY" ||
+        command.commandType === "RECONCILE_LIBRARY") &&
+      command.connectedLibraryId &&
+      command.bridgeRootId
+    ) {
+      const importedResult = await importRemoteBridgeScanReport({
+        bridgeDeviceId: deviceId,
+        bridgeRootId: command.bridgeRootId,
+        commandPayload: command.payload,
+        connectedLibraryId: command.connectedLibraryId,
+        report: submittedReport,
+      });
+      report = {
+        ...submittedReport,
+        result: importedResult ?? submittedReport.result,
+      };
+    } else {
+      report = await prepareBridgeCommandReportForPersistence(
+        deviceId,
+        submittedReport,
+      );
+    }
 
     return Response.json({
       command: await completeBridgeCloudCommand(deviceId, report),
