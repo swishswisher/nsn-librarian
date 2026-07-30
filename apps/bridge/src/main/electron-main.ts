@@ -19,11 +19,13 @@ import {
   getPairedBridgeDeviceId,
   pairBridgeWithCloud,
   sendBridgeHeartbeat,
+  syncBridgeRoots,
 } from "./cloud-client";
 import { checkBridgeUpdateManifest } from "./update-manager";
 
 let localServer: Server | null = null;
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
+const rootSyncIntervalMs = 60_000;
 
 async function startLocalBridgeServer() {
   if (localServer) {
@@ -56,6 +58,7 @@ export async function startElectronBridgeApp() {
   let mainWindow: InstanceType<typeof electron.BrowserWindow> | null = null;
   let isQuitting = false;
   let commandPollInFlight = false;
+  let lastRootSyncAt = 0;
 
   function createMainWindow() {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -150,6 +153,21 @@ export async function startElectronBridgeApp() {
     );
   }
 
+  async function syncLocalRoots(force = false) {
+    if (!force && Date.now() - lastRootSyncAt < rootSyncIntervalMs) {
+      return null;
+    }
+
+    const roots = await listRoots();
+    const result = await syncBridgeRoots(roots);
+
+    if (result) {
+      lastRootSyncAt = Date.now();
+    }
+
+    return result;
+  }
+
   async function desktopStatus() {
     const [bridgeDeviceId, roots] = await Promise.all([
       getPairedBridgeDeviceId(),
@@ -176,6 +194,7 @@ export async function startElectronBridgeApp() {
       results.push(await pauseBridgeWatcher(root.id));
     }
 
+    await syncLocalRoots(true).catch(() => null);
     return results;
   }
 
@@ -191,6 +210,7 @@ export async function startElectronBridgeApp() {
       results.push(await resumeBridgeWatcher(root.id));
     }
 
+    await syncLocalRoots(true).catch(() => null);
     return results;
   }
 
@@ -203,11 +223,13 @@ export async function startElectronBridgeApp() {
 
     try {
       await sendBridgeHeartbeat().catch(() => null);
+      await syncLocalRoots().catch(() => null);
       const reports = await processPendingBridgeCommands({
         selectFolders: chooseFolders,
       });
 
       if (reports.length > 0) {
+        await syncLocalRoots(true).catch(() => null);
         mainWindow?.webContents.send("nsn-bridge:commands-completed", reports);
       }
 
@@ -270,6 +292,7 @@ export async function startElectronBridgeApp() {
     }
 
     const device = await pairBridgeWithCloud(code);
+    await syncLocalRoots(true).catch(() => null);
     void pollCloud();
     return device;
   });
@@ -314,6 +337,8 @@ export async function startElectronBridgeApp() {
           }),
         );
       }
+
+      await syncLocalRoots(true).catch(() => null);
 
       return {
         ok: true,
