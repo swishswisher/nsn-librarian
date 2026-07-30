@@ -6,6 +6,7 @@ import {
 } from "@/lib/bridge/cloud-coordinator";
 import { prepareBridgeCommandReportForPersistence } from "@/lib/bridge/cloud-command-results";
 import { authenticateBridgeDeviceRequest } from "@/lib/bridge/device-request-auth";
+import { applyRemoteExecutionReport } from "@/lib/bridge/remote-execution";
 import { importRemoteBridgeScanReport } from "@/lib/bridge/remote-scan-queue";
 import { getPrismaClient } from "@/lib/db/prisma";
 
@@ -79,6 +80,14 @@ export async function POST(
       report = {
         ...submittedReport,
         result: importedResult ?? submittedReport.result,
+      };
+    } else if (command.commandType === "EXECUTE_PLAN") {
+      report = {
+        ...submittedReport,
+        result: await applyRemoteExecutionReport({
+          commandPayload: command.payload,
+          report: submittedReport,
+        }),
       };
     } else {
       report = await prepareBridgeCommandReportForPersistence(
