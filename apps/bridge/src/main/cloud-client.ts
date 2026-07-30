@@ -9,6 +9,7 @@ import {
   type BridgeCommandReport,
   type BridgeDeviceSummary,
 } from "../../../../packages/bridge-protocol/src";
+import type { BridgeRootSummary } from "../../../../bridge-app/src/types";
 
 import { readBridgeSecret, saveBridgeSecret } from "./keychain";
 
@@ -154,6 +155,22 @@ export async function sendBridgeHeartbeat() {
       appVersion: process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0",
       architecture: os.arch(),
       platform: bridgePlatform(),
+    },
+    { authenticated: true },
+  );
+}
+
+export async function syncBridgeRoots(roots: BridgeRootSummary[]) {
+  const bridgeDeviceId = await getPairedBridgeDeviceId();
+
+  if (!bridgeDeviceId) {
+    return null;
+  }
+
+  return postJson<{ libraries: unknown[]; ok: true }>(
+    `/api/bridge/cloud/devices/${encodeURIComponent(bridgeDeviceId)}/roots/sync`,
+    {
+      roots,
     },
     { authenticated: true },
   );
