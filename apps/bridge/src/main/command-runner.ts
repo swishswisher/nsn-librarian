@@ -43,6 +43,7 @@ import { readBridgeSecret, saveBridgeSecret } from "./keychain";
 
 const replayCacheSecret = "processed-command-replay-keys";
 const replayCacheLimit = 500;
+const privatePathKeys = new Set(["actualPath", "localPath", "rootPath"]);
 
 export type BridgeCommandRuntime = {
   selectFolders?: () => Promise<FolderSelectionResult[]>;
@@ -56,7 +57,11 @@ function payloadObject(payload: BridgeJson) {
 
 function jsonSafe(value: unknown): BridgeJson {
   return JSON.parse(
-    JSON.stringify(value, (_key, nestedValue) => {
+    JSON.stringify(value, (key, nestedValue) => {
+      if (privatePathKeys.has(key)) {
+        return undefined;
+      }
+
       if (typeof nestedValue === "bigint") {
         return nestedValue.toString();
       }
