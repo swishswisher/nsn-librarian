@@ -1,4 +1,5 @@
 import { getBridgeCloudStatus } from "@/lib/bridge/cloud-coordinator";
+import { cloudBridgeHealth } from "@/lib/bridge/effective-health";
 import { getLocalBridgeHealth } from "@/lib/bridge/local-bridge-client";
 
 export const runtime = "nodejs";
@@ -12,9 +13,12 @@ export async function GET() {
       devices: [],
     })),
   ]);
+  const bridge = localBridge.ok
+    ? localBridge
+    : cloudBridgeHealth(cloudBridge.devices);
 
   return Response.json({
-    bridge: localBridge,
+    bridge,
     cloud: cloudBridge,
     ok: true,
   });
