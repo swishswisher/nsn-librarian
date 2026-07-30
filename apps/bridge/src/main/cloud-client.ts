@@ -2,9 +2,11 @@ import os from "node:os";
 
 import {
   createBridgeDeviceId,
+  createBridgeDeviceRequestHeaders,
   createBridgeKeyPair,
   normalizeBridgePlatform,
   type BridgeCommandEnvelope,
+  type BridgeCommandReport,
   type BridgeDeviceSummary,
 } from "../../../../packages/bridge-protocol/src";
 
@@ -44,12 +46,59 @@ function bridgePlatform() {
   return "UNKNOWN";
 }
 
-async function postJson<T>(pathName: string, body: Record<string, unknown>) {
+async function pairedIdentity() {
+  const [bridgeDeviceId, privateKey] = await Promise.all([
+    readBridgeSecret("bridge-device-id"),
+    readBridgeSecret("device-private-key"),
+  ]);
+
+  if (!bridgeDeviceId || !privateKey) {
+    return null;
+  }
+
+  return {
+    bridgeDeviceId,
+    privateKey,
+  };
+}
+
+async function authenticatedHeaders(
+  method: string,
+  pathName: string,
+  bodyText = "",
+) {
+  const identity = await pairedIdentity();
+
+  if (!identity) {
+    throw new Error("BRIDGE_NOT_PAIRED");
+  }
+
+  return {
+    ...createBridgeDeviceRequestHeaders({
+      bodyText,
+      bridgeDeviceId: identity.bridgeDeviceId,
+      method,
+      pathname: pathName,
+      privateKey: identity.privateKey,
+    }),
+    "X-NSN-Bridge-Client": "nsn-macos-bridge",
+  };
+}
+
+async function postJson<T>(
+  pathName: string,
+  body: Record<string, unknown>,
+  options: { authenticated?: boolean } = {},
+) {
+  const bodyText = JSON.stringify(body);
   const response = await fetch(`${appUrl()}${pathName}`, {
-    body: JSON.stringify(body),
+    body: bodyText,
     headers: {
       "Content-Type": "application/json",
       "X-NSN-Bridge-Client": "nsn-macos-bridge",
+      ...(options.authenticated
+        ? await authenticatedHeaders("POST", pathName, bodyText)
+        : {}),
     },
     method: "POST",
   });
@@ -88,8 +137,12 @@ export async function pairBridgeWithCloud(pairingCode: string) {
   return payload.device;
 }
 
+export async function getPairedBridgeDeviceId() {
+  return readBridgeSecret("bridge-device-id");
+}
+
 export async function sendBridgeHeartbeat() {
-  const bridgeDeviceId = await readBridgeSecret("bridge-device-id");
+  const bridgeDeviceId = await getPairedBridgeDeviceId();
 
   if (!bridgeDeviceId) {
     return null;
@@ -102,32 +155,67 @@ export async function sendBridgeHeartbeat() {
       architecture: os.arch(),
       platform: bridgePlatform(),
     },
+    { authenticated: true },
   );
 }
 
 export async function fetchPendingBridgeCommands() {
-  const bridgeDeviceId = await readBridgeSecret("bridge-device-id");
+  const bridgeDeviceId = await getPairedBridgeDeviceId();
 
   if (!bridgeDeviceId) {
     return [] satisfies BridgeCommandEnvelope[];
   }
 
-  const response = await fetch(
-    `${appUrl()}/api/bridge/cloud/devices/${encodeURIComponent(
-      bridgeDeviceId,
-    )}/commands`,
-    {
-      headers: {
-        "X-NSN-Bridge-Client": "nsn-macos-bridge",
-      },
-      method: "GET",
-    },
-  );
+  const pathName = `/api/bridge/cloud/devices/${encodeURIComponent(
+    bridgeDeviceId,
+  )}/commands`;
+  const response = await fetch(`${appUrl()}${pathName}`, {
+    headers: await authenticatedHeaders("GET", pathName),
+    method: "GET",
+  });
   const payload = (await response.json().catch(() => null)) as
     | { commands?: BridgeCommandEnvelope[]; ok?: boolean }
     | null;
 
-  return payload?.ok && Array.isArray(payload.commands)
-    ? payload.commands
-    : [];
+  if (!response.ok || !payload?.ok || !Array.isArray(payload.commands)) {
+    throw new Error("BRIDGE_COMMAND_FETCH_FAILED");
+  }
+
+  return payload.commands;
+}
+
+export async function acknowledgeBridgeCommand(commandId: string) {
+  const bridgeDeviceId = await getPairedBridgeDeviceId();
+
+  if (!bridgeDeviceId) {
+    throw new Error("BRIDGE_NOT_PAIRED");
+  }
+
+  return postJson<{ ok: true }>(
+    `/api/bridge/cloud/devices/${encodeURIComponent(
+      bridgeDeviceId,
+    )}/commands/${encodeURIComponent(commandId)}/acknowledge`,
+    {},
+    { authenticated: true },
+  );
+}
+
+export async function reportBridgeCommand(report: BridgeCommandReport) {
+  const bridgeDeviceId = await getPairedBridgeDeviceId();
+
+  if (!bridgeDeviceId) {
+    throw new Error("BRIDGE_NOT_PAIRED");
+  }
+
+  return postJson<{ ok: true }>(
+    `/api/bridge/cloud/devices/${encodeURIComponent(
+      bridgeDeviceId,
+    )}/commands/${encodeURIComponent(report.commandId)}/complete`,
+    {
+      result: report.result ?? null,
+      safeErrorCategory: report.safeErrorCategory ?? null,
+      status: report.status,
+    },
+    { authenticated: true },
+  );
 }
