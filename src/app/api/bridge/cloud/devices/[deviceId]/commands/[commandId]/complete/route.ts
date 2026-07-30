@@ -1,4 +1,7 @@
-import type { BridgeCommandReport } from "../../../../../../../../../../packages/bridge-protocol/src";
+import type {
+  BridgeCommandReport,
+  BridgeJson,
+} from "../../../../../../../../../../packages/bridge-protocol/src";
 
 import {
   BridgeCloudError,
@@ -71,13 +74,13 @@ export async function POST(
       command.connectedLibraryId &&
       command.bridgeRootId
     ) {
-      const importedResult = await importRemoteBridgeScanReport({
+      const importedResult = (await importRemoteBridgeScanReport({
         bridgeDeviceId: deviceId,
         bridgeRootId: command.bridgeRootId,
         commandPayload: command.payload,
         connectedLibraryId: command.connectedLibraryId,
         report: submittedReport,
-      });
+      })) as BridgeJson | null;
       report = {
         ...submittedReport,
         result: importedResult ?? submittedReport.result,
