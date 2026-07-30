@@ -2,17 +2,23 @@ import {
   BridgeCloudError,
   fetchPendingBridgeCloudCommands,
 } from "@/lib/bridge/cloud-coordinator";
+import { authenticateBridgeDeviceRequest } from "@/lib/bridge/device-request-auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ deviceId: string }> },
 ) {
   const { deviceId } = await context.params;
 
   try {
+    await authenticateBridgeDeviceRequest({
+      bridgeDeviceId: deviceId,
+      request,
+    });
+
     return Response.json({
       commands: await fetchPendingBridgeCloudCommands(deviceId),
       ok: true,
