@@ -1,36 +1,119 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# NSN Library Machine
 
-## Getting Started
+Private internal tool for Domestic Appeal LLC and Neural ~ Synergistic ~ Network.
+This is the machine first: a production-grade foundation for Bridge-connected
+folder scanning, observation, review, memory, suggestions, and approved
+execution planning. Deanne's MacBook remains the source of truth for local
+files.
 
-First, run the development server:
+## Tech Stack
+
+- Next.js App Router with a required `src/` directory
+- TypeScript
+- Tailwind CSS
+- Prisma
+- PostgreSQL
+- OpenAI-ready observation architecture with deterministic fallback
+
+## Setup
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+cp .env.example .env
+npm run db:generate
+npm run dev:all
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Then open `http://localhost:3000/admin/library`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+To run the two local processes separately:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm run dev:web
+npm run dev:bridge
+```
 
-## Learn More
+## Environment Variables
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+DATABASE_URL=
+OPENAI_API_KEY=
+NSN_LOCAL_BRIDGE_URL=http://127.0.0.1:4777
+NSN_BRIDGE_PORT=4777
+NSN_BRIDGE_DATA_DIR=
+STORAGE_PROVIDER=
+STORAGE_BUCKET=
+STORAGE_ACCESS_KEY=
+STORAGE_SECRET_KEY=
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+`OPENAI_API_KEY` enables optional AI-assisted manual observation when present.
+The deterministic observer remains the fallback.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+The NSN Bridge companion app owns the private mapping from Bridge root
+identifier to actual local path. The web database stores knowledge work,
+history, permissions, safe location descriptions, and Bridge root IDs.
 
-## Deploy on Vercel
+## Database
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Prisma models live in `prisma/schema.prisma`.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Generate the client:
+
+```bash
+npm run db:generate
+```
+
+Create and apply a local migration after setting `DATABASE_URL`:
+
+```bash
+npm run db:migrate -- --name init-library-machine
+```
+
+Open Prisma Studio:
+
+```bash
+npm run db:studio
+```
+
+## App Routes
+
+- `/admin/library`
+- `/admin/library/connected-libraries`
+- `/admin/library/scan-sessions`
+- `/admin/library/documents`
+- `/admin/library/review`
+- `/admin/library/taxonomy`
+- `/admin/library/migration`
+
+## API Routes
+
+- `POST /api/bridge/scan`
+- `POST /api/bridge/connected-libraries/folder-picker`
+- `POST /api/bridge/connected-libraries`
+- `POST /api/library/classify`
+- `POST /api/library/review`
+- `POST /api/library/migration`
+
+The Bridge is the entry point for folder selection, scanning, watching, and
+approved filesystem execution. Legacy scan-session compatibility routes remain
+for older links and future cleanup.
+
+## Planned Phases
+
+1. Bridge-connected folders and scan sessions.
+2. Metadata-only scanned file records, observations, and review decisions.
+3. Review-safe AI observation with deterministic fallback.
+4. Memory, relationships, suggestions, and Notebook reflections shaped by human approval.
+5. Approved execution back through the local NSN Bridge.
+
+## Architecture Notes
+
+- UI components live under `src/components/library`.
+- Route handlers live under `src/app/api/library`.
+- AI classification lives under `src/lib/ai`.
+- Web Bridge orchestration lives under `src/lib/bridge`.
+- The local Bridge companion app lives under `bridge-app`.
+- File extraction and checksums live under `src/lib/files`.
+- Library orchestration placeholders live under `src/lib/library`.
+- Shared domain types live under `src/types/library.ts`.
