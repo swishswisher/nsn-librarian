@@ -2,6 +2,7 @@ import {
   BridgeExecutorError,
   previewOrganizationPlanExecution,
 } from "@/lib/bridge/executor";
+import { previewRemoteOrganizationPlanExecution } from "@/lib/bridge/remote-execution";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,7 +14,9 @@ export async function POST(
   const { planId } = await context.params;
 
   try {
-    const preview = await previewOrganizationPlanExecution(planId);
+    const preview =
+      (await previewRemoteOrganizationPlanExecution(planId)) ??
+      (await previewOrganizationPlanExecution(planId));
 
     return Response.json({
       ok: true,
