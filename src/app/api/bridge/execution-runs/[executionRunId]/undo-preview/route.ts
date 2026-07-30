@@ -1,3 +1,4 @@
+import { previewRemoteExecutionUndo } from "@/lib/bridge/remote-undo";
 import { BridgeUndoError, previewExecutionUndo } from "@/lib/bridge/undo";
 
 export const runtime = "nodejs";
@@ -10,7 +11,9 @@ export async function POST(
   const { executionRunId } = await context.params;
 
   try {
-    const preview = await previewExecutionUndo(executionRunId);
+    const preview =
+      (await previewRemoteExecutionUndo(executionRunId)) ??
+      (await previewExecutionUndo(executionRunId));
 
     return Response.json({
       ok: true,
