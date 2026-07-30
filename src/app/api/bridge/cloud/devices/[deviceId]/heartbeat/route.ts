@@ -2,6 +2,7 @@ import {
   BridgeCloudError,
   recordBridgeHeartbeat,
 } from "@/lib/bridge/cloud-coordinator";
+import { authenticateBridgeDeviceRequest } from "@/lib/bridge/device-request-auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,10 +14,15 @@ export async function POST(
   const { deviceId } = await context.params;
 
   try {
-    const body = (await request.json().catch(() => ({}))) as Record<
-      string,
-      unknown
-    >;
+    const bodyText = await request.text();
+    await authenticateBridgeDeviceRequest({
+      bodyText,
+      bridgeDeviceId: deviceId,
+      request,
+    });
+    const body = bodyText
+      ? (JSON.parse(bodyText) as Record<string, unknown>)
+      : {};
 
     return Response.json({
       device: await recordBridgeHeartbeat(deviceId, body),
