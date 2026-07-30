@@ -9,7 +9,11 @@ on:
       development_build:
         description: "Create an unsigned development build"
         required: false
-        default: "false"
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 jobs:
   build-macos:
@@ -17,6 +21,8 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: write
+    env:
+      NSN_UNSIGNED_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.development_build == 'true' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,7 +52,7 @@ jobs:
         run: npm run build:bridge
 
       - name: Prepare signing certificate
-        if: ${{ inputs.development_build != 'true' }}
+        if: ${{ env.NSN_UNSIGNED_BUILD != 'true' }}
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -62,7 +68,16 @@ jobs:
           security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" build.keychain
 
-      - name: Package macOS DMGs
+      - name: Package unsigned macOS DMGs
+        if: ${{ env.NSN_UNSIGNED_BUILD == 'true' }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NSN_UNSIGNED_BUILD: "true"
+        run: npm run package:bridge:mac
+
+      - name: Package signed macOS DMGs
+        if: ${{ env.NSN_UNSIGNED_BUILD != 'true' }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -70,6 +85,7 @@ jobs:
           CSC_LINK: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           CSC_KEY_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NSN_UNSIGNED_BUILD: "false"
         run: npm run package:bridge:mac
 
       - name: Calculate checksums
@@ -77,10 +93,23 @@ jobs:
           cd apps/bridge/dist/release
           shasum -a 256 *.dmg > SHA256SUMS.txt
 
+      - name: Upload development artifacts
+        if: ${{ github.event_name == 'workflow_dispatch' && env.NSN_UNSIGNED_BUILD == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsn-bridge-macos-unsigned
+          path: |
+            apps/bridge/dist/release/*.dmg
+            apps/bridge/dist/release/SHA256SUMS.txt
+            apps/bridge/dist/release/latest-mac.json
+          if-no-files-found: error
+
       - name: Upload release assets
+        if: ${{ github.event_name == 'push' }}
         uses: softprops/action-gh-release@v2
         with:
           fail_on_unmatched_files: true
+          prerelease: ${{ env.NSN_UNSIGNED_BUILD == 'true' }}
           files: |
             apps/bridge/dist/release/*.dmg
             apps/bridge/dist/release/SHA256SUMS.txt
