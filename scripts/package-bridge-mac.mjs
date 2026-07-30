@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 
@@ -18,10 +18,12 @@ if (process.platform !== "darwin") {
 
 if (!existsSync(electronBuilderBin)) {
   process.stderr.write(
-    "electron-builder is required to package signed macOS DMGs. Install release tooling before running package:bridge:mac.\n",
+    "electron-builder is required to package macOS DMGs. Install release tooling before running package:bridge:mac.\n",
   );
   process.exit(1);
 }
+
+const unsignedBuild = process.env.NSN_UNSIGNED_BUILD === "true";
 
 const buildResult = spawnSync("node", ["scripts/build-bridge-app.mjs"], {
   stdio: "inherit",
@@ -37,10 +39,51 @@ const packageResult = spawnSync(
   {
     env: {
       ...process.env,
-      CSC_HARDENED_RUNTIME: "true",
+      CSC_HARDENED_RUNTIME: unsignedBuild ? "false" : "true",
+      CSC_IDENTITY_AUTO_DISCOVERY: unsignedBuild ? "false" : process.env.CSC_IDENTITY_AUTO_DISCOVERY,
     },
     stdio: "inherit",
   },
 );
 
-process.exit(packageResult.status ?? 1);
+if (packageResult.status !== 0) {
+  process.exit(packageResult.status ?? 1);
+}
+
+const releaseDir = path.join(process.cwd(), "apps", "bridge", "dist", "release");
+
+if (unsignedBuild && existsSync(releaseDir)) {
+  for (const fileName of readdirSync(releaseDir)) {
+    if (!fileName.endsWith(".dmg") || fileName.includes("-unsigned")) {
+      continue;
+    }
+
+    const unsignedName = fileName.replace(/\.dmg$/u, "-unsigned.dmg");
+    renameSync(path.join(releaseDir, fileName), path.join(releaseDir, unsignedName));
+  }
+}
+
+const dmgFiles = existsSync(releaseDir)
+  ? readdirSync(releaseDir).filter((fileName) => fileName.endsWith(".dmg"))
+  : [];
+
+writeFileSync(
+  path.join(releaseDir, "latest-mac.json"),
+  `${JSON.stringify(
+    {
+      channel: unsignedBuild ? "development" : "production",
+      files: dmgFiles,
+      generatedAt: new Date().toISOString(),
+      signed: !unsignedBuild,
+    },
+    null,
+    2,
+  )}\n`,
+  "utf8",
+);
+
+process.stdout.write(
+  unsignedBuild
+    ? "Created unsigned NSN Bridge development DMGs. macOS will require manual approval on first launch.\n"
+    : "Created signed NSN Bridge production DMGs.\n",
+);
