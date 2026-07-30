@@ -1,0 +1,61 @@
+{
+  "version": "0.1.0",
+  "releaseDate": "2026-07-24",
+  "minimumMacOSVersion": "13.0",
+  "systemRequirements": [
+    "macOS 13 Ventura or newer",
+    "Apple Silicon Mac for the arm64 build",
+    "Intel Mac for the x64 build",
+    "Outbound HTTPS access to the NSN Librarian web app"
+  ],
+  "privacySummary": [
+    "The Bridge works only with folders Deanne explicitly chooses.",
+    "Watching is read-only until Deanne approves an Organization Plan and types EXECUTE.",
+    "NSN does not upload Deanne's full local library.",
+    "Disconnecting a folder does not delete local files.",
+    "Folder access can be revoked at any time."
+  ],
+  "releaseNotes": [
+    "Production Bridge architecture for macOS pairing, folder selection, command polling, and safe execution authorization.",
+    "Installer assets are published through GitHub Releases, not committed into the repository.",
+    "Unsigned development builds must be labeled before testing."
+  ],
+  "assets": [
+    {
+      "architecture": "arm64",
+      "available": false,
+      "fileName": "NSN-Bridge-v0.1.0-mac-arm64.dmg",
+      "kind": "dmg",
+      "sha256": "pending-release-asset",
+      "sizeBytes": null,
+      "url": null
+    },
+    {
+      "architecture": "x64",
+      "available": false,
+      "fileName": "NSN-Bridge-v0.1.0-mac-x64.dmg",
+      "kind": "dmg",
+      "sha256": "pending-release-asset",
+      "sizeBytes": null,
+      "url": null
+    },
+    {
+      "architecture": "universal",
+      "available": false,
+      "fileName": "latest-mac.json",
+      "kind": "json",
+      "sha256": "pending-release-asset",
+      "sizeBytes": null,
+      "url": null
+    },
+    {
+      "architecture": "universal",
+      "available": false,
+      "fileName": "SHA256SUMS.txt",
+      "kind": "checksums",
+      "sha256": "pending-release-asset",
+      "sizeBytes": null,
+      "url": null
+    }
+  ]
+}

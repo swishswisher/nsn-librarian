@@ -1,0 +1,24 @@
+appId: com.nsn.bridge
+productName: NSN Bridge
+artifactName: NSN-Bridge-v${version}-mac-${arch}.${ext}
+directories:
+  output: dist/release
+  buildResources: build
+files:
+  - dist/**
+  - package.json
+mac:
+  category: public.app-category.productivity
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+dmg:
+  sign: false
+publish:
+  provider: github

@@ -2,14 +2,35 @@
   "name": "nsn-library-machine",
   "version": "0.1.0",
   "private": true,
+  "workspaces": [
+    "apps/bridge",
+    "packages/*"
+  ],
   "scripts": {
     "dev": "next dev",
+    "dev:web": "next dev",
+    "dev:bridge": "tsx apps/bridge/src/main/dev.ts",
+    "dev:all": "tsx bridge-app/src/main/dev-all.ts",
     "build": "next build",
+    "build:web": "next build",
+    "build:bridge": "tsc --project apps/bridge/tsconfig.json --noEmit",
+    "package:bridge:mac": "node scripts/package-bridge-mac.mjs",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:bridge": "node --env-file=.env --test --import tsx bridge-app/tests/*.test.ts tests/integration/connected-libraries-reconnect.test.ts tests/integration/connected-library-file-resolver.test.ts tests/integration/connected-library-batch.test.ts tests/integration/scanned-file-image-filters.test.ts tests/integration/image-intelligence-processing.test.ts tests/integration/knowledge-graph-workflow-noise.test.ts tests/integration/connected-library-execution.test.ts",
+    "test:execution": "node --env-file=.env --test --import tsx tests/integration/connected-library-execution.test.ts",
+    "test:memory": "node --env-file=.env --test --import tsx tests/integration/librarian-memory-builder.test.ts",
+    "test:protocol": "node --env-file=.env --test --import tsx tests/integration/bridge-cloud-protocol.test.ts",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:studio": "prisma studio"
   },
   "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "mammoth": "^1.12.0",
     "next": "16.2.9",
+    "openai": "^6.45.0",
+    "pdf-parse": "^2.4.5",
     "react": "19.2.4",
     "react-dom": "19.2.4"
   },
@@ -19,9 +40,14 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "babel-plugin-react-compiler": "1.0.0",
+    "electron": "41.10.3",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.1",
     "eslint": "^9",
     "eslint-config-next": "16.2.9",
+    "prisma": "^6.19.3",
     "tailwindcss": "^4",
+    "tsx": "^4.23.0",
     "typescript": "^5"
   }
 }

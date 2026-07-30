@@ -1,0 +1,87 @@
+name: Release NSN Bridge for macOS
+
+on:
+  push:
+    tags:
+      - "bridge-v*"
+  workflow_dispatch:
+    inputs:
+      development_build:
+        description: "Create an unsigned development build"
+        required: false
+        default: "false"
+
+jobs:
+  build-macos:
+    name: Build macOS Bridge
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.13"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test protocol
+        run: npm run test:protocol
+
+      - name: Test Bridge
+        run: npm run test:bridge
+
+      - name: Build web
+        run: npm run build:web
+
+      - name: Type-check Bridge
+        run: npm run build:bridge
+
+      - name: Prepare signing certificate
+        if: ${{ inputs.development_build != 'true' }}
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12_BASE64" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ]; then
+            echo "Signing credentials are required for production Bridge releases."
+            exit 1
+          fi
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > certificate.p12
+          security create-keychain -p "$RUNNER_TEMP" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$RUNNER_TEMP" build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" build.keychain
+
+      - name: Package macOS DMGs
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_LINK: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run package:bridge:mac
+
+      - name: Calculate checksums
+        run: |
+          cd apps/bridge/dist/release
+          shasum -a 256 *.dmg > SHA256SUMS.txt
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            apps/bridge/dist/release/*.dmg
+            apps/bridge/dist/release/SHA256SUMS.txt
+            apps/bridge/dist/release/latest-mac.json

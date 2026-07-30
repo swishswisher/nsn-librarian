@@ -1,0 +1,1480 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum LibraryBatchStatus {
+  DRAFT
+  INGESTING
+  READY
+  FAILED
+  ARCHIVED
+}
+
+enum LibrarySourceType {
+  LOCAL_UPLOAD
+  MAC_BRIDGE
+  ZIP_IMPORT
+  MANUAL
+  EXTERNAL_DRIVE
+  UNKNOWN
+}
+
+enum KnowledgeItemKind {
+  DOCUMENT
+  IMAGE
+  AUDIO
+  VIDEO
+  EMAIL
+  PRESENTATION
+  SPREADSHEET
+  ARCHIVE
+  UNKNOWN
+}
+
+enum ExtractionStatus {
+  PENDING
+  EXTRACTING
+  COMPLETED
+  FAILED
+  UNSUPPORTED
+}
+
+enum ClassificationStatus {
+  PENDING
+  CLASSIFIED
+  NEEDS_REVIEW
+  FAILED
+  SKIPPED
+}
+
+enum ReviewStatus {
+  PENDING
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  NEEDS_REVIEW
+}
+
+enum DocumentPrimaryType {
+  ARTICLE_CANDIDATE
+  NEWSLETTER_CANDIDATE
+  WORKSHEET
+  CLINICAL_TOOL
+  CLINICAL_ASSESSMENT
+  RESEARCH_SOURCE
+  BOOK_REFERENCE
+  THOUGHT_BANK
+  CONCEPT_SEED
+  WEBSITE_CONTENT
+  MEDIA_ASSET
+  NSN_INFRASTRUCTURE
+  HANDOFF
+  UNKNOWN
+  NEEDS_REVIEW
+}
+
+enum OriginalVsSource {
+  DEANNE_ORIGINAL
+  OUTSIDE_SOURCE
+  MIXED
+  UNKNOWN
+}
+
+enum Publishability {
+  PUBLIC_READY
+  INTERNAL_ONLY
+  CLINICAL_RESTRICTED
+  REFERENCE_ONLY
+  DO_NOT_PUBLISH
+  NEEDS_REVIEW
+}
+
+enum MigrationActionType {
+  COPY
+  MOVE
+  LINK
+  SKIP
+  REVIEW
+}
+
+enum MigrationStatus {
+  PENDING
+  READY
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  BLOCKED
+}
+
+enum ObservationSessionStatus {
+  NEW
+  AWAITING_REVIEW
+  IN_REVIEW
+  APPROVED
+  MODIFIED
+  REJECTED
+  ARCHIVED
+}
+
+enum HumanDecisionType {
+  ACCEPT
+  MODIFY
+  REJECT
+  NOTE
+}
+
+enum KnowledgeConnectionStatus {
+  NEW
+  CONFIRMED
+  REJECTED
+  ARCHIVED
+}
+
+enum MemoryType {
+  THEME
+  TERM
+  PREFERENCE
+  RELATIONSHIP
+  NOTE
+}
+
+enum MemoryStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum BridgeScanSessionStatus {
+  PENDING
+  SCANNING
+  READING
+  EXAMINING
+  GENERATING_SUGGESTIONS
+  COMPLETED
+  COMPLETED_WITH_ERRORS
+  FAILED
+}
+
+enum ScannedFileReadStatus {
+  PENDING
+  SUPPORTED
+  UNSUPPORTED
+  FAILED
+}
+
+enum BridgeFileReadingStatus {
+  NOT_READ
+  READ
+  FAILED
+  UNSUPPORTED
+}
+
+enum AudioTranscriptionStatus {
+  NOT_REQUESTED
+  TRANSCRIBING
+  COMPLETED
+  UNAVAILABLE
+  FAILED
+}
+
+enum AudioPrivacyState {
+  PRIVATE
+  INTERNAL
+  REVIEW_REQUIRED
+  WEBSITE_CANDIDATE
+  APPROVED_FOR_PUBLIC_USE
+}
+
+enum VideoProcessingStatus {
+  NOT_REQUESTED
+  PROCESSING
+  COMPLETED
+  UNAVAILABLE
+  FAILED
+}
+
+enum VideoPrivacyState {
+  PRIVATE
+  INTERNAL
+  REVIEW_REQUIRED
+  WEBSITE_CANDIDATE
+  APPROVED_FOR_PUBLIC_USE
+}
+
+enum ImageProcessingStatus {
+  NOT_REQUESTED
+  PROCESSING
+  COMPLETED
+  UNAVAILABLE
+  FAILED
+}
+
+enum ImagePrivacyState {
+  PRIVATE
+  INTERNAL
+  REVIEW_REQUIRED
+  WEBSITE_CANDIDATE
+  APPROVED_FOR_PUBLIC_USE
+}
+
+enum ScannedFileProcessingStage {
+  DISCOVERED
+  READING_IMAGE_METADATA
+  METADATA_READY
+  PREPARING_PREVIEW
+  ANALYZING_IMAGE
+  OCR_PROCESSING
+  OBSERVING
+  RECOMMENDATIONS_READY
+  READING
+  READ
+  EXAMINING
+  EXAMINED
+  SUGGESTIONS_GENERATED
+  UNSUPPORTED
+  FAILED
+}
+
+enum OrganizationSuggestionType {
+  MOVE_FILE
+  RENAME_FILE
+  CREATE_FOLDER
+  GROUP_WITH_FILES
+  POSSIBLE_DUPLICATE
+  WEBSITE_CANDIDATE
+  KEEP_UNCHANGED
+}
+
+enum OrganizationSuggestionStatus {
+  PENDING
+  APPROVED
+  MODIFIED
+  REJECTED
+  LEFT_UNCHANGED
+}
+
+enum OrganizationPlanStatus {
+  DRAFT
+  READY_FOR_EXECUTION
+  EXECUTED
+  CANCELLED
+}
+
+enum ExecutionStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  PARTIALLY_COMPLETED
+  FAILED
+  BLOCKED
+}
+
+enum UndoStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  PARTIALLY_COMPLETED
+  FAILED
+  BLOCKED
+}
+
+enum BridgeMonitoringState {
+  NOT_CONNECTED
+  WATCHING
+  PAUSED
+  NEEDS_ATTENTION
+  STOPPED
+}
+
+enum BridgeMonitoringEventType {
+  FILE_ADDED
+  FILE_MODIFIED
+  FILE_RENAMED
+  FILE_MOVED
+  FILE_DELETED
+  FOLDER_ADDED
+  FOLDER_RENAMED
+  FOLDER_MOVED
+  FOLDER_DELETED
+}
+
+enum BridgeMonitoringProcessingStatus {
+  QUEUED
+  STABILIZING
+  PROCESSING
+  COMPLETED
+  NEEDS_ATTENTION
+  SKIPPED
+  FAILED
+}
+
+enum BridgeMonitoringBatchStatus {
+  OPEN
+  PROCESSING
+  READY_FOR_REVIEW
+  COMPLETED
+  COMPLETED_WITH_ERRORS
+  FAILED
+}
+
+enum ConnectedLibraryPlatform {
+  WINDOWS
+  MACOS
+  LINUX
+  UNKNOWN
+}
+
+enum ConnectedLibraryStatus {
+  CONNECTED
+  PAUSED
+  NEEDS_ATTENTION
+  DISCONNECTED
+  MERGED
+  HIDDEN_FROM_ACTIVE_LIST
+}
+
+enum BridgeDeviceStatus {
+  UNPAIRED
+  PAIRING
+  PAIRED
+  ONLINE
+  OFFLINE
+  UPDATE_REQUIRED
+  REVOKED
+}
+
+enum BridgePairingCodeStatus {
+  ACTIVE
+  CONSUMED
+  EXPIRED
+  REVOKED
+}
+
+enum BridgeCommandType {
+  SELECT_FOLDERS
+  REGISTER_ROOT
+  SCAN_LIBRARY
+  START_WATCHING
+  PAUSE_WATCHING
+  RESUME_WATCHING
+  STOP_WATCHING
+  READ_FILE_TEMPORARILY
+  PREVIEW_EXECUTION
+  EXECUTE_PLAN
+  PREVIEW_UNDO
+  EXECUTE_UNDO
+  RECONCILE_LIBRARY
+  REVOKE_ROOT_ACCESS
+}
+
+enum BridgeCommandStatus {
+  PENDING
+  ACKNOWLEDGED
+  RUNNING
+  COMPLETED
+  FAILED
+  EXPIRED
+  CANCELLED
+  REJECTED
+}
+
+enum BridgeAuditEventType {
+  PAIRING_CODE_CREATED
+  DEVICE_PAIRED
+  DEVICE_REVOKED
+  HEARTBEAT_RECEIVED
+  COMMAND_CREATED
+  COMMAND_ACKNOWLEDGED
+  COMMAND_COMPLETED
+  COMMAND_REJECTED
+}
+
+enum NotebookEntryType {
+  REFLECTION
+  SCAN_SUMMARY
+  OBSERVATION
+  HUMAN_REVISION
+  CONTEXT_NOTE
+  RECOMMENDATION_SUMMARY
+  ORGANIZATION_DECISION
+  ORGANIZATION_RESULT
+  UNDO_RESULT
+  MEMORY_LEARNING
+  QUESTION
+  GROWING_THEME
+  LANGUAGE_PREFERENCE
+  EMERGING_PATTERN
+  POSSIBLE_RELATIONSHIP
+  POSSIBLE_DUPLICATE
+  LEARNING_UPDATE
+}
+
+enum NotebookEntryStatus {
+  CURRENT
+  ARCHIVED
+  ACCEPTED
+  REJECTED
+  NOTEBOOK_ONLY
+}
+
+enum NotebookRevisionAction {
+  ACCEPT_REFLECTION
+  REVISE_REFLECTION
+  REVISE_WORDING
+  ADD_CONTEXT
+  ANSWER_QUESTION
+  REJECT_REFLECTION
+  APPROVE_FOR_MEMORY
+  KEEP_NOTEBOOK_ONLY
+  ARCHIVE
+  RESTORE
+}
+
+enum KnowledgeObjectType {
+  TOPIC
+  CONCEPT
+  FRAMEWORK
+  PERSON
+  PROJECT
+  WORKSHOP
+  RESOURCE
+  WEBSITE_ARTICLE
+  DECISION
+  PREFERENCE
+}
+
+enum KnowledgeObjectStatus {
+  PROVISIONAL
+  APPROVED
+  REJECTED
+  ARCHIVED
+}
+
+enum KnowledgeTrustLevel {
+  PROVISIONAL
+  HUMAN_APPROVED
+  EXCLUDED
+}
+
+enum KnowledgeRelationshipType {
+  RELATED_TO
+  PART_OF
+  MENTIONS
+  SUPPORTS
+  CONTRADICTS
+  DERIVED_FROM
+  USED_IN
+  CREATED_BY
+  PREFERRED_OVER
+  EVOLVED_FROM
+  SUITABLE_FOR
+  DUPLICATES
+  GROUPED_WITH
+  FILE_MOVED_TO
+  FILE_RENAMED_TO
+  FILE_GROUPED_WITH
+  FILE_USED_IN_PLAN
+  FILE_INCLUDED_IN_EXECUTION
+}
+
+enum KnowledgeRelationshipStatus {
+  PROVISIONAL
+  APPROVED
+  REJECTED
+  ARCHIVED
+}
+
+model LibraryBatch {
+  id         String             @id @default(cuid())
+  name       String
+  sourceType LibrarySourceType  @default(UNKNOWN)
+  notes      String?
+  status     LibraryBatchStatus @default(DRAFT)
+  createdAt  DateTime           @default(now())
+  updatedAt  DateTime           @updatedAt
+  documents  LibraryDocument[]
+
+  @@index([status])
+  @@index([sourceType])
+}
+
+model LibraryDocument {
+  id                   String                  @id @default(cuid())
+  batchId              String
+  itemKind             KnowledgeItemKind       @default(DOCUMENT)
+  originalFileName     String
+  normalizedFileName   String
+  mimeType             String?
+  extension            String?
+  fileSizeBytes        BigInt?
+  checksum             String?
+  rawText              String?
+  previewText          String?
+  wordCount            Int?
+  extractionStatus     ExtractionStatus        @default(PENDING)
+  classificationStatus ClassificationStatus    @default(PENDING)
+  reviewStatus         ReviewStatus            @default(PENDING)
+  storagePath          String?
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+  batch                LibraryBatch            @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  classification       DocumentClassification?
+  reviews              DocumentReview[]
+  migrationItems       MigrationQueueItem[]
+  observationSessions  ObservationSession[]
+  scannedFiles         ScannedFile[]
+
+  @@index([batchId])
+  @@index([itemKind])
+  @@index([checksum])
+  @@index([classificationStatus])
+  @@index([reviewStatus])
+}
+
+model DocumentClassification {
+  id                   String              @id @default(cuid())
+  documentId           String              @unique
+  primaryType          DocumentPrimaryType @default(NEEDS_REVIEW)
+  secondaryTypes       Json
+  topicTags            Json
+  audienceTags         Json
+  originalVsSource     OriginalVsSource    @default(UNKNOWN)
+  publishability       Publishability      @default(NEEDS_REVIEW)
+  suggestedDestination String?
+  confidenceScore      Float               @default(0)
+  reasoning            String?
+  articleSeedScore     Float               @default(0)
+  workshopScore        Float               @default(0)
+  bookSeedScore        Float               @default(0)
+  clinicalUtilityScore Float               @default(0)
+  researchValueScore   Float               @default(0)
+  duplicateRiskScore   Float               @default(0)
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  document             LibraryDocument     @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([primaryType])
+  @@index([publishability])
+}
+
+model DocumentReview {
+  id                  String               @id @default(cuid())
+  documentId          String
+  approvedType        DocumentPrimaryType?
+  approvedTags        Json
+  approvedDestination String?
+  isDeanneOriginal    Boolean              @default(false)
+  isReferenceOnly     Boolean              @default(false)
+  isArticleSeed       Boolean              @default(false)
+  isDoNotPublish      Boolean              @default(false)
+  notes               String?
+  decisionStatus      ReviewStatus         @default(PENDING)
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  document            LibraryDocument      @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@index([decisionStatus])
+}
+
+model LibraryTaxonomyNode {
+  id          String                @id @default(cuid())
+  name        String
+  slug        String                @unique
+  parentId    String?
+  nodeType    String
+  description String?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+  parent      LibraryTaxonomyNode?  @relation("TaxonomyTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children    LibraryTaxonomyNode[] @relation("TaxonomyTree")
+
+  @@index([parentId])
+  @@index([nodeType])
+}
+
+model DuplicateGroup {
+  id        String   @id @default(cuid())
+  groupHash String   @unique
+  status    String   @default("OPEN")
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+model MigrationQueueItem {
+  id              String              @id @default(cuid())
+  documentId      String
+  destinationPath String
+  actionType      MigrationActionType @default(REVIEW)
+  status          MigrationStatus     @default(PENDING)
+  notes           String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  document        LibraryDocument     @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@index([status])
+  @@index([actionType])
+}
+
+model ObservationSession {
+  id                String                   @id @default(cuid())
+  libraryDocumentId String
+  observerType      String
+  status            ObservationSessionStatus @default(AWAITING_REVIEW)
+  observations      Json
+  interpretations   Json
+  explanation       Json
+  planSuggestions   Json
+  confidence        Float                    @default(0)
+  warnings          Json
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @updatedAt
+  libraryDocument   LibraryDocument          @relation(fields: [libraryDocumentId], references: [id], onDelete: Cascade)
+  humanDecisions    HumanDecision[]
+  sourceConnections KnowledgeConnection[]    @relation("SourceObservationConnection")
+  targetConnections KnowledgeConnection[]    @relation("TargetObservationConnection")
+
+  @@index([libraryDocumentId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model HumanDecision {
+  id                   String             @id @default(cuid())
+  observationSessionId String
+  decisionType         HumanDecisionType
+  note                 String?
+  editedSuggestion     String?
+  createdAt            DateTime           @default(now())
+  observationSession   ObservationSession @relation(fields: [observationSessionId], references: [id], onDelete: Cascade)
+
+  @@index([observationSessionId])
+  @@index([decisionType])
+  @@index([createdAt])
+}
+
+model KnowledgeConnection {
+  id                         String                    @id @default(cuid())
+  createdAt                  DateTime                  @default(now())
+  sourceObservationSessionId String
+  targetObservationSessionId String
+  similarityScore            Float                     @default(0)
+  confidence                 Float                     @default(0)
+  sharedTerms                Json
+  reasoning                  String
+  status                     KnowledgeConnectionStatus @default(NEW)
+  sourceObservationSession   ObservationSession        @relation("SourceObservationConnection", fields: [sourceObservationSessionId], references: [id], onDelete: Cascade)
+  targetObservationSession   ObservationSession        @relation("TargetObservationConnection", fields: [targetObservationSessionId], references: [id], onDelete: Cascade)
+
+  @@index([sourceObservationSessionId])
+  @@index([targetObservationSessionId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model MemoryEntry {
+  id              String       @id @default(cuid())
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  memoryType      MemoryType
+  title           String
+  description     String
+  confidence      Float        @default(0)
+  evidence        Json
+  status          MemoryStatus @default(ACTIVE)
+  firstSeen       DateTime     @default(now())
+  lastSeen        DateTime     @default(now())
+  occurrenceCount Int          @default(1)
+  memoryKey       String       @unique
+
+  @@index([memoryType])
+  @@index([status])
+  @@index([lastSeen])
+}
+
+model ConnectedLibrary {
+  id                               String                   @id @default(cuid())
+  displayName                      String
+  localPath                        String                   @unique
+  bridgeRootId                     String?                  @unique
+  bridgeDeviceId                   String?
+  folderFingerprint                String?                  @unique
+  canonicalConnectedLibraryId      String?
+  safeLocalLocation                String?
+  platform                         ConnectedLibraryPlatform @default(UNKNOWN)
+  status                           ConnectedLibraryStatus   @default(CONNECTED)
+  connectedAt                      DateTime                 @default(now())
+  disconnectedAt                   DateTime?
+  hiddenFromActiveListAt           DateTime?
+  mergedAt                         DateTime?
+  isEnabled                        Boolean                  @default(true) @map("enabled")
+  isLegacyConnection               Boolean                  @default(false)
+  legacyReason                     String?
+  lastBridgeCheckAt                DateTime?
+  readPermission                   Boolean                  @default(true)
+  watchPermission                  Boolean                  @default(false)
+  recommendationPermission         Boolean                  @default(true)
+  organizationPlanPermission       Boolean                  @default(true)
+  createFolderPermission           Boolean                  @default(false)
+  moveFilePermission               Boolean                  @default(false)
+  renameFilePermission             Boolean                  @default(false)
+  lastScanAt                       DateTime?
+  lastMonitoringAt                 DateTime?
+  monitoringState                  BridgeMonitoringState    @default(STOPPED)
+  monitoringStartedAt              DateTime?
+  monitoringPausedAt               DateTime?
+  monitoringStoppedAt              DateTime?
+  monitoringLastCheckAt            DateTime?
+  monitoringLastSuccessfulCheckAt  DateTime?
+  monitoringHeartbeatAt            DateTime?
+  monitoringErrorCategory          String?
+  monitoringReconciliationRequired Boolean                  @default(false)
+  monitoringGeneration             Int                      @default(0)
+  createdAt                        DateTime                 @default(now())
+  updatedAt                        DateTime                 @updatedAt
+  bridgeDevice                     BridgeDevice?            @relation(fields: [bridgeDeviceId], references: [bridgeDeviceId], onDelete: SetNull)
+  scanSessions                     ScanSession[]
+  monitoringEvents                 MonitoringEvent[]
+  monitoringBatches                MonitoringBatch[]
+  organizationPlans                OrganizationPlan[]
+  executionRuns                    ExecutionRun[]
+  bridgeCommands                   BridgeCommand[]
+  bridgeAuditEntries               BridgeAuditEntry[]
+
+  @@index([isEnabled])
+  @@index([bridgeRootId])
+  @@index([bridgeDeviceId])
+  @@index([canonicalConnectedLibraryId])
+  @@index([disconnectedAt])
+  @@index([hiddenFromActiveListAt])
+  @@index([isLegacyConnection])
+  @@index([lastScanAt])
+  @@index([lastBridgeCheckAt])
+  @@index([lastMonitoringAt])
+  @@index([status])
+  @@index([platform])
+  @@index([monitoringState])
+  @@index([monitoringHeartbeatAt])
+  @@map("ConnectedFolder")
+}
+
+model BridgeDevice {
+  id                 String                   @id @default(cuid())
+  bridgeDeviceId     String                   @unique
+  deviceDisplayName  String
+  platform           ConnectedLibraryPlatform @default(UNKNOWN)
+  architecture       String
+  appVersion         String
+  publicKey          String
+  pairedAt           DateTime?
+  lastSeenAt         DateTime?
+  revokedAt          DateTime?
+  status             BridgeDeviceStatus       @default(UNPAIRED)
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+  connectedLibraries ConnectedLibrary[]
+  pairingCodes       BridgePairingCode[]      @relation("BridgePairingDevice")
+  commands           BridgeCommand[]
+  auditEntries       BridgeAuditEntry[]
+  executionRuns      ExecutionRun[]
+
+  @@index([status])
+  @@index([platform])
+  @@index([lastSeenAt])
+  @@index([revokedAt])
+}
+
+model BridgePairingCode {
+  id                String                  @id @default(cuid())
+  codeHash          String                  @unique
+  codeSuffix        String
+  requestedByUserId String                  @default("deanne")
+  status            BridgePairingCodeStatus @default(ACTIVE)
+  expiresAt         DateTime
+  consumedAt        DateTime?
+  pairedDeviceId    String?
+  attemptCount      Int                     @default(0)
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+  pairedDevice      BridgeDevice?           @relation("BridgePairingDevice", fields: [pairedDeviceId], references: [bridgeDeviceId], onDelete: SetNull)
+  auditEntries      BridgeAuditEntry[]
+
+  @@index([requestedByUserId])
+  @@index([status])
+  @@index([expiresAt])
+  @@index([pairedDeviceId])
+}
+
+model BridgeCommand {
+  id                   String              @id @default(cuid())
+  commandId            String              @unique
+  bridgeDeviceId       String
+  connectedLibraryId   String?
+  bridgeRootId         String?
+  commandType          BridgeCommandType
+  status               BridgeCommandStatus @default(PENDING)
+  issuedAt             DateTime            @default(now())
+  expiresAt            DateTime
+  authorizationContext Json
+  payload              Json
+  payloadHash          String
+  idempotencyKey       String              @unique
+  signature            String
+  acknowledgedAt       DateTime?
+  completedAt          DateTime?
+  result               Json?
+  safeErrorCategory    String?
+  createdBy            String              @default("SYSTEM")
+  device               BridgeDevice        @relation(fields: [bridgeDeviceId], references: [bridgeDeviceId], onDelete: Cascade)
+  connectedLibrary     ConnectedLibrary?   @relation(fields: [connectedLibraryId], references: [id], onDelete: SetNull)
+  auditEntries         BridgeAuditEntry[]
+
+  @@index([bridgeDeviceId])
+  @@index([connectedLibraryId])
+  @@index([bridgeRootId])
+  @@index([commandType])
+  @@index([status])
+  @@index([issuedAt])
+  @@index([expiresAt])
+}
+
+model BridgeAuditEntry {
+  id                 String               @id @default(cuid())
+  eventType          BridgeAuditEventType
+  bridgeDeviceId     String?
+  pairingCodeId      String?
+  commandId          String?
+  connectedLibraryId String?
+  actorUserId        String?
+  safeSummary        String
+  metadata           Json?
+  createdAt          DateTime             @default(now())
+  device             BridgeDevice?        @relation(fields: [bridgeDeviceId], references: [bridgeDeviceId], onDelete: SetNull)
+  pairingCode        BridgePairingCode?   @relation(fields: [pairingCodeId], references: [id], onDelete: SetNull)
+  command            BridgeCommand?       @relation(fields: [commandId], references: [commandId], onDelete: SetNull)
+  connectedLibrary   ConnectedLibrary?    @relation(fields: [connectedLibraryId], references: [id], onDelete: SetNull)
+
+  @@index([eventType])
+  @@index([bridgeDeviceId])
+  @@index([pairingCodeId])
+  @@index([commandId])
+  @@index([connectedLibraryId])
+  @@index([createdAt])
+}
+
+model ScanSession {
+  id                      String                   @id @default(cuid())
+  connectedFolderId       String
+  startedAt               DateTime                 @default(now())
+  completedAt             DateTime?
+  status                  BridgeScanSessionStatus  @default(PENDING)
+  filesScanned            Int                      @default(0)
+  supportedFiles          Int                      @default(0)
+  unsupportedFiles        Int                      @default(0)
+  failedFiles             Int                      @default(0)
+  observationsCreated     Int                      @default(0)
+  connectedFolder         ConnectedLibrary         @relation(fields: [connectedFolderId], references: [id], onDelete: Cascade)
+  scannedFiles            ScannedFile[]
+  organizationSuggestions OrganizationSuggestion[]
+  organizationPlans       OrganizationPlan[]
+  monitoringEvents        MonitoringEvent[]
+  monitoringBatches       MonitoringBatch[]
+
+  @@index([connectedFolderId])
+  @@index([status])
+  @@index([startedAt])
+}
+
+model ScannedFile {
+  id                      String                     @id @default(cuid())
+  sessionId               String
+  localPath               String
+  relativePath            String
+  fileType                String
+  checksum                String?
+  sizeBytes               BigInt?
+  lastModified            DateTime?
+  readStatus              ScannedFileReadStatus      @default(PENDING)
+  readingStatus           BridgeFileReadingStatus    @default(NOT_READ)
+  extractionStatus        ExtractionStatus           @default(PENDING)
+  characterCount          Int?
+  extractedAt             DateTime?
+  extractionErrorCategory String?
+  previewText             String?
+  libraryDocumentId       String?
+  scanError               String?
+  processingStage         ScannedFileProcessingStage @default(DISCOVERED)
+  processingErrorCategory String?
+  processedAt             DateTime?
+  sourceUnavailableAt     DateTime?
+  sourceUnavailableReason String?
+  sourceCreatedAt         DateTime?
+  createdAt               DateTime                   @default(now())
+  scanSession             ScanSession                @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  libraryDocument         LibraryDocument?           @relation(fields: [libraryDocumentId], references: [id], onDelete: SetNull)
+  organizationSuggestions OrganizationSuggestion[]
+  audioMetadata           AudioRecordingMetadata?
+  imageMetadata           ImageAssetMetadata?
+  videoMetadata           VideoRecordingMetadata?
+
+  @@index([sessionId])
+  @@index([readStatus])
+  @@index([readingStatus])
+  @@index([extractionStatus])
+  @@index([processingStage])
+  @@index([fileType])
+  @@index([checksum])
+  @@index([libraryDocumentId])
+  @@index([sourceUnavailableAt])
+}
+
+model AudioRecordingMetadata {
+  id                         String                   @id @default(cuid())
+  scannedFileId              String                   @unique
+  durationSeconds            Float?
+  sampleRateHz               Int?
+  bitrateKbps                Int?
+  channels                   Int?
+  codec                      String?
+  container                  String?
+  sourceCreatedAt            DateTime?
+  sourceModifiedAt           DateTime?
+  transcriptSnippet          String?
+  summary                    String?
+  transcriptionConfidence    Float?
+  transcriptionStatus        AudioTranscriptionStatus @default(NOT_REQUESTED)
+  transcriptionErrorCategory String?
+  privacyState               AudioPrivacyState        @default(REVIEW_REQUIRED)
+  humanLabels                Json
+  machineLabels              Json
+  provisionalTopics          Json
+  provisionalPeople          Json
+  provisionalProjects        Json
+  provisionalActionItems     Json
+  provisionalQuestions       Json
+  duplicateKind              String?
+  duplicateOfScannedFileId   String?
+  duplicateConfidence        Float?
+  audioFingerprint           String?
+  createdAt                  DateTime                 @default(now())
+  updatedAt                  DateTime                 @updatedAt
+  scannedFile                ScannedFile              @relation(fields: [scannedFileId], references: [id], onDelete: Cascade)
+
+  @@index([privacyState])
+  @@index([transcriptionStatus])
+  @@index([duplicateKind])
+  @@index([audioFingerprint])
+  @@index([sourceModifiedAt])
+}
+
+model VideoRecordingMetadata {
+  id                         String                @id @default(cuid())
+  scannedFileId              String                @unique
+  durationSeconds            Float?
+  width                      Int?
+  height                     Int?
+  frameRate                  Float?
+  codec                      String?
+  container                  String?
+  bitrateKbps                Int?
+  hasAudioTrack              Boolean?
+  sourceCreatedAt            DateTime?
+  sourceModifiedAt           DateTime?
+  transcriptSnippet          String?
+  summary                    String?
+  transcriptionConfidence    Float?
+  transcriptionStatus        VideoProcessingStatus @default(NOT_REQUESTED)
+  transcriptionErrorCategory String?
+  frameAnalysisStatus        VideoProcessingStatus @default(NOT_REQUESTED)
+  frameAnalysisErrorCategory String?
+  privacyState               VideoPrivacyState     @default(REVIEW_REQUIRED)
+  humanLabels                Json
+  machineLabels              Json
+  provisionalTopics          Json
+  provisionalPeople          Json
+  provisionalProjects        Json
+  provisionalQuestions       Json
+  selectedFrameDescriptions  Json
+  chapterSuggestions         Json
+  relatedSignals             Json
+  duplicateKind              String?
+  duplicateOfScannedFileId   String?
+  duplicateConfidence        Float?
+  videoFingerprint           String?
+  createdAt                  DateTime              @default(now())
+  updatedAt                  DateTime              @updatedAt
+  scannedFile                ScannedFile           @relation(fields: [scannedFileId], references: [id], onDelete: Cascade)
+
+  @@index([privacyState])
+  @@index([transcriptionStatus])
+  @@index([frameAnalysisStatus])
+  @@index([duplicateKind])
+  @@index([videoFingerprint])
+  @@index([sourceModifiedAt])
+}
+
+model ImageAssetMetadata {
+  id                          String                @id @default(cuid())
+  scannedFileId               String                @unique
+  width                       Int?
+  height                      Int?
+  format                      String?
+  orientation                 String?
+  colorProfile                String?
+  embeddedDate                DateTime?
+  cameraDevice                String?
+  sourceCreatedAt             DateTime?
+  sourceModifiedAt            DateTime?
+  previewStatus               ImageProcessingStatus @default(NOT_REQUESTED)
+  previewErrorCategory        String?
+  visualAnalysisStatus        ImageProcessingStatus @default(NOT_REQUESTED)
+  visualAnalysisErrorCategory String?
+  ocrStatus                   ImageProcessingStatus @default(NOT_REQUESTED)
+  ocrErrorCategory            String?
+  privacyState                ImagePrivacyState     @default(REVIEW_REQUIRED)
+  humanLabels                 Json
+  machineLabels               Json
+  provisionalTopics           Json
+  provisionalQuestions        Json
+  relatedSignals              Json
+  summary                     String?
+  textSnippet                 String?
+  duplicateKind               String?
+  duplicateOfScannedFileId    String?
+  duplicateConfidence         Float?
+  imageFingerprint            String?
+  createdAt                   DateTime              @default(now())
+  updatedAt                   DateTime              @updatedAt
+  scannedFile                 ScannedFile           @relation(fields: [scannedFileId], references: [id], onDelete: Cascade)
+
+  @@index([privacyState])
+  @@index([previewStatus])
+  @@index([visualAnalysisStatus])
+  @@index([ocrStatus])
+  @@index([duplicateKind])
+  @@index([imageFingerprint])
+  @@index([sourceModifiedAt])
+}
+
+model MonitoringBatch {
+  id                    String                      @id @default(cuid())
+  connectedFolderId     String
+  scanSessionId         String?
+  startedAt             DateTime                    @default(now())
+  completedAt           DateTime?
+  status                BridgeMonitoringBatchStatus @default(OPEN)
+  totalEvents           Int                         @default(0)
+  fileEvents            Int                         @default(0)
+  folderEvents          Int                         @default(0)
+  supportedFileEvents   Int                         @default(0)
+  unsupportedFileEvents Int                         @default(0)
+  failedEvents          Int                         @default(0)
+  summary               Json
+  notificationTitle     String?
+  notificationSummary   String?
+  notebookEntryId       String?
+  createdAt             DateTime                    @default(now())
+  updatedAt             DateTime                    @updatedAt
+  connectedFolder       ConnectedLibrary            @relation(fields: [connectedFolderId], references: [id], onDelete: Cascade)
+  scanSession           ScanSession?                @relation(fields: [scanSessionId], references: [id], onDelete: SetNull)
+  events                MonitoringEvent[]
+
+  @@index([connectedFolderId])
+  @@index([scanSessionId])
+  @@index([status])
+  @@index([startedAt])
+  @@index([completedAt])
+}
+
+model MonitoringEvent {
+  id                   String                           @id @default(cuid())
+  connectedFolderId    String
+  scanSessionId        String?
+  batchId              String?
+  executionRunId       String?
+  eventType            BridgeMonitoringEventType
+  previousRelativePath String?
+  currentRelativePath  String?
+  detectedAt           DateTime                         @default(now())
+  stabilizedAt         DateTime?
+  checksumBefore       String?
+  checksumAfter        String?
+  sizeBefore           BigInt?
+  sizeAfter            BigInt?
+  modifiedAtBefore     DateTime?
+  modifiedAtAfter      DateTime?
+  renameMoveConfidence Float?
+  processingStatus     BridgeMonitoringProcessingStatus @default(QUEUED)
+  safeErrorCategory    String?
+  retryCount           Int                              @default(0)
+  processedAt          DateTime?
+  eventKey             String                           @unique
+  createdAt            DateTime                         @default(now())
+  updatedAt            DateTime                         @updatedAt
+  connectedFolder      ConnectedLibrary                 @relation(fields: [connectedFolderId], references: [id], onDelete: Cascade)
+  scanSession          ScanSession?                     @relation(fields: [scanSessionId], references: [id], onDelete: SetNull)
+  batch                MonitoringBatch?                 @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  executionRun         ExecutionRun?                    @relation(fields: [executionRunId], references: [id], onDelete: SetNull)
+
+  @@index([connectedFolderId])
+  @@index([scanSessionId])
+  @@index([batchId])
+  @@index([executionRunId])
+  @@index([eventType])
+  @@index([processingStatus])
+  @@index([detectedAt])
+}
+
+model OrganizationSuggestion {
+  id                    String                           @id @default(cuid())
+  scannedFileId         String
+  scanSessionId         String
+  suggestionType        OrganizationSuggestionType
+  currentRelativePath   String
+  proposedRelativePath  String?
+  proposedFileName      String?
+  title                 String
+  explanation           String
+  confidence            Float                            @default(0)
+  status                OrganizationSuggestionStatus     @default(PENDING)
+  whySuggested          Json
+  supportingInformation Json
+  suggestionKey         String                           @unique
+  createdAt             DateTime                         @default(now())
+  updatedAt             DateTime                         @updatedAt
+  reviewedAt            DateTime?
+  scannedFile           ScannedFile                      @relation(fields: [scannedFileId], references: [id], onDelete: Cascade)
+  scanSession           ScanSession                      @relation(fields: [scanSessionId], references: [id], onDelete: Cascade)
+  revisions             OrganizationSuggestionRevision[]
+
+  @@index([scannedFileId])
+  @@index([scanSessionId])
+  @@index([suggestionType])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model OrganizationSuggestionRevision {
+  id                  String                 @id @default(cuid())
+  suggestionId        String
+  revisedRelativePath String?
+  revisedFileName     String?
+  context             String?
+  createdAt           DateTime               @default(now())
+  suggestion          OrganizationSuggestion @relation(fields: [suggestionId], references: [id], onDelete: Cascade)
+
+  @@index([suggestionId])
+  @@index([createdAt])
+}
+
+model OrganizationPlan {
+  id                 String                 @id @default(cuid())
+  scanSessionId      String
+  connectedLibraryId String
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+  createdBy          String
+  status             OrganizationPlanStatus @default(DRAFT)
+  totalActions       Int                    @default(0)
+  approvedActions    Int                    @default(0)
+  modifiedActions    Int                    @default(0)
+  rejectedActions    Int                    @default(0)
+  unchangedActions   Int                    @default(0)
+  actions            Json
+  warnings           Json
+  skippedItems       Json
+  history            Json
+  scanSession        ScanSession            @relation(fields: [scanSessionId], references: [id], onDelete: Cascade)
+  connectedLibrary   ConnectedLibrary       @relation(fields: [connectedLibraryId], references: [id], onDelete: Cascade)
+  executionRuns      ExecutionRun[]
+
+  @@index([scanSessionId])
+  @@index([connectedLibraryId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([updatedAt])
+}
+
+model ExecutionRun {
+  id                   String            @id @default(cuid())
+  organizationPlanId   String
+  connectedLibraryId   String
+  bridgeDeviceId       String?
+  status               ExecutionStatus   @default(PENDING)
+  startedAt            DateTime          @default(now())
+  completedAt          DateTime?
+  totalActions         Int               @default(0)
+  completedActions     Int               @default(0)
+  successfulActions    Int               @default(0)
+  failedActions        Int               @default(0)
+  durationMs           Int?
+  safeErrorCategory    String?
+  errorCategory        String?
+  bridgeRootId         String?
+  permissionSnapshot   Json?
+  reconciliationStatus String            @default("NOT_REQUESTED")
+  organizationPlan     OrganizationPlan  @relation(fields: [organizationPlanId], references: [id], onDelete: Cascade)
+  connectedLibrary     ConnectedLibrary  @relation(fields: [connectedLibraryId], references: [id], onDelete: Cascade)
+  bridgeDevice         BridgeDevice?     @relation(fields: [bridgeDeviceId], references: [bridgeDeviceId], onDelete: SetNull)
+  actions              ExecutionAction[]
+  undoRuns             UndoRun[]
+  monitoringEvents     MonitoringEvent[]
+
+  @@index([organizationPlanId])
+  @@index([connectedLibraryId])
+  @@index([bridgeDeviceId])
+  @@index([status])
+  @@index([startedAt])
+  @@index([completedAt])
+}
+
+model ExecutionAction {
+  id                       String          @id @default(cuid())
+  executionRunId           String
+  actionType               String
+  sourceRelativePath       String
+  destinationRelativePath  String
+  status                   ExecutionStatus @default(PENDING)
+  startedAt                DateTime?
+  completedAt              DateTime?
+  safeErrorCategory        String?
+  sourceChecksumBefore     String?
+  destinationChecksumAfter String?
+  sequence                 Int
+  createdFilesystemItem    Boolean         @default(false)
+  executionRun             ExecutionRun    @relation(fields: [executionRunId], references: [id], onDelete: Cascade)
+  undoActions              UndoAction[]
+
+  @@index([executionRunId])
+  @@index([status])
+  @@index([sequence])
+}
+
+model UndoRun {
+  id                String       @id @default(cuid())
+  executionRunId    String
+  status            UndoStatus   @default(PENDING)
+  startedAt         DateTime     @default(now())
+  completedAt       DateTime?
+  totalActions      Int          @default(0)
+  completedActions  Int          @default(0)
+  failedActions     Int          @default(0)
+  durationMs        Int?
+  safeErrorCategory String?
+  executionRun      ExecutionRun @relation(fields: [executionRunId], references: [id], onDelete: Cascade)
+  actions           UndoAction[]
+
+  @@index([executionRunId])
+  @@index([status])
+  @@index([startedAt])
+  @@index([completedAt])
+}
+
+model UndoAction {
+  id                        String          @id @default(cuid())
+  undoRunId                 String
+  originalExecutionActionId String
+  actionType                String
+  sourceRelativePath        String
+  destinationRelativePath   String
+  sequence                  Int
+  status                    UndoStatus      @default(PENDING)
+  startedAt                 DateTime?
+  completedAt               DateTime?
+  safeErrorCategory         String?
+  undoRun                   UndoRun         @relation(fields: [undoRunId], references: [id], onDelete: Cascade)
+  originalExecutionAction   ExecutionAction @relation(fields: [originalExecutionActionId], references: [id], onDelete: Cascade)
+
+  @@index([undoRunId])
+  @@index([originalExecutionActionId])
+  @@index([status])
+  @@index([sequence])
+}
+
+model NotebookEntry {
+  id                   String                  @id @default(cuid())
+  entryType            NotebookEntryType
+  title                String
+  summary              String
+  body                 String
+  status               NotebookEntryStatus     @default(CURRENT)
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+  archivedAt           DateTime?
+  sourceType           String
+  sourceId             String
+  sourceKey            String                  @unique
+  scanSessionId        String?
+  scannedFileId        String?
+  observationSessionId String?
+  recommendationId     String?
+  organizationPlanId   String?
+  executionRunId       String?
+  undoRunId            String?
+  memoryItemId         String?
+  requiresAttention    Boolean                 @default(false)
+  approvedForMemory    Boolean                 @default(false)
+  provenanceSummary    String
+  history              Json
+  relatedEntryKeys     Json
+  revisions            NotebookEntryRevision[]
+
+  @@index([entryType])
+  @@index([status])
+  @@index([sourceType])
+  @@index([sourceId])
+  @@index([scanSessionId])
+  @@index([observationSessionId])
+  @@index([recommendationId])
+  @@index([organizationPlanId])
+  @@index([executionRunId])
+  @@index([undoRunId])
+  @@index([memoryItemId])
+  @@index([requiresAttention])
+  @@index([createdAt])
+  @@index([updatedAt])
+}
+
+model NotebookEntryRevision {
+  id              String                 @id @default(cuid())
+  notebookEntryId String
+  actionType      NotebookRevisionAction
+  revisedTitle    String?
+  revisedSummary  String?
+  revisedBody     String?
+  note            String?
+  createdAt       DateTime               @default(now())
+  notebookEntry   NotebookEntry          @relation(fields: [notebookEntryId], references: [id], onDelete: Cascade)
+
+  @@index([notebookEntryId])
+  @@index([actionType])
+  @@index([createdAt])
+}
+
+model KnowledgeObject {
+  id                String                    @id @default(cuid())
+  objectType        KnowledgeObjectType
+  name              String
+  normalizedName    String
+  description       String
+  status            KnowledgeObjectStatus     @default(PROVISIONAL)
+  confidence        Float                     @default(0)
+  trustLevel        KnowledgeTrustLevel       @default(PROVISIONAL)
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
+  approvedAt        DateTime?
+  approvedBy        String?
+  firstSeen         DateTime                  @default(now())
+  lastSeen          DateTime                  @default(now())
+  occurrenceCount   Int                       @default(1)
+  provenanceSummary String
+  evidence          Json
+  sourceKeys        Json
+  canonicalObjectId String?
+  canonicalObject   KnowledgeObject?          @relation("KnowledgeObjectCanonical", fields: [canonicalObjectId], references: [id], onDelete: SetNull)
+  mergedObjects     KnowledgeObject[]         @relation("KnowledgeObjectCanonical")
+  revisions         KnowledgeObjectRevision[]
+  mergedInto        KnowledgeObjectMerge[]    @relation("KnowledgeMergedObject")
+  canonicalMerges   KnowledgeObjectMerge[]    @relation("KnowledgeCanonicalObject")
+  sourceRelations   KnowledgeRelationship[]   @relation("KnowledgeRelationshipSource")
+  targetRelations   KnowledgeRelationship[]   @relation("KnowledgeRelationshipTarget")
+
+  @@unique([objectType, normalizedName])
+  @@index([objectType])
+  @@index([normalizedName])
+  @@index([status])
+  @@index([trustLevel])
+  @@index([canonicalObjectId])
+  @@index([lastSeen])
+}
+
+model KnowledgeRelationship {
+  id                String                          @id @default(cuid())
+  sourceObjectId    String
+  targetObjectId    String
+  relationshipType  KnowledgeRelationshipType
+  confidence        Float                           @default(0)
+  trustLevel        KnowledgeTrustLevel             @default(PROVISIONAL)
+  status            KnowledgeRelationshipStatus     @default(PROVISIONAL)
+  explanation       String
+  createdAt         DateTime                        @default(now())
+  updatedAt         DateTime                        @updatedAt
+  approvedAt        DateTime?
+  provenanceSummary String
+  evidence          Json
+  relationshipKey   String                          @unique
+  sourceObject      KnowledgeObject                 @relation("KnowledgeRelationshipSource", fields: [sourceObjectId], references: [id], onDelete: Cascade)
+  targetObject      KnowledgeObject                 @relation("KnowledgeRelationshipTarget", fields: [targetObjectId], references: [id], onDelete: Cascade)
+  revisions         KnowledgeRelationshipRevision[]
+
+  @@index([sourceObjectId])
+  @@index([targetObjectId])
+  @@index([relationshipType])
+  @@index([status])
+  @@index([trustLevel])
+  @@index([createdAt])
+}
+
+model KnowledgeObjectRevision {
+  id             String          @id @default(cuid())
+  objectId       String
+  actionType     String
+  previousName   String?
+  revisedName    String?
+  previousType   String?
+  revisedType    String?
+  previousStatus String?
+  revisedStatus  String?
+  note           String?
+  createdAt      DateTime        @default(now())
+  createdBy      String?
+  object         KnowledgeObject @relation(fields: [objectId], references: [id], onDelete: Cascade)
+
+  @@index([objectId])
+  @@index([actionType])
+  @@index([createdAt])
+}
+
+model KnowledgeRelationshipRevision {
+  id                 String                @id @default(cuid())
+  relationshipId     String
+  actionType         String
+  previousStatus     String?
+  revisedStatus      String?
+  previousType       String?
+  revisedType        String?
+  revisedExplanation String?
+  note               String?
+  createdAt          DateTime              @default(now())
+  createdBy          String?
+  relationship       KnowledgeRelationship @relation(fields: [relationshipId], references: [id], onDelete: Cascade)
+
+  @@index([relationshipId])
+  @@index([actionType])
+  @@index([createdAt])
+}
+
+model KnowledgeObjectMerge {
+  id                String          @id @default(cuid())
+  canonicalObjectId String
+  mergedObjectId    String
+  createdAt         DateTime        @default(now())
+  createdBy         String?
+  reason            String?
+  provenanceSummary String
+  canonicalObject   KnowledgeObject @relation("KnowledgeCanonicalObject", fields: [canonicalObjectId], references: [id], onDelete: Cascade)
+  mergedObject      KnowledgeObject @relation("KnowledgeMergedObject", fields: [mergedObjectId], references: [id], onDelete: Cascade)
+
+  @@unique([canonicalObjectId, mergedObjectId])
+  @@index([canonicalObjectId])
+  @@index([mergedObjectId])
+  @@index([createdAt])
+}
