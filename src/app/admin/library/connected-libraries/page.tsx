@@ -1,16 +1,25 @@
 import { ConnectedLibrariesManager } from "@/components/library/ConnectedLibrariesManager";
 import { LibraryShell } from "@/components/library/LibraryShell";
 import { NsnPageHeader } from "@/components/library/NsnPageHeader";
+import { getBridgeCloudStatus } from "@/lib/bridge/cloud-coordinator";
 import { getConnectedLibraries } from "@/lib/bridge/connected-libraries";
+import { cloudBridgeHealth } from "@/lib/bridge/effective-health";
 import { getLocalBridgeHealth } from "@/lib/bridge/local-bridge-client";
 
 export const dynamic = "force-dynamic";
 
 export default async function ConnectedLibrariesPage() {
-  const [libraries, bridgeHealth] = await Promise.all([
+  const [libraries, localBridgeHealth, cloudStatus] = await Promise.all([
     getConnectedLibraries(),
     getLocalBridgeHealth(),
+    getBridgeCloudStatus().catch(() => ({
+      connectedLibraries: [],
+      devices: [],
+    })),
   ]);
+  const bridgeHealth = localBridgeHealth.ok
+    ? localBridgeHealth
+    : cloudBridgeHealth(cloudStatus.devices);
   const connectedCount = libraries.filter(
     (library) =>
       library.bridgeReachable &&
@@ -41,7 +50,9 @@ export default async function ConnectedLibrariesPage() {
       bridgeLabel={
         bridgeHealth.ok
           ? `${connectedCount} active, ${historicalCount} historical`
-          : "Bridge unavailable"
+          : bridgeHealth.paired
+            ? "Mac paired, Bridge offline"
+            : "Bridge not paired"
       }
       bridgeTone={bridgeHealth.ok ? "approved" : "pending"}
     >
