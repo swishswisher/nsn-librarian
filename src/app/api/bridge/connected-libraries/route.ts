@@ -1,3 +1,5 @@
+import { getBridgeCloudStatus } from "@/lib/bridge/cloud-coordinator";
+import { applyCloudBridgeReachability } from "@/lib/bridge/cloud-library-reachability";
 import {
   connectBridgeLibrary,
   ConnectedLibraryError,
@@ -61,9 +63,17 @@ function permissionsFromBody(body: Record<string, unknown>) {
 
 export async function GET() {
   try {
+    const [libraries, cloud] = await Promise.all([
+      getConnectedLibraries(),
+      getBridgeCloudStatus().catch(() => ({
+        connectedLibraries: [],
+        devices: [],
+      })),
+    ]);
+
     return Response.json({
       ok: true,
-      libraries: await getConnectedLibraries(),
+      libraries: applyCloudBridgeReachability(libraries, cloud.devices),
     });
   } catch (error) {
     return connectedLibraryErrorResponse(error);
