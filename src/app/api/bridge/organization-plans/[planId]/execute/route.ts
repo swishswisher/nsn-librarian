@@ -4,10 +4,7 @@ import {
   BridgeExecutorError,
   executeOrganizationPlan,
 } from "@/lib/bridge/executor";
-import {
-  BridgeCloudError,
-  queueExecutionCommandForApprovedPlan,
-} from "@/lib/bridge/cloud-coordinator";
+import { queueRemoteOrganizationPlanExecution } from "@/lib/bridge/remote-execution";
 import {
   getNotebookArchiveRoute,
   getNotebookRoute,
@@ -52,20 +49,21 @@ export async function POST(
   }
 
   try {
-    const queuedCommand = await queueExecutionCommandForApprovedPlan(
+    const queued = await queueRemoteOrganizationPlanExecution(
       planId,
       body.confirmation,
     );
 
-    if (queuedCommand) {
+    if (queued) {
+      revalidatePath(getOrganizationPlanRoute(queued.plan.scanSessionId));
+      revalidatePath(getScanSessionRoute(queued.plan.scanSessionId));
       revalidatePath("/admin/library");
 
       return Response.json({
-        command: queuedCommand,
         message:
-          "The approved plan was sent to the paired Bridge for safe execution.",
+          "The approved plan was sent to the paired Mac Bridge. The Bridge will independently validate every action before changing files.",
         ok: true,
-        queuedExecution: true,
+        ...queued,
       });
     }
 
@@ -88,16 +86,6 @@ export async function POST(
           ok: false,
           error: error.message,
           preview: error.preview,
-        },
-        { status: error.statusCode },
-      );
-    }
-
-    if (error instanceof BridgeCloudError) {
-      return Response.json(
-        {
-          ok: false,
-          error: error.message,
         },
         { status: error.statusCode },
       );
