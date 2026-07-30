@@ -2,6 +2,7 @@ import { ConnectedLibrariesManager } from "@/components/library/ConnectedLibrari
 import { LibraryShell } from "@/components/library/LibraryShell";
 import { NsnPageHeader } from "@/components/library/NsnPageHeader";
 import { getBridgeCloudStatus } from "@/lib/bridge/cloud-coordinator";
+import { applyCloudBridgeReachability } from "@/lib/bridge/cloud-library-reachability";
 import { getConnectedLibraries } from "@/lib/bridge/connected-libraries";
 import { cloudBridgeHealth } from "@/lib/bridge/effective-health";
 import { getLocalBridgeHealth } from "@/lib/bridge/local-bridge-client";
@@ -9,7 +10,7 @@ import { getLocalBridgeHealth } from "@/lib/bridge/local-bridge-client";
 export const dynamic = "force-dynamic";
 
 export default async function ConnectedLibrariesPage() {
-  const [libraries, localBridgeHealth, cloudStatus] = await Promise.all([
+  const [storedLibraries, localBridgeHealth, cloudStatus] = await Promise.all([
     getConnectedLibraries(),
     getLocalBridgeHealth(),
     getBridgeCloudStatus().catch(() => ({
@@ -17,6 +18,10 @@ export default async function ConnectedLibrariesPage() {
       devices: [],
     })),
   ]);
+  const libraries = applyCloudBridgeReachability(
+    storedLibraries,
+    cloudStatus.devices,
+  );
   const bridgeHealth = localBridgeHealth.ok
     ? localBridgeHealth
     : cloudBridgeHealth(cloudStatus.devices);
