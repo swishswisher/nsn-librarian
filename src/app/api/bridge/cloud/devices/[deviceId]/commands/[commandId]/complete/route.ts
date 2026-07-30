@@ -4,6 +4,7 @@ import {
   BridgeCloudError,
   completeBridgeCloudCommand,
 } from "@/lib/bridge/cloud-coordinator";
+import { prepareBridgeCommandReportForPersistence } from "@/lib/bridge/cloud-command-results";
 import { authenticateBridgeDeviceRequest } from "@/lib/bridge/device-request-auth";
 
 export const runtime = "nodejs";
@@ -38,7 +39,7 @@ export async function POST(
       throw new BridgeCloudError("Expected a safe Bridge command result.", 400);
     }
 
-    const report: BridgeCommandReport = {
+    const submittedReport: BridgeCommandReport = {
       commandId,
       result:
         body.result === undefined
@@ -50,6 +51,10 @@ export async function POST(
           : null,
       status,
     };
+    const report = await prepareBridgeCommandReportForPersistence(
+      deviceId,
+      submittedReport,
+    );
 
     return Response.json({
       command: await completeBridgeCloudCommand(deviceId, report),
