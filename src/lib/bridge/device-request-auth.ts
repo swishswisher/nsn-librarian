@@ -1,3 +1,5 @@
+import { createHash, randomUUID } from "node:crypto";
+
 import {
   bridgeRequestHeaderNames,
   bridgeRequestTimestampIsFresh,
@@ -7,14 +9,37 @@ import {
 import { getPrismaClient } from "@/lib/db/prisma";
 import { BridgeCloudError } from "@/lib/bridge/cloud-coordinator";
 
-const seenNonces = new Map<string, number>();
 const nonceRetentionMs = 10 * 60 * 1000;
 
-function pruneSeenNonces(now = Date.now()) {
-  for (const [key, expiresAt] of seenNonces.entries()) {
-    if (expiresAt <= now) {
-      seenNonces.delete(key);
-    }
+async function consumeBridgeRequestNonce(
+  bridgeDeviceId: string,
+  nonce: string,
+) {
+  const prisma = getPrismaClient();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + nonceRetentionMs);
+  const nonceHash = createHash("sha256")
+    .update(`${bridgeDeviceId}:${nonce}`)
+    .digest("hex");
+
+  await prisma.$executeRaw`
+    DELETE FROM "BridgeRequestNonce"
+    WHERE "expiresAt" <= ${now}
+  `;
+  const inserted = await prisma.$queryRaw<Array<{ id: string }>>`
+    INSERT INTO "BridgeRequestNonce"
+      ("id", "bridgeDeviceId", "nonceHash", "expiresAt", "createdAt")
+    VALUES
+      (${`bridge_nonce_${randomUUID()}`}, ${bridgeDeviceId}, ${nonceHash}, ${expiresAt}, ${now})
+    ON CONFLICT ("nonceHash") DO NOTHING
+    RETURNING "id"
+  `;
+
+  if (inserted.length === 0) {
+    throw new BridgeCloudError(
+      "This Bridge request has already been used.",
+      409,
+    );
   }
 }
 
@@ -37,7 +62,10 @@ export async function authenticateBridgeDeviceRequest(input: {
     !signature ||
     !timestamp
   ) {
-    throw new BridgeCloudError("This Bridge request could not be authenticated.", 401);
+    throw new BridgeCloudError(
+      "This Bridge request could not be authenticated.",
+      401,
+    );
   }
 
   if (!bridgeRequestTimestampIsFresh(timestamp)) {
@@ -68,17 +96,13 @@ export async function authenticateBridgeDeviceRequest(input: {
   });
 
   if (!verified) {
-    throw new BridgeCloudError("This Bridge request signature is invalid.", 401);
+    throw new BridgeCloudError(
+      "This Bridge request signature is invalid.",
+      401,
+    );
   }
 
-  pruneSeenNonces();
-  const replayKey = `${bridgeDeviceId}:${nonce}`;
-
-  if (seenNonces.has(replayKey)) {
-    throw new BridgeCloudError("This Bridge request has already been used.", 409);
-  }
-
-  seenNonces.set(replayKey, Date.now() + nonceRetentionMs);
+  await consumeBridgeRequestNonce(bridgeDeviceId, nonce);
 
   return device;
 }
