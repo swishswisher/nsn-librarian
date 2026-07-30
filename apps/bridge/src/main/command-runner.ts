@@ -39,6 +39,11 @@ import {
   getPairedBridgeDeviceId,
   reportBridgeCommand,
 } from "./cloud-client";
+import {
+  loadBridgeCommandOutbox,
+  queueBridgeCommandReport,
+  removeBridgeCommandReport,
+} from "./command-outbox";
 import { readBridgeSecret, saveBridgeSecret } from "./keychain";
 
 const replayCacheSecret = "processed-command-replay-keys";
@@ -123,6 +128,34 @@ function undoActions(value: BridgeJson | undefined) {
       typeof item.sourceRelativePath === "string" &&
       typeof item.destinationRelativePath === "string",
   );
+}
+
+function requiredExecutionActions(value: BridgeJson | undefined) {
+  const actions = executionActions(value);
+
+  if (actions.length === 0) {
+    throw new BridgeAppError(
+      "The execution command did not contain any valid approved actions.",
+      "NO_VALID_ACTIONS",
+      422,
+    );
+  }
+
+  return actions;
+}
+
+function requiredUndoActions(value: BridgeJson | undefined) {
+  const actions = undoActions(value);
+
+  if (actions.length === 0) {
+    throw new BridgeAppError(
+      "The Undo command did not contain any valid approved actions.",
+      "NO_VALID_UNDO_ACTIONS",
+      422,
+    );
+  }
+
+  return actions;
 }
 
 function permissionPatch(payload: Record<string, BridgeJson>) {
@@ -219,22 +252,22 @@ async function executeCommand(
     case "PREVIEW_EXECUTION":
       return previewBridgeExecution(
         requiredRootId(command),
-        executionActions(payload.actions),
+        requiredExecutionActions(payload.actions),
       );
     case "EXECUTE_PLAN":
       return executeBridgePlanActions(
         requiredRootId(command),
-        executionActions(payload.actions),
+        requiredExecutionActions(payload.actions),
       );
     case "PREVIEW_UNDO":
       return previewBridgeUndo(
         requiredRootId(command),
-        undoActions(payload.actions),
+        requiredUndoActions(payload.actions),
       );
     case "EXECUTE_UNDO":
       return executeBridgeUndoActions(
         requiredRootId(command),
-        undoActions(payload.actions),
+        requiredUndoActions(payload.actions),
       );
     case "RECONCILE_LIBRARY": {
       const rootId = requiredRootId(command);
@@ -257,17 +290,53 @@ async function executeCommand(
   }
 }
 
+async function submitPersistedReport(
+  replayKey: string,
+  report: BridgeCommandReport,
+) {
+  await queueBridgeCommandReport(replayKey, report);
+
+  try {
+    await reportBridgeCommand(report);
+    await removeBridgeCommandReport(report.commandId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function flushPendingReports() {
+  const pending = await loadBridgeCommandOutbox();
+  const delivered = new Set<string>();
+
+  for (const item of pending) {
+    try {
+      await reportBridgeCommand(item.report);
+      await removeBridgeCommandReport(item.report.commandId);
+      await rememberReplayKey(item.replayKey);
+      delivered.add(item.report.commandId);
+    } catch {
+      // The report remains in the local outbox. Never repeat the file action.
+    }
+  }
+
+  return delivered;
+}
+
 async function rejectCommand(
   command: BridgeCommandEnvelope,
   safeErrorCategory: string,
+  replayKey: string,
 ) {
-  await acknowledgeBridgeCommand(command.commandId).catch(() => undefined);
-  await reportBridgeCommand({
+  const report: BridgeCommandReport = {
     commandId: command.commandId,
     result: null,
     safeErrorCategory,
     status: "REJECTED",
-  });
+  };
+
+  await acknowledgeBridgeCommand(command.commandId).catch(() => undefined);
+  await submitPersistedReport(replayKey, report);
 }
 
 export async function processPendingBridgeCommands(
@@ -279,8 +348,12 @@ export async function processPendingBridgeCommands(
     return [];
   }
 
+  const deliveredReports = await flushPendingReports();
   const commands = await fetchPendingBridgeCommands();
   const replayKeys = new Set(await loadReplayKeys());
+  const pendingReports = new Set(
+    (await loadBridgeCommandOutbox()).map((item) => item.report.commandId),
+  );
   const reports: BridgeCommandReport[] = [];
 
   for (const command of commands) {
@@ -290,21 +363,41 @@ export async function processPendingBridgeCommands(
       continue;
     }
 
+    if (deliveredReports.has(command.commandId)) {
+      continue;
+    }
+
+    if (pendingReports.has(command.commandId)) {
+      continue;
+    }
+
     if (bridgeCommandIsExpired(command.expiresAt)) {
-      await rejectCommand(command, "COMMAND_EXPIRED").catch(() => undefined);
+      await rejectCommand(command, "COMMAND_EXPIRED", replayKey).catch(
+        () => undefined,
+      );
       continue;
     }
 
     if (hashBridgeCommandPayload(command.payload) !== command.payloadHash) {
-      await rejectCommand(command, "PAYLOAD_CHANGED").catch(() => undefined);
+      await rejectCommand(command, "PAYLOAD_CHANGED", replayKey).catch(
+        () => undefined,
+      );
       continue;
     }
 
     if (replayKeys.has(replayKey)) {
-      await rejectCommand(command, "COMMAND_REPLAYED").catch(() => undefined);
+      await rejectCommand(
+        command,
+        "COMMAND_RECOVERY_REQUIRED",
+        replayKey,
+      ).catch(() => undefined);
       continue;
     }
 
+    // Persist the replay marker before acknowledgement or filesystem work. If
+    // the process stops mid-command, the command is never executed a second time.
+    await rememberReplayKey(replayKey);
+    replayKeys.add(replayKey);
     await acknowledgeBridgeCommand(command.commandId);
 
     let report: BridgeCommandReport;
@@ -329,9 +422,7 @@ export async function processPendingBridgeCommands(
       };
     }
 
-    await reportBridgeCommand(report);
-    await rememberReplayKey(replayKey);
-    replayKeys.add(replayKey);
+    await submitPersistedReport(replayKey, report);
     reports.push(report);
   }
 
