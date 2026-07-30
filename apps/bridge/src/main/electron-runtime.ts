@@ -1,5 +1,6 @@
 type BrowserWindowConstructor = new (options: Record<string, unknown>) => {
   focus: () => void;
+  hide: () => void;
   isDestroyed: () => boolean;
   loadURL: (url: string) => Promise<void>;
   on: (eventName: string, listener: (...args: unknown[]) => void) => void;
@@ -15,8 +16,13 @@ type ElectronMenu = {
 };
 
 type ElectronTray = new (image: unknown) => {
+  on: (eventName: string, listener: (...args: unknown[]) => void) => void;
   setContextMenu: (menu: unknown) => void;
   setToolTip: (tooltip: string) => void;
+};
+
+type ElectronNativeImage = {
+  setTemplateImage: (isTemplate: boolean) => void;
 };
 
 export type ElectronRuntime = {
@@ -40,7 +46,7 @@ export type ElectronRuntime = {
     showMessageBox: (
       window: unknown,
       options: Record<string, unknown>,
-    ) => Promise<unknown>;
+    ) => Promise<{ response: number }>;
     showOpenDialog: (
       window: unknown,
       options: Record<string, unknown>,
@@ -53,7 +59,8 @@ export type ElectronRuntime = {
     ) => void;
   };
   nativeImage: {
-    createEmpty: () => unknown;
+    createEmpty: () => ElectronNativeImage;
+    createFromDataURL: (dataUrl: string) => ElectronNativeImage;
   };
   shell: {
     openExternal: (url: string) => Promise<void>;
