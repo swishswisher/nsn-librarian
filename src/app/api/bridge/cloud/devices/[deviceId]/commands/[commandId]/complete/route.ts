@@ -8,6 +8,7 @@ import { prepareBridgeCommandReportForPersistence } from "@/lib/bridge/cloud-com
 import { authenticateBridgeDeviceRequest } from "@/lib/bridge/device-request-auth";
 import { applyRemoteExecutionReport } from "@/lib/bridge/remote-execution";
 import { importRemoteBridgeScanReport } from "@/lib/bridge/remote-scan-queue";
+import { applyRemoteUndoReport } from "@/lib/bridge/remote-undo";
 import { getPrismaClient } from "@/lib/db/prisma";
 
 export const runtime = "nodejs";
@@ -85,6 +86,14 @@ export async function POST(
       report = {
         ...submittedReport,
         result: await applyRemoteExecutionReport({
+          commandPayload: command.payload,
+          report: submittedReport,
+        }),
+      };
+    } else if (command.commandType === "EXECUTE_UNDO") {
+      report = {
+        ...submittedReport,
+        result: await applyRemoteUndoReport({
           commandPayload: command.payload,
           report: submittedReport,
         }),
