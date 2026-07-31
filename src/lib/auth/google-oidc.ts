@@ -32,7 +32,8 @@ type GoogleIdTokenClaims = {
   sub?: string;
 };
 
-type GoogleJwk = JsonWebKey & {
+type GoogleJwk = {
+  [key: string]: string | string[] | undefined;
   alg?: string;
   kid?: string;
   use?: string;
