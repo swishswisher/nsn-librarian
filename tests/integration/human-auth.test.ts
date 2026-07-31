@@ -18,22 +18,16 @@ const passwordHash =
 const originalSecret = process.env.NSN_AUTH_SECRET;
 const originalUsers = process.env.NSN_AUTH_USERS_JSON;
 
+function approvedUser(email: string, name: string, role: "OWNER" | "LIBRARIAN") {
+  return { email, name, passwordHash, role };
+}
+
 function configureAuth() {
   process.env.NSN_AUTH_SECRET =
     "test-auth-secret-that-is-longer-than-thirty-two-characters";
   process.env.NSN_AUTH_USERS_JSON = JSON.stringify([
-    {
-      email: "david@example.com",
-      name: "David",
-      passwordHash,
-      role: "OWNER",
-    },
-    {
-      email: "deanne@example.com",
-      name: "Deanne",
-      passwordHash,
-      role: "LIBRARIAN",
-    },
+    approvedUser("david@example.com", "David", "OWNER"),
+    approvedUser("deanne@example.com", "Deanne", "LIBRARIAN"),
   ]);
 }
 
@@ -68,14 +62,22 @@ test("accepts only configured users and rejects a tampered session", () => {
   assert.equal(verifyHumanSessionToken(`${token}tampered`), null);
 
   process.env.NSN_AUTH_USERS_JSON = JSON.stringify([
-    {
-      email: "deanne@example.com",
-      name: "Deanne",
-      passwordHash,
-      role: "LIBRARIAN",
-    },
+    approvedUser("deanne@example.com", "Deanne", "LIBRARIAN"),
   ]);
   assert.equal(verifyHumanSessionToken(token), null);
+});
+
+test("refuses an auth configuration with more than two human accounts", () => {
+  configureAuth();
+  process.env.NSN_AUTH_USERS_JSON = JSON.stringify([
+    approvedUser("david@example.com", "David", "OWNER"),
+    approvedUser("deanne@example.com", "Deanne", "LIBRARIAN"),
+    approvedUser("third@example.com", "Third User", "LIBRARIAN"),
+  ]);
+
+  const status = authConfigurationStatus();
+  assert.equal(status.tooManyUsers, true);
+  assert.equal(status.configured, false);
 });
 
 test("verifies the scrypt password hash without storing a plain password", async () => {
