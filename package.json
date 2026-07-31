@@ -7,7 +7,6 @@
     "packages/*"
   ],
   "scripts": {
-    "auth:hash-password": "node scripts/hash-nsn-password.mjs",
     "dev": "next dev",
     "dev:web": "next dev",
     "dev:bridge": "tsx apps/bridge/src/main/dev.ts",
