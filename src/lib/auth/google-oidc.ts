@@ -95,7 +95,10 @@ function safePicture(value: unknown) {
 
   try {
     const url = new URL(value);
-    return url.protocol === "https:" ? url.toString() : null;
+    const googleHosted =
+      url.hostname === "googleusercontent.com" ||
+      url.hostname.endsWith(".googleusercontent.com");
+    return url.protocol === "https:" && googleHosted ? url.toString() : null;
   } catch {
     return null;
   }
