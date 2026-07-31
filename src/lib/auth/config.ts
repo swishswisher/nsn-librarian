@@ -7,6 +7,8 @@ export type ConfiguredAuthUser = {
   role: NsnAuthRole;
 };
 
+const maximumApprovedUsers = 2;
+
 function normalizedEmail(value: unknown) {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
@@ -80,10 +82,13 @@ export function findConfiguredAuthUser(email: string) {
 export function authConfigurationStatus() {
   const secret = process.env.NSN_AUTH_SECRET?.trim() ?? "";
   const users = configuredAuthUsers();
+  const tooManyUsers = users.length > maximumApprovedUsers;
 
   return {
-    configured: secret.length >= 32 && users.length > 0,
+    configured: secret.length >= 32 && users.length > 0 && !tooManyUsers,
     hasSecret: secret.length >= 32,
+    maximumApprovedUsers,
+    tooManyUsers,
     userCount: users.length,
   };
 }
