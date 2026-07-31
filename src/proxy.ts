@@ -16,9 +16,12 @@ import {
 function protectedResponse() {
   const response = NextResponse.next();
   response.headers.set("Cache-Control", "private, no-store");
+  response.headers.set("Cross-Origin-Opener-Policy", "same-origin");
+  response.headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   response.headers.set("Referrer-Policy", "same-origin");
   response.headers.set("X-Content-Type-Options", "nosniff");
   response.headers.set("X-Frame-Options", "DENY");
+  response.headers.set("X-Robots-Tag", "noindex, nofollow, noarchive");
   return response;
 }
 
