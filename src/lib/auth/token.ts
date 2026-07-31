@@ -1,21 +1,24 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 import {
+  authSecret,
   findConfiguredAuthUser,
   type ConfiguredAuthUser,
   type NsnAuthRole,
 } from "./config";
 
 export const HUMAN_SESSION_COOKIE = "nsn_session";
-const sessionVersion = 1;
+const sessionVersion = 2;
 const defaultSessionHours = 8;
 
 type HumanSessionPayload = {
   email: string;
   expiresAt: number;
+  googleSubject: string;
   issuedAt: number;
   jti: string;
   name: string;
+  picture: string | null;
   role: NsnAuthRole;
   version: number;
 };
@@ -23,14 +26,18 @@ type HumanSessionPayload = {
 export type HumanSession = {
   email: string;
   expiresAt: Date;
+  googleSubject: string;
   name: string;
+  picture: string | null;
   role: NsnAuthRole;
 };
 
-function authSecret() {
-  const secret = process.env.NSN_AUTH_SECRET?.trim() ?? "";
-  return secret.length >= 32 ? secret : null;
-}
+export type VerifiedGoogleIdentity = {
+  email: string;
+  googleSubject: string;
+  name: string;
+  picture: string | null;
+};
 
 function sessionDurationSeconds() {
   const configured = Number(process.env.NSN_AUTH_SESSION_HOURS ?? defaultSessionHours);
@@ -58,20 +65,45 @@ function safeSignatureEqual(left: string, right: string) {
   );
 }
 
-export function createHumanSessionToken(user: ConfiguredAuthUser) {
+function safePicture(value: unknown) {
+  if (typeof value !== "string" || value.length > 2048) {
+    return null;
+  }
+
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function createHumanSessionToken(
+  user: ConfiguredAuthUser,
+  identity: VerifiedGoogleIdentity,
+) {
   const secret = authSecret();
 
   if (!secret) {
     throw new Error("NSN_AUTH_NOT_CONFIGURED");
   }
 
+  if (
+    user.email !== identity.email.trim().toLowerCase() ||
+    (user.googleSubject && user.googleSubject !== identity.googleSubject)
+  ) {
+    throw new Error("GOOGLE_IDENTITY_NOT_APPROVED");
+  }
+
   const issuedAt = Math.floor(Date.now() / 1000);
   const payload: HumanSessionPayload = {
     email: user.email,
     expiresAt: issuedAt + sessionDurationSeconds(),
+    googleSubject: identity.googleSubject,
     issuedAt,
     jti: randomUUID(),
-    name: user.name,
+    name: user.name || identity.name,
+    picture: safePicture(identity.picture),
     role: user.role,
     version: sessionVersion,
   };
@@ -109,6 +141,8 @@ export function verifyHumanSessionToken(token: string | null | undefined) {
       payload.version !== sessionVersion ||
       typeof payload.email !== "string" ||
       typeof payload.expiresAt !== "number" ||
+      typeof payload.googleSubject !== "string" ||
+      !payload.googleSubject ||
       typeof payload.issuedAt !== "number" ||
       typeof payload.jti !== "string" ||
       payload.expiresAt <= now ||
@@ -120,14 +154,20 @@ export function verifyHumanSessionToken(token: string | null | undefined) {
 
     const configuredUser = findConfiguredAuthUser(payload.email);
 
-    if (!configuredUser) {
+    if (
+      !configuredUser ||
+      (configuredUser.googleSubject &&
+        configuredUser.googleSubject !== payload.googleSubject)
+    ) {
       return null;
     }
 
     return {
       email: configuredUser.email,
       expiresAt: new Date(payload.expiresAt * 1000),
+      googleSubject: payload.googleSubject,
       name: configuredUser.name,
+      picture: safePicture(payload.picture),
       role: configuredUser.role,
     } satisfies HumanSession;
   } catch {
