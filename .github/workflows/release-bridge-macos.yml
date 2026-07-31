@@ -50,8 +50,10 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_test?schema=public
       NEXT_PUBLIC_APP_URL: https://nsn-librarian.vercel.app
       NSN_LIBRARIAN_APP_URL: https://nsn-librarian.vercel.app
-      NSN_AUTH_SECRET: ci-auth-secret-with-at-least-thirty-two-characters
-      NSN_AUTH_USERS_JSON: '[{"email":"ci@example.com","name":"CI User","passwordHash":"scrypt$16384$8$1$P8jHqWKy4BTWAxtbx0F4KA$lJEt1Uo6FGfSbOhXh4BdNhks_I_olwzdWWIUMCEPUMmSoc4y1WshMpXT8HgvnEC0W_YfGE18U-OAc-8RMvQXwQ","role":"OWNER"}]'
+      AUTH_SECRET: ci-auth-secret-with-at-least-thirty-two-characters
+      AUTH_GOOGLE_ID: ci-google-client-id.apps.googleusercontent.com
+      AUTH_GOOGLE_SECRET: ci-google-client-secret
+      NSN_AUTH_ALLOWED_USERS_JSON: '[{"email":"ci@example.com","googleSubject":"ci-google-subject","name":"CI User","role":"OWNER"}]'
       NSN_BRIDGE_COMMAND_SIGNING_SECRET: ci-command-signing-secret-with-at-least-32-characters
       NSN_BRIDGE_PAIRING_SECRET: ci-pairing-secret-with-at-least-32-characters
     steps:
@@ -75,8 +77,6 @@ jobs:
           npx prisma db push --skip-generate
           psql postgresql://postgres:postgres@127.0.0.1:5432/nsn_test \
             -f prisma/migrations/20260730170000_bridge_request_nonce/migration.sql
-          psql postgresql://postgres:postgres@127.0.0.1:5432/nsn_test \
-            -f prisma/migrations/20260731103000_human_auth_throttle/migration.sql
 
       - name: Lint
         run: npm run lint
