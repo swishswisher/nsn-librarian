@@ -59,20 +59,26 @@ export async function saveBridgeSecret(account: string, value: string) {
 }
 
 export async function readBridgeSecret(account: string) {
-  if (process.platform === "darwin") {
-    return runSecurityCli([
-      "find-generic-password",
-      "-s",
-      serviceName,
-      "-a",
-      account,
-      "-w",
-    ]);
+  try {
+    if (process.platform === "darwin") {
+      const value = await runSecurityCli([
+        "find-generic-password",
+        "-s",
+        serviceName,
+        "-a",
+        account,
+        "-w",
+      ]);
+
+      return value || null;
+    }
+
+    const parsed = JSON.parse(
+      await readFile(fallbackSecretPath(account), "utf8"),
+    ) as { value?: unknown };
+
+    return typeof parsed.value === "string" ? parsed.value : null;
+  } catch {
+    return null;
   }
-
-  const parsed = JSON.parse(
-    await readFile(fallbackSecretPath(account), "utf8"),
-  ) as { value?: unknown };
-
-  return typeof parsed.value === "string" ? parsed.value : null;
 }

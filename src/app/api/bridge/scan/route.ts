@@ -3,6 +3,9 @@ import {
   startBridgeScanSessionFromEnvironment,
 } from "@/lib/bridge/processing-pipeline";
 import { ConnectedLibraryError } from "@/lib/bridge/connected-libraries";
+import { getPrismaClient } from "@/lib/db/prisma";
+import { BridgeCloudError } from "@/lib/bridge/cloud-coordinator";
+import { queueRemoteBridgeScan } from "@/lib/bridge/remote-scan-queue";
 import {
   BridgeScannerError,
   isDevelopmentBridgeScannerEnabled,
@@ -32,9 +35,20 @@ export async function POST(request: Request) {
   }
 
   try {
-    const result = connectedLibraryId
-      ? await startBridgeScanSessionForConnectedLibrary(connectedLibraryId)
-      : await startBridgeScanSessionFromEnvironment();
+    let result;
+
+    if (connectedLibraryId) {
+      const library = await getPrismaClient().connectedLibrary.findUnique({
+        select: { bridgeDeviceId: true },
+        where: { id: connectedLibraryId },
+      });
+
+      result = library?.bridgeDeviceId
+        ? await queueRemoteBridgeScan(connectedLibraryId)
+        : await startBridgeScanSessionForConnectedLibrary(connectedLibraryId);
+    } else {
+      result = await startBridgeScanSessionFromEnvironment();
+    }
 
     return Response.json({
       ok: true,
@@ -45,7 +59,8 @@ export async function POST(request: Request) {
   } catch (error) {
     if (
       error instanceof BridgeScannerError ||
-      error instanceof ConnectedLibraryError
+      error instanceof ConnectedLibraryError ||
+      error instanceof BridgeCloudError
     ) {
       return Response.json(
         {
@@ -60,7 +75,7 @@ export async function POST(request: Request) {
       {
         ok: false,
         error:
-          "The Librarian could not start the folder scan right now. Check the NSN Bridge and try again.",
+          "The Librarian could not start the folder scan right now. Open NSN Bridge on the connected Mac and try again.",
       },
       { status: 500 },
     );

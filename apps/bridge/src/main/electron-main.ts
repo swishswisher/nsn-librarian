@@ -5,19 +5,27 @@ import path from "node:path";
 import { createBridgeServer } from "../../../../bridge-app/src/api/server";
 import {
   createFolderSelection,
+  listRoots,
   registerRootFromSelection,
 } from "../../../../bridge-app/src/main/registry";
+import {
+  pauseBridgeWatcher,
+  resumeBridgeWatcher,
+} from "../../../../bridge-app/src/watcher/watcher";
+import { processPendingBridgeCommands } from "./command-runner";
 import { bridgeRendererHtml } from "./renderer-html";
 import { loadElectronRuntime } from "./electron-runtime";
 import {
-  fetchPendingBridgeCommands,
+  getPairedBridgeDeviceId,
   pairBridgeWithCloud,
   sendBridgeHeartbeat,
+  syncBridgeRoots,
 } from "./cloud-client";
 import { checkBridgeUpdateManifest } from "./update-manager";
 
 let localServer: Server | null = null;
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
+const rootSyncIntervalMs = 60_000;
 
 async function startLocalBridgeServer() {
   if (localServer) {
@@ -49,6 +57,8 @@ export async function startElectronBridgeApp() {
 
   let mainWindow: InstanceType<typeof electron.BrowserWindow> | null = null;
   let isQuitting = false;
+  let commandPollInFlight = false;
+  let lastRootSyncAt = 0;
 
   function createMainWindow() {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -76,89 +86,44 @@ export async function startElectronBridgeApp() {
     );
     mainWindow.on("ready-to-show", () => mainWindow?.show());
     mainWindow.on("close", (event: unknown) => {
-      if (!isQuitting) {
-        if (
-          typeof event === "object" &&
-          event !== null &&
-          "preventDefault" in event &&
-          typeof event.preventDefault === "function"
-        ) {
-          event.preventDefault();
-        }
-        void electron.dialog.showMessageBox(mainWindow, {
+      if (isQuitting) {
+        return;
+      }
+
+      if (
+        typeof event === "object" &&
+        event !== null &&
+        "preventDefault" in event &&
+        typeof event.preventDefault === "function"
+      ) {
+        event.preventDefault();
+      }
+
+      void electron.dialog
+        .showMessageBox(mainWindow, {
           buttons: ["Keep Running", "Quit Bridge"],
           defaultId: 0,
           message:
             "Closing this window can leave the Bridge running in the menu bar so connected folders can keep watching.",
           title: "Keep NSN Bridge running?",
           type: "question",
+        })
+        .then((choice: { response: number }) => {
+          if (choice.response === 1) {
+            isQuitting = true;
+            localServer?.close();
+            electron.app.quit();
+            return;
+          }
+
+          mainWindow?.hide();
         });
-      }
     });
 
     return mainWindow;
   }
 
-  const tray = new electron.Tray(electron.nativeImage.createEmpty());
-
-  function buildMenu() {
-    const menu = electron.Menu.buildFromTemplate([
-      { enabled: false, label: "NSN Bridge status: Ready" },
-      { click: createMainWindow, label: "Open Bridge" },
-      {
-        click: () =>
-          void electron.shell.openExternal(
-            process.env.NSN_LIBRARIAN_APP_URL ?? "http://localhost:3000",
-          ),
-        label: "Open NSN Librarian",
-      },
-      {
-        enabled: false,
-        label: "Watching status: controlled by folder permissions",
-      },
-      {
-        click: () => mainWindow?.webContents.send("nsn-bridge:pause-watching"),
-        label: "Pause Watching",
-      },
-      {
-        click: () => mainWindow?.webContents.send("nsn-bridge:resume-watching"),
-        label: "Resume Watching",
-      },
-      {
-        click: () => mainWindow?.webContents.send("nsn-bridge:check-updates"),
-        label: "Check for Updates",
-      },
-      {
-        click: () => {
-          isQuitting = true;
-          localServer?.close();
-          electron.app.quit();
-        },
-        label: "Quit",
-      },
-    ]);
-
-    electron.Menu.setApplicationMenu(menu);
-    tray.setContextMenu(menu);
-    tray.setToolTip("NSN Bridge");
-  }
-
-  electron.ipcMain.handle("nsn-bridge:pair", async (_event: unknown, code: unknown) => {
-    if (typeof code !== "string") {
-      return null;
-    }
-
-    return pairBridgeWithCloud(code);
-  });
-  electron.ipcMain.handle("nsn-bridge:heartbeat", sendBridgeHeartbeat);
-  electron.ipcMain.handle("nsn-bridge:commands", fetchPendingBridgeCommands);
-  electron.ipcMain.handle("nsn-bridge:check-updates", checkBridgeUpdateManifest);
-  electron.ipcMain.handle("nsn-bridge:open-librarian", () =>
-    electron.shell.openExternal(
-      process.env.NSN_LIBRARIAN_APP_URL ?? "http://localhost:3000",
-    ),
-  );
-  electron.ipcMain.handle("nsn-bridge:choose-folders", async () => {
+  async function chooseFolders() {
     const result = await electron.dialog.showOpenDialog(createMainWindow(), {
       buttonLabel: "Add Selected Folders",
       message: "Choose folders for NSN Bridge",
@@ -176,49 +141,209 @@ export async function startElectronBridgeApp() {
         const selection = await createFolderSelection(filePath);
 
         return {
-          displayName: selection.suggestedDisplayName,
+          ancestorRootIds: selection.ancestorRootIds,
           expiresAt: selection.expiresAt,
+          platform: selection.platform,
           rootId: selection.rootId,
           safeLocation: selection.safeLocation,
           selectionToken: selection.selectionToken,
+          suggestedDisplayName: selection.suggestedDisplayName,
         };
       }),
     );
-  });
-  electron.ipcMain.handle(
-    "nsn-bridge:connect-folders",
-    async (_event: unknown, folders: unknown) => {
-    const selectedFolders = Array.isArray(folders) ? folders : [];
-    const roots = [];
+  }
 
-    for (const folder of selectedFolders) {
-      if (
-        typeof folder !== "object" ||
-        folder === null ||
-        typeof (folder as { selectionToken?: unknown }).selectionToken !==
-          "string"
-      ) {
+  async function syncLocalRoots(force = false) {
+    if (!force && Date.now() - lastRootSyncAt < rootSyncIntervalMs) {
+      return null;
+    }
+
+    const roots = await listRoots();
+    const result = await syncBridgeRoots(roots);
+
+    if (result) {
+      lastRootSyncAt = Date.now();
+    }
+
+    return result;
+  }
+
+  async function desktopStatus() {
+    const [bridgeDeviceId, roots] = await Promise.all([
+      getPairedBridgeDeviceId(),
+      listRoots(),
+    ]);
+
+    return {
+      appVersion: process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0",
+      bridgeDeviceId,
+      paired: Boolean(bridgeDeviceId),
+      roots,
+    };
+  }
+
+  async function pauseAllWatching() {
+    const roots = await listRoots();
+    const results = [];
+
+    for (const root of roots) {
+      if (!root.watchPermission || root.watcherState === "STOPPED") {
         continue;
       }
 
-      roots.push(
-        await registerRootFromSelection({
-          permissions: {
-            organizationPlanPermission: true,
-            readPermission: true,
-            recommendationPermission: true,
-            watchPermission: false,
-          },
-          selectionToken: (folder as { selectionToken: string })
-            .selectionToken,
-        }),
-      );
+      results.push(await pauseBridgeWatcher(root.id));
     }
 
-    return {
-      ok: true,
-      roots,
-    };
+    await syncLocalRoots(true).catch(() => null);
+    return results;
+  }
+
+  async function resumeAllWatching() {
+    const roots = await listRoots();
+    const results = [];
+
+    for (const root of roots) {
+      if (!root.watchPermission || root.status === "DISCONNECTED") {
+        continue;
+      }
+
+      results.push(await resumeBridgeWatcher(root.id));
+    }
+
+    await syncLocalRoots(true).catch(() => null);
+    return results;
+  }
+
+  async function pollCloud() {
+    if (commandPollInFlight) {
+      return [];
+    }
+
+    commandPollInFlight = true;
+
+    try {
+      await sendBridgeHeartbeat().catch(() => null);
+      await syncLocalRoots().catch(() => null);
+      const reports = await processPendingBridgeCommands({
+        selectFolders: chooseFolders,
+      });
+
+      if (reports.length > 0) {
+        await syncLocalRoots(true).catch(() => null);
+        mainWindow?.webContents.send("nsn-bridge:commands-completed", reports);
+      }
+
+      return reports;
+    } finally {
+      commandPollInFlight = false;
+    }
+  }
+
+  const trayImage = electron.nativeImage.createFromDataURL(
+    `data:image/svg+xml;base64,${Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18"><path fill="black" d="M3 2h8l4 4v10H3z"/><path fill="white" d="M10 2v5h5"/><circle cx="7" cy="11" r="2" fill="white"/></svg>',
+    ).toString("base64")}`,
+  );
+  trayImage.setTemplateImage(true);
+  const tray = new electron.Tray(trayImage);
+
+  function buildMenu() {
+    const menu = electron.Menu.buildFromTemplate([
+      { enabled: false, label: "NSN Bridge status: Ready" },
+      { click: createMainWindow, label: "Open Bridge" },
+      {
+        click: () =>
+          void electron.shell.openExternal(
+            process.env.NSN_LIBRARIAN_APP_URL ?? "http://localhost:3000",
+          ),
+        label: "Open NSN Librarian",
+      },
+      {
+        click: () => void pauseAllWatching(),
+        label: "Pause Watching",
+      },
+      {
+        click: () => void resumeAllWatching(),
+        label: "Resume Watching",
+      },
+      {
+        click: () => void checkBridgeUpdateManifest(),
+        label: "Check for Updates",
+      },
+      {
+        click: () => {
+          isQuitting = true;
+          localServer?.close();
+          electron.app.quit();
+        },
+        label: "Quit",
+      },
+    ]);
+
+    electron.Menu.setApplicationMenu(menu);
+    tray.setContextMenu(menu);
+    tray.setToolTip("NSN Bridge");
+    tray.on("click", createMainWindow);
+  }
+
+  electron.ipcMain.handle("nsn-bridge:pair", async (_event: unknown, code: unknown) => {
+    if (typeof code !== "string") {
+      return null;
+    }
+
+    const device = await pairBridgeWithCloud(code);
+    await syncLocalRoots(true).catch(() => null);
+    void pollCloud();
+    return device;
+  });
+  electron.ipcMain.handle("nsn-bridge:status", desktopStatus);
+  electron.ipcMain.handle("nsn-bridge:heartbeat", sendBridgeHeartbeat);
+  electron.ipcMain.handle("nsn-bridge:commands", pollCloud);
+  electron.ipcMain.handle("nsn-bridge:check-updates", checkBridgeUpdateManifest);
+  electron.ipcMain.handle("nsn-bridge:pause-watching", pauseAllWatching);
+  electron.ipcMain.handle("nsn-bridge:resume-watching", resumeAllWatching);
+  electron.ipcMain.handle("nsn-bridge:open-librarian", () =>
+    electron.shell.openExternal(
+      process.env.NSN_LIBRARIAN_APP_URL ?? "http://localhost:3000",
+    ),
+  );
+  electron.ipcMain.handle("nsn-bridge:choose-folders", chooseFolders);
+  electron.ipcMain.handle(
+    "nsn-bridge:connect-folders",
+    async (_event: unknown, folders: unknown) => {
+      const selectedFolders = Array.isArray(folders) ? folders : [];
+      const roots = [];
+
+      for (const folder of selectedFolders) {
+        if (
+          typeof folder !== "object" ||
+          folder === null ||
+          typeof (folder as { selectionToken?: unknown }).selectionToken !==
+            "string"
+        ) {
+          continue;
+        }
+
+        roots.push(
+          await registerRootFromSelection({
+            permissions: {
+              organizationPlanPermission: true,
+              readPermission: true,
+              recommendationPermission: true,
+              watchPermission: false,
+            },
+            selectionToken: (folder as { selectionToken: string })
+              .selectionToken,
+          }),
+        );
+      }
+
+      await syncLocalRoots(true).catch(() => null);
+
+      return {
+        ok: true,
+        roots,
+      };
     },
   );
   electron.ipcMain.handle("nsn-bridge:login-item", (_event: unknown, enabled: unknown) => {
@@ -231,19 +356,17 @@ export async function startElectronBridgeApp() {
     electron.app.quit();
   });
 
+  electron.app.on("second-instance", createMainWindow);
   buildMenu();
   createMainWindow();
 
+  void pollCloud().catch(() => undefined);
   const pollInterval = setInterval(() => {
-    void sendBridgeHeartbeat();
-    void fetchPendingBridgeCommands().then((commands: unknown[]) => {
-      if (commands.length > 0) {
-        mainWindow?.webContents.send("nsn-bridge:commands-ready", commands);
-      }
-    });
+    void pollCloud().catch(() => undefined);
   }, 15_000);
 
   electron.app.on("before-quit", () => {
+    isQuitting = true;
     clearInterval(pollInterval);
     localServer?.close();
   });

@@ -2,8 +2,9 @@ appId: com.nsn.bridge
 productName: NSN Bridge
 artifactName: NSN-Bridge-v${version}-mac-${arch}.${ext}
 directories:
-  output: dist/release
-  buildResources: build
+  app: apps/bridge
+  output: apps/bridge/dist/release
+  buildResources: apps/bridge/build
 files:
   - dist/**
   - package.json

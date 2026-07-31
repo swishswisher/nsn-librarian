@@ -1,5 +1,7 @@
 import { processNextBridgeScanSessionFile } from "@/lib/bridge/processing-pipeline";
 import { ConnectedLibraryError } from "@/lib/bridge/connected-libraries";
+import { remoteSessionIsCloudManaged } from "@/lib/bridge/remote-scan-queue";
+import { getBridgeScanSessionProgress } from "@/lib/bridge/scan-sessions";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,6 +13,23 @@ export async function POST(
   const { sessionId } = await context.params;
 
   try {
+    if (await remoteSessionIsCloudManaged(sessionId)) {
+      const current = await getBridgeScanSessionProgress(sessionId);
+
+      if (!current) {
+        throw new ConnectedLibraryError(
+          "The Librarian could not find this cloud-managed scan session.",
+          404,
+        );
+      }
+
+      return Response.json({
+        ok: true,
+        progress: current.progress,
+        session: current.session,
+      });
+    }
+
     const body = (await request.json().catch(() => null)) as {
       retryFailed?: unknown;
       retryStartedAt?: unknown;

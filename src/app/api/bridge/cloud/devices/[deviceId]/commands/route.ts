@@ -1,20 +1,24 @@
-import {
-  BridgeCloudError,
-  fetchPendingBridgeCloudCommands,
-} from "@/lib/bridge/cloud-coordinator";
+import { BridgeCloudError } from "@/lib/bridge/cloud-coordinator";
+import { authenticateBridgeDeviceRequest } from "@/lib/bridge/device-request-auth";
+import { fetchRecoverableBridgeCommands } from "@/lib/bridge/recoverable-commands";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ deviceId: string }> },
 ) {
   const { deviceId } = await context.params;
 
   try {
+    await authenticateBridgeDeviceRequest({
+      bridgeDeviceId: deviceId,
+      request,
+    });
+
     return Response.json({
-      commands: await fetchPendingBridgeCloudCommands(deviceId),
+      commands: await fetchRecoverableBridgeCommands(deviceId),
       ok: true,
     });
   } catch (error) {

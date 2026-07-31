@@ -1,7 +1,12 @@
 name: Release NSN Bridge for macOS
 
 on:
+  pull_request:
+    branches:
+      - master
   push:
+    branches:
+      - master
     tags:
       - "bridge-v*"
   workflow_dispatch:
@@ -9,14 +14,48 @@ on:
       development_build:
         description: "Create an unsigned development build"
         required: false
-        default: "false"
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      publish_release:
+        description: "Publish the DMGs as a GitHub prerelease"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 jobs:
-  build-macos:
-    name: Build macOS Bridge
-    runs-on: macos-latest
-    permissions:
-      contents: write
+  quality:
+    name: Test NSN web and Bridge
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: nsn_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_test?schema=public
+      NEXT_PUBLIC_APP_URL: https://nsn-librarian.vercel.app
+      NSN_LIBRARIAN_APP_URL: https://nsn-librarian.vercel.app
+      AUTH_SECRET: ci-auth-secret-with-at-least-thirty-two-characters
+      AUTH_GOOGLE_ID: ci-google-client-id.apps.googleusercontent.com
+      AUTH_GOOGLE_SECRET: ci-google-client-secret
+      NSN_AUTH_ALLOWED_USERS_JSON: '[{"email":"ci@example.com","googleSubject":"ci-google-subject","name":"CI User","role":"OWNER"}]'
+      NSN_BRIDGE_COMMAND_SIGNING_SECRET: ci-command-signing-secret-with-at-least-32-characters
+      NSN_BRIDGE_PAIRING_SECRET: ci-pairing-secret-with-at-least-32-characters
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,8 +69,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Prepare test database
+        run: |
+          npx prisma db push --skip-generate
+          psql postgresql://postgres:postgres@127.0.0.1:5432/nsn_test \
+            -f prisma/migrations/20260730170000_bridge_request_nonce/migration.sql
+
       - name: Lint
         run: npm run lint
+
+      - name: Test human auth
+        run: npm run test:auth
 
       - name: Test protocol
         run: npm run test:protocol
@@ -45,8 +96,59 @@ jobs:
       - name: Type-check Bridge
         run: npm run build:bridge
 
+  build-macos:
+    name: Build macOS Bridge
+    needs: quality
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      NSN_LIBRARIAN_APP_URL: ${{ vars.NSN_LIBRARIAN_APP_URL || 'https://nsn-librarian.vercel.app' }}
+      TMPDIR: /private/tmp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine build mode
+        id: build_mode
+        env:
+          DEVELOPMENT_BUILD: ${{ inputs.development_build || 'true' }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        shell: bash
+        run: |
+          unsigned=false
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            unsigned=true
+          elif [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "branch" ]; then
+            unsigned=true
+          elif [ "$EVENT_NAME" = "push" ] && [[ "$REF_NAME" == *dev* ]]; then
+            unsigned=true
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DEVELOPMENT_BUILD" = "true" ]; then
+            unsigned=true
+          fi
+
+          echo "unsigned=$unsigned" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.13"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Type-check Bridge
+        run: npm run build:bridge
+
       - name: Prepare signing certificate
-        if: ${{ inputs.development_build != 'true' }}
+        if: ${{ steps.build_mode.outputs.unsigned == 'false' }}
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -62,7 +164,16 @@ jobs:
           security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" build.keychain
 
-      - name: Package macOS DMGs
+      - name: Package unsigned macOS DMGs
+        if: ${{ steps.build_mode.outputs.unsigned == 'true' }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NSN_UNSIGNED_BUILD: "true"
+        run: npm run package:bridge:mac
+
+      - name: Package signed macOS DMGs
+        if: ${{ steps.build_mode.outputs.unsigned == 'false' }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -70,17 +181,69 @@ jobs:
           CSC_LINK: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           CSC_KEY_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NSN_UNSIGNED_BUILD: "false"
         run: npm run package:bridge:mac
 
       - name: Calculate checksums
         run: |
           cd apps/bridge/dist/release
           shasum -a 256 *.dmg > SHA256SUMS.txt
+          shasum -a 256 latest-mac.json >> SHA256SUMS.txt
+
+      - name: Upload Apple Silicon build artifact
+        if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_release != 'true') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsn-bridge-macos-arm64-${{ steps.build_mode.outputs.unsigned == 'true' && 'unsigned' || 'signed' }}
+          path: |
+            apps/bridge/dist/release/*mac-arm64*.dmg
+            apps/bridge/dist/release/SHA256SUMS.txt
+            apps/bridge/dist/release/latest-mac.json
+          if-no-files-found: error
+
+      - name: Upload Intel build artifact
+        if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_release != 'true') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsn-bridge-macos-x64-${{ steps.build_mode.outputs.unsigned == 'true' && 'unsigned' || 'signed' }}
+          path: |
+            apps/bridge/dist/release/*mac-x64*.dmg
+            apps/bridge/dist/release/SHA256SUMS.txt
+            apps/bridge/dist/release/latest-mac.json
+          if-no-files-found: error
+
+      - name: Resolve release metadata
+        id: release
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_NAME" = "master" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag=bridge-v0.1.0-dev-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "${{ inputs.publish_release }}" = "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag=bridge-v0.1.0-dev-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload release assets
+        if: ${{ steps.release.outputs.publish == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: NSN Bridge ${{ steps.release.outputs.tag }}
+          body: |
+            Unsigned internal NSN Bridge build for Deanne's MacBook.
+
+            macOS may require manual approval through System Settings → Privacy & Security → Open Anyway.
+
+            Nothing moves without an approved Organization Plan and typed EXECUTE confirmation. Undo requires typed UNDO confirmation.
           fail_on_unmatched_files: true
+          prerelease: ${{ steps.build_mode.outputs.unsigned == 'true' }}
           files: |
             apps/bridge/dist/release/*.dmg
             apps/bridge/dist/release/SHA256SUMS.txt

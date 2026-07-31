@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
+import path from "node:path";
 import { after, before, beforeEach, test } from "node:test";
 
 import { PrismaClient } from "@prisma/client";
@@ -140,24 +141,24 @@ test("same folder selected twice reuses one canonical ConnectedLibrary", async (
   assert.equal(rows[0]?.status, "CONNECTED");
 });
 
-test("path casing, slash direction, and trailing slash variants produce one fingerprint", () => {
-  const base = "D:\\NSN-Full-System-Test-Library";
-  const slashVariant = "D:/NSN-Full-System-Test-Library/";
-  const trailingVariant = "D:\\NSN-Full-System-Test-Library\\";
+test("native path and trailing slash variants produce one fingerprint", () => {
+  const base = path.join(process.cwd(), "NSN-Full-System-Test-Library");
+  const trailingVariant = `${base}${path.sep}`;
 
-  assert.equal(
-    stableFolderFingerprintForLocalPath(slashVariant),
-    stableFolderFingerprintForLocalPath(base),
-  );
   assert.equal(
     stableFolderFingerprintForLocalPath(trailingVariant),
     stableFolderFingerprintForLocalPath(base),
   );
 
   if (process.platform === "win32") {
+    const windowsBase = "D:\\NSN-Full-System-Test-Library";
+    assert.equal(
+      stableFolderFingerprintForLocalPath("D:/NSN-Full-System-Test-Library/"),
+      stableFolderFingerprintForLocalPath(windowsBase),
+    );
     assert.equal(
       stableFolderFingerprintForLocalPath("d:\\nsn-full-system-test-library"),
-      stableFolderFingerprintForLocalPath(base),
+      stableFolderFingerprintForLocalPath(windowsBase),
     );
   }
 });
@@ -205,13 +206,18 @@ test("concurrent duplicate connection attempts leave one canonical record", asyn
 });
 
 test("duplicate reconciliation is idempotent and relinks history", async () => {
-  const basePath = "D:\\NSN-Full-System-Test-Library";
-  const variantPath = "D:/NSN-Full-System-Test-Library/";
+  const basePath = path.join(process.cwd(), "NSN-Full-System-Test-Library");
+  const variantPath = `${basePath}${path.sep}`;
   const first = await prisma.connectedLibrary.create({
     data: {
       displayName: "Canonical raw path",
       localPath: basePath,
-      platform: "WINDOWS",
+      platform:
+        process.platform === "win32"
+          ? "WINDOWS"
+          : process.platform === "darwin"
+            ? "MACOS"
+            : "LINUX",
       status: "CONNECTED",
     },
   });
@@ -220,7 +226,12 @@ test("duplicate reconciliation is idempotent and relinks history", async () => {
       displayName: "Duplicate raw path",
       isEnabled: false,
       localPath: variantPath,
-      platform: "WINDOWS",
+      platform:
+        process.platform === "win32"
+          ? "WINDOWS"
+          : process.platform === "darwin"
+            ? "MACOS"
+            : "LINUX",
       status: "DISCONNECTED",
     },
   });
