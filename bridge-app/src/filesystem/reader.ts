@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import mammoth from "mammoth";
+import { CanvasFactory } from "pdf-parse/worker";
 import { PDFParse } from "pdf-parse";
 
 import { BridgeAppError, type BridgeReadResult } from "../types";
@@ -72,6 +73,7 @@ async function extractText(filePath: string, extension: string) {
   if (extension === ".pdf") {
     const buffer = await readFile(filePath);
     const parser = new PDFParse({
+      CanvasFactory,
       data: new Uint8Array(buffer),
       isEvalSupported: false,
       useWorkerFetch: false,
