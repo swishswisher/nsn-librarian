@@ -1,5 +1,4 @@
 import type { Server } from "node:http";
-import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { createBridgeServer } from "../../../../bridge-app/src/api/server";
@@ -24,7 +23,7 @@ import {
 import { checkBridgeUpdateManifest } from "./update-manager";
 
 let localServer: Server | null = null;
-const currentDir = path.dirname(fileURLToPath(import.meta.url));
+const currentDir = __dirname;
 const rootSyncIntervalMs = 60_000;
 
 async function startLocalBridgeServer() {

@@ -3,5 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "dist/main.cjs"
+  "main": "dist/main.cjs",
+  "dependencies": {
+    "@napi-rs/canvas": "0.1.80",
+    "pdf-parse": "2.4.5"
+  }
 }

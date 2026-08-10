@@ -13,6 +13,15 @@ const librarianAppUrl =
   process.env.NSN_LIBRARIAN_APP_URL?.trim() ||
   "https://nsn-librarian.vercel.app";
 const bridgeVersion = bridgePackage.version || "0.1.0";
+const mainExternals = [
+  "electron",
+  "pdf-parse",
+  "pdf-parse/worker",
+  "pdf-parse/*",
+  "@napi-rs/canvas",
+  "@napi-rs/canvas-*",
+];
+const preloadExternals = ["electron"];
 
 await mkdir(distDir, { recursive: true });
 
@@ -23,7 +32,7 @@ await build({
     "process.env.NSN_LIBRARIAN_APP_URL": JSON.stringify(librarianAppUrl),
   },
   entryPoints: [path.join(bridgeDir, "src", "main", "main.ts")],
-  external: ["electron"],
+  external: mainExternals,
   format: "cjs",
   outfile: path.join(distDir, "main.cjs"),
   platform: "node",
@@ -34,7 +43,7 @@ await build({
 await build({
   bundle: true,
   entryPoints: [path.join(bridgeDir, "src", "main", "preload.ts")],
-  external: ["electron"],
+  external: preloadExternals,
   format: "cjs",
   outfile: path.join(distDir, "preload.cjs"),
   platform: "node",

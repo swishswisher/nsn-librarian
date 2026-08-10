@@ -8,6 +8,8 @@ directories:
 files:
   - dist/**
   - package.json
+asarUnpack:
+  - node_modules/@napi-rs/canvas*/**/*.node
 mac:
   category: public.app-category.productivity
   hardenedRuntime: true
