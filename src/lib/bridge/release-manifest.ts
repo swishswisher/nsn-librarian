@@ -94,15 +94,55 @@ function parseChecksums(value: string) {
 }
 
 function architectureForAsset(fileName: string) {
-  if (/mac-arm64/i.test(fileName)) {
+  if (/(?:^|[-_.])mac-arm64(?:[-_.]|$)/iu.test(fileName)) {
     return "arm64" as const;
   }
 
-  if (/mac-x64/i.test(fileName)) {
+  if (/(?:^|[-_.])mac-x64(?:[-_.]|$)/iu.test(fileName)) {
     return "x64" as const;
   }
 
   return "universal" as const;
+}
+
+function pendingDmgAsset(
+  architecture: Extract<BridgeReleaseAsset["architecture"], "arm64" | "x64">,
+  fallback: BridgeReleaseManifest,
+): BridgeReleaseAsset {
+  const fallbackAsset = fallback.assets.find(
+    (asset) => asset.kind === "dmg" && asset.architecture === architecture,
+  );
+
+  return (
+    fallbackAsset ?? {
+      architecture,
+      available: false,
+      fileName: `NSN-Bridge-v${fallback.version}-mac-${architecture}-unsigned.dmg`,
+      kind: "dmg",
+      sha256: "pending-release-asset",
+      sizeBytes: null,
+      url: null,
+    }
+  );
+}
+
+function withRequiredMacDmgAssets(
+  assets: BridgeReleaseAsset[],
+  fallback: BridgeReleaseManifest,
+) {
+  const next = [...assets];
+
+  for (const architecture of ["arm64", "x64"] as const) {
+    const hasArchitecture = next.some(
+      (asset) => asset.kind === "dmg" && asset.architecture === architecture,
+    );
+
+    if (!hasArchitecture) {
+      next.push(pendingDmgAsset(architecture, fallback));
+    }
+  }
+
+  return next;
 }
 
 function releaseNotes(release: GitHubRelease, fallback: string[]) {
@@ -157,7 +197,7 @@ async function loadGitHubReleaseManifest(
       )
     : "";
   const checksums = parseChecksums(checksumText);
-  const assets: BridgeReleaseAsset[] = release.assets
+  const discoveredAssets: BridgeReleaseAsset[] = release.assets
     .filter(
       (asset) =>
         asset.name.endsWith(".dmg") ||
@@ -177,6 +217,7 @@ async function loadGitHubReleaseManifest(
       sizeBytes: asset.size,
       url: checksums.get(asset.name) ? asset.browser_download_url : null,
     }));
+  const assets = withRequiredMacDmgAssets(discoveredAssets, fallback);
   const parsedVersion = parseBridgeReleaseVersion(
     release.tag_name.replace(/^bridge-/u, ""),
   );

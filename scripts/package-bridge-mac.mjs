@@ -24,6 +24,16 @@ if (!existsSync(electronBuilderBin)) {
 }
 
 const unsignedBuild = process.env.NSN_UNSIGNED_BUILD === "true";
+const bridgeArch = process.env.NSN_BRIDGE_ARCH?.trim();
+const bridgeArchFlag =
+  bridgeArch === "arm64" ? "--arm64" : bridgeArch === "x64" ? "--x64" : null;
+
+if (!bridgeArchFlag) {
+  process.stderr.write(
+    "NSN_BRIDGE_ARCH must be set to arm64 or x64 when packaging the macOS Bridge.\n",
+  );
+  process.exit(1);
+}
 
 const buildResult = spawnSync("node", ["scripts/build-bridge-app.mjs"], {
   stdio: "inherit",
@@ -35,7 +45,13 @@ if (buildResult.status !== 0) {
 
 const packageResult = spawnSync(
   electronBuilderBin,
-  ["--config", "apps/bridge/electron-builder.yml", "--mac", "dmg"],
+  [
+    "--config",
+    "apps/bridge/electron-builder.yml",
+    "--mac",
+    "dmg",
+    bridgeArchFlag,
+  ],
   {
     env: {
       ...process.env,
@@ -66,6 +82,19 @@ if (unsignedBuild && existsSync(releaseDir)) {
 const dmgFiles = existsSync(releaseDir)
   ? readdirSync(releaseDir).filter((fileName) => fileName.endsWith(".dmg"))
   : [];
+const expectedArchDmgs = dmgFiles.filter((fileName) =>
+  fileName.includes(`mac-${bridgeArch}`),
+);
+const wrongArchDmgs = dmgFiles.filter(
+  (fileName) => !fileName.includes(`mac-${bridgeArch}`),
+);
+
+if (expectedArchDmgs.length !== 1 || wrongArchDmgs.length > 0) {
+  process.stderr.write(
+    `Expected exactly one macOS ${bridgeArch} DMG, found ${expectedArchDmgs.length}. Unexpected DMGs: ${wrongArchDmgs.join(", ") || "none"}.\n`,
+  );
+  process.exit(1);
+}
 
 writeFileSync(
   path.join(releaseDir, "latest-mac.json"),
@@ -84,6 +113,6 @@ writeFileSync(
 
 process.stdout.write(
   unsignedBuild
-    ? "Created unsigned NSN Bridge development DMGs. macOS will require manual approval on first launch.\n"
-    : "Created signed NSN Bridge production DMGs.\n",
+    ? `Created unsigned NSN Bridge development DMG for ${bridgeArch}. macOS will require manual approval on first launch.\n`
+    : `Created signed NSN Bridge production DMG for ${bridgeArch}.\n`,
 );

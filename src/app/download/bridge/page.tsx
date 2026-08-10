@@ -12,6 +12,21 @@ import {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+type MacArchitecture = Extract<
+  BridgeReleaseAsset["architecture"],
+  "arm64" | "x64"
+>;
+
+const macDownloadArchitectures: MacArchitecture[] = ["arm64", "x64"];
+
+function architectureLabel(architecture: MacArchitecture) {
+  return architecture === "arm64" ? "Apple Silicon" : "Intel Mac";
+}
+
+function pendingFileName(version: string, architecture: MacArchitecture) {
+  return `NSN-Bridge-v${version}-mac-${architecture}-unsigned.dmg`;
+}
+
 function formatReleaseDate(value: string) {
   return new Intl.DateTimeFormat("en-US", {
     dateStyle: "long",
@@ -31,16 +46,15 @@ function formatSize(value: number | null) {
 }
 
 function DownloadAction({
+  architecture,
   asset,
   suggested,
 }: {
+  architecture: MacArchitecture;
   asset: BridgeReleaseAsset | undefined;
   suggested: boolean;
 }) {
-  const label =
-    asset?.architecture === "x64"
-      ? "Download for Intel Mac"
-      : "Download for Apple Silicon";
+  const label = `Download for ${architectureLabel(architecture)}`;
   const className = [
     "inline-flex min-h-11 w-full max-w-full items-center justify-center rounded-md border px-4 text-center text-sm font-semibold transition sm:w-fit",
     suggested
@@ -54,7 +68,7 @@ function DownloadAction({
   if (!asset?.available || !asset.url) {
     return (
       <span aria-disabled="true" className={className}>
-        {label} — pending
+        {label} - pending
       </span>
     );
   }
@@ -73,8 +87,10 @@ export default async function BridgeDownloadPage() {
     requestHeaders.get("user-agent") ?? "",
   );
   const macAssets = manifest.assets.filter((asset) => asset.kind === "dmg");
-  const armAsset = macAssets.find((asset) => asset.architecture === "arm64");
-  const intelAsset = macAssets.find((asset) => asset.architecture === "x64");
+  const downloadAssets = macDownloadArchitectures.map((architecture) => ({
+    architecture,
+    asset: macAssets.find((asset) => asset.architecture === architecture),
+  }));
 
   return (
     <main className="min-h-screen bg-[var(--nsn-cream)] px-4 py-8 text-[var(--nsn-navy)] sm:px-6 lg:px-8">
@@ -95,14 +111,14 @@ export default async function BridgeDownloadPage() {
             </p>
           </div>
           <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:flex-wrap">
-            <DownloadAction
-              asset={armAsset}
-              suggested={suggested === "arm64"}
-            />
-            <DownloadAction
-              asset={intelAsset}
-              suggested={suggested === "x64"}
-            />
+            {downloadAssets.map(({ architecture, asset }) => (
+              <DownloadAction
+                architecture={architecture}
+                asset={asset}
+                key={architecture}
+                suggested={suggested === architecture}
+              />
+            ))}
           </div>
           <p className="break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
             This is an unsigned internal-testing build because the project does
@@ -119,23 +135,22 @@ export default async function BridgeDownloadPage() {
             Downloads
           </h2>
           <div className="grid min-w-0 gap-4 md:grid-cols-2">
-            {macAssets.map((asset) => (
-              <NsnCard className="grid min-w-0 gap-3" key={asset.fileName}>
+            {downloadAssets.map(({ architecture, asset }) => (
+              <NsnCard className="grid min-w-0 gap-3" key={architecture}>
                 <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <h3 className="break-words font-semibold [overflow-wrap:anywhere]">
-                    {asset.architecture === "arm64"
-                      ? "Apple Silicon"
-                      : "Intel Mac"}
+                    {architectureLabel(architecture)}
                   </h3>
-                  <NsnBadge tone={asset.available ? "approved" : "pending"}>
-                    {asset.available ? "Available" : "Pending release"}
+                  <NsnBadge tone={asset?.available ? "approved" : "pending"}>
+                    {asset?.available ? "Available" : "Pending release"}
                   </NsnBadge>
                 </div>
                 <dl className="grid min-w-0 gap-2 text-sm leading-6 text-[var(--nsn-slate)]">
                   <div className="min-w-0">
                     <dt className="font-semibold text-[var(--nsn-navy)]">File</dt>
                     <dd className="break-words [overflow-wrap:anywhere]">
-                      {asset.fileName}
+                      {asset?.fileName ??
+                        pendingFileName(manifest.version, architecture)}
                     </dd>
                   </div>
                   <div>
@@ -148,12 +163,12 @@ export default async function BridgeDownloadPage() {
                   </div>
                   <div>
                     <dt className="font-semibold text-[var(--nsn-navy)]">Size</dt>
-                    <dd>{formatSize(asset.sizeBytes)}</dd>
+                    <dd>{formatSize(asset?.sizeBytes ?? null)}</dd>
                   </div>
                   <div className="min-w-0">
                     <dt className="font-semibold text-[var(--nsn-navy)]">SHA-256</dt>
                     <dd className="break-words font-mono text-xs [overflow-wrap:anywhere]">
-                      {asset.sha256}
+                      {asset?.sha256 ?? "pending-release-asset"}
                     </dd>
                   </div>
                 </dl>
@@ -170,7 +185,7 @@ export default async function BridgeDownloadPage() {
               <li>2. Open the DMG and drag NSN Bridge into Applications.</li>
               <li>3. Try to open NSN Bridge once.</li>
               <li>
-                4. If macOS blocks it, open System Settings → Privacy &amp;
+                4. If macOS blocks it, open System Settings -&gt; Privacy &amp;
                 Security and choose Open Anyway.
               </li>
               <li>5. Return to NSN Bridge and choose Pair This Mac.</li>

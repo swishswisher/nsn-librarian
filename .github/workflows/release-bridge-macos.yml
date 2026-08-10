@@ -98,14 +98,23 @@ jobs:
         run: npm run build:bridge
 
   build-macos:
-    name: Build macOS Bridge
+    name: Build macOS Bridge (${{ matrix.architecture }})
     needs: quality
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            runner: macos-26
+          - architecture: x64
+            runner: macos-26-intel
     permissions:
-      contents: write
+      contents: read
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_build?schema=public
       DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_build?schema=public
+      NSN_BRIDGE_ARCH: ${{ matrix.architecture }}
       NSN_LIBRARIAN_APP_URL: ${{ vars.NSN_LIBRARIAN_APP_URL || 'https://nsn-librarian.vercel.app' }}
       TMPDIR: /private/tmp
     steps:
@@ -150,6 +159,19 @@ jobs:
       - name: Type-check Bridge
         run: npm run build:bridge
 
+      - name: Verify native PDF dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$NSN_BRIDGE_ARCH" = "arm64" ]; then
+            canvas_package="@napi-rs/canvas-darwin-arm64"
+          else
+            canvas_package="@napi-rs/canvas-darwin-x64"
+          fi
+
+          NSN_CANVAS_PACKAGE="$canvas_package" node -e "const pkg = process.env.NSN_CANVAS_PACKAGE; console.log(require.resolve(pkg));"
+
       - name: Prepare signing certificate
         if: ${{ steps.build_mode.outputs.unsigned == 'false' }}
         env:
@@ -167,7 +189,7 @@ jobs:
           security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" build.keychain
 
-      - name: Package unsigned macOS DMGs
+      - name: Package unsigned macOS DMG
         if: ${{ steps.build_mode.outputs.unsigned == 'true' }}
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
@@ -175,7 +197,7 @@ jobs:
           NSN_UNSIGNED_BUILD: "true"
         run: npm run package:bridge:mac
 
-      - name: Package signed macOS DMGs
+      - name: Package signed macOS DMG
         if: ${{ steps.build_mode.outputs.unsigned == 'false' }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -187,51 +209,143 @@ jobs:
           NSN_UNSIGNED_BUILD: "false"
         run: npm run package:bridge:mac
 
-      - name: Calculate checksums
-        run: |
-          cd apps/bridge/dist/release
-          shasum -a 256 *.dmg > SHA256SUMS.txt
-          shasum -a 256 latest-mac.json >> SHA256SUMS.txt
-
-      - name: Upload Apple Silicon build artifact
-        if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_release != 'true') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: nsn-bridge-macos-arm64-${{ steps.build_mode.outputs.unsigned == 'true' && 'unsigned' || 'signed' }}
-          path: |
-            apps/bridge/dist/release/*mac-arm64*.dmg
-            apps/bridge/dist/release/SHA256SUMS.txt
-            apps/bridge/dist/release/latest-mac.json
-          if-no-files-found: error
-
-      - name: Upload Intel build artifact
-        if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_release != 'true') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: nsn-bridge-macos-x64-${{ steps.build_mode.outputs.unsigned == 'true' && 'unsigned' || 'signed' }}
-          path: |
-            apps/bridge/dist/release/*mac-x64*.dmg
-            apps/bridge/dist/release/SHA256SUMS.txt
-            apps/bridge/dist/release/latest-mac.json
-          if-no-files-found: error
-
-      - name: Resolve release metadata
-        id: release
+      - name: Verify architecture output
         shell: bash
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+          set -euo pipefail
+
+          cd apps/bridge/dist/release
+          arch_count="$(find . -maxdepth 1 -type f -name "*mac-${NSN_BRIDGE_ARCH}*.dmg" | wc -l | tr -d ' ')"
+          other_count="$(find . -maxdepth 1 -type f -name "*.dmg" ! -name "*mac-${NSN_BRIDGE_ARCH}*.dmg" | wc -l | tr -d ' ')"
+
+          if [ "$arch_count" -ne 1 ] || [ "$other_count" -ne 0 ]; then
+            echo "Expected exactly one ${NSN_BRIDGE_ARCH} DMG and no other architecture DMGs."
+            find . -maxdepth 1 -type f -name "*.dmg" -print
+            exit 1
+          fi
+
+      - name: Upload architecture DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsn-bridge-macos-${{ matrix.architecture }}-${{ steps.build_mode.outputs.unsigned == 'true' && 'unsigned' || 'signed' }}
+          path: apps/bridge/dist/release/*mac-${{ matrix.architecture }}*.dmg
+          if-no-files-found: error
+
+  publish-macos:
+    name: Publish macOS Bridge release
+    needs: build-macos
+    if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish_release == 'true') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve release metadata
+        id: release
+        env:
+          DEVELOPMENT_BUILD: ${{ inputs.development_build || 'true' }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          RUN_NUMBER: ${{ github.run_number }}
+        shell: bash
+        run: |
+          unsigned=false
+
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "branch" ]; then
+            unsigned=true
+          elif [ "$EVENT_NAME" = "push" ] && [[ "$REF_NAME" == *dev* ]]; then
+            unsigned=true
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DEVELOPMENT_BUILD" = "true" ]; then
+            unsigned=true
+          fi
+
+          if [ "$unsigned" = "true" ]; then
+            echo "channel=unsigned" >> "$GITHUB_OUTPUT"
+            echo "release_channel=development" >> "$GITHUB_OUTPUT"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=signed" >> "$GITHUB_OUTPUT"
+            echo "release_channel=production" >> "$GITHUB_OUTPUT"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-          elif [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_NAME" = "master" ]; then
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "push" ] && [ "$REF_NAME" = "master" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "tag=bridge-v0.1.0-dev-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
-          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "${{ inputs.publish_release }}" = "true" ]; then
+            echo "tag=bridge-v0.1.0-dev-${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${{ inputs.publish_release }}" = "true" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "tag=bridge-v0.1.0-dev-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "tag=bridge-v0.1.0-dev-${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "tag=" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Download Apple Silicon artifact
+        if: ${{ steps.release.outputs.publish == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: nsn-bridge-macos-arm64-${{ steps.release.outputs.channel }}
+          path: release-assets
+
+      - name: Download Intel artifact
+        if: ${{ steps.release.outputs.publish == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: nsn-bridge-macos-x64-${{ steps.release.outputs.channel }}
+          path: release-assets
+
+      - name: Verify and prepare combined release assets
+        if: ${{ steps.release.outputs.publish == 'true' }}
+        env:
+          NSN_RELEASE_CHANNEL: ${{ steps.release.outputs.release_channel }}
+          NSN_RELEASE_SIGNED: ${{ steps.release.outputs.signed }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd release-assets
+          arm64_count="$(find . -maxdepth 1 -type f -name "NSN-Bridge-v*-mac-arm64*.dmg" | wc -l | tr -d ' ')"
+          x64_count="$(find . -maxdepth 1 -type f -name "NSN-Bridge-v*-mac-x64*.dmg" | wc -l | tr -d ' ')"
+
+          if [ "$arm64_count" -ne 1 ] || [ "$x64_count" -ne 1 ]; then
+            echo "Both Apple Silicon and Intel Mac DMGs are required before publishing."
+            find . -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const files = fs
+            .readdirSync(".")
+            .filter((fileName) => fileName.endsWith(".dmg"))
+            .sort((left, right) => {
+              const leftRank = left.includes("mac-arm64") ? 0 : 1;
+              const rightRank = right.includes("mac-arm64") ? 0 : 1;
+
+              return leftRank - rightRank || left.localeCompare(right);
+            });
+
+          fs.writeFileSync(
+            "latest-mac.json",
+            `${JSON.stringify(
+              {
+                channel: process.env.NSN_RELEASE_CHANNEL,
+                files,
+                generatedAt: new Date().toISOString(),
+                signed: process.env.NSN_RELEASE_SIGNED === "true",
+              },
+              null,
+              2,
+            )}\n`,
+            "utf8",
+          );
+          NODE
+
+          shasum -a 256 *.dmg latest-mac.json > SHA256SUMS.txt
 
       - name: Upload release assets
         if: ${{ steps.release.outputs.publish == 'true' }}
@@ -242,12 +356,12 @@ jobs:
           body: |
             Unsigned internal NSN Bridge build for Deanne's MacBook.
 
-            macOS may require manual approval through System Settings → Privacy & Security → Open Anyway.
+            macOS may require manual approval through System Settings -> Privacy & Security -> Open Anyway.
 
             Nothing moves without an approved Organization Plan and typed EXECUTE confirmation. Undo requires typed UNDO confirmation.
           fail_on_unmatched_files: true
-          prerelease: ${{ steps.build_mode.outputs.unsigned == 'true' }}
+          prerelease: ${{ steps.release.outputs.signed != 'true' }}
           files: |
-            apps/bridge/dist/release/*.dmg
-            apps/bridge/dist/release/SHA256SUMS.txt
-            apps/bridge/dist/release/latest-mac.json
+            release-assets/*.dmg
+            release-assets/SHA256SUMS.txt
+            release-assets/latest-mac.json
