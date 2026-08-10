@@ -48,6 +48,7 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_test?schema=public
+      DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_test?schema=public
       NEXT_PUBLIC_APP_URL: https://nsn-librarian.vercel.app
       NSN_LIBRARIAN_APP_URL: https://nsn-librarian.vercel.app
       AUTH_SECRET: ci-auth-secret-with-at-least-thirty-two-characters
@@ -103,6 +104,8 @@ jobs:
     permissions:
       contents: write
     env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_build?schema=public
+      DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_build?schema=public
       NSN_LIBRARIAN_APP_URL: ${{ vars.NSN_LIBRARIAN_APP_URL || 'https://nsn-librarian.vercel.app' }}
       TMPDIR: /private/tmp
     steps:
