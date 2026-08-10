@@ -23,6 +23,9 @@
     "test:memory": "node --env-file-if-exists=.env --test --import tsx tests/integration/librarian-memory-builder.test.ts",
     "test:protocol": "node --env-file-if-exists=.env --test --import tsx tests/integration/bridge-cloud-protocol.test.ts tests/integration/bridge-device-auth.test.ts",
     "db:generate": "prisma generate",
+    "db:validate": "prisma validate",
+    "db:deploy": "prisma migrate deploy",
+    "db:status": "prisma migrate status",
     "db:migrate": "prisma migrate dev",
     "db:studio": "prisma studio"
   },

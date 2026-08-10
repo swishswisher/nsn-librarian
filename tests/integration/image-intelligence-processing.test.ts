@@ -23,9 +23,11 @@ let prisma: PrismaClient;
 let bridgeServer: Server;
 let tempRoot: string;
 let testDatabaseUrl: string;
+let testDirectDatabaseUrl: string;
 let previousBridgeDataDir: string | undefined;
 let previousBridgeUrl: string | undefined;
 let previousDatabaseUrl: string | undefined;
+let previousDirectDatabaseUrl: string | undefined;
 let previousDeveloperFallback: string | undefined;
 let previousOpenAIKey: string | undefined;
 let previousClaudeKey: string | undefined;
@@ -43,9 +45,10 @@ let updateScannedImageReviewState: typeof import("../../src/lib/bridge/image-rea
 
 const testSchemaName = `image_intelligence_test_${process.pid}_${Date.now()}`;
 
-function databaseUrlForSchema(schemaName: string) {
-  const databaseUrl = process.env.DATABASE_URL;
-
+function databaseUrlForSchema(
+  schemaName: string,
+  databaseUrl = process.env.DATABASE_URL,
+) {
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is required for image intelligence tests.");
   }
@@ -66,6 +69,7 @@ function runPrismaDbPush() {
     env: {
       ...process.env,
       DATABASE_URL: testDatabaseUrl,
+      DIRECT_URL: testDirectDatabaseUrl,
     },
     stdio: "pipe",
   });
@@ -210,13 +214,19 @@ before(async () => {
   previousBridgeDataDir = process.env.NSN_BRIDGE_DATA_DIR;
   previousBridgeUrl = process.env.NSN_LOCAL_BRIDGE_URL;
   previousDatabaseUrl = process.env.DATABASE_URL;
+  previousDirectDatabaseUrl = process.env.DIRECT_URL;
   previousDeveloperFallback = process.env.NSN_ENABLE_DEVELOPER_BRIDGE_FALLBACK;
   previousOpenAIKey = process.env.OPENAI_API_KEY;
   previousClaudeKey = process.env.CLAUDE_API_KEY;
 
   testDatabaseUrl = databaseUrlForSchema(testSchemaName);
+  testDirectDatabaseUrl = databaseUrlForSchema(
+    testSchemaName,
+    process.env.DIRECT_URL ?? process.env.DATABASE_URL,
+  );
   tempRoot = await mkdtemp(path.join(os.tmpdir(), "nsn-image-intel-test-"));
   process.env.DATABASE_URL = testDatabaseUrl;
+  process.env.DIRECT_URL = testDirectDatabaseUrl;
   process.env.NSN_BRIDGE_DATA_DIR = path.join(tempRoot, ".bridge-data");
   process.env.NSN_ENABLE_DEVELOPER_BRIDGE_FALLBACK = "false";
   process.env.OPENAI_API_KEY = "";
@@ -287,6 +297,12 @@ after(async () => {
     delete process.env.DATABASE_URL;
   } else {
     process.env.DATABASE_URL = previousDatabaseUrl;
+  }
+
+  if (previousDirectDatabaseUrl === undefined) {
+    delete process.env.DIRECT_URL;
+  } else {
+    process.env.DIRECT_URL = previousDirectDatabaseUrl;
   }
 
   if (previousDeveloperFallback === undefined) {

@@ -24,12 +24,14 @@ let evidenceFromJson: typeof import("../../src/lib/knowledge/provenance").eviden
 let knowledgeRelationshipProposalLabel: typeof import("../../src/lib/knowledge/presentation").knowledgeRelationshipProposalLabel;
 let organizationHistoryLocationsFromEvidence: typeof import("../../src/lib/knowledge/presentation").organizationHistoryLocationsFromEvidence;
 let testDatabaseUrl: string;
+let testDirectDatabaseUrl: string;
 
 const testSchemaName = `knowledge_graph_noise_test_${process.pid}_${Date.now()}`;
 
-function databaseUrlForSchema(schemaName: string) {
-  const databaseUrl = process.env.DATABASE_URL;
-
+function databaseUrlForSchema(
+  schemaName: string,
+  databaseUrl = process.env.DATABASE_URL,
+) {
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is required for Knowledge Graph tests.");
   }
@@ -50,6 +52,7 @@ function runPrismaDbPush() {
     env: {
       ...process.env,
       DATABASE_URL: testDatabaseUrl,
+      DIRECT_URL: testDirectDatabaseUrl,
     },
     stdio: "pipe",
   });
@@ -78,7 +81,12 @@ function json(value: unknown) {
 
 before(async () => {
   testDatabaseUrl = databaseUrlForSchema(testSchemaName);
+  testDirectDatabaseUrl = databaseUrlForSchema(
+    testSchemaName,
+    process.env.DIRECT_URL ?? process.env.DATABASE_URL,
+  );
   process.env.DATABASE_URL = testDatabaseUrl;
+  process.env.DIRECT_URL = testDirectDatabaseUrl;
   runPrismaDbPush();
 
   const prismaModule = await import("../../src/lib/db/prisma");

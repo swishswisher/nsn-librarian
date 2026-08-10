@@ -166,6 +166,7 @@ test("protects human APIs but exempts signed Bridge device traffic", () => {
     true,
   );
   assert.equal(isHumanApiPath("/api/library/review"), true);
+  assert.equal(isHumanApiPath("/api/database/health"), true);
 });
 
 test("blocks open redirects and cross-origin state-changing requests", () => {

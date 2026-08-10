@@ -11,11 +11,13 @@ type BuildMemoryFromApprovedSession = typeof buildMemoryFromApprovedSessionType;
 let prisma: PrismaClient;
 let buildMemoryFromApprovedSession: BuildMemoryFromApprovedSession;
 let testDatabaseUrl: string;
+let testDirectDatabaseUrl: string;
 const testSchemaName = `memory_builder_test_${process.pid}_${Date.now()}`;
 
-function databaseUrlForSchema(schemaName: string) {
-  const databaseUrl = process.env.DATABASE_URL;
-
+function databaseUrlForSchema(
+  schemaName: string,
+  databaseUrl = process.env.DATABASE_URL,
+) {
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is required for Memory Builder integration tests.");
   }
@@ -36,6 +38,7 @@ function runPrismaDbPush() {
     env: {
       ...process.env,
       DATABASE_URL: testDatabaseUrl,
+      DIRECT_URL: testDirectDatabaseUrl,
     },
     stdio: "pipe",
   });
@@ -52,7 +55,12 @@ async function resetTestData() {
 
 before(async () => {
   testDatabaseUrl = databaseUrlForSchema(testSchemaName);
+  testDirectDatabaseUrl = databaseUrlForSchema(
+    testSchemaName,
+    process.env.DIRECT_URL ?? process.env.DATABASE_URL,
+  );
   process.env.DATABASE_URL = testDatabaseUrl;
+  process.env.DIRECT_URL = testDirectDatabaseUrl;
   runPrismaDbPush();
 
   const prismaModule = await import("../../src/lib/db/prisma");

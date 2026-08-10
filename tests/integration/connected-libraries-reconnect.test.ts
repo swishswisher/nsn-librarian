@@ -18,12 +18,14 @@ let hideConnectedLibrary: typeof import("../../src/lib/bridge/connected-librarie
 let reconcileDuplicateConnectedLibraries: typeof import("../../src/lib/bridge/connected-libraries").reconcileDuplicateConnectedLibraries;
 let stableFolderFingerprintForLocalPath: typeof import("../../src/lib/bridge/connected-libraries").stableFolderFingerprintForLocalPath;
 let testDatabaseUrl: string;
+let testDirectDatabaseUrl: string;
 
 const testSchemaName = `connected_libraries_test_${process.pid}_${Date.now()}`;
 
-function databaseUrlForSchema(schemaName: string) {
-  const databaseUrl = process.env.DATABASE_URL;
-
+function databaseUrlForSchema(
+  schemaName: string,
+  databaseUrl = process.env.DATABASE_URL,
+) {
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is required for Connected Library tests.");
   }
@@ -44,6 +46,7 @@ function runPrismaDbPush() {
     env: {
       ...process.env,
       DATABASE_URL: testDatabaseUrl,
+      DIRECT_URL: testDirectDatabaseUrl,
     },
     stdio: "pipe",
   });
@@ -97,7 +100,12 @@ async function connectedRowsForFingerprint(fingerprint: string) {
 
 before(async () => {
   testDatabaseUrl = databaseUrlForSchema(testSchemaName);
+  testDirectDatabaseUrl = databaseUrlForSchema(
+    testSchemaName,
+    process.env.DIRECT_URL ?? process.env.DATABASE_URL,
+  );
   process.env.DATABASE_URL = testDatabaseUrl;
+  process.env.DIRECT_URL = testDirectDatabaseUrl;
   runPrismaDbPush();
 
   const prismaModule = await import("../../src/lib/db/prisma");
