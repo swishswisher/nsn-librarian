@@ -1,7 +1,5 @@
 import { readFile } from "node:fs/promises";
 
-import { PDFParse } from "pdf-parse";
-
 import type { DocumentReader } from "@/lib/reading-room/types";
 import { buildReadingResult } from "@/lib/reading-room/utils";
 
@@ -13,7 +11,13 @@ function stringFromMetadata(value: unknown) {
 
 export const readPdf: DocumentReader = async (input) => {
   const buffer = await readFile(input.filePath);
-  let parser: PDFParse | undefined;
+  let parser:
+    | {
+        destroy(): Promise<void>;
+        getInfo(): Promise<{ info?: unknown; total?: number }>;
+        getText(): Promise<{ text: string; total?: number }>;
+      }
+    | undefined;
 
   try {
     if (!buffer.subarray(0, 4).equals(Buffer.from("%PDF"))) {
@@ -26,7 +30,13 @@ export const readPdf: DocumentReader = async (input) => {
       });
     }
 
+    const [{ CanvasFactory }, { PDFParse }] = await Promise.all([
+      import("pdf-parse/worker"),
+      import("pdf-parse"),
+    ]);
+
     parser = new PDFParse({
+      CanvasFactory,
       data: new Uint8Array(buffer),
       isEvalSupported: false,
       useWorkerFetch: false,

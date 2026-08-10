@@ -2,7 +2,6 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import mammoth from "mammoth";
-import { PDFParse } from "pdf-parse";
 
 import { BridgeAppError, type BridgeReadResult } from "../types";
 import { resolveBridgeRootFile } from "./resolver";
@@ -70,8 +69,15 @@ async function extractText(filePath: string, extension: string) {
   }
 
   if (extension === ".pdf") {
+    // Keep the PDF runtime out of the Vercel web application's startup path.
+    // It is needed only by the local Bridge when Deanne explicitly reads a PDF.
+    const [{ CanvasFactory }, { PDFParse }] = await Promise.all([
+      import("pdf-parse/worker"),
+      import("pdf-parse"),
+    ]);
     const buffer = await readFile(filePath);
     const parser = new PDFParse({
+      CanvasFactory,
       data: new Uint8Array(buffer),
       isEvalSupported: false,
       useWorkerFetch: false,

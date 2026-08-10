@@ -1,7 +1,6 @@
 import { readDocx } from "@/lib/reading-room/readers/read-docx";
 import { readHtml } from "@/lib/reading-room/readers/read-html";
 import { readMarkdown } from "@/lib/reading-room/readers/read-markdown";
-import { readPdf } from "@/lib/reading-room/readers/read-pdf";
 import { readTxt } from "@/lib/reading-room/readers/read-txt";
 import type {
   DocumentReader,
@@ -10,12 +9,18 @@ import type {
 } from "@/lib/reading-room/types";
 import { buildReadingResult, normalizeExtension } from "@/lib/reading-room/utils";
 
+const readPdfLazily: DocumentReader = async (input) => {
+  const { readPdf } = await import("@/lib/reading-room/readers/read-pdf");
+
+  return readPdf(input);
+};
+
 const readersByExtension: Record<string, DocumentReader> = {
   docx: readDocx,
   htm: readHtml,
   html: readHtml,
   md: readMarkdown,
-  pdf: readPdf,
+  pdf: readPdfLazily,
   txt: readTxt,
 };
 
