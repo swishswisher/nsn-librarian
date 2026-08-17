@@ -356,6 +356,7 @@ export async function startElectronBridgeApp() {
   });
 
   electron.app.on("second-instance", createMainWindow);
+  electron.app.on("activate", createMainWindow);
   buildMenu();
   createMainWindow();
 

@@ -43,6 +43,29 @@ export function bridgeRendererHtml() {
       h2 { font-size: 18px; }
       p { color: var(--muted); line-height: 1.6; }
       .actions, .folder-list, .status-grid { display: grid; gap: 10px; }
+      .pairing-form {
+        display: grid;
+        gap: 10px;
+        margin-top: 12px;
+      }
+      .pairing-form[hidden] { display: none; }
+      .field { display: grid; gap: 6px; }
+      label {
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 800;
+      }
+      input {
+        min-height: 44px;
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: white;
+        color: var(--ink);
+        font: inherit;
+        padding: 10px 12px;
+      }
+      input:disabled { cursor: not-allowed; opacity: 0.55; }
       .notice {
         min-height: 24px;
         color: var(--muted);
@@ -110,6 +133,23 @@ export function bridgeRendererHtml() {
           <button class="primary" id="pairButton">Pair This Mac</button>
           <button id="openWebButton">Open NSN Librarian</button>
         </div>
+        <form class="pairing-form" id="pairingForm" hidden>
+          <div class="field">
+            <label for="pairingCodeInput">Pairing code</label>
+            <input
+              id="pairingCodeInput"
+              name="pairingCode"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              maxlength="16"
+            />
+          </div>
+          <div class="actions">
+            <button class="primary" id="pairSubmitButton" type="submit">Pair This Mac</button>
+            <button id="pairCancelButton" type="button">Cancel</button>
+          </div>
+        </form>
       </section>
 
       <section>
@@ -154,10 +194,41 @@ export function bridgeRendererHtml() {
       const watchingCopy = document.getElementById("watchingCopy");
       const notice = document.getElementById("notice");
       const pairButton = document.getElementById("pairButton");
+      const pairingForm = document.getElementById("pairingForm");
+      const pairingCodeInput = document.getElementById("pairingCodeInput");
+      const pairSubmitButton = document.getElementById("pairSubmitButton");
+      const pairCancelButton = document.getElementById("pairCancelButton");
+      let pairingFormDismissed = false;
 
       function showNotice(message, isError) {
         notice.textContent = message;
         notice.className = isError ? "notice error" : "notice";
+      }
+
+      function clearPairingCode() {
+        pairingCodeInput.value = "";
+      }
+
+      function showPairingForm(shouldFocus) {
+        pairingFormDismissed = false;
+        pairingForm.hidden = false;
+        pairButton.hidden = true;
+        if (shouldFocus) {
+          pairingCodeInput.focus();
+        }
+      }
+
+      function hidePairingForm() {
+        pairingForm.hidden = true;
+        pairButton.hidden = false;
+        clearPairingCode();
+      }
+
+      function setPairingControlsDisabled(disabled) {
+        pairButton.disabled = disabled;
+        pairSubmitButton.disabled = disabled;
+        pairCancelButton.disabled = disabled;
+        pairingCodeInput.disabled = disabled;
       }
 
       function renderFolders() {
@@ -199,11 +270,16 @@ export function bridgeRendererHtml() {
               ? "This Mac is paired. Choose folders when Deanne is ready."
               : "This Mac is paired with " + connectedRoots.length + " connected folder" + (connectedRoots.length === 1 ? "." : "s.");
             pairButton.textContent = "Pair Again";
+            pairingFormDismissed = false;
+            hidePairingForm();
           } else {
             statusBadge.textContent = "Not paired";
             statusBadge.className = "badge warning";
             stateCopy.textContent = "Pair this Mac with NSN Librarian.";
             pairButton.textContent = "Pair This Mac";
+            if (!pairingFormDismissed) {
+              showPairingForm(false);
+            }
           }
           watchingCopy.textContent = watchingCount > 0
             ? "Watching " + watchingCount + " connected folder" + (watchingCount === 1 ? "." : "s.")
@@ -238,15 +314,34 @@ export function bridgeRendererHtml() {
         }
       });
 
-      pairButton.addEventListener("click", async () => {
-        const code = window.prompt("Enter the pairing code shown by NSN Librarian.");
-        if (!code) return;
+      pairButton.addEventListener("click", () => {
+        showPairingForm(true);
+      });
+
+      pairCancelButton.addEventListener("click", () => {
+        pairingFormDismissed = true;
+        hidePairingForm();
+      });
+
+      pairingForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const code = pairingCodeInput.value.trim();
+        if (!code) {
+          showNotice("Enter the pairing code shown by NSN Librarian.", true);
+          pairingCodeInput.focus();
+          return;
+        }
+
+        setPairingControlsDisabled(true);
         try {
           await window.nsnBridge.pairWithCode(code);
+          clearPairingCode();
           await refreshStatus();
           showNotice("This Mac is paired with NSN Librarian.", false);
         } catch {
-          showNotice("That pairing code could not be verified.", true);
+          showNotice("That pairing code could not be verified. Generate a new code in NSN Librarian and try again.", true);
+        } finally {
+          setPairingControlsDisabled(false);
         }
       });
 
