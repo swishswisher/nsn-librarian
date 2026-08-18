@@ -205,6 +205,35 @@ export function bridgeRendererHtml() {
         notice.className = isError ? "notice error" : "notice";
       }
 
+      function safeFolderSelectionMessage(error) {
+        const code = error && typeof error === "object" && typeof error.code === "string"
+          ? error.code
+          : "FOLDER_SELECTION_FAILED";
+        if (code === "FOLDER_PICKER_FAILED") {
+          return "The macOS folder picker could not open.";
+        }
+        if (code === "FOLDER_UNREADABLE") {
+          return "The selected folder could not be read.";
+        }
+        if (code === "UNSAFE_SYSTEM_ROOT") {
+          return "Choose a personal folder instead of the whole computer or drive.";
+        }
+        if (code === "UNSAFE_SYSTEM_DIRECTORY") {
+          return "Choose a personal folder instead of a system folder.";
+        }
+        if (code === "UNSAFE_APPLICATION_DIRECTORY") {
+          return "Choose a personal folder instead of an NSN application folder.";
+        }
+        if (code === "UNSAFE_SYMLINK") {
+          return "Choose a real folder instead of a symlink.";
+        }
+        if (code === "FOLDER_SELECTION_PERSISTENCE_FAILED") {
+          return "The Bridge could not save that folder selection locally.";
+        }
+
+        return "The selected folder could not be chosen safely.";
+      }
+
       function clearPairingCode() {
         pairingCodeInput.value = "";
       }
@@ -297,9 +326,11 @@ export function bridgeRendererHtml() {
             selectedFolders.push(...result);
             renderFolders();
             showNotice("Review the selected folders, then connect them.", false);
+          } else {
+            showNotice("No folder was selected.", false);
           }
-        } catch {
-          showNotice("The folder picker could not open.", true);
+        } catch (error) {
+          showNotice(safeFolderSelectionMessage(error), true);
         }
       });
 

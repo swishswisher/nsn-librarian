@@ -14,6 +14,22 @@ const unsafeWindowsDirectoryNames = new Set([
   "system volume information",
 ]);
 
+const unsafePosixDirectoryNames = new Set([
+  "applications",
+  "bin",
+  "boot",
+  "dev",
+  "etc",
+  "library",
+  "network",
+  "private",
+  "sbin",
+  "system",
+  "usr",
+  "var",
+  "volumes",
+]);
+
 const unsafeFolderNames = new Set([
   ".git",
   ".next",
@@ -22,6 +38,10 @@ const unsafeFolderNames = new Set([
 ]);
 
 const invalidPathCharacters = /[<>:"\\|?*\u0000]/;
+
+export type RootPathValidationOptions = {
+  forbiddenApplicationPaths?: string[];
+};
 
 export function bridgePlatform(): BridgePlatform {
   if (process.platform === "win32") {
@@ -97,7 +117,11 @@ function ensureNotSystemDirectory(actualPath: string) {
   const parts = relative.split(path.sep).filter(Boolean);
   const firstPart = parts[0]?.toLowerCase();
 
-  if (firstPart && unsafeWindowsDirectoryNames.has(firstPart)) {
+  if (
+    firstPart &&
+    (unsafeWindowsDirectoryNames.has(firstPart) ||
+      (bridgePlatform() !== "WINDOWS" && unsafePosixDirectoryNames.has(firstPart)))
+  ) {
     throw new BridgeAppError(
       "Choose a personal work folder instead of a system folder.",
       "UNSAFE_SYSTEM_DIRECTORY",
@@ -114,19 +138,50 @@ function ensureNotSystemDirectory(actualPath: string) {
   }
 }
 
-function ensureNotAppDirectory(actualPath: string) {
-  const appRoot = path.resolve(process.cwd());
+function normalizedApplicationPath(value: string) {
+  const trimmed = value.trim();
 
-  if (isSameOrInside(appRoot, actualPath) || isSameOrInside(actualPath, appRoot)) {
-    throw new BridgeAppError(
-      "Choose a library folder outside the NSN application files.",
-      "UNSAFE_APPLICATION_DIRECTORY",
-      422,
-    );
+  if (!trimmed) {
+    return null;
+  }
+
+  const resolved = path.resolve(trimmed);
+  const parsed = path.parse(resolved);
+
+  if (normalizeForComparison(resolved) === normalizeForComparison(parsed.root)) {
+    return null;
+  }
+
+  return resolved;
+}
+
+function ensureNotAppDirectory(
+  actualPath: string,
+  options: RootPathValidationOptions,
+) {
+  const forbiddenApplicationPaths = [
+    ...new Set(
+      (options.forbiddenApplicationPaths ?? [])
+        .map(normalizedApplicationPath)
+        .filter((value): value is string => value !== null),
+    ),
+  ];
+
+  for (const appPath of forbiddenApplicationPaths) {
+    if (isSameOrInside(appPath, actualPath) || isSameOrInside(actualPath, appPath)) {
+      throw new BridgeAppError(
+        "Choose a library folder outside the NSN application files.",
+        "UNSAFE_APPLICATION_DIRECTORY",
+        422,
+      );
+    }
   }
 }
 
-export async function validateRootPath(folderPath: string) {
+export async function validateRootPath(
+  folderPath: string,
+  options: RootPathValidationOptions = {},
+) {
   const trimmed = folderPath.trim();
 
   if (!trimmed) {
@@ -136,10 +191,26 @@ export async function validateRootPath(folderPath: string) {
   const resolvedPath = path.resolve(trimmed);
   const stats = await lstat(resolvedPath).catch(() => null);
 
-  if (!stats || !stats.isDirectory() || stats.isSymbolicLink()) {
+  if (!stats) {
     throw new BridgeAppError(
       "Choose a readable folder before connecting it.",
-      "UNREADABLE_ROOT",
+      "FOLDER_UNREADABLE",
+      422,
+    );
+  }
+
+  if (stats.isSymbolicLink()) {
+    throw new BridgeAppError(
+      "Choose a real folder instead of a symlink.",
+      "UNSAFE_SYMLINK",
+      422,
+    );
+  }
+
+  if (!stats.isDirectory()) {
+    throw new BridgeAppError(
+      "Choose a readable folder before connecting it.",
+      "FOLDER_UNREADABLE",
       422,
     );
   }
@@ -147,7 +218,7 @@ export async function validateRootPath(folderPath: string) {
   await access(resolvedPath, fsConstants.R_OK).catch(() => {
     throw new BridgeAppError(
       "The NSN Bridge could not read that folder safely.",
-      "UNREADABLE_ROOT",
+      "FOLDER_UNREADABLE",
       422,
     );
   });
@@ -156,7 +227,7 @@ export async function validateRootPath(folderPath: string) {
 
   ensureNotDriveRoot(realRoot);
   ensureNotSystemDirectory(realRoot);
-  ensureNotAppDirectory(realRoot);
+  ensureNotAppDirectory(realRoot, options);
 
   return path.normalize(realRoot);
 }

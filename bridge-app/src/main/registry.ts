@@ -18,6 +18,7 @@ import {
   bridgePlatform,
   displayNameForFolder,
   pathKey,
+  type RootPathValidationOptions,
   safeLocationDescription,
   validateRootPath,
 } from "../filesystem/safety";
@@ -27,6 +28,8 @@ type RegistryFile = {
   roots: BridgeRootRecord[];
   selections: FolderSelectionRecord[];
 };
+
+export type FolderSelectionOptions = RootPathValidationOptions;
 
 const folderSelectionTtlMs = 10 * 60 * 1000;
 
@@ -124,8 +127,9 @@ export function summarizeBridgeRoot(root: BridgeRootRecord): BridgeRootSummary {
 
 export async function createFolderSelection(
   folderPath: string,
+  options: RootPathValidationOptions = {},
 ): Promise<FolderSelectionResult> {
-  const actualPath = await validateRootPath(folderPath);
+  const actualPath = await validateRootPath(folderPath, options);
   const rootId = rootIdForPath(actualPath);
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + folderSelectionTtlMs).toISOString();
@@ -144,7 +148,13 @@ export async function createFolderSelection(
 
   removeExpiredSelections(registry);
   registry.selections.push(selection);
-  await writeRegistry(registry);
+  await writeRegistry(registry).catch(() => {
+    throw new BridgeAppError(
+      "The Bridge could not save that folder selection locally.",
+      "FOLDER_SELECTION_PERSISTENCE_FAILED",
+      500,
+    );
+  });
 
   return {
     ancestorRootIds: selection.ancestorRootIds,
@@ -174,6 +184,7 @@ function permissionsWithReadInvariant(
 }
 
 export async function registerRootFromSelection(input: {
+  validationOptions?: RootPathValidationOptions;
   displayName?: string;
   permissions?: Partial<BridgePermissions>;
   selectionToken: string;
@@ -207,7 +218,10 @@ export async function registerRootFromSelection(input: {
 
   registry.selections.splice(selectionIndex, 1);
 
-  const actualPath = await validateRootPath(selection.actualPath);
+  const actualPath = await validateRootPath(
+    selection.actualPath,
+    input.validationOptions,
+  );
   const rootId = rootIdForPath(actualPath);
   const permissions = permissionsWithReadInvariant(input.permissions ?? {});
   const displayName =
@@ -249,7 +263,13 @@ export async function registerRootFromSelection(input: {
     registry.roots.push(root);
   }
 
-  await writeRegistry(registry);
+  await writeRegistry(registry).catch(() => {
+    throw new BridgeAppError(
+      "The Bridge could not save that connected folder locally.",
+      "FOLDER_SELECTION_PERSISTENCE_FAILED",
+      500,
+    );
+  });
 
   return summarizeBridgeRoot(root);
 }

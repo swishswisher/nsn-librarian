@@ -3,7 +3,6 @@ import path from "node:path";
 
 import { createBridgeServer } from "../../../../bridge-app/src/api/server";
 import {
-  createFolderSelection,
   listRoots,
   registerRootFromSelection,
 } from "../../../../bridge-app/src/main/registry";
@@ -21,10 +20,50 @@ import {
   syncBridgeRoots,
 } from "./cloud-client";
 import { checkBridgeUpdateManifest } from "./update-manager";
+import {
+  folderSelectionIpcResult,
+  selectFoldersFromDialog,
+} from "./folder-selection";
 
 let localServer: Server | null = null;
 const currentDir = __dirname;
 const rootSyncIntervalMs = 60_000;
+
+function processResourcesPath() {
+  return (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+}
+
+function readApplicationPath(readPath: () => string) {
+  try {
+    return readPath();
+  } catch {
+    return null;
+  }
+}
+
+function bridgeApplicationPaths(electron: ReturnType<typeof loadElectronRuntime>) {
+  const candidates = [
+    readApplicationPath(() => electron.app.getAppPath()),
+    processResourcesPath(),
+    readApplicationPath(() => electron.app.getPath("exe")),
+  ].filter(
+    (value): value is string =>
+      typeof value === "string" && value.trim().length > 0,
+  );
+
+  return [
+    ...new Set(
+      candidates.flatMap((candidate) => [
+        candidate,
+        path.dirname(candidate),
+      ]),
+    ),
+  ];
+}
+
+function isMasBuild() {
+  return (process as NodeJS.Process & { mas?: boolean }).mas === true;
+}
 
 async function startLocalBridgeServer() {
   if (localServer) {
@@ -54,6 +93,7 @@ export async function startElectronBridgeApp() {
   await electron.app.whenReady();
   await startLocalBridgeServer();
 
+  const forbiddenApplicationPaths = bridgeApplicationPaths(electron);
   let mainWindow: InstanceType<typeof electron.BrowserWindow> | null = null;
   let isQuitting = false;
   let commandPollInFlight = false;
@@ -123,33 +163,22 @@ export async function startElectronBridgeApp() {
   }
 
   async function chooseFolders() {
-    const result = await electron.dialog.showOpenDialog(createMainWindow(), {
+    const dialogOptions: Record<string, unknown> = {
       buttonLabel: "Add Selected Folders",
       message: "Choose folders for NSN Bridge",
       properties: ["openDirectory", "multiSelections", "createDirectory"],
-      securityScopedBookmarks: true,
       title: "Choose folders for NSN Bridge",
-    });
+    };
 
-    if (result.canceled) {
-      return [];
+    if (isMasBuild()) {
+      dialogOptions.securityScopedBookmarks = true;
     }
 
-    return Promise.all(
-      result.filePaths.map(async (filePath: string) => {
-        const selection = await createFolderSelection(filePath);
-
-        return {
-          ancestorRootIds: selection.ancestorRootIds,
-          expiresAt: selection.expiresAt,
-          platform: selection.platform,
-          rootId: selection.rootId,
-          safeLocation: selection.safeLocation,
-          selectionToken: selection.selectionToken,
-          suggestedDisplayName: selection.suggestedDisplayName,
-        };
-      }),
-    );
+    return selectFoldersFromDialog({
+      forbiddenApplicationPaths,
+      showOpenDialog: () =>
+        electron.dialog.showOpenDialog(createMainWindow(), dialogOptions),
+    });
   }
 
   async function syncLocalRoots(force = false) {
@@ -306,7 +335,9 @@ export async function startElectronBridgeApp() {
       process.env.NSN_LIBRARIAN_APP_URL ?? "http://localhost:3000",
     ),
   );
-  electron.ipcMain.handle("nsn-bridge:choose-folders", chooseFolders);
+  electron.ipcMain.handle("nsn-bridge:choose-folders", () =>
+    folderSelectionIpcResult(chooseFolders),
+  );
   electron.ipcMain.handle(
     "nsn-bridge:connect-folders",
     async (_event: unknown, folders: unknown) => {
@@ -333,6 +364,9 @@ export async function startElectronBridgeApp() {
             },
             selectionToken: (folder as { selectionToken: string })
               .selectionToken,
+            validationOptions: {
+              forbiddenApplicationPaths,
+            },
           }),
         );
       }

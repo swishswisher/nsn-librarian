@@ -33,8 +33,9 @@ export type ElectronRuntime = {
     dock?: {
       show: () => void;
     };
+    getAppPath: () => string;
     getLoginItemSettings: () => { openAtLogin: boolean };
-    getPath: (name: "userData") => string;
+    getPath: (name: "exe" | "userData") => string;
     isPackaged: boolean;
     on: (eventName: string, listener: (...args: unknown[]) => void) => void;
     quit: () => void;

@@ -19,6 +19,18 @@ type NsnBridgeApi = {
   resumeWatching: () => Promise<unknown>;
 };
 
+type FolderSelectionIpcResult =
+  | Awaited<ReturnType<NsnBridgeApi["chooseFolders"]>>
+  | {
+      code?: unknown;
+      message?: unknown;
+      ok: false;
+    }
+  | {
+      ok: true;
+      selections?: Awaited<ReturnType<NsnBridgeApi["chooseFolders"]>>;
+    };
+
 const runtimeRequire = eval("require") as NodeRequire;
 const { contextBridge, ipcRenderer } = runtimeRequire("electron") as {
   contextBridge: {
@@ -29,19 +41,42 @@ const { contextBridge, ipcRenderer } = runtimeRequire("electron") as {
   };
 };
 
+function safeBridgeError(message: string, code: string) {
+  const error = new Error(message);
+
+  Object.assign(error, { code });
+
+  return error;
+}
+
 contextBridge.exposeInMainWorld("nsnBridge", {
   checkForUpdates: () => ipcRenderer.invoke("nsn-bridge:check-updates"),
-  chooseFolders: () =>
-    ipcRenderer.invoke("nsn-bridge:choose-folders") as Promise<
-      Array<{
-        displayName?: string;
-        expiresAt: string;
-        rootId: string;
-        safeLocation: string;
-        selectionToken: string;
-        suggestedDisplayName?: string;
-      }>
-    >,
+  chooseFolders: async () => {
+    const response = (await ipcRenderer.invoke(
+      "nsn-bridge:choose-folders",
+    )) as FolderSelectionIpcResult;
+
+    if (Array.isArray(response)) {
+      return response;
+    }
+
+    if (response && typeof response === "object" && response.ok === false) {
+      throw safeBridgeError(
+        typeof response.message === "string"
+          ? response.message
+          : "The selected folder could not be chosen safely.",
+        typeof response.code === "string"
+          ? response.code
+          : "FOLDER_SELECTION_FAILED",
+      );
+    }
+
+    if (response && typeof response === "object" && response.ok === true) {
+      return Array.isArray(response.selections) ? response.selections : [];
+    }
+
+    return [];
+  },
   connectSelectedFolders: (folders: unknown[]) =>
     ipcRenderer.invoke("nsn-bridge:connect-folders", folders),
   getStatus: () => ipcRenderer.invoke("nsn-bridge:status"),

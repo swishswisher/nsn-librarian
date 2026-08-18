@@ -65,6 +65,7 @@ function rendererScript() {
 }
 
 async function createRendererHarness(options: {
+  chooseFolders?: () => Promise<unknown>;
   pairFails?: boolean;
   pairedInitially?: boolean;
 } = {}): Promise<RendererHarness> {
@@ -105,7 +106,7 @@ async function createRendererHarness(options: {
     window: {
       nsnBridge: {
         checkForUpdates: async () => undefined,
-        chooseFolders: async () => [],
+        chooseFolders: options.chooseFolders ?? (async () => []),
         connectSelectedFolders: async () => undefined,
         getStatus: async () => {
           statusCallCount += 1;
@@ -221,6 +222,39 @@ describe("Bridge desktop renderer", () => {
     assert.equal(harness.elements.pairingCodeInput.value, "");
     assert.equal(harness.elements.pairingForm.hidden, true);
     assert.deepEqual(harness.pairWithCodeCalls, []);
+  });
+
+  it("does not show a folder-picker error when selection is cancelled", async () => {
+    const harness = await createRendererHarness({
+      chooseFolders: async () => [],
+    });
+
+    await harness.elements.chooseButton.dispatch("click");
+
+    assert.equal(harness.elements.notice.textContent, "No folder was selected.");
+    assert.equal(harness.elements.notice.className, "notice");
+  });
+
+  it("shows validation errors without calling them picker failures", async () => {
+    const error = new Error("private absolute path detail");
+
+    Object.assign(error, { code: "UNSAFE_APPLICATION_DIRECTORY" });
+
+    const harness = await createRendererHarness({
+      chooseFolders: async () => {
+        throw error;
+      },
+    });
+
+    await harness.elements.chooseButton.dispatch("click");
+
+    assert.equal(
+      harness.elements.notice.textContent,
+      "Choose a personal folder instead of an NSN application folder.",
+    );
+    assert.equal(harness.elements.notice.textContent.includes("picker"), false);
+    assert.equal(harness.elements.notice.textContent.includes("private"), false);
+    assert.equal(harness.elements.notice.className, "notice error");
   });
 });
 
