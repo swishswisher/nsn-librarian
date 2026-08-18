@@ -4,16 +4,29 @@ import type { LocalBridgeHealth } from "./local-bridge-client";
 
 const onlineWindowMs = 90_000;
 
+export function selectCloudBridgeHealthDevice(devices: BridgeDeviceSummary[]) {
+  return devices
+    .filter((device) => device.status !== "REVOKED")
+    .sort((left, right) =>
+      (right.lastSeenAt ?? "").localeCompare(left.lastSeenAt ?? ""),
+    )[0] ?? null;
+}
+
+export function effectiveBridgeHealth(
+  localBridgeHealth: LocalBridgeHealth,
+  devices: BridgeDeviceSummary[],
+  now = new Date(),
+): LocalBridgeHealth {
+  return localBridgeHealth.ok
+    ? localBridgeHealth
+    : cloudBridgeHealth(devices, now);
+}
+
 export function cloudBridgeHealth(
   devices: BridgeDeviceSummary[],
   now = new Date(),
 ): LocalBridgeHealth {
-  const activeDevices = devices
-    .filter((device) => device.status !== "REVOKED")
-    .sort((left, right) =>
-      (right.lastSeenAt ?? "").localeCompare(left.lastSeenAt ?? ""),
-    );
-  const device = activeDevices[0];
+  const device = selectCloudBridgeHealthDevice(devices);
 
   if (!device) {
     return {

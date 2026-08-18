@@ -12,9 +12,16 @@ import {
   validateBridgeCommandForDevice,
   validateBridgeReleaseManifest,
   validatePairingRedemption,
+  type BridgeDeviceSummary,
   type BridgeReleaseManifest,
 } from "../../packages/bridge-protocol/src";
 import { validateBridgeRelativePath } from "../../packages/filesystem-plans/src";
+import {
+  cloudBridgeHealth,
+  effectiveBridgeHealth,
+} from "../../src/lib/bridge/effective-health";
+import { bridgeHomeHealthDisplay } from "../../src/lib/bridge/home-health";
+import type { LocalBridgeHealth } from "../../src/lib/bridge/local-bridge-client";
 
 describe("Bridge cloud protocol", () => {
   const pairingSecret = "test-pairing-secret";
@@ -239,5 +246,143 @@ describe("Bridge cloud protocol", () => {
       version: "0.1.0",
     });
     assert.equal(validation.ok, true);
+  });
+});
+
+describe("Bridge effective Home health", () => {
+  const now = new Date("2026-08-18T12:00:00.000Z");
+  const localReady: LocalBridgeHealth = {
+    message: "Bridge ready",
+    ok: true,
+    paired: true,
+    platform: "darwin",
+    status: "BRIDGE_READY",
+    version: "0.1.0",
+  };
+  const localUnavailable: LocalBridgeHealth = {
+    message: "The NSN Bridge is not reachable from this server.",
+    ok: false,
+    paired: false,
+    platform: null,
+    status: "BRIDGE_UNAVAILABLE",
+    version: null,
+  };
+
+  function device(
+    overrides: Partial<BridgeDeviceSummary> = {},
+  ): BridgeDeviceSummary {
+    return {
+      appVersion: "0.1.0",
+      architecture: "x64",
+      bridgeDeviceId: "bridge-device-intel-mac",
+      deviceDisplayName: "Deanne's Intel Mac",
+      lastSeenAt: now.toISOString(),
+      pairedAt: now.toISOString(),
+      platform: "MACOS",
+      revokedAt: null,
+      status: "ONLINE",
+      ...overrides,
+    };
+  }
+
+  function display(bridgeHealth: LocalBridgeHealth, devices: BridgeDeviceSummary[]) {
+    return bridgeHomeHealthDisplay({
+      bridgeHealth,
+      devices,
+      formatLastSeen: () => "18 Aug 2026, 12:00 PM",
+    });
+  }
+
+  it("keeps Home ready when the local Bridge is directly reachable", () => {
+    const health = effectiveBridgeHealth(localReady, [], now);
+    const home = display(health, []);
+
+    assert.equal(health.ok, true);
+    assert.equal(health.status, "BRIDGE_READY");
+    assert.equal(home.badgeLabel, "Bridge ready");
+    assert.equal(home.thisMacLabel, "This Mac is online");
+    assert.equal(home.deviceLabel, "This Mac");
+    assert.equal(home.versionLabel, "0.1.0");
+  });
+
+  it("uses a recent ONLINE cloud heartbeat when local Bridge is unavailable", () => {
+    const devices = [device()];
+    const health = effectiveBridgeHealth(localUnavailable, devices, now);
+    const home = display(health, devices);
+
+    assert.equal(health.ok, true);
+    assert.equal(health.status, "BRIDGE_READY");
+    assert.equal(home.badgeLabel, "Bridge ready");
+    assert.equal(home.thisMacLabel, "This Mac is online");
+    assert.equal(home.deviceLabel, "Deanne's Intel Mac");
+    assert.equal(
+      home.versionLabel,
+      "0.1.0, last seen 18 Aug 2026, 12:00 PM",
+    );
+  });
+
+  it("marks Home unavailable when the cloud device is stale or offline", () => {
+    const staleDevices = [
+      device({
+        lastSeenAt: new Date(now.getTime() - 91_000).toISOString(),
+      }),
+    ];
+    const offlineDevices = [device({ status: "OFFLINE" })];
+    const staleHealth = effectiveBridgeHealth(
+      localUnavailable,
+      staleDevices,
+      now,
+    );
+    const offlineHealth = effectiveBridgeHealth(
+      localUnavailable,
+      offlineDevices,
+      now,
+    );
+
+    assert.equal(staleHealth.ok, false);
+    assert.equal(staleHealth.status, "BRIDGE_UNAVAILABLE");
+    assert.equal(display(staleHealth, staleDevices).badgeLabel, "Bridge unavailable");
+    assert.equal(offlineHealth.ok, false);
+    assert.equal(offlineHealth.status, "BRIDGE_UNAVAILABLE");
+  });
+
+  it("keeps Home in the not-paired state when no active cloud device exists", () => {
+    const health = effectiveBridgeHealth(localUnavailable, [], now);
+    const home = display(health, []);
+
+    assert.equal(health.ok, false);
+    assert.equal(health.paired, false);
+    assert.equal(home.badgeLabel, "Bridge not paired");
+    assert.equal(home.thisMacLabel, "No paired Mac yet");
+    assert.equal(home.deviceLabel, "No paired Mac yet");
+    assert.equal(home.versionLabel, "Pair a Mac to begin");
+  });
+
+  it("does not let Home badge and This Mac labels contradict each other", () => {
+    const staleDevices = [
+      device({
+        lastSeenAt: new Date(now.getTime() - 91_000).toISOString(),
+      }),
+    ];
+    const cases = [
+      display(effectiveBridgeHealth(localReady, [], now), []),
+      display(effectiveBridgeHealth(localUnavailable, [device()], now), [device()]),
+      display(
+        cloudBridgeHealth(
+          staleDevices,
+          now,
+        ),
+        staleDevices,
+      ),
+      display(effectiveBridgeHealth(localUnavailable, [], now), []),
+    ];
+
+    for (const home of cases) {
+      if (home.badgeLabel === "Bridge ready") {
+        assert.equal(home.thisMacLabel, "This Mac is online");
+      } else {
+        assert.notEqual(home.thisMacLabel, "This Mac is online");
+      }
+    }
   });
 });

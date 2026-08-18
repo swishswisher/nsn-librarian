@@ -7,6 +7,8 @@ import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
 import { NsnCard } from "@/components/library/NsnCard";
 import { getBridgeCloudStatus } from "@/lib/bridge/cloud-coordinator";
 import { getConnectedLibraries } from "@/lib/bridge/connected-libraries";
+import { effectiveBridgeHealth } from "@/lib/bridge/effective-health";
+import { bridgeHomeHealthDisplay } from "@/lib/bridge/home-health";
 import { getMonitoringDashboardData } from "@/lib/bridge/monitor";
 import { getCurrentOrganizationPlanForHomepage } from "@/lib/bridge/planner";
 import {
@@ -746,7 +748,7 @@ export default async function LibraryAdminPage() {
     knowledgePreview,
     monitoringDashboard,
     connectedLibraries,
-    bridgeHealth,
+    localBridgeHealth,
     cloudBridgeStatus,
   ] = await Promise.all([
     getBridgeScanSessions(10),
@@ -764,6 +766,15 @@ export default async function LibraryAdminPage() {
       devices: [],
     })),
   ]);
+  const bridgeHealth = effectiveBridgeHealth(
+    localBridgeHealth,
+    cloudBridgeStatus.devices,
+  );
+  const bridgeDisplay = bridgeHomeHealthDisplay({
+    bridgeHealth,
+    devices: cloudBridgeStatus.devices,
+    formatLastSeen: formatDateTime,
+  });
   const activeConnectedLibraries = connectedLibraries.filter(
     (library) =>
       !library.requiresReconnect &&
@@ -791,7 +802,7 @@ export default async function LibraryAdminPage() {
     progress || currentPlan
       ? bridgeStatusLabel(progress, currentPlan, "Bridge ready")
       : !bridgeHealth.ok
-        ? "Bridge unavailable"
+        ? bridgeDisplay.badgeLabel
       : activeConnectedLibraries.length > 0
         ? `${activeConnectedLibraries.length} active`
         : monitoringBridgeLabel(monitoringDashboard) ?? "Bridge ready";
@@ -799,14 +810,26 @@ export default async function LibraryAdminPage() {
     progress || currentPlan
       ? bridgeStatusTone(progress, currentPlan)
       : !bridgeHealth.ok
-        ? "pending"
+        ? bridgeDisplay.badgeTone
       : activeConnectedLibraries.length > 0
         ? "approved"
         : monitoringBridgeTone(monitoringDashboard);
-  const firstBridgeDevice = cloudBridgeStatus.devices[0] ?? null;
-  const onlineDeviceCount = cloudBridgeStatus.devices.filter(
-    (device) => device.status === "ONLINE",
-  ).length;
+  const bridgeStatusHref =
+    activeConnectedLibraries.length > 0
+      ? getBridgeMonitoringRoute()
+      : bridgeHealth.ok
+        ? getConnectedLibrariesRoute()
+        : bridgeHealth.paired
+          ? getConnectedLibrariesRoute()
+          : getBridgeDownloadRoute();
+  const bridgeStatusActionLabel =
+    activeConnectedLibraries.length > 0
+      ? "Open Monitoring"
+      : bridgeHealth.ok
+        ? "Connect Folder"
+        : bridgeHealth.paired
+          ? "Open Connected Libraries"
+          : "Download Bridge";
 
   return (
     <LibraryShell active="overview" bridgeLabel={bridgeLabel} bridgeTone={bridgeTone}>
@@ -971,7 +994,9 @@ export default async function LibraryAdminPage() {
           <NsnCard className="min-w-0">
             <div className="grid min-w-0 gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
               <div className="min-w-0">
-                <NsnBadge tone={bridgeTone}>{bridgeLabel}</NsnBadge>
+                <NsnBadge tone={bridgeDisplay.badgeTone}>
+                  {bridgeDisplay.badgeLabel}
+                </NsnBadge>
                 <p className="mt-4 max-w-3xl break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
                   Deanne&apos;s local computer remains the source of truth. The
                   web app keeps observations, decisions, Memory, Notebook
@@ -984,9 +1009,7 @@ export default async function LibraryAdminPage() {
                       This Mac
                     </dt>
                     <dd className="break-words [overflow-wrap:anywhere]">
-                      {onlineDeviceCount > 0
-                        ? "This Mac is online"
-                        : "NSN Bridge is offline"}
+                      {bridgeDisplay.thisMacLabel}
                     </dd>
                   </div>
                   <div className="min-w-0 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-3">
@@ -994,8 +1017,7 @@ export default async function LibraryAdminPage() {
                       Device
                     </dt>
                     <dd className="break-words [overflow-wrap:anywhere]">
-                      {firstBridgeDevice?.deviceDisplayName ??
-                        "No paired Mac yet"}
+                      {bridgeDisplay.deviceLabel}
                     </dd>
                   </div>
                   <div className="min-w-0 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-3">
@@ -1003,32 +1025,16 @@ export default async function LibraryAdminPage() {
                       Version
                     </dt>
                     <dd className="break-words [overflow-wrap:anywhere]">
-                      {firstBridgeDevice
-                        ? `${firstBridgeDevice.appVersion}, last seen ${
-                            firstBridgeDevice.lastSeenAt
-                              ? formatDateTime(firstBridgeDevice.lastSeenAt)
-                              : "not yet"
-                          }`
-                        : "Pair a Mac to begin"}
+                      {bridgeDisplay.versionLabel}
                     </dd>
                   </div>
                 </dl>
               </div>
               <Link
                 className="inline-flex min-h-11 w-full max-w-full items-center justify-center rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sage-mist)] sm:w-fit"
-                href={
-                  activeConnectedLibraries.length > 0
-                    ? getBridgeMonitoringRoute()
-                    : bridgeHealth.ok
-                      ? getConnectThisMacRoute()
-                      : getBridgeDownloadRoute()
-                }
+                href={bridgeStatusHref}
               >
-                {activeConnectedLibraries.length > 0
-                  ? "Open Monitoring"
-                  : bridgeHealth.ok
-                    ? "Connect This Mac"
-                    : "Download Bridge"}
+                {bridgeStatusActionLabel}
               </Link>
             </div>
           </NsnCard>
