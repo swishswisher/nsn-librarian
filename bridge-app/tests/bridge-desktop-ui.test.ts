@@ -45,6 +45,7 @@ class FakeElement {
 
 type RendererHarness = {
   elements: Record<string, FakeElement>;
+  openDownloadedUpdateCalls: () => number;
   pairWithCodeCalls: string[];
   statusCallCount: () => number;
 };
@@ -66,14 +67,21 @@ function rendererScript() {
 
 async function createRendererHarness(options: {
   chooseFolders?: () => Promise<unknown>;
+  checkForUpdates?: () => Promise<unknown>;
+  downloadUpdate?: () => Promise<unknown>;
+  getUpdateStatus?: () => Promise<unknown>;
+  openDownloadedUpdate?: () => Promise<unknown>;
   pairFails?: boolean;
   pairedInitially?: boolean;
 } = {}): Promise<RendererHarness> {
   const ids = [
     "chooseButton",
     "connectButton",
+    "cancelUpdateButton",
+    "downloadUpdateButton",
     "folderList",
     "notice",
+    "openUpdateButton",
     "openWebButton",
     "pairButton",
     "pairCancelButton",
@@ -85,6 +93,10 @@ async function createRendererHarness(options: {
     "resumeButton",
     "stateCopy",
     "statusBadge",
+    "updateBadge",
+    "updateCopy",
+    "updateNotes",
+    "updateSteps",
     "updatesButton",
     "watchingCopy",
   ];
@@ -92,6 +104,7 @@ async function createRendererHarness(options: {
     ids.map((id) => [id, new FakeElement(id)]),
   ) as Record<string, FakeElement>;
   const pairWithCodeCalls: string[] = [];
+  let openDownloadedUpdateCalls = 0;
   let paired = options.pairedInitially === true;
   let statusCallCount = 0;
   const document = {
@@ -105,9 +118,28 @@ async function createRendererHarness(options: {
     document,
     window: {
       nsnBridge: {
-        checkForUpdates: async () => undefined,
+        cancelDownloadedUpdate: async () => ({
+          message: "The downloaded update was removed.",
+          state: "UPDATE_AVAILABLE",
+        }),
+        checkForUpdates:
+          options.checkForUpdates ??
+          (async () => ({
+            currentVersion: "0.1.0",
+            latestVersion: "0.1.0",
+            releaseNotes: [],
+            state: "UP_TO_DATE",
+          })),
         chooseFolders: options.chooseFolders ?? (async () => []),
         connectSelectedFolders: async () => undefined,
+        downloadUpdate:
+          options.downloadUpdate ??
+          (async () => ({
+            currentVersion: "0.1.0",
+            latestVersion: "0.1.1",
+            releaseNotes: [],
+            state: "READY_TO_OPEN",
+          })),
         getStatus: async () => {
           statusCallCount += 1;
 
@@ -116,6 +148,27 @@ async function createRendererHarness(options: {
             roots: [],
           };
         },
+        getUpdateStatus:
+          options.getUpdateStatus ??
+          (async () => ({
+            currentVersion: "0.1.0",
+            latestVersion: "0.1.0",
+            releaseNotes: [],
+            state: "IDLE",
+          })),
+        onUpdateStatus: () => undefined,
+        openDownloadedUpdate:
+          options.openDownloadedUpdate ??
+          (async () => {
+            openDownloadedUpdateCalls += 1;
+
+            return {
+              currentVersion: "0.1.0",
+              latestVersion: "0.1.1",
+              releaseNotes: [],
+              state: "READY_TO_OPEN",
+            };
+          }),
         openLibrarian: () => undefined,
         pairWithCode: async (code: string) => {
           pairWithCodeCalls.push(code);
@@ -138,6 +191,7 @@ async function createRendererHarness(options: {
 
   return {
     elements,
+    openDownloadedUpdateCalls: () => openDownloadedUpdateCalls,
     pairWithCodeCalls,
     statusCallCount: () => statusCallCount,
   };
@@ -256,6 +310,83 @@ describe("Bridge desktop renderer", () => {
     assert.equal(harness.elements.notice.textContent.includes("private"), false);
     assert.equal(harness.elements.notice.className, "notice error");
   });
+
+  it("renders an up-to-date manual update check", async () => {
+    const harness = await createRendererHarness({
+      checkForUpdates: async () => ({
+        currentVersion: "0.1.98",
+        latestVersion: "0.1.98",
+        releaseNotes: [],
+        state: "UP_TO_DATE",
+      }),
+    });
+
+    await harness.elements.updatesButton.dispatch("click");
+
+    assert.equal(harness.elements.updateBadge.textContent, "Up to date");
+    assert.equal(
+      harness.elements.updateCopy.textContent,
+      "NSN Bridge 0.1.98 is the latest version.",
+    );
+    assert.equal(harness.elements.downloadUpdateButton.hidden, true);
+    assert.equal(harness.elements.notice.textContent, "NSN Bridge is up to date.");
+  });
+
+  it("renders an available update without exposing raw release internals", async () => {
+    const harness = await createRendererHarness({
+      checkForUpdates: async () => ({
+        currentVersion: "0.1.97",
+        latestVersion: "0.1.98",
+        releaseNotes: ["Fixed packaged Mac folder selection."],
+        state: "UPDATE_AVAILABLE",
+      }),
+    });
+
+    await harness.elements.updatesButton.dispatch("click");
+
+    assert.equal(harness.elements.updateBadge.textContent, "Update available");
+    assert.equal(harness.elements.updateCopy.textContent, "Version 0.1.98 is available.");
+    assert.equal(harness.elements.downloadUpdateButton.hidden, false);
+    assert.equal(harness.elements.openUpdateButton.hidden, true);
+    assert.equal(harness.elements.updateCopy.textContent.includes("SHA"), false);
+  });
+
+  it("does not claim success when update checking fails", async () => {
+    const harness = await createRendererHarness({
+      checkForUpdates: async () => ({
+        message: "Update information is not available right now.",
+        releaseNotes: [],
+        state: "FAILED",
+      }),
+    });
+
+    await harness.elements.updatesButton.dispatch("click");
+
+    assert.equal(harness.elements.updateBadge.textContent, "Update unavailable");
+    assert.equal(
+      harness.elements.notice.textContent,
+      "Update information is not available right now.",
+    );
+    assert.equal(harness.elements.notice.className, "notice error");
+  });
+
+  it("opens only the verified downloaded update action", async () => {
+    const harness = await createRendererHarness({
+      downloadUpdate: async () => ({
+        currentVersion: "0.1.97",
+        latestVersion: "0.1.98",
+        releaseNotes: [],
+        state: "READY_TO_OPEN",
+      }),
+    });
+
+    await harness.elements.downloadUpdateButton.dispatch("click");
+    await harness.elements.openUpdateButton.dispatch("click");
+
+    assert.equal(harness.elements.openUpdateButton.hidden, false);
+    assert.equal(harness.elements.updateSteps.hidden, false);
+    assert.equal(harness.openDownloadedUpdateCalls(), 1);
+  });
 });
 
 describe("Bridge desktop app lifecycle", () => {
@@ -276,5 +407,53 @@ describe("Bridge desktop app lifecycle", () => {
     assert.match(source, /isQuitting = true;/);
     assert.match(source, /localServer\?\.close\(\);/);
     assert.match(source, /electron\.app\.quit\(\);/);
+  });
+
+  it("uses the packaged Electron version as the reported Bridge version", async () => {
+    const source = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
+
+    assert.match(source, /setBridgeRuntimeAppVersion\(electron\.app\.getVersion\(\)\);/);
+    assert.match(source, /appVersion: bridgeRuntimeAppVersion\(\)/);
+  });
+
+  it("keeps assisted update IPC narrow", async () => {
+    const preloadSource = await readFile("apps/bridge/src/main/preload.ts", "utf8");
+    const mainSource = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
+
+    assert.match(preloadSource, /downloadUpdate: \(\) =>/);
+    assert.match(preloadSource, /openDownloadedUpdate: \(\) =>/);
+    assert.match(mainSource, /"nsn-bridge:download-update"/);
+    assert.match(mainSource, /"nsn-bridge:open-downloaded-update"/);
+    assert.equal(preloadSource.includes("openPath"), false);
+    assert.equal(preloadSource.includes("downloadUrl"), false);
+  });
+
+  it("checks for updates after startup without automatically downloading", async () => {
+    const source = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
+    const startupCheck = /setTimeout\(\(\) => \{\s+void checkForUpdatesAndNotify\(\)\.catch\(\(\) => undefined\);\s+\}, 5_000\);/s;
+
+    assert.match(source, startupCheck);
+    assert.equal(/setTimeout[\s\S]*downloadUpdate/.test(source), false);
+  });
+
+  it("keeps unsigned updates as assisted DMG installation only", async () => {
+    const managerSource = await readFile("apps/bridge/src/main/update-manager.ts", "utf8");
+    const packageSource = await readFile("package.json", "utf8");
+
+    assert.equal(packageSource.includes("electron-updater"), false);
+    assert.equal(managerSource.includes("autoUpdater"), false);
+    assert.equal(managerSource.includes("Keychain"), false);
+    assert.equal(managerSource.includes(".nsn-bridge"), false);
+  });
+
+  it("stamps one release version into both macOS architecture builds", async () => {
+    const workflow = await readFile(".github/workflows/release-bridge-macos.yml", "utf8");
+    const packageScript = await readFile("scripts/package-bridge-mac.mjs", "utf8");
+
+    assert.match(workflow, /version="0\.1\.\$\{RUN_NUMBER\}"/);
+    assert.match(workflow, /echo "tag=bridge-v\$\{version\}"/);
+    assert.match(workflow, /NSN_BRIDGE_RELEASE_VERSION: \$\{\{ steps\.bridge_version\.outputs\.version \}\}/);
+    assert.match(packageScript, /NSN_BRIDGE_RELEASE_VERSION/);
+    assert.match(packageScript, /bridgePackage\.version = releaseVersion/);
   });
 });

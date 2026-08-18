@@ -144,6 +144,30 @@ jobs:
 
           echo "unsigned=$unsigned" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve Bridge release version
+        id: bridge_version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          RUN_NUMBER: ${{ github.run_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            version="${REF_NAME#bridge-v}"
+          else
+            version="0.1.${RUN_NUMBER}"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Bridge release version must be x.y.z, got: $version"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -194,6 +218,7 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NSN_BRIDGE_RELEASE_VERSION: ${{ steps.bridge_version.outputs.version }}
           NSN_UNSIGNED_BUILD: "true"
         run: npm run package:bridge:mac
 
@@ -206,6 +231,7 @@ jobs:
           CSC_LINK: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           CSC_KEY_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NSN_BRIDGE_RELEASE_VERSION: ${{ steps.bridge_version.outputs.version }}
           NSN_UNSIGNED_BUILD: "false"
         run: npm run package:bridge:mac
 
@@ -249,6 +275,8 @@ jobs:
           RUN_NUMBER: ${{ github.run_number }}
         shell: bash
         run: |
+          set -euo pipefail
+
           unsigned=false
 
           if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "branch" ]; then
@@ -270,14 +298,27 @@ jobs:
           fi
 
           if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            version="${REF_NAME#bridge-v}"
+          else
+            version="0.1.${RUN_NUMBER}"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Bridge release version must be x.y.z, got: $version"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
             echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
           elif [ "$EVENT_NAME" = "push" ] && [ "$REF_NAME" = "master" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "tag=bridge-v0.1.0-dev-${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "tag=bridge-v${version}" >> "$GITHUB_OUTPUT"
           elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${{ inputs.publish_release }}" = "true" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "tag=bridge-v0.1.0-dev-${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "tag=bridge-v${version}" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "tag=" >> "$GITHUB_OUTPUT"
@@ -302,6 +343,7 @@ jobs:
         env:
           NSN_RELEASE_CHANNEL: ${{ steps.release.outputs.release_channel }}
           NSN_RELEASE_SIGNED: ${{ steps.release.outputs.signed }}
+          NSN_RELEASE_VERSION: ${{ steps.release.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -313,6 +355,16 @@ jobs:
           if [ "$arm64_count" -ne 1 ] || [ "$x64_count" -ne 1 ]; then
             echo "Both Apple Silicon and Intel Mac DMGs are required before publishing."
             find . -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          if ! find . -maxdepth 1 -type f -name "NSN-Bridge-v${NSN_RELEASE_VERSION}-mac-arm64*.dmg" | grep -q .; then
+            echo "Apple Silicon DMG does not match release version ${NSN_RELEASE_VERSION}."
+            exit 1
+          fi
+
+          if ! find . -maxdepth 1 -type f -name "NSN-Bridge-v${NSN_RELEASE_VERSION}-mac-x64*.dmg" | grep -q .; then
+            echo "Intel DMG does not match release version ${NSN_RELEASE_VERSION}."
             exit 1
           fi
 
@@ -337,6 +389,7 @@ jobs:
                 files,
                 generatedAt: new Date().toISOString(),
                 signed: process.env.NSN_RELEASE_SIGNED === "true",
+                version: process.env.NSN_RELEASE_VERSION,
               },
               null,
               2,

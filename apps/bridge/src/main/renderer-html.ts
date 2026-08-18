@@ -111,6 +111,17 @@ export function bridgeRendererHtml() {
       }
       .folder strong { overflow-wrap: anywhere; }
       .folder small { color: var(--muted); overflow-wrap: anywhere; }
+      .update-panel { display: grid; gap: 10px; }
+      .update-notes, .update-steps {
+        display: grid;
+        gap: 6px;
+        margin: 0;
+        padding-left: 18px;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+      .update-notes:empty, .update-steps[hidden] { display: none; }
+      .update-notes li, .update-steps li { overflow-wrap: anywhere; }
       @media (min-width: 720px) {
         main { padding: 28px; }
         .actions, .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -178,8 +189,23 @@ export function bridgeRendererHtml() {
 
       <section>
         <h2>Updates</h2>
+        <div class="update-panel">
+          <span class="badge warning" id="updateBadge">Not checked</span>
+          <p id="updateCopy">NSN Bridge can check for a verified update.</p>
+          <ul class="update-notes" id="updateNotes"></ul>
+          <ol class="update-steps" id="updateSteps" hidden>
+            <li>Quit NSN Bridge.</li>
+            <li>Drag NSN Bridge to Applications.</li>
+            <li>Choose Replace if macOS asks.</li>
+            <li>Open NSN Bridge again.</li>
+            <li>If macOS blocks the unsigned build, use System Settings -&gt; Privacy &amp; Security -&gt; Open Anyway.</li>
+          </ol>
+        </div>
         <div class="actions">
           <button id="updatesButton">Check for Updates</button>
+          <button class="primary" id="downloadUpdateButton" hidden>Download Update</button>
+          <button class="primary" id="openUpdateButton" hidden>Open Update</button>
+          <button id="cancelUpdateButton" hidden>Cancel / Remove Download</button>
           <button id="quitButton">Quit Bridge</button>
         </div>
       </section>
@@ -198,6 +224,14 @@ export function bridgeRendererHtml() {
       const pairingCodeInput = document.getElementById("pairingCodeInput");
       const pairSubmitButton = document.getElementById("pairSubmitButton");
       const pairCancelButton = document.getElementById("pairCancelButton");
+      const updateBadge = document.getElementById("updateBadge");
+      const updateCopy = document.getElementById("updateCopy");
+      const updateNotes = document.getElementById("updateNotes");
+      const updateSteps = document.getElementById("updateSteps");
+      const updatesButton = document.getElementById("updatesButton");
+      const downloadUpdateButton = document.getElementById("downloadUpdateButton");
+      const openUpdateButton = document.getElementById("openUpdateButton");
+      const cancelUpdateButton = document.getElementById("cancelUpdateButton");
       let pairingFormDismissed = false;
 
       function showNotice(message, isError) {
@@ -258,6 +292,90 @@ export function bridgeRendererHtml() {
         pairSubmitButton.disabled = disabled;
         pairCancelButton.disabled = disabled;
         pairingCodeInput.disabled = disabled;
+      }
+
+      function updateBadgeLabel(state) {
+        if (state === "UP_TO_DATE") {
+          return "Up to date";
+        }
+        if (state === "UPDATE_AVAILABLE") {
+          return "Update available";
+        }
+        if (state === "DOWNLOADING") {
+          return "Downloading";
+        }
+        if (state === "VERIFYING") {
+          return "Verifying";
+        }
+        if (state === "READY_TO_OPEN") {
+          return "Update ready";
+        }
+        if (state === "FAILED") {
+          return "Update unavailable";
+        }
+        if (state === "CHECKING") {
+          return "Checking";
+        }
+
+        return "Not checked";
+      }
+
+      function updateMessage(result) {
+        if (!result || typeof result !== "object") {
+          return "NSN Bridge can check for a verified update.";
+        }
+
+        if (result.state === "UP_TO_DATE") {
+          return "NSN Bridge " + result.currentVersion + " is the latest version.";
+        }
+        if (result.state === "UPDATE_AVAILABLE") {
+          return "Version " + result.latestVersion + " is available.";
+        }
+        if (result.state === "DOWNLOADING") {
+          return typeof result.downloadProgressPercent === "number"
+            ? "Downloading update... " + result.downloadProgressPercent + "%"
+            : "Downloading update...";
+        }
+        if (result.state === "VERIFYING") {
+          return "Verifying the downloaded update.";
+        }
+        if (result.state === "READY_TO_OPEN") {
+          return "Version " + result.latestVersion + " has been downloaded and verified.";
+        }
+        if (typeof result.message === "string" && result.message.length > 0) {
+          return result.message;
+        }
+
+        return "Update information is not available right now.";
+      }
+
+      function renderUpdateResult(result) {
+        const state = result && typeof result === "object" && typeof result.state === "string"
+          ? result.state
+          : "IDLE";
+        updateBadge.textContent = updateBadgeLabel(state);
+        updateBadge.className = state === "FAILED" ? "badge warning" : "badge";
+        updateCopy.textContent = updateMessage(result);
+        updateNotes.innerHTML = "";
+
+        if (result && Array.isArray(result.releaseNotes)) {
+          result.releaseNotes.slice(0, 6).forEach((note) => {
+            if (typeof note !== "string" || note.trim().length === 0) {
+              return;
+            }
+
+            const item = document.createElement("li");
+            item.textContent = note;
+            updateNotes.appendChild(item);
+          });
+        }
+
+        updatesButton.disabled = state === "CHECKING" || state === "DOWNLOADING" || state === "VERIFYING";
+        downloadUpdateButton.hidden = state !== "UPDATE_AVAILABLE";
+        downloadUpdateButton.disabled = state === "DOWNLOADING" || state === "VERIFYING";
+        openUpdateButton.hidden = state !== "READY_TO_OPEN";
+        cancelUpdateButton.hidden = state !== "READY_TO_OPEN" && state !== "DOWNLOADING" && state !== "VERIFYING";
+        updateSteps.hidden = state !== "READY_TO_OPEN";
       }
 
       function renderFolders() {
@@ -387,11 +505,56 @@ export function bridgeRendererHtml() {
         await refreshStatus();
         showNotice("Watching resumed for folders that permit it.", false);
       });
-      document.getElementById("updatesButton").addEventListener("click", async () => {
-        await window.nsnBridge.checkForUpdates();
-        showNotice("The Bridge checked for an available update.", false);
+      updatesButton.addEventListener("click", async () => {
+        renderUpdateResult({ state: "CHECKING", currentVersion: "", latestVersion: "", releaseNotes: [] });
+        try {
+          const result = await window.nsnBridge.checkForUpdates();
+          renderUpdateResult(result);
+          if (result && result.state === "UP_TO_DATE") {
+            showNotice("NSN Bridge is up to date.", false);
+          } else if (result && result.state === "UPDATE_AVAILABLE") {
+            showNotice("A Bridge update is available.", false);
+          } else if (result && result.state === "FAILED") {
+            showNotice(result.message || "Update information is not available right now.", true);
+          }
+        } catch {
+          renderUpdateResult({ state: "FAILED", message: "Update information is not available right now.", releaseNotes: [] });
+          showNotice("Update information is not available right now.", true);
+        }
+      });
+      downloadUpdateButton.addEventListener("click", async () => {
+        renderUpdateResult({ state: "DOWNLOADING", releaseNotes: [] });
+        try {
+          renderUpdateResult(await window.nsnBridge.downloadUpdate());
+        } catch {
+          renderUpdateResult({ state: "FAILED", message: "The update could not be downloaded right now.", releaseNotes: [] });
+        }
+      });
+      openUpdateButton.addEventListener("click", async () => {
+        try {
+          renderUpdateResult(await window.nsnBridge.openDownloadedUpdate());
+          showNotice("The verified update is open. Follow the installation steps shown above.", false);
+        } catch {
+          showNotice("The verified update could not be opened right now.", true);
+        }
+      });
+      cancelUpdateButton.addEventListener("click", async () => {
+        try {
+          renderUpdateResult(await window.nsnBridge.cancelDownloadedUpdate());
+          showNotice("The downloaded update was removed.", false);
+        } catch {
+          showNotice("The downloaded update could not be removed right now.", true);
+        }
       });
       document.getElementById("quitButton").addEventListener("click", () => window.nsnBridge.quit());
+      if (typeof window.nsnBridge.onUpdateStatus === "function") {
+        window.nsnBridge.onUpdateStatus(renderUpdateResult);
+      }
+      if (typeof window.nsnBridge.getUpdateStatus === "function") {
+        window.nsnBridge.getUpdateStatus()
+          .then(renderUpdateResult)
+          .catch(() => undefined);
+      }
       refreshStatus();
     </script>
   </body>

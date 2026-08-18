@@ -6,7 +6,9 @@ import type {
   BridgeReleaseManifest,
 } from "../../../packages/bridge-protocol/src";
 import {
+  compareBridgeReleaseVersions,
   parseBridgeReleaseVersion,
+  selectBridgeReleaseAsset,
   validateBridgeReleaseManifest,
 } from "../../../packages/bridge-protocol/src";
 
@@ -174,65 +176,83 @@ async function loadGitHubReleaseManifest(
   }
 
   const releases = (await response.json()) as GitHubRelease[];
-  const release = releases.find(
-    (item) =>
-      !item.draft &&
-      item.tag_name.startsWith("bridge-v") &&
-      item.assets.some((asset) => asset.name.endsWith(".dmg")),
-  );
-
-  if (!release) {
-    return null;
-  }
-
-  const checksumAsset = release.assets.find(
-    (asset) => asset.name === "SHA256SUMS.txt",
-  );
-  const checksumText = checksumAsset
-    ? await fetch(checksumAsset.browser_download_url, {
-        headers: githubHeaders(),
-        next: { revalidate: 300 },
-      }).then((checksumResponse) =>
-        checksumResponse.ok ? checksumResponse.text() : "",
-      )
-    : "";
-  const checksums = parseChecksums(checksumText);
-  const discoveredAssets: BridgeReleaseAsset[] = release.assets
+  const releaseCandidates = releases
     .filter(
-      (asset) =>
-        asset.name.endsWith(".dmg") ||
-        asset.name === "SHA256SUMS.txt" ||
-        asset.name === "latest-mac.json",
+      (item) =>
+        !item.draft &&
+        item.tag_name.startsWith("bridge-v") &&
+        Boolean(parseBridgeReleaseVersion(item.tag_name.replace(/^bridge-/u, ""))),
     )
-    .map((asset) => ({
-      architecture: architectureForAsset(asset.name),
-      available: Boolean(checksums.get(asset.name)),
-      fileName: asset.name,
-      kind: asset.name.endsWith(".dmg")
-        ? "dmg"
-        : asset.name === "SHA256SUMS.txt"
-          ? "checksums"
-          : "json",
-      sha256: checksums.get(asset.name) ?? "pending-release-asset",
-      sizeBytes: asset.size,
-      url: checksums.get(asset.name) ? asset.browser_download_url : null,
-    }));
-  const assets = withRequiredMacDmgAssets(discoveredAssets, fallback);
-  const parsedVersion = parseBridgeReleaseVersion(
-    release.tag_name.replace(/^bridge-/u, ""),
-  );
+    .sort((left, right) => {
+      const comparison = compareBridgeReleaseVersions(
+        left.tag_name.replace(/^bridge-/u, ""),
+        right.tag_name.replace(/^bridge-/u, ""),
+      );
 
-  if (!parsedVersion) {
-    return null;
+      return comparison === null ? 0 : -comparison;
+    });
+
+  for (const release of releaseCandidates) {
+    const checksumAsset = release.assets.find(
+      (asset) => asset.name === "SHA256SUMS.txt",
+    );
+    const checksumText = checksumAsset
+      ? await fetch(checksumAsset.browser_download_url, {
+          headers: githubHeaders(),
+          next: { revalidate: 300 },
+        }).then((checksumResponse) =>
+          checksumResponse.ok ? checksumResponse.text() : "",
+        )
+      : "";
+    const checksums = parseChecksums(checksumText);
+    const discoveredAssets: BridgeReleaseAsset[] = release.assets
+      .filter(
+        (asset) =>
+          asset.name.endsWith(".dmg") ||
+          asset.name === "SHA256SUMS.txt" ||
+          asset.name === "latest-mac.json",
+      )
+      .map((asset) => ({
+        architecture: architectureForAsset(asset.name),
+        available: Boolean(checksums.get(asset.name)),
+        fileName: asset.name,
+        kind: asset.name.endsWith(".dmg")
+          ? "dmg"
+          : asset.name === "SHA256SUMS.txt"
+            ? "checksums"
+            : "json",
+        sha256: checksums.get(asset.name) ?? "pending-release-asset",
+        sizeBytes: asset.size,
+        url: checksums.get(asset.name) ? asset.browser_download_url : null,
+      }));
+    const assets = withRequiredMacDmgAssets(discoveredAssets, fallback);
+    const parsedVersion = parseBridgeReleaseVersion(
+      release.tag_name.replace(/^bridge-/u, ""),
+    );
+
+    if (!parsedVersion) {
+      continue;
+    }
+
+    const manifest = {
+      ...fallback,
+      assets,
+      releaseDate: release.published_at ?? fallback.releaseDate,
+      releaseNotes: releaseNotes(release, fallback.releaseNotes),
+      version: parsedVersion.version,
+    };
+    const validation = validateBridgeReleaseManifest(manifest);
+    const hasInstallableMacDmg = Boolean(
+      selectBridgeReleaseAsset(manifest, "arm64") ||
+        selectBridgeReleaseAsset(manifest, "x64"),
+    );
+
+    if (validation.ok && hasInstallableMacDmg) {
+      return manifest;
+    }
   }
 
-  return {
-    ...fallback,
-    assets,
-    releaseDate: release.published_at ?? fallback.releaseDate,
-    releaseNotes: releaseNotes(release, fallback.releaseNotes),
-    version: parsedVersion.version,
-  };
+  return null;
 }
 
 export async function getBridgeReleaseManifest() {

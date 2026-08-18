@@ -14,12 +14,14 @@ import { processPendingBridgeCommands } from "./command-runner";
 import { bridgeRendererHtml } from "./renderer-html";
 import { loadElectronRuntime } from "./electron-runtime";
 import {
+  bridgeRuntimeAppVersion,
   getPairedBridgeDeviceId,
   pairBridgeWithCloud,
   sendBridgeHeartbeat,
+  setBridgeRuntimeAppVersion,
   syncBridgeRoots,
 } from "./cloud-client";
-import { checkBridgeUpdateManifest } from "./update-manager";
+import { createBridgeUpdateManager } from "./update-manager";
 import {
   folderSelectionIpcResult,
   selectFoldersFromDialog,
@@ -28,6 +30,7 @@ import {
 let localServer: Server | null = null;
 const currentDir = __dirname;
 const rootSyncIntervalMs = 60_000;
+const updateCheckIntervalMs = 6 * 60 * 60 * 1000;
 
 function processResourcesPath() {
   return (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
@@ -91,9 +94,16 @@ export async function startElectronBridgeApp() {
   }
 
   await electron.app.whenReady();
+  setBridgeRuntimeAppVersion(electron.app.getVersion());
   await startLocalBridgeServer();
 
   const forbiddenApplicationPaths = bridgeApplicationPaths(electron);
+  const updateManager = createBridgeUpdateManager({
+    architecture: process.arch,
+    currentVersion: bridgeRuntimeAppVersion(),
+    openPath: electron.shell.openPath,
+    updateDirectory: path.join(electron.app.getPath("temp"), "nsn-bridge-updates"),
+  });
   let mainWindow: InstanceType<typeof electron.BrowserWindow> | null = null;
   let isQuitting = false;
   let commandPollInFlight = false;
@@ -203,11 +213,22 @@ export async function startElectronBridgeApp() {
     ]);
 
     return {
-      appVersion: process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0",
+      appVersion: bridgeRuntimeAppVersion(),
       bridgeDeviceId,
       paired: Boolean(bridgeDeviceId),
       roots,
     };
+  }
+
+  function sendUpdateStatus(payload = updateManager.getState()) {
+    mainWindow?.webContents.send("nsn-bridge:update-status", payload);
+  }
+
+  async function checkForUpdatesAndNotify() {
+    const result = await updateManager.checkForUpdates();
+
+    sendUpdateStatus(result);
+    return result;
   }
 
   async function pauseAllWatching() {
@@ -295,7 +316,7 @@ export async function startElectronBridgeApp() {
         label: "Resume Watching",
       },
       {
-        click: () => void checkBridgeUpdateManifest(),
+        click: () => void checkForUpdatesAndNotify(),
         label: "Check for Updates",
       },
       {
@@ -327,7 +348,28 @@ export async function startElectronBridgeApp() {
   electron.ipcMain.handle("nsn-bridge:status", desktopStatus);
   electron.ipcMain.handle("nsn-bridge:heartbeat", sendBridgeHeartbeat);
   electron.ipcMain.handle("nsn-bridge:commands", pollCloud);
-  electron.ipcMain.handle("nsn-bridge:check-updates", checkBridgeUpdateManifest);
+  electron.ipcMain.handle("nsn-bridge:update-status", () =>
+    updateManager.getState(),
+  );
+  electron.ipcMain.handle("nsn-bridge:check-updates", checkForUpdatesAndNotify);
+  electron.ipcMain.handle("nsn-bridge:download-update", async () => {
+    const result = await updateManager.downloadUpdate();
+
+    sendUpdateStatus(result);
+    return result;
+  });
+  electron.ipcMain.handle("nsn-bridge:open-downloaded-update", async () => {
+    const result = await updateManager.openDownloadedUpdate();
+
+    sendUpdateStatus(result);
+    return result;
+  });
+  electron.ipcMain.handle("nsn-bridge:cancel-downloaded-update", async () => {
+    const result = await updateManager.cancelDownloadedUpdate();
+
+    sendUpdateStatus(result);
+    return result;
+  });
   electron.ipcMain.handle("nsn-bridge:pause-watching", pauseAllWatching);
   electron.ipcMain.handle("nsn-bridge:resume-watching", resumeAllWatching);
   electron.ipcMain.handle("nsn-bridge:open-librarian", () =>
@@ -395,13 +437,20 @@ export async function startElectronBridgeApp() {
   createMainWindow();
 
   void pollCloud().catch(() => undefined);
+  setTimeout(() => {
+    void checkForUpdatesAndNotify().catch(() => undefined);
+  }, 5_000);
   const pollInterval = setInterval(() => {
     void pollCloud().catch(() => undefined);
   }, 15_000);
+  const updateCheckInterval = setInterval(() => {
+    void checkForUpdatesAndNotify().catch(() => undefined);
+  }, updateCheckIntervalMs);
 
   electron.app.on("before-quit", () => {
     isQuitting = true;
     clearInterval(pollInterval);
+    clearInterval(updateCheckInterval);
     localServer?.close();
   });
 }

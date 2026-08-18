@@ -1,4 +1,10 @@
-import { existsSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 
@@ -27,12 +33,44 @@ const unsignedBuild = process.env.NSN_UNSIGNED_BUILD === "true";
 const bridgeArch = process.env.NSN_BRIDGE_ARCH?.trim();
 const bridgeArchFlag =
   bridgeArch === "arm64" ? "--arm64" : bridgeArch === "x64" ? "--x64" : null;
+const bridgePackagePath = path.join(
+  process.cwd(),
+  "apps",
+  "bridge",
+  "package.json",
+);
+const releaseVersion = process.env.NSN_BRIDGE_RELEASE_VERSION?.trim();
+let originalBridgePackageText = null;
 
 if (!bridgeArchFlag) {
   process.stderr.write(
     "NSN_BRIDGE_ARCH must be set to arm64 or x64 when packaging the macOS Bridge.\n",
   );
   process.exit(1);
+}
+
+if (releaseVersion && !/^\d+\.\d+\.\d+$/u.test(releaseVersion)) {
+  process.stderr.write(
+    "NSN_BRIDGE_RELEASE_VERSION must be a valid x.y.z semver version.\n",
+  );
+  process.exit(1);
+}
+
+if (releaseVersion) {
+  originalBridgePackageText = readFileSync(bridgePackagePath, "utf8");
+  const bridgePackage = JSON.parse(originalBridgePackageText);
+
+  bridgePackage.version = releaseVersion;
+  writeFileSync(
+    bridgePackagePath,
+    `${JSON.stringify(bridgePackage, null, 2)}\n`,
+    "utf8",
+  );
+  process.on("exit", () => {
+    if (originalBridgePackageText !== null) {
+      writeFileSync(bridgePackagePath, originalBridgePackageText, "utf8");
+    }
+  });
 }
 
 const buildResult = spawnSync("node", ["scripts/build-bridge-app.mjs"], {
@@ -99,12 +137,13 @@ if (expectedArchDmgs.length !== 1 || wrongArchDmgs.length > 0) {
 writeFileSync(
   path.join(releaseDir, "latest-mac.json"),
   `${JSON.stringify(
-    {
-      channel: unsignedBuild ? "development" : "production",
-      files: dmgFiles,
-      generatedAt: new Date().toISOString(),
-      signed: !unsignedBuild,
-    },
+      {
+        channel: unsignedBuild ? "development" : "production",
+        files: dmgFiles,
+        generatedAt: new Date().toISOString(),
+        signed: !unsignedBuild,
+        version: releaseVersion ?? JSON.parse(readFileSync(bridgePackagePath, "utf8")).version,
+      },
     null,
     2,
   )}\n`,

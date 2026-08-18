@@ -1,4 +1,4 @@
-export const bridgeVersion = "0.1.0";
+export const bridgeVersion = process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0";
 
 export const bridgePlatforms = ["WINDOWS", "MACOS", "LINUX", "UNKNOWN"] as const;
 export type BridgePlatform = (typeof bridgePlatforms)[number];

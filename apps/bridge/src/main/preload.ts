@@ -1,4 +1,5 @@
 type NsnBridgeApi = {
+  cancelDownloadedUpdate: () => Promise<unknown>;
   checkForUpdates: () => Promise<unknown>;
   chooseFolders: () => Promise<
     Array<{
@@ -11,7 +12,11 @@ type NsnBridgeApi = {
     }>
   >;
   connectSelectedFolders: (folders: unknown[]) => Promise<unknown>;
+  downloadUpdate: () => Promise<unknown>;
   getStatus: () => Promise<unknown>;
+  getUpdateStatus: () => Promise<unknown>;
+  onUpdateStatus: (listener: (payload: unknown) => void) => void;
+  openDownloadedUpdate: () => Promise<unknown>;
   openLibrarian: () => Promise<unknown>;
   pairWithCode: (code: string) => Promise<unknown>;
   pauseWatching: () => Promise<unknown>;
@@ -38,6 +43,10 @@ const { contextBridge, ipcRenderer } = runtimeRequire("electron") as {
   };
   ipcRenderer: {
     invoke: (channel: string, ...args: unknown[]) => Promise<unknown>;
+    on: (
+      channel: string,
+      listener: (_event: unknown, payload: unknown) => void,
+    ) => void;
   };
 };
 
@@ -50,6 +59,8 @@ function safeBridgeError(message: string, code: string) {
 }
 
 contextBridge.exposeInMainWorld("nsnBridge", {
+  cancelDownloadedUpdate: () =>
+    ipcRenderer.invoke("nsn-bridge:cancel-downloaded-update"),
   checkForUpdates: () => ipcRenderer.invoke("nsn-bridge:check-updates"),
   chooseFolders: async () => {
     const response = (await ipcRenderer.invoke(
@@ -79,7 +90,20 @@ contextBridge.exposeInMainWorld("nsnBridge", {
   },
   connectSelectedFolders: (folders: unknown[]) =>
     ipcRenderer.invoke("nsn-bridge:connect-folders", folders),
+  downloadUpdate: () => ipcRenderer.invoke("nsn-bridge:download-update"),
   getStatus: () => ipcRenderer.invoke("nsn-bridge:status"),
+  getUpdateStatus: () => ipcRenderer.invoke("nsn-bridge:update-status"),
+  onUpdateStatus: (listener: (payload: unknown) => void) => {
+    if (typeof listener !== "function") {
+      return;
+    }
+
+    ipcRenderer.on("nsn-bridge:update-status", (_event, payload) => {
+      listener(payload);
+    });
+  },
+  openDownloadedUpdate: () =>
+    ipcRenderer.invoke("nsn-bridge:open-downloaded-update"),
   openLibrarian: () => ipcRenderer.invoke("nsn-bridge:open-librarian"),
   pairWithCode: (code: string) => ipcRenderer.invoke("nsn-bridge:pair", code),
   pauseWatching: () => ipcRenderer.invoke("nsn-bridge:pause-watching"),

@@ -5,7 +5,7 @@ import type {
 } from "./types";
 
 export function parseBridgeReleaseVersion(version: string) {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version.trim());
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version.trim());
 
   if (!match) {
     return null;
@@ -19,18 +19,68 @@ export function parseBridgeReleaseVersion(version: string) {
   };
 }
 
+export function compareBridgeReleaseVersions(left: string, right: string) {
+  const parsedLeft = parseBridgeReleaseVersion(left);
+  const parsedRight = parseBridgeReleaseVersion(right);
+
+  if (!parsedLeft || !parsedRight) {
+    return null;
+  }
+
+  if (parsedLeft.major !== parsedRight.major) {
+    return parsedLeft.major - parsedRight.major;
+  }
+
+  if (parsedLeft.minor !== parsedRight.minor) {
+    return parsedLeft.minor - parsedRight.minor;
+  }
+
+  return parsedLeft.patch - parsedRight.patch;
+}
+
+export function bridgeReleaseVersionIsNewer(candidate: string, current: string) {
+  const comparison = compareBridgeReleaseVersions(candidate, current);
+
+  return comparison !== null && comparison > 0;
+}
+
 function validSha256(value: string) {
   return /^[a-f0-9]{64}$/i.test(value);
 }
 
+export function bridgeReleaseFileNameIsSafe(fileName: string) {
+  const trimmed = fileName.trim();
+
+  return (
+    trimmed.length > 0 &&
+    trimmed === fileName &&
+    !trimmed.includes("/") &&
+    !trimmed.includes("\\") &&
+    !trimmed.includes("..") &&
+    !trimmed.startsWith(".")
+  );
+}
+
+function bridgeReleaseUrlIsSafe(value: string) {
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function validateReleaseAsset(asset: BridgeReleaseAsset) {
-  if (!asset.fileName.trim()) {
+  if (!bridgeReleaseFileNameIsSafe(asset.fileName)) {
     return "Every Bridge release asset needs a file name.";
   }
 
   if (asset.available) {
     if (!asset.url) {
       return "Available Bridge assets need a download URL.";
+    }
+
+    if (!bridgeReleaseUrlIsSafe(asset.url)) {
+      return "Available Bridge assets need a secure download URL.";
     }
 
     if (!validSha256(asset.sha256)) {
@@ -77,6 +127,24 @@ export function validateBridgeReleaseManifest(
     message: "The Bridge release manifest is valid.",
     ok: true,
   };
+}
+
+export function selectBridgeReleaseAsset(
+  manifest: BridgeReleaseManifest,
+  architecture: Extract<BridgeReleaseAsset["architecture"], "arm64" | "x64">,
+) {
+  return (
+    manifest.assets.find(
+      (asset) =>
+        asset.kind === "dmg" &&
+        asset.architecture === architecture &&
+        asset.available &&
+        Boolean(asset.url) &&
+        validSha256(asset.sha256) &&
+        bridgeReleaseFileNameIsSafe(asset.fileName) &&
+        bridgeReleaseUrlIsSafe(asset.url ?? ""),
+    ) ?? null
+  );
 }
 
 export function suggestedMacArchitecture(userAgent: string) {

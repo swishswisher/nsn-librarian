@@ -35,7 +35,8 @@ export type ElectronRuntime = {
     };
     getAppPath: () => string;
     getLoginItemSettings: () => { openAtLogin: boolean };
-    getPath: (name: "exe" | "userData") => string;
+    getPath: (name: "exe" | "temp" | "userData") => string;
+    getVersion: () => string;
     isPackaged: boolean;
     on: (eventName: string, listener: (...args: unknown[]) => void) => void;
     quit: () => void;
@@ -65,6 +66,7 @@ export type ElectronRuntime = {
   };
   shell: {
     openExternal: (url: string) => Promise<void>;
+    openPath: (filePath: string) => Promise<string>;
   };
 };
 

@@ -13,6 +13,20 @@ import type { BridgeRootSummary } from "../../../../bridge-app/src/types";
 
 import { readBridgeSecret, saveBridgeSecret } from "./keychain";
 
+let runtimeAppVersion = process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0";
+
+export function setBridgeRuntimeAppVersion(version: string) {
+  const trimmed = version.trim();
+
+  if (trimmed) {
+    runtimeAppVersion = trimmed;
+  }
+}
+
+export function bridgeRuntimeAppVersion() {
+  return runtimeAppVersion;
+}
+
 type PairingResponse =
   | {
       device: BridgeDeviceSummary;
@@ -118,7 +132,7 @@ export async function pairBridgeWithCloud(pairingCode: string) {
   const payload = await postJson<PairingResponse>(
     "/api/bridge/cloud/pairing-codes/redeem",
     {
-      appVersion: process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0",
+      appVersion: bridgeRuntimeAppVersion(),
       architecture: os.arch(),
       bridgeDeviceId,
       deviceDisplayName: os.hostname() || "This Mac",
@@ -152,7 +166,7 @@ export async function sendBridgeHeartbeat() {
   return postJson<{ ok: true }>(
     `/api/bridge/cloud/devices/${encodeURIComponent(bridgeDeviceId)}/heartbeat`,
     {
-      appVersion: process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0",
+      appVersion: bridgeRuntimeAppVersion(),
       architecture: os.arch(),
       platform: bridgePlatform(),
     },

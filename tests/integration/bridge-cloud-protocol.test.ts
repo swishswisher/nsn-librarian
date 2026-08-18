@@ -8,7 +8,9 @@ import {
   createBridgeCommandReplayKey,
   createBridgeKeyPair,
   createPairingCode,
+  bridgeReleaseVersionIsNewer,
   parseBridgeReleaseVersion,
+  selectBridgeReleaseAsset,
   validateBridgeCommandForDevice,
   validateBridgeReleaseManifest,
   validatePairingRedemption,
@@ -246,6 +248,79 @@ describe("Bridge cloud protocol", () => {
       version: "0.1.0",
     });
     assert.equal(validation.ok, true);
+  });
+
+  it("orders release versions without collapsing prerelease suffixes", () => {
+    assert.equal(bridgeReleaseVersionIsNewer("0.1.98", "0.1.97"), true);
+    assert.equal(bridgeReleaseVersionIsNewer("0.1.98", "0.1.98"), false);
+    assert.equal(bridgeReleaseVersionIsNewer("0.1.97", "0.1.98"), false);
+    assert.equal(parseBridgeReleaseVersion("0.1.0-dev-98"), null);
+  });
+
+  it("selects only installable architecture-compatible DMG assets", () => {
+    const manifest: BridgeReleaseManifest = {
+      assets: [
+        {
+          architecture: "arm64",
+          available: true,
+          fileName: "NSN-Bridge-v0.1.98-mac-arm64-unsigned.dmg",
+          kind: "dmg",
+          sha256: "a".repeat(64),
+          sizeBytes: 1024,
+          url: "https://downloads.example/arm64.dmg",
+        },
+        {
+          architecture: "x64",
+          available: true,
+          fileName: "NSN-Bridge-v0.1.98-mac-x64-unsigned.dmg",
+          kind: "dmg",
+          sha256: "b".repeat(64),
+          sizeBytes: 1024,
+          url: "https://downloads.example/x64.dmg",
+        },
+      ],
+      minimumMacOSVersion: "13.0",
+      privacySummary: ["Folders stay on this Mac."],
+      releaseDate: "2026-08-18T00:00:00.000Z",
+      releaseNotes: ["Test release."],
+      systemRequirements: ["macOS 13 or newer."],
+      version: "0.1.98",
+    };
+
+    assert.equal(
+      selectBridgeReleaseAsset(manifest, "arm64")?.fileName,
+      "NSN-Bridge-v0.1.98-mac-arm64-unsigned.dmg",
+    );
+    assert.equal(
+      selectBridgeReleaseAsset(manifest, "x64")?.fileName,
+      "NSN-Bridge-v0.1.98-mac-x64-unsigned.dmg",
+    );
+    assert.equal(
+      selectBridgeReleaseAsset(
+        {
+          ...manifest,
+          assets: [manifest.assets[0]],
+        },
+        "x64",
+      ),
+      null,
+    );
+    assert.equal(
+      selectBridgeReleaseAsset(
+        {
+          ...manifest,
+          assets: [
+            {
+              ...manifest.assets[1],
+              available: false,
+              url: null,
+            },
+          ],
+        },
+        "x64",
+      ),
+      null,
+    );
   });
 });
 

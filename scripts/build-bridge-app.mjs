@@ -12,7 +12,10 @@ const bridgePackage = JSON.parse(
 const librarianAppUrl =
   process.env.NSN_LIBRARIAN_APP_URL?.trim() ||
   "https://nsn-librarian.vercel.app";
-const bridgeVersion = bridgePackage.version || "0.1.0";
+const bridgeVersion =
+  process.env.NSN_BRIDGE_RELEASE_VERSION?.trim() ||
+  bridgePackage.version ||
+  "0.1.0";
 const mainExternals = [
   "electron",
   "pdf-parse",
