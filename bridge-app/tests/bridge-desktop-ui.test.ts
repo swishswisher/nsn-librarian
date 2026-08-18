@@ -44,6 +44,7 @@ class FakeElement {
 }
 
 type RendererHarness = {
+  connectSelectedFoldersCalls: () => unknown[][];
   elements: Record<string, FakeElement>;
   openDownloadedUpdateCalls: () => number;
   pairWithCodeCalls: string[];
@@ -68,6 +69,7 @@ function rendererScript() {
 async function createRendererHarness(options: {
   chooseFolders?: () => Promise<unknown>;
   checkForUpdates?: () => Promise<unknown>;
+  connectSelectedFolders?: (folders: unknown[]) => Promise<unknown>;
   downloadUpdate?: () => Promise<unknown>;
   getUpdateStatus?: () => Promise<unknown>;
   openDownloadedUpdate?: () => Promise<unknown>;
@@ -104,6 +106,7 @@ async function createRendererHarness(options: {
     ids.map((id) => [id, new FakeElement(id)]),
   ) as Record<string, FakeElement>;
   const pairWithCodeCalls: string[] = [];
+  const connectSelectedFoldersCalls: unknown[][] = [];
   let openDownloadedUpdateCalls = 0;
   let paired = options.pairedInitially === true;
   let statusCallCount = 0;
@@ -131,7 +134,12 @@ async function createRendererHarness(options: {
             state: "UP_TO_DATE",
           })),
         chooseFolders: options.chooseFolders ?? (async () => []),
-        connectSelectedFolders: async () => undefined,
+        connectSelectedFolders:
+          options.connectSelectedFolders ??
+          (async (folders: unknown[]) => {
+            connectSelectedFoldersCalls.push(folders);
+            return { ok: true, roots: [] };
+          }),
         downloadUpdate:
           options.downloadUpdate ??
           (async () => ({
@@ -190,6 +198,7 @@ async function createRendererHarness(options: {
   await settleRenderer();
 
   return {
+    connectSelectedFoldersCalls: () => connectSelectedFoldersCalls,
     elements,
     openDownloadedUpdateCalls: () => openDownloadedUpdateCalls,
     pairWithCodeCalls,
@@ -311,6 +320,87 @@ describe("Bridge desktop renderer", () => {
     assert.equal(harness.elements.notice.className, "notice error");
   });
 
+  it("shows expired-selection connection errors without dropping the selected folder", async () => {
+    const error = new Error("raw token detail should stay hidden");
+
+    Object.assign(error, { code: "SELECTION_EXPIRED" });
+
+    const harness = await createRendererHarness({
+      chooseFolders: async () => [
+        {
+          safeLocation: "Documents/Inbox",
+          selectionToken: "selection-token",
+          suggestedDisplayName: "Inbox",
+        },
+      ],
+      connectSelectedFolders: async () => {
+        throw error;
+      },
+    });
+
+    await harness.elements.chooseButton.dispatch("click");
+    await harness.elements.connectButton.dispatch("click");
+
+    assert.equal(
+      harness.elements.notice.textContent,
+      "That folder selection expired. Choose the folder again.",
+    );
+    assert.equal(harness.elements.notice.textContent.includes("token"), false);
+    assert.equal(harness.elements.folderList.children.length, 1);
+    assert.equal(harness.elements.connectButton.disabled, false);
+  });
+
+  it("shows local persistence connection errors safely", async () => {
+    const error = new Error("raw filesystem detail should stay hidden");
+
+    Object.assign(error, { code: "FOLDER_SELECTION_PERSISTENCE_FAILED" });
+
+    const harness = await createRendererHarness({
+      chooseFolders: async () => [
+        {
+          safeLocation: "Documents/Inbox",
+          selectionToken: "selection-token",
+          suggestedDisplayName: "Inbox",
+        },
+      ],
+      connectSelectedFolders: async () => {
+        throw error;
+      },
+    });
+
+    await harness.elements.chooseButton.dispatch("click");
+    await harness.elements.connectButton.dispatch("click");
+
+    assert.equal(
+      harness.elements.notice.textContent,
+      "The Bridge could not save this connected folder locally.",
+    );
+    assert.equal(harness.elements.notice.textContent.includes("filesystem"), false);
+    assert.equal(harness.elements.notice.className, "notice error");
+  });
+
+  it("clears selected folders after a successful safe connection result", async () => {
+    const harness = await createRendererHarness({
+      chooseFolders: async () => [
+        {
+          safeLocation: "Documents/Inbox",
+          selectionToken: "selection-token",
+          suggestedDisplayName: "Inbox",
+        },
+      ],
+    });
+
+    await harness.elements.chooseButton.dispatch("click");
+    await harness.elements.connectButton.dispatch("click");
+
+    assert.equal(harness.connectSelectedFoldersCalls().length, 1);
+    assert.equal(harness.elements.folderList.children.length, 0);
+    assert.equal(
+      harness.elements.notice.textContent,
+      "The selected folders are connected. Nothing will move without approval.",
+    );
+  });
+
   it("renders an up-to-date manual update check", async () => {
     const harness = await createRendererHarness({
       checkForUpdates: async () => ({
@@ -426,6 +516,17 @@ describe("Bridge desktop app lifecycle", () => {
     assert.match(mainSource, /"nsn-bridge:open-downloaded-update"/);
     assert.equal(preloadSource.includes("openPath"), false);
     assert.equal(preloadSource.includes("downloadUrl"), false);
+  });
+
+  it("keeps folder connection IPC structured and safe", async () => {
+    const preloadSource = await readFile("apps/bridge/src/main/preload.ts", "utf8");
+    const mainSource = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
+
+    assert.match(preloadSource, /connectSelectedFolders: async/);
+    assert.match(preloadSource, /ROOT_REGISTRATION_FAILED/);
+    assert.match(mainSource, /folderConnectionIpcResult/);
+    assert.match(mainSource, /getPairedBridgeDeviceId/);
+    assert.equal(preloadSource.includes("actualPath"), false);
   });
 
   it("checks for updates after startup without automatically downloading", async () => {

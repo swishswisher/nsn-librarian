@@ -268,6 +268,41 @@ export function bridgeRendererHtml() {
         return "The selected folder could not be chosen safely.";
       }
 
+      function safeFolderConnectionMessage(error) {
+        const code = error && typeof error === "object" && typeof error.code === "string"
+          ? error.code
+          : "ROOT_REGISTRATION_FAILED";
+        if (code === "SELECTION_EXPIRED") {
+          return "That folder selection expired. Choose the folder again.";
+        }
+        if (code === "MISSING_SELECTION_TOKEN") {
+          return "Choose a folder before connecting it.";
+        }
+        if (code === "FOLDER_UNREADABLE") {
+          return "The selected folder could no longer be read.";
+        }
+        if (code === "UNSAFE_SYSTEM_ROOT") {
+          return "Choose a personal folder instead of the whole computer or drive.";
+        }
+        if (code === "UNSAFE_SYSTEM_DIRECTORY") {
+          return "Choose a personal folder instead of a system folder.";
+        }
+        if (code === "UNSAFE_APPLICATION_DIRECTORY") {
+          return "Choose a personal folder instead of an NSN application folder.";
+        }
+        if (code === "UNSAFE_SYMLINK") {
+          return "Choose a real folder instead of a symlink.";
+        }
+        if (code === "FOLDER_SELECTION_PERSISTENCE_FAILED") {
+          return "The Bridge could not save this connected folder locally.";
+        }
+        if (code === "BRIDGE_NOT_PAIRED") {
+          return "Pair this Mac before connecting folders.";
+        }
+
+        return "The selected folder could not be connected safely.";
+      }
+
       function clearPairingCode() {
         pairingCodeInput.value = "";
       }
@@ -458,8 +493,8 @@ export function bridgeRendererHtml() {
           selectedFolders.splice(0, selectedFolders.length);
           await refreshStatus();
           showNotice("The selected folders are connected. Nothing will move without approval.", false);
-        } catch {
-          showNotice("The selected folders could not be connected safely.", true);
+        } catch (error) {
+          showNotice(safeFolderConnectionMessage(error), true);
         }
       });
 

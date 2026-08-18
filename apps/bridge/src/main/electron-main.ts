@@ -2,10 +2,7 @@ import type { Server } from "node:http";
 import path from "node:path";
 
 import { createBridgeServer } from "../../../../bridge-app/src/api/server";
-import {
-  listRoots,
-  registerRootFromSelection,
-} from "../../../../bridge-app/src/main/registry";
+import { listRoots } from "../../../../bridge-app/src/main/registry";
 import {
   pauseBridgeWatcher,
   resumeBridgeWatcher,
@@ -26,6 +23,10 @@ import {
   folderSelectionIpcResult,
   selectFoldersFromDialog,
 } from "./folder-selection";
+import {
+  connectSelectedBridgeFolders,
+  folderConnectionIpcResult,
+} from "./folder-connection";
 
 let localServer: Server | null = null;
 const currentDir = __dirname;
@@ -383,42 +384,22 @@ export async function startElectronBridgeApp() {
   electron.ipcMain.handle(
     "nsn-bridge:connect-folders",
     async (_event: unknown, folders: unknown) => {
-      const selectedFolders = Array.isArray(folders) ? folders : [];
-      const roots = [];
-
-      for (const folder of selectedFolders) {
-        if (
-          typeof folder !== "object" ||
-          folder === null ||
-          typeof (folder as { selectionToken?: unknown }).selectionToken !==
-            "string"
-        ) {
-          continue;
-        }
-
-        roots.push(
-          await registerRootFromSelection({
-            permissions: {
-              organizationPlanPermission: true,
-              readPermission: true,
-              recommendationPermission: true,
-              watchPermission: false,
-            },
-            selectionToken: (folder as { selectionToken: string })
-              .selectionToken,
-            validationOptions: {
-              forbiddenApplicationPaths,
-            },
-          }),
-        );
-      }
-
-      await syncLocalRoots(true).catch(() => null);
-
-      return {
-        ok: true,
-        roots,
-      };
+      return folderConnectionIpcResult(() =>
+        connectSelectedBridgeFolders({
+          folders,
+          getPairedBridgeDeviceId,
+          permissions: {
+            organizationPlanPermission: true,
+            readPermission: true,
+            recommendationPermission: true,
+            watchPermission: false,
+          },
+          syncRoots: () => syncLocalRoots(true),
+          validationOptions: {
+            forbiddenApplicationPaths,
+          },
+        }),
+      );
     },
   );
   electron.ipcMain.handle("nsn-bridge:login-item", (_event: unknown, enabled: unknown) => {

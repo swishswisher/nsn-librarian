@@ -208,15 +208,13 @@ export async function registerRootFromSelection(input: {
   const selection = registry.selections[selectionIndex];
 
   if (!selection) {
-    await writeRegistry(registry);
+    await writeRegistry(registry).catch(() => undefined);
     throw new BridgeAppError(
       "That folder selection expired. Choose the folder again.",
       "SELECTION_EXPIRED",
       410,
     );
   }
-
-  registry.selections.splice(selectionIndex, 1);
 
   const actualPath = await validateRootPath(
     selection.actualPath,
@@ -226,7 +224,13 @@ export async function registerRootFromSelection(input: {
   const permissions = permissionsWithReadInvariant(input.permissions ?? {});
   const displayName =
     input.displayName?.trim() || selection.suggestedDisplayName;
-  const existingRoot = registry.roots.find((root) => root.id === rootId);
+  const nextRegistry: RegistryFile = {
+    roots: registry.roots.map((root) => ({ ...root })),
+    selections: registry.selections.filter(
+      (_selection, index) => index !== selectionIndex,
+    ),
+  };
+  const existingRoot = nextRegistry.roots.find((root) => root.id === rootId);
   const timestamp = nowIso();
   let root: BridgeRootRecord;
 
@@ -260,10 +264,10 @@ export async function registerRootFromSelection(input: {
       updatedAt: timestamp,
       watcherState: permissions.watchPermission ? "PAUSED" : "STOPPED",
     };
-    registry.roots.push(root);
+    nextRegistry.roots.push(root);
   }
 
-  await writeRegistry(registry).catch(() => {
+  await writeRegistry(nextRegistry).catch(() => {
     throw new BridgeAppError(
       "The Bridge could not save that connected folder locally.",
       "FOLDER_SELECTION_PERSISTENCE_FAILED",

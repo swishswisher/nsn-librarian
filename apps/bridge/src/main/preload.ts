@@ -36,6 +36,17 @@ type FolderSelectionIpcResult =
       selections?: Awaited<ReturnType<NsnBridgeApi["chooseFolders"]>>;
     };
 
+type FolderConnectionIpcResult =
+  | {
+      code?: unknown;
+      message?: unknown;
+      ok: false;
+    }
+  | {
+      ok: true;
+      roots?: unknown[];
+    };
+
 const runtimeRequire = eval("require") as NodeRequire;
 const { contextBridge, ipcRenderer } = runtimeRequire("electron") as {
   contextBridge: {
@@ -58,6 +69,10 @@ function safeBridgeError(message: string, code: string) {
   return error;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 contextBridge.exposeInMainWorld("nsnBridge", {
   cancelDownloadedUpdate: () =>
     ipcRenderer.invoke("nsn-bridge:cancel-downloaded-update"),
@@ -71,7 +86,7 @@ contextBridge.exposeInMainWorld("nsnBridge", {
       return response;
     }
 
-    if (response && typeof response === "object" && response.ok === false) {
+    if (isRecord(response) && response.ok === false) {
       throw safeBridgeError(
         typeof response.message === "string"
           ? response.message
@@ -82,14 +97,31 @@ contextBridge.exposeInMainWorld("nsnBridge", {
       );
     }
 
-    if (response && typeof response === "object" && response.ok === true) {
+    if (isRecord(response) && response.ok === true) {
       return Array.isArray(response.selections) ? response.selections : [];
     }
 
     return [];
   },
-  connectSelectedFolders: (folders: unknown[]) =>
-    ipcRenderer.invoke("nsn-bridge:connect-folders", folders),
+  connectSelectedFolders: async (folders: unknown[]) => {
+    const response = (await ipcRenderer.invoke(
+      "nsn-bridge:connect-folders",
+      folders,
+    )) as FolderConnectionIpcResult | unknown;
+
+    if (isRecord(response) && response.ok === false) {
+      throw safeBridgeError(
+        typeof response.message === "string"
+          ? response.message
+          : "The selected folder could not be connected safely.",
+        typeof response.code === "string"
+          ? response.code
+          : "ROOT_REGISTRATION_FAILED",
+      );
+    }
+
+    return response;
+  },
   downloadUpdate: () => ipcRenderer.invoke("nsn-bridge:download-update"),
   getStatus: () => ipcRenderer.invoke("nsn-bridge:status"),
   getUpdateStatus: () => ipcRenderer.invoke("nsn-bridge:update-status"),
