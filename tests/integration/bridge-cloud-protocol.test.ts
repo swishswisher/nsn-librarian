@@ -22,7 +22,10 @@ import {
   cloudBridgeHealth,
   effectiveBridgeHealth,
 } from "../../src/lib/bridge/effective-health";
-import { bridgeHomeHealthDisplay } from "../../src/lib/bridge/home-health";
+import {
+  bridgeHomeHealthDisplay,
+  bridgeHomeShellStatus,
+} from "../../src/lib/bridge/home-health";
 import type { LocalBridgeHealth } from "../../src/lib/bridge/local-bridge-client";
 
 describe("Bridge cloud protocol", () => {
@@ -486,5 +489,126 @@ describe("Bridge effective Home health", () => {
         assert.notEqual(home.thisMacLabel, "This Mac is online");
       }
     }
+  });
+
+  it("keeps stopped folder watching state out of the global Home Bridge label", () => {
+    const home = display(
+      effectiveBridgeHealth(localUnavailable, [device()], now),
+      [device()],
+    );
+    const shellStatus = bridgeHomeShellStatus({
+      activeProgress: null,
+      bridgeDisplay: home,
+      currentPlan: null,
+    });
+
+    assert.equal(shellStatus.label, "Bridge ready");
+    assert.notEqual(shellStatus.label, "Stopped");
+  });
+
+  it("keeps watcher activity from replacing the global Home Bridge label", () => {
+    const home = display(
+      effectiveBridgeHealth(localUnavailable, [device()], now),
+      [device()],
+    );
+    const labelsThatMustRemainFolderOnly = [
+      "Stopped",
+      "Paused",
+      "Not watching",
+      "Watching for changes",
+    ];
+
+    for (const folderOnlyLabel of labelsThatMustRemainFolderOnly) {
+      const shellStatus = bridgeHomeShellStatus({
+        activeProgress: null,
+        bridgeDisplay: home,
+        currentPlan: null,
+      });
+
+      assert.equal(shellStatus.label, "Bridge ready");
+      assert.notEqual(shellStatus.label, folderOnlyLabel);
+    }
+  });
+
+  it("uses effective health for offline and unpaired Home Bridge labels", () => {
+    const offlineHome = display(
+      effectiveBridgeHealth(
+        localUnavailable,
+        [
+          device({
+            lastSeenAt: new Date(now.getTime() - 91_000).toISOString(),
+          }),
+        ],
+        now,
+      ),
+      [device({ lastSeenAt: new Date(now.getTime() - 91_000).toISOString() })],
+    );
+    const unpairedHome = display(effectiveBridgeHealth(localUnavailable, [], now), []);
+
+    assert.equal(
+      bridgeHomeShellStatus({
+        activeProgress: null,
+        bridgeDisplay: offlineHome,
+        currentPlan: null,
+      }).label,
+      "Bridge unavailable",
+    );
+    assert.equal(
+      bridgeHomeShellStatus({
+        activeProgress: null,
+        bridgeDisplay: unpairedHome,
+        currentPlan: null,
+      }).label,
+      "Bridge not paired",
+    );
+  });
+
+  it("allows active scan and plan workflow states to supersede Bridge health", () => {
+    const home = display(
+      effectiveBridgeHealth(localUnavailable, [device()], now),
+      [device()],
+    );
+
+    assert.equal(
+      bridgeHomeShellStatus({
+        activeProgress: {
+          completedAt: null,
+          currentStage: "SCANNING",
+          failedFiles: 0,
+          filesDiscovered: 1,
+          filesExamined: 0,
+          filesProcessed: 0,
+          filesRead: 0,
+          filesWithSuggestions: 0,
+          folderDisplayName: "SCAN_ROOT_A_GENERAL_INBOX",
+          isActive: true,
+          isStale: false,
+          lastActivityAt: now.toISOString(),
+          pendingSuggestions: 0,
+          remainingFiles: 1,
+          sessionId: "scan_session_test",
+          startedAt: now.toISOString(),
+          suggestionsGenerated: 0,
+          supportedFiles: 1,
+          unsupportedFiles: 0,
+        },
+        bridgeDisplay: home,
+        currentPlan: null,
+      }).label,
+      "Scanning your library",
+    );
+    assert.equal(
+      bridgeHomeShellStatus({
+        activeProgress: null,
+        bridgeDisplay: home,
+        currentPlan: {
+          latestExecution: null,
+          plan: {
+            status: "DRAFT",
+          },
+        },
+      }).label,
+      "Waiting for your approval",
+    );
   });
 });

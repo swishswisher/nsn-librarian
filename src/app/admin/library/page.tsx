@@ -8,7 +8,10 @@ import { NsnCard } from "@/components/library/NsnCard";
 import { getBridgeCloudStatus } from "@/lib/bridge/cloud-coordinator";
 import { getConnectedLibraries } from "@/lib/bridge/connected-libraries";
 import { effectiveBridgeHealth } from "@/lib/bridge/effective-health";
-import { bridgeHomeHealthDisplay } from "@/lib/bridge/home-health";
+import {
+  bridgeHomeHealthDisplay,
+  bridgeHomeShellStatus,
+} from "@/lib/bridge/home-health";
 import { getMonitoringDashboardData } from "@/lib/bridge/monitor";
 import { getCurrentOrganizationPlanForHomepage } from "@/lib/bridge/planner";
 import {
@@ -85,140 +88,6 @@ function formatShortDate(value: string) {
   }).format(new Date(value));
 }
 
-function scanStageLabel(status: BridgeScanProcessingProgress["currentStage"]) {
-  if (status === "SCANNING") {
-    return "Scanning your library";
-  }
-
-  if (status === "READING") {
-    return "Reading library items";
-  }
-
-  if (status === "EXAMINING") {
-    return "Preparing observations";
-  }
-
-  if (status === "GENERATING_SUGGESTIONS") {
-    return "Preparing recommendations";
-  }
-
-  if (status === "COMPLETED_WITH_ERRORS") {
-    return "Needs attention";
-  }
-
-  if (status === "COMPLETED") {
-    return "Ready";
-  }
-
-  if (status === "FAILED") {
-    return "Needs attention";
-  }
-
-  return "Getting ready";
-}
-
-function bridgeStatusLabel(
-  activeProgress: BridgeScanProcessingProgress | null,
-  currentPlan: CurrentPlan,
-  fallbackLabel: string,
-) {
-  if (activeProgress?.isActive) {
-    return scanStageLabel(activeProgress.currentStage);
-  }
-
-  const latestExecution = currentPlan?.latestExecution;
-  const latestUndo = latestExecution?.latestUndoRun;
-
-  if (
-    latestUndo?.status === "FAILED" ||
-    latestUndo?.status === "PARTIALLY_COMPLETED" ||
-    latestUndo?.status === "BLOCKED" ||
-    latestExecution?.status === "FAILED"
-  ) {
-    return "Needs attention";
-  }
-
-  if (latestUndo?.status === "COMPLETED") {
-    return "Ready";
-  }
-
-  if (
-    latestExecution?.status === "COMPLETED" ||
-    latestExecution?.status === "PARTIALLY_COMPLETED"
-  ) {
-    return "Undo available";
-  }
-
-  if (currentPlan?.plan.status === "READY_FOR_EXECUTION") {
-    return "Waiting for final approval";
-  }
-
-  if (currentPlan?.plan.status === "DRAFT") {
-    return "Waiting for your approval";
-  }
-
-  return fallbackLabel;
-}
-
-function bridgeStatusTone(
-  activeProgress: BridgeScanProcessingProgress | null,
-  currentPlan: CurrentPlan,
-): NsnBadgeTone {
-  if (activeProgress?.isActive) {
-    return "migration";
-  }
-
-  const latestExecution = currentPlan?.latestExecution;
-  const latestUndo = latestExecution?.latestUndoRun;
-
-  if (
-    latestUndo?.status === "FAILED" ||
-    latestUndo?.status === "PARTIALLY_COMPLETED" ||
-    latestUndo?.status === "BLOCKED" ||
-    latestExecution?.status === "FAILED"
-  ) {
-    return "review";
-  }
-
-  if (
-    currentPlan?.plan.status === "READY_FOR_EXECUTION" ||
-    latestExecution?.status === "COMPLETED" ||
-    latestUndo?.status === "COMPLETED"
-  ) {
-    return "approved";
-  }
-
-  return "pending";
-}
-
-function monitoringBridgeTone(dashboard: MonitoringDashboard): NsnBadgeTone {
-  const folder = dashboard.folders[0];
-
-  if (!folder) {
-    return "pending";
-  }
-
-  if (folder.state === "WATCHING") {
-    return "approved";
-  }
-
-  if (folder.state === "NEEDS_ATTENTION") {
-    return "review";
-  }
-
-  return "pending";
-}
-
-function monitoringBridgeLabel(dashboard: MonitoringDashboard) {
-  const folder = dashboard.folders[0];
-
-  if (!folder) {
-    return null;
-  }
-
-  return folder.humanState;
-}
-
 function executionNeedsAttention(execution: BridgeExecutionRunSummary | null) {
   const latestUndo = execution?.latestUndoRun;
 
@@ -245,6 +114,34 @@ function undoIsAvailable(execution: BridgeExecutionRunSummary | null) {
     execution.status === "COMPLETED" ||
     execution.status === "PARTIALLY_COMPLETED"
   );
+}
+
+function monitoringFolderSummary(dashboard: MonitoringDashboard) {
+  const folderCount = dashboard.folders.length;
+
+  if (folderCount === 0) {
+    return "No connected folders yet";
+  }
+
+  const watchingCount = dashboard.folders.filter(
+    (folder) => folder.state === "WATCHING",
+  ).length;
+  const attentionCount = dashboard.folders.filter(
+    (folder) => folder.state === "NEEDS_ATTENTION",
+  ).length;
+  const folderLabel = `${folderCount} connected folder${
+    folderCount === 1 ? "" : "s"
+  }`;
+
+  if (attentionCount > 0) {
+    return `${folderLabel} · ${attentionCount} need attention`;
+  }
+
+  if (watchingCount > 0) {
+    return `${folderLabel} · ${watchingCount} watching`;
+  }
+
+  return `${folderLabel} · Not watching`;
 }
 
 function buildAttentionTasks({
@@ -798,22 +695,13 @@ export default async function LibraryAdminPage() {
     currentPlan,
     scanSessions,
   });
-  const bridgeLabel =
-    progress || currentPlan
-      ? bridgeStatusLabel(progress, currentPlan, "Bridge ready")
-      : !bridgeHealth.ok
-        ? bridgeDisplay.badgeLabel
-      : activeConnectedLibraries.length > 0
-        ? `${activeConnectedLibraries.length} active`
-        : monitoringBridgeLabel(monitoringDashboard) ?? "Bridge ready";
-  const bridgeTone =
-    progress || currentPlan
-      ? bridgeStatusTone(progress, currentPlan)
-      : !bridgeHealth.ok
-        ? bridgeDisplay.badgeTone
-      : activeConnectedLibraries.length > 0
-        ? "approved"
-        : monitoringBridgeTone(monitoringDashboard);
+  const bridgeShellStatus = bridgeHomeShellStatus({
+    activeProgress: progress,
+    bridgeDisplay,
+    currentPlan,
+  });
+  const bridgeLabel = bridgeShellStatus.label;
+  const bridgeTone = bridgeShellStatus.tone;
   const bridgeStatusHref =
     activeConnectedLibraries.length > 0
       ? getBridgeMonitoringRoute()
@@ -1003,7 +891,7 @@ export default async function LibraryAdminPage() {
                   reflections, scan sessions, recommendations, plans,
                   organization history, and undo records.
                 </p>
-                <dl className="mt-4 grid min-w-0 gap-3 text-sm leading-6 text-[var(--nsn-slate)] sm:grid-cols-3">
+                <dl className="mt-4 grid min-w-0 gap-3 text-sm leading-6 text-[var(--nsn-slate)] sm:grid-cols-2 lg:grid-cols-4">
                   <div className="min-w-0 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-3">
                     <dt className="font-semibold text-[var(--nsn-navy)]">
                       This Mac
@@ -1026,6 +914,14 @@ export default async function LibraryAdminPage() {
                     </dt>
                     <dd className="break-words [overflow-wrap:anywhere]">
                       {bridgeDisplay.versionLabel}
+                    </dd>
+                  </div>
+                  <div className="min-w-0 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-3">
+                    <dt className="font-semibold text-[var(--nsn-navy)]">
+                      Folders
+                    </dt>
+                    <dd className="break-words [overflow-wrap:anywhere]">
+                      {monitoringFolderSummary(monitoringDashboard)}
                     </dd>
                   </div>
                 </dl>
