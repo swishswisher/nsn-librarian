@@ -287,7 +287,7 @@ describe("Bridge desktop renderer", () => {
     assert.equal(harness.statusCallCount(), initialStatusCalls + 1);
     assert.equal(
       harness.elements.notice.textContent,
-      "This Mac is paired with NSN Librarian.",
+      "This Mac is paired and connected to NSN Librarian.",
     );
     assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
   });
@@ -313,12 +313,13 @@ describe("Bridge desktop renderer", () => {
     );
   });
 
-  it("shows connection unavailable when pairing is complete but cloud contact fails", async () => {
+  it("shows folder sync pending when heartbeat succeeds but root sync fails", async () => {
     const harness = await createRendererHarness({
       statusOverride: async () => ({
         cloud: {
           cloudConnectionState: "ROOT_SYNC_FAILED",
-          latestSafeCloudErrorCategory: "ROOT_SYNC_FAILED",
+          lastSuccessfulHeartbeatAt: "2026-08-19T10:00:00.000Z",
+          latestSafeCloudErrorCategory: "SERVER_ERROR",
         },
         paired: true,
         pairingState: "PAIRED_AND_READY",
@@ -333,11 +334,34 @@ describe("Bridge desktop renderer", () => {
 
     assert.equal(
       harness.elements.statusBadge.textContent,
-      "Paired, connection unavailable",
+      "Connected, folder sync pending",
     );
     assert.match(
       harness.elements.stateCopy.textContent,
-      /NSN Librarian has not received the latest folder update/,
+      /Folder sync is still pending/,
+    );
+  });
+
+  it("shows clock guidance when signed Bridge requests are expired", async () => {
+    const harness = await createRendererHarness({
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState: "AUTH_UNAVAILABLE",
+          latestSafeCloudErrorCategory: "REQUEST_EXPIRED",
+        },
+        paired: true,
+        pairingState: "PAIRED_AND_READY",
+        roots: [],
+      }),
+    });
+
+    assert.equal(
+      harness.elements.statusBadge.textContent,
+      "Paired, check Mac clock",
+    );
+    assert.match(
+      harness.elements.stateCopy.textContent,
+      /date or time appears out of sync/,
     );
   });
 

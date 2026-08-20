@@ -39,6 +39,7 @@ async function consumeBridgeRequestNonce(
     throw new BridgeCloudError(
       "This Bridge request has already been used.",
       409,
+      "REQUEST_REPLAYED",
     );
   }
 }
@@ -65,11 +66,16 @@ export async function authenticateBridgeDeviceRequest(input: {
     throw new BridgeCloudError(
       "This Bridge request could not be authenticated.",
       401,
+      "BRIDGE_AUTH_REJECTED",
     );
   }
 
   if (!bridgeRequestTimestampIsFresh(timestamp)) {
-    throw new BridgeCloudError("This Bridge request has expired.", 401);
+    throw new BridgeCloudError(
+      "This Bridge request has expired.",
+      401,
+      "REQUEST_EXPIRED",
+    );
   }
 
   const prisma = getPrismaClient();
@@ -80,7 +86,11 @@ export async function authenticateBridgeDeviceRequest(input: {
   });
 
   if (!device || device.status === "REVOKED") {
-    throw new BridgeCloudError("This Bridge device is not paired.", 401);
+    throw new BridgeCloudError(
+      "This Bridge device is not paired.",
+      401,
+      "DEVICE_NOT_PAIRED",
+    );
   }
 
   const url = new URL(request.url);
@@ -99,6 +109,7 @@ export async function authenticateBridgeDeviceRequest(input: {
     throw new BridgeCloudError(
       "This Bridge request signature is invalid.",
       401,
+      "REQUEST_SIGNATURE_INVALID",
     );
   }
 

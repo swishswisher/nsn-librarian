@@ -230,7 +230,7 @@ export async function startElectronBridgeApp() {
 
     return {
       safeErrorCategory:
-        identity.status === "UNAVAILABLE"
+        identity.status === "UNAVAILABLE" || identity.status === "UNUSABLE"
           ? identity.safeErrorCategory
           : "PAIRING_INCOMPLETE",
       status: identity.status,
@@ -326,7 +326,7 @@ export async function startElectronBridgeApp() {
 
     if (!bridgeIdentityCanAuthenticate(identity)) {
       cloudState.recordAuthenticationUnavailable(
-        identity.status === "UNAVAILABLE"
+        identity.status === "UNAVAILABLE" || identity.status === "UNUSABLE"
           ? identity.safeErrorCategory
           : "PAIRING_INCOMPLETE",
       );
@@ -334,7 +334,7 @@ export async function startElectronBridgeApp() {
       return {
         ok: false,
         safeErrorCategory:
-          identity.status === "UNAVAILABLE"
+          identity.status === "UNAVAILABLE" || identity.status === "UNUSABLE"
             ? identity.safeErrorCategory
             : "PAIRING_INCOMPLETE",
       };

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 const serviceName = "NSN Bridge";
+const encodedSecretPrefix = "nsn-secret-v1:";
 
 export type BridgeSecretReadResult =
   | {
@@ -52,6 +53,26 @@ function shouldUseMacKeychain() {
   );
 }
 
+function encodeSecretValue(value: string) {
+  return `${encodedSecretPrefix}${Buffer.from(value, "utf8").toString(
+    "base64",
+  )}`;
+}
+
+function decodeSecretValue(value: string) {
+  if (!value.startsWith(encodedSecretPrefix)) {
+    return value;
+  }
+
+  try {
+    return Buffer.from(value.slice(encodedSecretPrefix.length), "base64").toString(
+      "utf8",
+    );
+  } catch {
+    return "";
+  }
+}
+
 function runSecurityCli(args: string[]) {
   return new Promise<string>((resolve, reject) => {
     const child = spawn("/usr/bin/security", args, {
@@ -94,6 +115,8 @@ function isMissingMacSecret(error: unknown) {
 }
 
 export async function saveBridgeSecret(account: string, value: string) {
+  const storedValue = encodeSecretValue(value);
+
   if (shouldUseMacKeychain()) {
     await runSecurityCli([
       "add-generic-password",
@@ -103,7 +126,7 @@ export async function saveBridgeSecret(account: string, value: string) {
       "-a",
       account,
       "-w",
-      value,
+      storedValue,
     ]);
     return;
   }
@@ -111,7 +134,7 @@ export async function saveBridgeSecret(account: string, value: string) {
   await mkdir(localSecretsDir(), { recursive: true });
   await writeFile(
     fallbackSecretPath(account),
-    `${JSON.stringify({ value }, null, 2)}\n`,
+    `${JSON.stringify({ value: storedValue }, null, 2)}\n`,
     {
       encoding: "utf8",
       mode: 0o600,
@@ -139,11 +162,13 @@ export async function readBridgeSecretState(
         "-w",
       ]);
 
-      return value
+      const decoded = decodeSecretValue(value);
+
+      return decoded
         ? {
             account,
             status: "PRESENT",
-            value,
+            value: decoded,
           }
         : {
             account,
@@ -156,11 +181,14 @@ export async function readBridgeSecretState(
       await readFile(fallbackSecretPath(account), "utf8"),
     ) as { value?: unknown };
 
-    return typeof parsed.value === "string" && parsed.value.length > 0
+    const decoded =
+      typeof parsed.value === "string" ? decodeSecretValue(parsed.value) : "";
+
+    return decoded.length > 0
       ? {
           account,
           status: "PRESENT",
-          value: parsed.value,
+          value: decoded,
         }
       : {
           account,

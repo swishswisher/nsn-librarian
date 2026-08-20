@@ -26,11 +26,13 @@ const defaultOwnerId = "deanne";
 const activePairingCodeLimit = 5;
 
 export class BridgeCloudError extends Error {
+  code: string;
   statusCode: number;
 
-  constructor(message: string, statusCode = 400) {
+  constructor(message: string, statusCode = 400, code = "BRIDGE_CLOUD_ERROR") {
     super(message);
     this.name = "BridgeCloudError";
+    this.code = code;
     this.statusCode = statusCode;
   }
 }
@@ -238,7 +240,11 @@ export async function pairBridgeDevice(
   });
 
   if (!pairing) {
-    throw new BridgeCloudError("That pairing code could not be verified.", 401);
+    throw new BridgeCloudError(
+      "That pairing code could not be verified.",
+      401,
+      "PAIRING_CODE_INVALID",
+    );
   }
 
   const validation = validatePairingRedemption({
@@ -264,7 +270,7 @@ export async function pairBridgeDevice(
         id: pairing.id,
       },
     });
-    throw new BridgeCloudError(validation.message, 401);
+    throw new BridgeCloudError(validation.message, 401, validation.code);
   }
 
   const now = new Date();
@@ -275,23 +281,23 @@ export async function pairBridgeDevice(
         architecture: registration.architecture,
         bridgeDeviceId: registration.bridgeDeviceId,
         deviceDisplayName: registration.deviceDisplayName,
-        lastSeenAt: now,
+        lastSeenAt: null,
         pairedAt: now,
         platform: registration.platform,
         publicKey: registration.publicKey,
         revokedAt: null,
-        status: "ONLINE",
+        status: "PAIRED",
       },
       update: {
         appVersion: registration.appVersion,
         architecture: registration.architecture,
         deviceDisplayName: registration.deviceDisplayName,
-        lastSeenAt: now,
+        lastSeenAt: null,
         pairedAt: now,
         platform: registration.platform,
         publicKey: registration.publicKey,
         revokedAt: null,
-        status: "ONLINE",
+        status: "PAIRED",
       },
       where: {
         bridgeDeviceId: registration.bridgeDeviceId,
@@ -350,7 +356,11 @@ export async function recordBridgeHeartbeat(
   });
 
   if (!existing || existing.status === "REVOKED") {
-    throw new BridgeCloudError("This Bridge device is not paired.", 401);
+    throw new BridgeCloudError(
+      "This Bridge device is not paired.",
+      401,
+      "DEVICE_NOT_PAIRED",
+    );
   }
 
   const now = new Date();

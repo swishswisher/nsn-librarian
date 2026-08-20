@@ -50,7 +50,7 @@ describe("Bridge cloud runtime state", () => {
     assert.equal(cloudState.getState().cloudConnectionState, "ROOT_SYNC_FAILED");
     assert.equal(
       cloudState.getState().latestSafeCloudErrorCategory,
-      "ROOT_SYNC_FAILED",
+      "NETWORK_UNAVAILABLE",
     );
   });
 
@@ -75,13 +75,45 @@ describe("Bridge cloud runtime state", () => {
       safeCloudErrorCategory(
         new BridgeAppError("hidden detail", "KEYCHAIN_UNAVAILABLE", 503),
       ),
-      "AUTH_UNAVAILABLE",
+      "KEYCHAIN_UNAVAILABLE",
     );
     assert.equal(
       safeCloudErrorCategory(
         new BridgeAppError("hidden detail", "BRIDGE_NOT_PAIRED", 401),
       ),
-      "AUTH_UNAVAILABLE",
+      "BRIDGE_NOT_PAIRED",
+    );
+  });
+
+  it("keeps exact auth failure categories while showing auth unavailable state", () => {
+    const cloudState = createBridgeCloudState();
+
+    cloudState.recordHeartbeatFailure(
+      new BridgeAppError("clock detail stays local", "REQUEST_EXPIRED", 401),
+    );
+
+    assert.equal(cloudState.getState().cloudConnectionState, "AUTH_UNAVAILABLE");
+    assert.equal(
+      cloudState.getState().latestSafeCloudErrorCategory,
+      "REQUEST_EXPIRED",
+    );
+  });
+
+  it("keeps root-sync failures separate from the last successful heartbeat", () => {
+    const cloudState = createBridgeCloudState(
+      () => new Date("2026-08-19T10:00:00.000Z"),
+    );
+
+    cloudState.recordHeartbeatSuccess();
+    cloudState.recordRootSyncFailure(
+      new BridgeAppError("server detail stays local", "SERVER_ERROR", 503),
+    );
+
+    assert.equal(cloudState.getState().cloudConnectionState, "ROOT_SYNC_FAILED");
+    assert.equal(cloudState.getState().latestSafeCloudErrorCategory, "SERVER_ERROR");
+    assert.equal(
+      cloudState.getState().lastSuccessfulHeartbeatAt,
+      "2026-08-19T10:00:00.000Z",
     );
   });
 });

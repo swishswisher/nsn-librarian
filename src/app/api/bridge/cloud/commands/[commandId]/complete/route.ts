@@ -56,6 +56,7 @@ export async function POST(
     if (error instanceof BridgeCloudError) {
       return Response.json(
         {
+          code: error.code,
           error: error.message,
           ok: false,
         },

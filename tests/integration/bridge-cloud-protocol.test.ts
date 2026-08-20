@@ -396,6 +396,33 @@ describe("Bridge effective Home health", () => {
     );
   });
 
+  it("does not treat pairing alone as a recent cloud heartbeat", () => {
+    const pairedOnly = [
+      device({
+        lastSeenAt: null,
+        status: "PAIRED",
+      }),
+    ];
+    const pairedWithTimestampButNoOnlineStatus = [
+      device({
+        status: "PAIRED",
+      }),
+    ];
+
+    assert.equal(
+      effectiveBridgeHealth(localUnavailable, pairedOnly, now).ok,
+      false,
+    );
+    assert.equal(
+      effectiveBridgeHealth(
+        localUnavailable,
+        pairedWithTimestampButNoOnlineStatus,
+        now,
+      ).ok,
+      false,
+    );
+  });
+
   it("marks Home unavailable when the cloud device is stale or offline", () => {
     const staleDevices = [
       device({

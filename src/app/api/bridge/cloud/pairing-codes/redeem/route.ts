@@ -11,6 +11,7 @@ function errorResponse(error: unknown) {
   if (error instanceof BridgeCloudError) {
     return Response.json(
       {
+        code: error.code,
         error: error.message,
         ok: false,
       },

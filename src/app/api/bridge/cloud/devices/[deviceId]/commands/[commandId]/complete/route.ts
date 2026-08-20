@@ -115,7 +115,7 @@ export async function POST(
   } catch (error) {
     if (error instanceof BridgeCloudError) {
       return Response.json(
-        { error: error.message, ok: false },
+        { code: error.code, error: error.message, ok: false },
         { status: error.statusCode },
       );
     }

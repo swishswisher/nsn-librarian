@@ -18,20 +18,47 @@ function nowIso(now: () => Date) {
   return now().toISOString();
 }
 
+const authenticationErrorCategories = new Set([
+  "BRIDGE_AUTH_REJECTED",
+  "BRIDGE_NOT_PAIRED",
+  "DEVICE_NOT_PAIRED",
+  "KEYCHAIN_UNAVAILABLE",
+  "PAIRING_INCOMPLETE",
+  "PAIRING_PRIVATE_KEY_INVALID",
+  "PRIVATE_KEY_INVALID",
+  "REQUEST_EXPIRED",
+  "REQUEST_SIGNATURE_INVALID",
+  "REQUEST_SIGNING_FAILED",
+  "SECRET_READ_FAILED",
+]);
+
 export function safeCloudErrorCategory(error: unknown) {
   if (error instanceof BridgeAppError) {
-    if (
-      error.code === "BRIDGE_NOT_PAIRED" ||
-      error.code === "KEYCHAIN_UNAVAILABLE" ||
-      error.code === "PAIRING_INCOMPLETE" ||
-      error.code === "SECRET_READ_FAILED"
-    ) {
-      return "AUTH_UNAVAILABLE";
+    if (authenticationErrorCategories.has(error.code)) {
+      return error.code;
     }
 
     if (error.code === "ROOT_SYNC_FAILED") {
       return "ROOT_SYNC_FAILED";
     }
+
+    if (error.code === "SERVER_ERROR") {
+      return "SERVER_ERROR";
+    }
+  }
+
+  return "NETWORK_UNAVAILABLE";
+}
+
+function cloudConnectionStateForCategory(
+  safeErrorCategory: string,
+): BridgeCloudConnectionState {
+  if (authenticationErrorCategories.has(safeErrorCategory)) {
+    return "AUTH_UNAVAILABLE";
+  }
+
+  if (safeErrorCategory === "ROOT_SYNC_FAILED") {
+    return "ROOT_SYNC_FAILED";
   }
 
   return "NETWORK_UNAVAILABLE";
@@ -61,7 +88,8 @@ export function createBridgeCloudState(now: () => Date = () => new Date()) {
 
       state = {
         ...state,
-        cloudConnectionState: safeErrorCategory,
+        cloudConnectionState:
+          cloudConnectionStateForCategory(safeErrorCategory),
         latestSafeCloudErrorCategory: safeErrorCategory,
       };
     },
@@ -70,7 +98,8 @@ export function createBridgeCloudState(now: () => Date = () => new Date()) {
 
       state = {
         ...state,
-        cloudConnectionState: safeErrorCategory,
+        cloudConnectionState:
+          cloudConnectionStateForCategory(safeErrorCategory),
         latestSafeCloudErrorCategory: safeErrorCategory,
       };
     },
@@ -84,17 +113,16 @@ export function createBridgeCloudState(now: () => Date = () => new Date()) {
     },
     recordRootSyncFailure(error: unknown) {
       const safeErrorCategory = safeCloudErrorCategory(error);
+      const cloudConnectionState =
+        cloudConnectionStateForCategory(safeErrorCategory);
 
       state = {
         ...state,
         cloudConnectionState:
-          safeErrorCategory === "AUTH_UNAVAILABLE"
+          cloudConnectionState === "AUTH_UNAVAILABLE"
             ? "AUTH_UNAVAILABLE"
             : "ROOT_SYNC_FAILED",
-        latestSafeCloudErrorCategory:
-          safeErrorCategory === "AUTH_UNAVAILABLE"
-            ? safeErrorCategory
-            : "ROOT_SYNC_FAILED",
+        latestSafeCloudErrorCategory: safeErrorCategory,
       };
     },
     recordRootSyncSuccess() {

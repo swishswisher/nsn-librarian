@@ -33,7 +33,7 @@ type BridgePairingStateForConnection =
     }
   | {
       safeErrorCategory?: string;
-      status: "INCOMPLETE" | "UNAVAILABLE";
+      status: "INCOMPLETE" | "UNAVAILABLE" | "UNUSABLE";
     };
 
 type FolderSyncAttemptResult =
@@ -60,6 +60,10 @@ const safeMessages: Record<string, string> = {
     "NSN Bridge could not access its saved pairing credentials.",
   PAIRING_INCOMPLETE:
     "NSN Bridge cannot access its saved device credentials. Pair this Mac again.",
+  PRIVATE_KEY_INVALID:
+    "NSN Bridge cannot use its saved device credentials. Pair this Mac again.",
+  REQUEST_SIGNING_FAILED:
+    "NSN Bridge cannot use its saved device credentials. Pair this Mac again.",
   SECRET_READ_FAILED:
     "NSN Bridge could not access its saved pairing credentials.",
   FOLDER_SELECTION_PERSISTENCE_FAILED:
@@ -143,6 +147,8 @@ function normalizePairingCode(
   }
 
   return state.safeErrorCategory === "KEYCHAIN_UNAVAILABLE" ||
+    state.safeErrorCategory === "PRIVATE_KEY_INVALID" ||
+    state.safeErrorCategory === "REQUEST_SIGNING_FAILED" ||
     state.safeErrorCategory === "SECRET_READ_FAILED"
     ? state.safeErrorCategory
     : "PAIRING_INCOMPLETE";

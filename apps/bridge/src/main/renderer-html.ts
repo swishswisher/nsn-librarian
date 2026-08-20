@@ -464,15 +464,35 @@ export function bridgeRendererHtml() {
           : "UNKNOWN";
       }
 
-      function pairedStateCopy(rootCount, cloudConnectionState) {
-        if (cloudConnectionState === "NETWORK_UNAVAILABLE" || cloudConnectionState === "ROOT_SYNC_FAILED") {
+      function statusLatestCloudErrorCategory(status) {
+        return status &&
+          typeof status === "object" &&
+          status.cloud &&
+          typeof status.cloud === "object" &&
+          typeof status.cloud.latestSafeCloudErrorCategory === "string"
+          ? status.cloud.latestSafeCloudErrorCategory
+          : null;
+      }
+
+      function pairedStateCopy(rootCount, cloudConnectionState, latestSafeCloudErrorCategory) {
+        if (latestSafeCloudErrorCategory === "REQUEST_EXPIRED") {
+          return "This Mac is paired, but its date or time appears out of sync. Check Date & Time, then try again.";
+        }
+
+        if (cloudConnectionState === "ROOT_SYNC_FAILED") {
+          return rootCount === 0
+            ? "This Mac is connected to NSN Librarian. Folder sync is still pending."
+            : "This Mac is connected to NSN Librarian with " + rootCount + " connected folder" + (rootCount === 1 ? ". Folder sync is still pending." : "s. Folder sync is still pending.");
+        }
+
+        if (cloudConnectionState === "NETWORK_UNAVAILABLE") {
           return rootCount === 0
             ? "This Mac is paired, but NSN Librarian has not heard from it yet."
             : "This Mac is paired with " + rootCount + " connected folder" + (rootCount === 1 ? ", but NSN Librarian has not received the latest folder update." : "s, but NSN Librarian has not received the latest folder update.");
         }
 
         if (cloudConnectionState === "AUTH_UNAVAILABLE") {
-          return "NSN Bridge cannot access its saved device credentials. Pair this Mac again.";
+          return "NSN Bridge cannot use its saved device credentials. Pair this Mac again.";
         }
 
         if (cloudConnectionState === "UNKNOWN") {
@@ -493,6 +513,7 @@ export function bridgeRendererHtml() {
           const watchingCount = connectedRoots.filter((root) => root.watcherState === "WATCHING").length;
           const pairingState = statusPairingState(status);
           const cloudConnectionState = statusCloudState(status);
+          const latestSafeCloudErrorCategory = statusLatestCloudErrorCategory(status);
           if (pairingState === "PAIRED_AND_READY") {
             if (cloudConnectionState === "ONLINE") {
               statusBadge.textContent = "Paired and ready";
@@ -500,11 +521,17 @@ export function bridgeRendererHtml() {
             } else if (cloudConnectionState === "UNKNOWN") {
               statusBadge.textContent = "Paired, checking connection";
               statusBadge.className = "badge warning";
+            } else if (latestSafeCloudErrorCategory === "REQUEST_EXPIRED") {
+              statusBadge.textContent = "Paired, check Mac clock";
+              statusBadge.className = "badge warning";
+            } else if (cloudConnectionState === "ROOT_SYNC_FAILED") {
+              statusBadge.textContent = "Connected, folder sync pending";
+              statusBadge.className = "badge warning";
             } else {
               statusBadge.textContent = "Paired, connection unavailable";
               statusBadge.className = "badge warning";
             }
-            stateCopy.textContent = pairedStateCopy(connectedRoots.length, cloudConnectionState);
+            stateCopy.textContent = pairedStateCopy(connectedRoots.length, cloudConnectionState, latestSafeCloudErrorCategory);
             pairButton.textContent = "Pair Again";
             pairingFormDismissed = false;
             hidePairingForm();
@@ -537,8 +564,10 @@ export function bridgeRendererHtml() {
             ? "Watching " + watchingCount + " connected folder" + (watchingCount === 1 ? "." : "s.")
             : "Watching is paused or has not been enabled for any connected folder.";
           renderFolders();
+          return status;
         } catch {
           showNotice("The Bridge could not refresh its local status.", true);
+          return null;
         }
       }
 
@@ -595,8 +624,17 @@ export function bridgeRendererHtml() {
         try {
           await window.nsnBridge.pairWithCode(code);
           clearPairingCode();
-          await refreshStatus();
-          showNotice("This Mac is paired with NSN Librarian.", false);
+          const status = await refreshStatus();
+          const cloudConnectionState = statusCloudState(status);
+          const latestSafeCloudErrorCategory = statusLatestCloudErrorCategory(status);
+
+          if (cloudConnectionState === "ONLINE") {
+            showNotice("This Mac is paired and connected to NSN Librarian.", false);
+          } else if (latestSafeCloudErrorCategory === "REQUEST_EXPIRED") {
+            showNotice("This Mac is paired, but its date or time appears out of sync. Check Date & Time, then try again.", true);
+          } else {
+            showNotice("This Mac is paired. It is still checking its connection to NSN Librarian.", false);
+          }
         } catch {
           showNotice("That pairing code could not be verified. Generate a new code in NSN Librarian and try again.", true);
         } finally {

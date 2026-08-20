@@ -1,3 +1,8 @@
+import {
+  createPrivateKey,
+  sign as signPayload,
+  verify as verifyPayload,
+} from "node:crypto";
 import os from "node:os";
 
 import {
@@ -22,11 +27,30 @@ import {
 } from "./keychain";
 
 let runtimeAppVersion = process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0";
+type BridgeCloudDiagnosticOperation = "commands" | "heartbeat" | "root-sync";
+type BridgeCloudDiagnosticStage =
+  | "COMPLETE_IDENTITY_LOADED"
+  | "FETCH_RESPONSE_RECEIVED"
+  | "FETCH_STARTED"
+  | "HEARTBEAT_SUCCEEDED"
+  | "PRIVATE_KEY_PARSE_FAILED"
+  | "PRIVATE_KEY_PARSE_STARTED"
+  | "PRIVATE_KEY_PARSE_SUCCEEDED"
+  | "REQUEST_SIGNED"
+  | "RESPONSE_REJECTED"
+  | "SIGNING_FAILED";
+type BridgeCloudDiagnosticDetails = {
+  category?: string;
+  stage: BridgeCloudDiagnosticStage;
+  status?: number;
+};
 type BridgeFetch = (
   input: RequestInfo | URL,
   init?: RequestInit,
 ) => Promise<Response>;
 let bridgeFetch: BridgeFetch = (input, init) => fetch(input, init);
+let bridgeDiagnosticSink: ((message: string) => void) | null = (message) =>
+  console.info(message);
 
 export type CompleteBridgeIdentity = {
   bridgeDeviceId: string;
@@ -41,6 +65,13 @@ export type SafeBridgePairingState =
       privateKeyStatus: "MISSING" | "PRESENT";
       safeErrorCategory: "PAIRING_INCOMPLETE";
       status: "INCOMPLETE";
+    }
+  | {
+      bridgeDeviceId: string;
+      bridgeDeviceIdStatus: "PRESENT";
+      privateKeyStatus: "PRESENT";
+      safeErrorCategory: "PRIVATE_KEY_INVALID" | "REQUEST_SIGNING_FAILED";
+      status: "UNUSABLE";
     }
   | {
       bridgeDeviceId: string | null;
@@ -64,6 +95,12 @@ export function bridgeRuntimeAppVersion() {
 
 export function setBridgeCloudFetchForTests(fetcher?: BridgeFetch) {
   bridgeFetch = fetcher ?? ((input, init) => fetch(input, init));
+}
+
+export function setBridgeCloudDiagnosticSinkForTests(
+  sink?: ((message: string) => void) | null,
+) {
+  bridgeDiagnosticSink = sink === undefined ? (message) => console.info(message) : sink;
 }
 
 type PairingResponse =
@@ -102,6 +139,70 @@ function bridgePlatform() {
 
 function secretValue(result: BridgeSecretReadResult) {
   return result.status === "PRESENT" ? result.value : null;
+}
+
+function logCloudDiagnostic(
+  operation: BridgeCloudDiagnosticOperation | undefined,
+  details: BridgeCloudDiagnosticDetails,
+) {
+  if (!operation || !bridgeDiagnosticSink) {
+    return;
+  }
+
+  const pieces = [`[NSN Bridge] ${operation}`, `stage=${details.stage}`];
+
+  if (typeof details.status === "number") {
+    pieces.push(`status=${details.status}`);
+  }
+
+  if (details.category) {
+    pieces.push(`category=${details.category}`);
+  }
+
+  bridgeDiagnosticSink(pieces.join(" "));
+}
+
+export function assertBridgePrivateKeyCanSign(input: {
+  privateKey: string;
+  publicKey?: string;
+}) {
+  let parsedPrivateKey: ReturnType<typeof createPrivateKey>;
+
+  try {
+    parsedPrivateKey = createPrivateKey(input.privateKey);
+  } catch {
+    throw new BridgeAppError(
+      "NSN Bridge could not use its saved device credentials.",
+      "PRIVATE_KEY_INVALID",
+      401,
+    );
+  }
+
+  try {
+    const challenge = Buffer.from("nsn-bridge-private-key-check", "utf8");
+    const signature = signPayload(null, challenge, parsedPrivateKey);
+
+    if (
+      input.publicKey &&
+      !verifyPayload(null, challenge, input.publicKey, signature)
+    ) {
+      throw new BridgeAppError(
+        "NSN Bridge could not verify its saved device credentials.",
+        "PRIVATE_KEY_INVALID",
+        401,
+      );
+    }
+  } catch (error) {
+    if (error instanceof BridgeAppError) {
+      throw error;
+    }
+
+    throw new BridgeAppError(
+      "NSN Bridge could not sign with its saved device credentials.",
+      "REQUEST_SIGNING_FAILED",
+      401,
+    );
+  }
 }
 
 function unavailableCategory(
@@ -148,6 +249,22 @@ export async function getCompletePairedBridgeIdentity(): Promise<
   }
 
   if (bridgeDeviceId.status === "PRESENT" && privateKey.status === "PRESENT") {
+    try {
+      assertBridgePrivateKeyCanSign({ privateKey: privateKey.value });
+    } catch (error) {
+      return {
+        bridgeDeviceId: bridgeDeviceId.value,
+        bridgeDeviceIdStatus: "PRESENT",
+        privateKeyStatus: "PRESENT",
+        safeErrorCategory:
+          error instanceof BridgeAppError &&
+          error.code === "REQUEST_SIGNING_FAILED"
+            ? "REQUEST_SIGNING_FAILED"
+            : "PRIVATE_KEY_INVALID",
+        status: "UNUSABLE",
+      };
+    }
+
     return {
       bridgeDeviceId: bridgeDeviceId.value,
       privateKey: privateKey.value,
@@ -181,6 +298,14 @@ function bridgeIdentityError(
     );
   }
 
+  if (identity.status === "UNUSABLE") {
+    return new BridgeAppError(
+      "NSN Bridge could not use its saved device credentials.",
+      identity.safeErrorCategory,
+      401,
+    );
+  }
+
   return new BridgeAppError(
     "Pair this Mac again before the Bridge can contact NSN Librarian.",
     "BRIDGE_NOT_PAIRED",
@@ -203,47 +328,195 @@ async function authenticatedHeaders(
   pathName: string,
   bodyText = "",
   identity?: CompleteBridgeIdentity,
+  diagnosticOperation?: BridgeCloudDiagnosticOperation,
 ) {
   const pairedIdentity = identity ?? (await requireCompletePairedBridgeIdentity());
+  logCloudDiagnostic(diagnosticOperation, {
+    stage: "COMPLETE_IDENTITY_LOADED",
+  });
 
-  return {
-    ...createBridgeDeviceRequestHeaders({
-      bodyText,
-      bridgeDeviceId: pairedIdentity.bridgeDeviceId,
-      method,
-      pathname: pathName,
-      privateKey: pairedIdentity.privateKey,
-    }),
-    "X-NSN-Bridge-Client": "nsn-macos-bridge",
-  };
+  try {
+    logCloudDiagnostic(diagnosticOperation, {
+      stage: "PRIVATE_KEY_PARSE_STARTED",
+    });
+    assertBridgePrivateKeyCanSign({ privateKey: pairedIdentity.privateKey });
+    logCloudDiagnostic(diagnosticOperation, {
+      stage: "PRIVATE_KEY_PARSE_SUCCEEDED",
+    });
+  } catch (error) {
+    logCloudDiagnostic(diagnosticOperation, {
+      category:
+        error instanceof BridgeAppError ? error.code : "PRIVATE_KEY_INVALID",
+      stage: "PRIVATE_KEY_PARSE_FAILED",
+    });
+    throw error;
+  }
+
+  try {
+    const headers = {
+      ...createBridgeDeviceRequestHeaders({
+        bodyText,
+        bridgeDeviceId: pairedIdentity.bridgeDeviceId,
+        method,
+        pathname: pathName,
+        privateKey: pairedIdentity.privateKey,
+      }),
+      "X-NSN-Bridge-Client": "nsn-macos-bridge",
+    };
+
+    logCloudDiagnostic(diagnosticOperation, {
+      stage: "REQUEST_SIGNED",
+    });
+
+    return headers;
+  } catch {
+    logCloudDiagnostic(diagnosticOperation, {
+      category: "REQUEST_SIGNING_FAILED",
+      stage: "SIGNING_FAILED",
+    });
+    throw new BridgeAppError(
+      "NSN Bridge could not sign its request.",
+      "REQUEST_SIGNING_FAILED",
+      401,
+    );
+  }
+}
+
+type SafeCloudResponsePayload = {
+  code?: unknown;
+  error?: unknown;
+  ok?: unknown;
+};
+
+function safeErrorCategoryFromPayload(
+  response: Response,
+  payload: SafeCloudResponsePayload | null,
+) {
+  if (typeof payload?.code === "string" && payload.code.trim().length > 0) {
+    return payload.code.trim();
+  }
+
+  const message =
+    typeof payload?.error === "string" ? payload.error.toLowerCase() : "";
+
+  if (response.status === 401) {
+    if (message.includes("expired")) {
+      return "REQUEST_EXPIRED";
+    }
+
+    if (message.includes("signature")) {
+      return "REQUEST_SIGNATURE_INVALID";
+    }
+
+    if (message.includes("not paired")) {
+      return "DEVICE_NOT_PAIRED";
+    }
+
+    return "BRIDGE_AUTH_REJECTED";
+  }
+
+  if (response.status >= 500) {
+    return "SERVER_ERROR";
+  }
+
+  return "BRIDGE_CLOUD_REQUEST_FAILED";
+}
+
+function safeErrorMessageForCategory(category: string) {
+  if (category === "REQUEST_EXPIRED") {
+    return "NSN Bridge could not contact NSN Librarian because this Mac's clock appears out of sync.";
+  }
+
+  if (
+    category === "REQUEST_SIGNATURE_INVALID" ||
+    category === "BRIDGE_AUTH_REJECTED" ||
+    category === "DEVICE_NOT_PAIRED"
+  ) {
+    return "NSN Bridge could not authenticate with NSN Librarian.";
+  }
+
+  if (category === "SERVER_ERROR") {
+    return "NSN Librarian could not complete the Bridge request right now.";
+  }
+
+  return "NSN Bridge could not contact NSN Librarian right now.";
 }
 
 async function postJson<T>(
   pathName: string,
   body: Record<string, unknown>,
-  options: { authenticated?: boolean; identity?: CompleteBridgeIdentity } = {},
+  options: {
+    authenticated?: boolean;
+    diagnosticOperation?: BridgeCloudDiagnosticOperation;
+    identity?: CompleteBridgeIdentity;
+  } = {},
 ) {
   const bodyText = JSON.stringify(body);
-  const response = await bridgeFetch(`${appUrl()}${pathName}`, {
-    body: bodyText,
-    headers: {
-      "Content-Type": "application/json",
-      "X-NSN-Bridge-Client": "nsn-macos-bridge",
-      ...(options.authenticated
-        ? await authenticatedHeaders(
-            "POST",
-            pathName,
-            bodyText,
-            options.identity,
-          )
-        : {}),
-    },
-    method: "POST",
+  const headers = {
+    "Content-Type": "application/json",
+    "X-NSN-Bridge-Client": "nsn-macos-bridge",
+    ...(options.authenticated
+      ? await authenticatedHeaders(
+          "POST",
+          pathName,
+          bodyText,
+          options.identity,
+          options.diagnosticOperation,
+        )
+      : {}),
+  };
+  let response: Response;
+
+  logCloudDiagnostic(options.diagnosticOperation, {
+    stage: "FETCH_STARTED",
   });
-  const payload = (await response.json().catch(() => null)) as T | null;
+
+  try {
+    response = await bridgeFetch(`${appUrl()}${pathName}`, {
+      body: bodyText,
+      headers,
+      method: "POST",
+    });
+  } catch {
+    logCloudDiagnostic(options.diagnosticOperation, {
+      category: "NETWORK_UNAVAILABLE",
+      stage: "RESPONSE_REJECTED",
+    });
+    throw new BridgeAppError(
+      "NSN Bridge could not reach NSN Librarian.",
+      "NETWORK_UNAVAILABLE",
+      503,
+    );
+  }
+
+  logCloudDiagnostic(options.diagnosticOperation, {
+    stage: "FETCH_RESPONSE_RECEIVED",
+    status: response.status,
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | (T & SafeCloudResponsePayload)
+    | null;
 
   if (!response.ok || !payload) {
-    throw new Error("BRIDGE_CLOUD_REQUEST_FAILED");
+    const category = safeErrorCategoryFromPayload(response, payload);
+
+    logCloudDiagnostic(options.diagnosticOperation, {
+      category,
+      stage: "RESPONSE_REJECTED",
+      status: response.status,
+    });
+    throw new BridgeAppError(
+      safeErrorMessageForCategory(category),
+      category,
+      response.status,
+    );
+  }
+
+  if (options.diagnosticOperation === "heartbeat") {
+    logCloudDiagnostic(options.diagnosticOperation, {
+      stage: "HEARTBEAT_SUCCEEDED",
+    });
   }
 
   return payload;
@@ -290,6 +563,19 @@ export async function pairBridgeWithCloud(pairingCode: string) {
         503,
       );
     }
+
+    try {
+      assertBridgePrivateKeyCanSign({
+        privateKey: savedIdentity.privateKey,
+        publicKey: keys.publicKey,
+      });
+    } catch {
+      throw new BridgeAppError(
+        "NSN Bridge could not verify its saved pairing credentials.",
+        "PAIRING_PRIVATE_KEY_INVALID",
+        503,
+      );
+    }
   } catch (error) {
     if (bridgeIdentityCanAuthenticate(previousIdentity)) {
       await Promise.allSettled([
@@ -328,7 +614,7 @@ export async function sendBridgeHeartbeat() {
       architecture: os.arch(),
       platform: bridgePlatform(),
     },
-    { authenticated: true, identity },
+    { authenticated: true, diagnosticOperation: "heartbeat", identity },
   );
 }
 
@@ -342,7 +628,7 @@ export async function syncBridgeRoots(roots: BridgeRootSummary[]) {
     {
       roots,
     },
-    { authenticated: true, identity },
+    { authenticated: true, diagnosticOperation: "root-sync", identity },
   );
 }
 
@@ -356,16 +642,58 @@ export async function fetchPendingBridgeCommands() {
   const pathName = `/api/bridge/cloud/devices/${encodeURIComponent(
     identity.bridgeDeviceId,
   )}/commands`;
-  const response = await bridgeFetch(`${appUrl()}${pathName}`, {
-    headers: await authenticatedHeaders("GET", pathName, "", identity),
-    method: "GET",
+  const headers = await authenticatedHeaders(
+    "GET",
+    pathName,
+    "",
+    identity,
+    "commands",
+  );
+  let response: Response;
+
+  logCloudDiagnostic("commands", {
+    stage: "FETCH_STARTED",
   });
+
+  try {
+    response = await bridgeFetch(`${appUrl()}${pathName}`, {
+      headers,
+      method: "GET",
+    });
+  } catch {
+    logCloudDiagnostic("commands", {
+      category: "NETWORK_UNAVAILABLE",
+      stage: "RESPONSE_REJECTED",
+    });
+    throw new BridgeAppError(
+      "NSN Bridge could not reach NSN Librarian.",
+      "NETWORK_UNAVAILABLE",
+      503,
+    );
+  }
+
+  logCloudDiagnostic("commands", {
+    stage: "FETCH_RESPONSE_RECEIVED",
+    status: response.status,
+  });
+
   const payload = (await response.json().catch(() => null)) as
-    | { commands?: BridgeCommandEnvelope[]; ok?: boolean }
+    | ({ commands?: BridgeCommandEnvelope[]; ok?: boolean } & SafeCloudResponsePayload)
     | null;
 
   if (!response.ok || !payload?.ok || !Array.isArray(payload.commands)) {
-    throw new Error("BRIDGE_COMMAND_FETCH_FAILED");
+    const category = safeErrorCategoryFromPayload(response, payload);
+
+    logCloudDiagnostic("commands", {
+      category,
+      stage: "RESPONSE_REJECTED",
+      status: response.status,
+    });
+    throw new BridgeAppError(
+      safeErrorMessageForCategory(category),
+      category,
+      response.status,
+    );
   }
 
   return payload.commands;
