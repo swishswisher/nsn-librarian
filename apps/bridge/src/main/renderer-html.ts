@@ -299,6 +299,12 @@ export function bridgeRendererHtml() {
         if (code === "BRIDGE_NOT_PAIRED") {
           return "Pair this Mac before connecting folders.";
         }
+        if (code === "PAIRING_INCOMPLETE") {
+          return "NSN Bridge cannot access its saved device credentials. Pair this Mac again.";
+        }
+        if (code === "KEYCHAIN_UNAVAILABLE" || code === "SECRET_READ_FAILED") {
+          return "NSN Bridge could not access its saved pairing credentials.";
+        }
 
         return "The selected folder could not be connected safely.";
       }
@@ -440,20 +446,84 @@ export function bridgeRendererHtml() {
         connectButton.disabled = selectedFolders.length === 0;
       }
 
+      function statusPairingState(status) {
+        return status && typeof status === "object" && typeof status.pairingState === "string"
+          ? status.pairingState
+          : status && status.paired
+            ? "PAIRED_AND_READY"
+            : "NOT_PAIRED";
+      }
+
+      function statusCloudState(status) {
+        return status &&
+          typeof status === "object" &&
+          status.cloud &&
+          typeof status.cloud === "object" &&
+          typeof status.cloud.cloudConnectionState === "string"
+          ? status.cloud.cloudConnectionState
+          : "UNKNOWN";
+      }
+
+      function pairedStateCopy(rootCount, cloudConnectionState) {
+        if (cloudConnectionState === "NETWORK_UNAVAILABLE" || cloudConnectionState === "ROOT_SYNC_FAILED") {
+          return rootCount === 0
+            ? "This Mac is paired, but NSN Librarian has not heard from it yet."
+            : "This Mac is paired with " + rootCount + " connected folder" + (rootCount === 1 ? ", but NSN Librarian has not received the latest folder update." : "s, but NSN Librarian has not received the latest folder update.");
+        }
+
+        if (cloudConnectionState === "AUTH_UNAVAILABLE") {
+          return "NSN Bridge cannot access its saved device credentials. Pair this Mac again.";
+        }
+
+        if (cloudConnectionState === "UNKNOWN") {
+          return rootCount === 0
+            ? "This Mac is paired. Checking its connection to NSN Librarian."
+            : "This Mac is paired with " + rootCount + " connected folder" + (rootCount === 1 ? ". Checking its connection to NSN Librarian." : "s. Checking its connection to NSN Librarian.");
+        }
+
+        return rootCount === 0
+          ? "This Mac is paired. Choose folders when Deanne is ready."
+          : "This Mac is paired with " + rootCount + " connected folder" + (rootCount === 1 ? "." : "s.");
+      }
+
       async function refreshStatus() {
         try {
           const status = await window.nsnBridge.getStatus();
           connectedRoots = status && Array.isArray(status.roots) ? status.roots : [];
           const watchingCount = connectedRoots.filter((root) => root.watcherState === "WATCHING").length;
-          if (status && status.paired) {
-            statusBadge.textContent = "Paired and ready";
-            statusBadge.className = "badge";
-            stateCopy.textContent = connectedRoots.length === 0
-              ? "This Mac is paired. Choose folders when Deanne is ready."
-              : "This Mac is paired with " + connectedRoots.length + " connected folder" + (connectedRoots.length === 1 ? "." : "s.");
+          const pairingState = statusPairingState(status);
+          const cloudConnectionState = statusCloudState(status);
+          if (pairingState === "PAIRED_AND_READY") {
+            if (cloudConnectionState === "ONLINE") {
+              statusBadge.textContent = "Paired and ready";
+              statusBadge.className = "badge";
+            } else if (cloudConnectionState === "UNKNOWN") {
+              statusBadge.textContent = "Paired, checking connection";
+              statusBadge.className = "badge warning";
+            } else {
+              statusBadge.textContent = "Paired, connection unavailable";
+              statusBadge.className = "badge warning";
+            }
+            stateCopy.textContent = pairedStateCopy(connectedRoots.length, cloudConnectionState);
             pairButton.textContent = "Pair Again";
             pairingFormDismissed = false;
             hidePairingForm();
+          } else if (pairingState === "PAIRING_NEEDS_ATTENTION") {
+            statusBadge.textContent = "Pairing needs attention";
+            statusBadge.className = "badge warning";
+            stateCopy.textContent = "NSN Bridge cannot access its saved device credentials. Pair this Mac again.";
+            pairButton.textContent = "Pair Again";
+            if (!pairingFormDismissed) {
+              showPairingForm(false);
+            }
+          } else if (pairingState === "KEYCHAIN_UNAVAILABLE") {
+            statusBadge.textContent = "Keychain unavailable";
+            statusBadge.className = "badge warning";
+            stateCopy.textContent = "NSN Bridge could not access its saved pairing credentials.";
+            pairButton.textContent = "Pair Again";
+            if (!pairingFormDismissed) {
+              showPairingForm(false);
+            }
           } else {
             statusBadge.textContent = "Not paired";
             statusBadge.className = "badge warning";
@@ -489,10 +559,15 @@ export function bridgeRendererHtml() {
 
       connectButton.addEventListener("click", async () => {
         try {
-          await window.nsnBridge.connectSelectedFolders(selectedFolders);
+          const result = await window.nsnBridge.connectSelectedFolders(selectedFolders);
           selectedFolders.splice(0, selectedFolders.length);
           await refreshStatus();
-          showNotice("The selected folders are connected. Nothing will move without approval.", false);
+          showNotice(
+            result && typeof result === "object" && typeof result.message === "string"
+              ? result.message
+              : "The selected folders are connected to NSN Librarian. Nothing will move without approval.",
+            false,
+          );
         } catch (error) {
           showNotice(safeFolderConnectionMessage(error), true);
         }

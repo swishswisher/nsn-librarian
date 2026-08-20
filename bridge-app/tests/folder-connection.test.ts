@@ -91,13 +91,13 @@ describe("Bridge folder connection pipeline", () => {
     const folder = await makeFolder("Users", "test", "Documents", "Round Trip");
     const selection = await createFolderSelection(folder);
     const clonedSelection = JSON.parse(JSON.stringify(selection)) as unknown;
-    const roots = await connectSelectedBridgeFolders({
+    const result = await connectSelectedBridgeFolders({
       folders: [clonedSelection],
       getPairedBridgeDeviceId: async () => "bridge-device-test",
     });
 
-    assert.equal(roots.length, 1);
-    assert.equal(roots[0]?.displayName, "Round Trip");
+    assert.equal(result.roots.length, 1);
+    assert.equal(result.roots[0]?.displayName, "Round Trip");
   });
 
   it("returns SELECTION_EXPIRED for a missing selection", async () => {
@@ -219,6 +219,59 @@ describe("Bridge folder connection pipeline", () => {
     assert.equal(serialized.includes("Private Folder"), true);
   });
 
+  it("reports full success when local connection and cloud sync both succeed", async () => {
+    const folder = await makeFolder("Users", "test", "Documents", "Synced");
+    const selection = await createFolderSelection(folder);
+    const result = await connectSelectedBridgeFolders({
+      folders: [selection],
+      getBridgePairingState: async () => ({ status: "COMPLETE" }),
+      syncRoots: async () => ({ ok: true }),
+    });
+
+    assert.equal(result.cloudSyncStatus, "SYNCED");
+    assert.equal(result.roots.length, 1);
+    assert.equal(
+      result.message,
+      "The selected folders are connected to NSN Librarian. Nothing will move without approval.",
+    );
+  });
+
+  it("keeps the local root when cloud sync is temporarily unavailable", async () => {
+    const folder = await makeFolder("Users", "test", "Documents", "Pending Sync");
+    const selection = await createFolderSelection(folder);
+    const result = await connectSelectedBridgeFolders({
+      folders: [selection],
+      getBridgePairingState: async () => ({ status: "COMPLETE" }),
+      syncRoots: async () => {
+        throw new Error("network detail stays local");
+      },
+    });
+
+    assert.equal(result.cloudSyncStatus, "PENDING");
+    assert.equal(result.safeCloudErrorCategory, "ROOT_SYNC_FAILED");
+    assert.equal(result.roots[0]?.displayName, "Pending Sync");
+    assert.equal((await listRoots()).length, 1);
+    assert.match(result.message, /connected on this Mac/);
+  });
+
+  it("does not connect folders when pairing credentials are incomplete", async () => {
+    const folder = await makeFolder("Users", "test", "Documents", "Needs Pairing");
+    const selection = await createFolderSelection(folder);
+    const result = await folderConnectionIpcResult(() =>
+      connectSelectedBridgeFolders({
+        folders: [selection],
+        getBridgePairingState: async () => ({
+          safeErrorCategory: "PAIRING_INCOMPLETE",
+          status: "INCOMPLETE",
+        }),
+      }),
+    );
+
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? null : result.code, "PAIRING_INCOMPLETE");
+    assert.equal((await listRoots()).length, 0);
+  });
+
   it("accepts packaged-style macOS user folders when cwd is filesystem root", async () => {
     const previousCwd = process.cwd();
     const folder = await makeFolder(
@@ -284,12 +337,12 @@ describe("Bridge folder connection pipeline", () => {
         filePaths: [folder],
       }),
     });
-    const roots = await connectSelectedBridgeFolders({
+    const result = await connectSelectedBridgeFolders({
       folders: selections,
       getPairedBridgeDeviceId: async () => "bridge-device-test",
     });
 
-    assert.equal(roots.length, 1);
+    assert.equal(result.roots.length, 1);
     assert.equal((await listRoots()).length, 1);
     assert.equal(await readFile(filePath, "utf8"), "do not move");
 

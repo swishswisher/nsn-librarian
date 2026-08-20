@@ -10,8 +10,11 @@ import {
 
 export type FolderConnectionIpcResult =
   | {
+      cloudSyncStatus: "NOT_ATTEMPTED" | "PENDING" | "SYNCED";
+      message: string;
       ok: true;
       roots: BridgeRootSummary[];
+      safeCloudErrorCategory?: string | null;
     }
   | {
       code: string;
@@ -19,17 +22,46 @@ export type FolderConnectionIpcResult =
       ok: false;
     };
 
+export type ConnectedBridgeFoldersResult = Extract<
+  FolderConnectionIpcResult,
+  { ok: true }
+>;
+
+type BridgePairingStateForConnection =
+  | {
+      status: "COMPLETE";
+    }
+  | {
+      safeErrorCategory?: string;
+      status: "INCOMPLETE" | "UNAVAILABLE";
+    };
+
+type FolderSyncAttemptResult =
+  | {
+      ok: boolean;
+      safeErrorCategory?: string | null;
+    }
+  | null
+  | undefined;
+
 type ConnectFoldersInput = {
   folders: unknown;
-  getPairedBridgeDeviceId: () => Promise<string | null>;
+  getBridgePairingState?: () => Promise<BridgePairingStateForConnection>;
+  getPairedBridgeDeviceId?: () => Promise<string | null>;
   permissions?: Partial<BridgePermissions>;
   registerRoot?: typeof registerRootFromSelection;
-  syncRoots?: () => Promise<unknown>;
+  syncRoots?: () => Promise<FolderSyncAttemptResult>;
   validationOptions?: FolderSelectionOptions;
 };
 
 const safeMessages: Record<string, string> = {
   BRIDGE_NOT_PAIRED: "Pair this Mac before connecting folders.",
+  KEYCHAIN_UNAVAILABLE:
+    "NSN Bridge could not access its saved pairing credentials.",
+  PAIRING_INCOMPLETE:
+    "NSN Bridge cannot access its saved device credentials. Pair this Mac again.",
+  SECRET_READ_FAILED:
+    "NSN Bridge could not access its saved pairing credentials.",
   FOLDER_SELECTION_PERSISTENCE_FAILED:
     "The Bridge could not save this connected folder locally.",
   FOLDER_UNREADABLE: "The selected folder could no longer be read.",
@@ -99,23 +131,81 @@ function logConnectionDiagnostic(stage: string, code?: string) {
   console.info(`[NSN Bridge] connect-folders${payload}`);
 }
 
+function normalizePairingCode(
+  state: BridgePairingStateForConnection | null,
+) {
+  if (!state) {
+    return "BRIDGE_NOT_PAIRED";
+  }
+
+  if (state.status === "COMPLETE") {
+    return null;
+  }
+
+  return state.safeErrorCategory === "KEYCHAIN_UNAVAILABLE" ||
+    state.safeErrorCategory === "SECRET_READ_FAILED"
+    ? state.safeErrorCategory
+    : "PAIRING_INCOMPLETE";
+}
+
+async function requireConnectionPairing(input: ConnectFoldersInput) {
+  if (input.getBridgePairingState) {
+    const state = await input.getBridgePairingState();
+    const code = normalizePairingCode(state);
+
+    if (code) {
+      throw new BridgeAppError(safeFolderConnectionMessage(code), code, 401);
+    }
+
+    return;
+  }
+
+  const bridgeDeviceId = await input.getPairedBridgeDeviceId?.();
+
+  if (!bridgeDeviceId) {
+    throw new BridgeAppError(
+      safeFolderConnectionMessage("BRIDGE_NOT_PAIRED"),
+      "BRIDGE_NOT_PAIRED",
+      401,
+    );
+  }
+}
+
+function connectionSuccessMessage(
+  roots: BridgeRootSummary[],
+  cloudSyncStatus: ConnectedBridgeFoldersResult["cloudSyncStatus"],
+) {
+  if (cloudSyncStatus === "SYNCED") {
+    return "The selected folders are connected to NSN Librarian. Nothing will move without approval.";
+  }
+
+  const subject = roots.length === 1 ? "The folder is" : "The selected folders are";
+
+  return `${subject} connected on this Mac, but NSN Librarian has not received ${
+    roots.length === 1 ? "it" : "them"
+  } yet. The Bridge will keep trying.`;
+}
+
 export async function connectSelectedBridgeFolders({
   folders,
+  getBridgePairingState,
   getPairedBridgeDeviceId,
   permissions,
   registerRoot = registerRootFromSelection,
   syncRoots,
   validationOptions,
 }: ConnectFoldersInput) {
-  const bridgeDeviceId = await getPairedBridgeDeviceId();
+  try {
+    await requireConnectionPairing({
+      folders,
+      getBridgePairingState,
+      getPairedBridgeDeviceId,
+    });
+  } catch (error) {
+    const safeError = folderConnectionFailureFromError(error);
 
-  if (!bridgeDeviceId) {
-    logConnectionDiagnostic("paired-check", "BRIDGE_NOT_PAIRED");
-    throw new BridgeAppError(
-      safeFolderConnectionMessage("BRIDGE_NOT_PAIRED"),
-      "BRIDGE_NOT_PAIRED",
-      401,
-    );
+    logConnectionDiagnostic("paired-check", safeError.code);
+    throw safeError;
   }
 
   const selectedFolders = Array.isArray(folders) ? folders : [];
@@ -161,22 +251,43 @@ export async function connectSelectedBridgeFolders({
     }
   }
 
-  await syncRoots?.().catch(() => {
-    logConnectionDiagnostic("sync-failed", "ROOT_SYNC_FAILED");
-    return null;
-  });
+  let cloudSyncStatus: ConnectedBridgeFoldersResult["cloudSyncStatus"] =
+    syncRoots ? "PENDING" : "NOT_ATTEMPTED";
+  let safeCloudErrorCategory: string | null = null;
 
-  return roots;
+  if (syncRoots) {
+    try {
+      const syncResult = await syncRoots();
+
+      if (syncResult && syncResult.ok === true) {
+        cloudSyncStatus = "SYNCED";
+      } else {
+        cloudSyncStatus = "PENDING";
+        safeCloudErrorCategory =
+          syncResult?.safeErrorCategory ?? "ROOT_SYNC_FAILED";
+        logConnectionDiagnostic("sync-pending", safeCloudErrorCategory);
+      }
+    } catch {
+      cloudSyncStatus = "PENDING";
+      safeCloudErrorCategory = "ROOT_SYNC_FAILED";
+      logConnectionDiagnostic("sync-failed", safeCloudErrorCategory);
+    }
+  }
+
+  return {
+    cloudSyncStatus,
+    message: connectionSuccessMessage(roots, cloudSyncStatus),
+    ok: true as const,
+    roots,
+    safeCloudErrorCategory,
+  };
 }
 
 export async function folderConnectionIpcResult(
-  connectFolders: () => Promise<BridgeRootSummary[]>,
+  connectFolders: () => Promise<ConnectedBridgeFoldersResult>,
 ): Promise<FolderConnectionIpcResult> {
   try {
-    return {
-      ok: true,
-      roots: await connectFolders(),
-    };
+    return await connectFolders();
   } catch (error) {
     const safeError = folderConnectionFailureFromError(error);
 

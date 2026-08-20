@@ -9,11 +9,46 @@ import {
   type BridgeCommandReport,
   type BridgeDeviceSummary,
 } from "../../../../packages/bridge-protocol/src";
-import type { BridgeRootSummary } from "../../../../bridge-app/src/types";
+import {
+  BridgeAppError,
+  type BridgeRootSummary,
+} from "../../../../bridge-app/src/types";
 
-import { readBridgeSecret, saveBridgeSecret } from "./keychain";
+import {
+  readBridgeSecret,
+  readBridgeSecretState,
+  saveBridgeSecret,
+  type BridgeSecretReadResult,
+} from "./keychain";
 
 let runtimeAppVersion = process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0";
+type BridgeFetch = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
+let bridgeFetch: BridgeFetch = (input, init) => fetch(input, init);
+
+export type CompleteBridgeIdentity = {
+  bridgeDeviceId: string;
+  privateKey: string;
+  status: "COMPLETE";
+};
+
+export type SafeBridgePairingState =
+  | {
+      bridgeDeviceId: string | null;
+      bridgeDeviceIdStatus: "MISSING" | "PRESENT";
+      privateKeyStatus: "MISSING" | "PRESENT";
+      safeErrorCategory: "PAIRING_INCOMPLETE";
+      status: "INCOMPLETE";
+    }
+  | {
+      bridgeDeviceId: string | null;
+      bridgeDeviceIdStatus: BridgeSecretReadResult["status"];
+      privateKeyStatus: BridgeSecretReadResult["status"];
+      safeErrorCategory: "KEYCHAIN_UNAVAILABLE" | "SECRET_READ_FAILED";
+      status: "UNAVAILABLE";
+    };
 
 export function setBridgeRuntimeAppVersion(version: string) {
   const trimmed = version.trim();
@@ -25,6 +60,10 @@ export function setBridgeRuntimeAppVersion(version: string) {
 
 export function bridgeRuntimeAppVersion() {
   return runtimeAppVersion;
+}
+
+export function setBridgeCloudFetchForTests(fetcher?: BridgeFetch) {
+  bridgeFetch = fetcher ?? ((input, init) => fetch(input, init));
 }
 
 type PairingResponse =
@@ -61,40 +100,119 @@ function bridgePlatform() {
   return "UNKNOWN";
 }
 
-async function pairedIdentity() {
-  const [bridgeDeviceId, privateKey] = await Promise.all([
-    readBridgeSecret("bridge-device-id"),
-    readBridgeSecret("device-private-key"),
-  ]);
+function secretValue(result: BridgeSecretReadResult) {
+  return result.status === "PRESENT" ? result.value : null;
+}
 
-  if (!bridgeDeviceId || !privateKey) {
-    return null;
+function unavailableCategory(
+  bridgeDeviceId: BridgeSecretReadResult,
+  privateKey: BridgeSecretReadResult,
+) {
+  if (
+    bridgeDeviceId.status === "UNAVAILABLE" &&
+    bridgeDeviceId.safeErrorCategory === "KEYCHAIN_UNAVAILABLE"
+  ) {
+    return "KEYCHAIN_UNAVAILABLE";
+  }
+
+  if (
+    privateKey.status === "UNAVAILABLE" &&
+    privateKey.safeErrorCategory === "KEYCHAIN_UNAVAILABLE"
+  ) {
+    return "KEYCHAIN_UNAVAILABLE";
+  }
+
+  return "SECRET_READ_FAILED";
+}
+
+export async function getCompletePairedBridgeIdentity(): Promise<
+  CompleteBridgeIdentity | SafeBridgePairingState
+> {
+  const [bridgeDeviceId, privateKey] = await Promise.all([
+    readBridgeSecretState("bridge-device-id"),
+    readBridgeSecretState("device-private-key"),
+  ]);
+  const safeBridgeDeviceId = secretValue(bridgeDeviceId);
+
+  if (
+    bridgeDeviceId.status === "UNAVAILABLE" ||
+    privateKey.status === "UNAVAILABLE"
+  ) {
+    return {
+      bridgeDeviceId: safeBridgeDeviceId,
+      bridgeDeviceIdStatus: bridgeDeviceId.status,
+      privateKeyStatus: privateKey.status,
+      safeErrorCategory: unavailableCategory(bridgeDeviceId, privateKey),
+      status: "UNAVAILABLE",
+    };
+  }
+
+  if (bridgeDeviceId.status === "PRESENT" && privateKey.status === "PRESENT") {
+    return {
+      bridgeDeviceId: bridgeDeviceId.value,
+      privateKey: privateKey.value,
+      status: "COMPLETE",
+    };
   }
 
   return {
-    bridgeDeviceId,
-    privateKey,
+    bridgeDeviceId: safeBridgeDeviceId,
+    bridgeDeviceIdStatus: bridgeDeviceId.status,
+    privateKeyStatus: privateKey.status,
+    safeErrorCategory: "PAIRING_INCOMPLETE",
+    status: "INCOMPLETE",
   };
+}
+
+export function bridgeIdentityCanAuthenticate(
+  identity: CompleteBridgeIdentity | SafeBridgePairingState,
+): identity is CompleteBridgeIdentity {
+  return identity.status === "COMPLETE";
+}
+
+function bridgeIdentityError(
+  identity: CompleteBridgeIdentity | SafeBridgePairingState,
+) {
+  if (identity.status === "UNAVAILABLE") {
+    return new BridgeAppError(
+      "NSN Bridge could not access its saved pairing credentials.",
+      identity.safeErrorCategory,
+      503,
+    );
+  }
+
+  return new BridgeAppError(
+    "Pair this Mac again before the Bridge can contact NSN Librarian.",
+    "BRIDGE_NOT_PAIRED",
+    401,
+  );
+}
+
+async function requireCompletePairedBridgeIdentity() {
+  const identity = await getCompletePairedBridgeIdentity();
+
+  if (!bridgeIdentityCanAuthenticate(identity)) {
+    throw bridgeIdentityError(identity);
+  }
+
+  return identity;
 }
 
 async function authenticatedHeaders(
   method: string,
   pathName: string,
   bodyText = "",
+  identity?: CompleteBridgeIdentity,
 ) {
-  const identity = await pairedIdentity();
-
-  if (!identity) {
-    throw new Error("BRIDGE_NOT_PAIRED");
-  }
+  const pairedIdentity = identity ?? (await requireCompletePairedBridgeIdentity());
 
   return {
     ...createBridgeDeviceRequestHeaders({
       bodyText,
-      bridgeDeviceId: identity.bridgeDeviceId,
+      bridgeDeviceId: pairedIdentity.bridgeDeviceId,
       method,
       pathname: pathName,
-      privateKey: identity.privateKey,
+      privateKey: pairedIdentity.privateKey,
     }),
     "X-NSN-Bridge-Client": "nsn-macos-bridge",
   };
@@ -103,16 +221,21 @@ async function authenticatedHeaders(
 async function postJson<T>(
   pathName: string,
   body: Record<string, unknown>,
-  options: { authenticated?: boolean } = {},
+  options: { authenticated?: boolean; identity?: CompleteBridgeIdentity } = {},
 ) {
   const bodyText = JSON.stringify(body);
-  const response = await fetch(`${appUrl()}${pathName}`, {
+  const response = await bridgeFetch(`${appUrl()}${pathName}`, {
     body: bodyText,
     headers: {
       "Content-Type": "application/json",
       "X-NSN-Bridge-Client": "nsn-macos-bridge",
       ...(options.authenticated
-        ? await authenticatedHeaders("POST", pathName, bodyText)
+        ? await authenticatedHeaders(
+            "POST",
+            pathName,
+            bodyText,
+            options.identity,
+          )
         : {}),
     },
     method: "POST",
@@ -127,6 +250,7 @@ async function postJson<T>(
 }
 
 export async function pairBridgeWithCloud(pairingCode: string) {
+  const previousIdentity = await getCompletePairedBridgeIdentity();
   const bridgeDeviceId = createBridgeDeviceId();
   const keys = createBridgeKeyPair();
   const payload = await postJson<PairingResponse>(
@@ -143,11 +267,47 @@ export async function pairBridgeWithCloud(pairingCode: string) {
   );
 
   if (!payload.ok) {
-    throw new Error("PAIRING_FAILED");
+    throw new BridgeAppError(
+      "That pairing code could not be verified.",
+      "PAIRING_FAILED",
+      401,
+    );
   }
 
-  await saveBridgeSecret("device-private-key", keys.privateKey);
-  await saveBridgeSecret("bridge-device-id", payload.device.bridgeDeviceId);
+  try {
+    await saveBridgeSecret("device-private-key", keys.privateKey);
+    await saveBridgeSecret("bridge-device-id", payload.device.bridgeDeviceId);
+
+    const savedIdentity = await getCompletePairedBridgeIdentity();
+
+    if (
+      !bridgeIdentityCanAuthenticate(savedIdentity) ||
+      savedIdentity.bridgeDeviceId !== payload.device.bridgeDeviceId
+    ) {
+      throw new BridgeAppError(
+        "NSN Bridge could not save its pairing credentials securely.",
+        "PAIRING_PERSISTENCE_FAILED",
+        503,
+      );
+    }
+  } catch (error) {
+    if (bridgeIdentityCanAuthenticate(previousIdentity)) {
+      await Promise.allSettled([
+        saveBridgeSecret("device-private-key", previousIdentity.privateKey),
+        saveBridgeSecret("bridge-device-id", previousIdentity.bridgeDeviceId),
+      ]);
+    }
+
+    if (error instanceof BridgeAppError) {
+      throw error;
+    }
+
+    throw new BridgeAppError(
+      "NSN Bridge could not save its pairing credentials securely.",
+      "PAIRING_PERSISTENCE_FAILED",
+      503,
+    );
+  }
 
   return payload.device;
 }
@@ -157,51 +317,47 @@ export async function getPairedBridgeDeviceId() {
 }
 
 export async function sendBridgeHeartbeat() {
-  const bridgeDeviceId = await getPairedBridgeDeviceId();
-
-  if (!bridgeDeviceId) {
-    return null;
-  }
+  const identity = await requireCompletePairedBridgeIdentity();
 
   return postJson<{ ok: true }>(
-    `/api/bridge/cloud/devices/${encodeURIComponent(bridgeDeviceId)}/heartbeat`,
+    `/api/bridge/cloud/devices/${encodeURIComponent(
+      identity.bridgeDeviceId,
+    )}/heartbeat`,
     {
       appVersion: bridgeRuntimeAppVersion(),
       architecture: os.arch(),
       platform: bridgePlatform(),
     },
-    { authenticated: true },
+    { authenticated: true, identity },
   );
 }
 
 export async function syncBridgeRoots(roots: BridgeRootSummary[]) {
-  const bridgeDeviceId = await getPairedBridgeDeviceId();
-
-  if (!bridgeDeviceId) {
-    return null;
-  }
+  const identity = await requireCompletePairedBridgeIdentity();
 
   return postJson<{ libraries: unknown[]; ok: true }>(
-    `/api/bridge/cloud/devices/${encodeURIComponent(bridgeDeviceId)}/roots/sync`,
+    `/api/bridge/cloud/devices/${encodeURIComponent(
+      identity.bridgeDeviceId,
+    )}/roots/sync`,
     {
       roots,
     },
-    { authenticated: true },
+    { authenticated: true, identity },
   );
 }
 
 export async function fetchPendingBridgeCommands() {
-  const bridgeDeviceId = await getPairedBridgeDeviceId();
+  const identity = await getCompletePairedBridgeIdentity();
 
-  if (!bridgeDeviceId) {
+  if (!bridgeIdentityCanAuthenticate(identity)) {
     return [] satisfies BridgeCommandEnvelope[];
   }
 
   const pathName = `/api/bridge/cloud/devices/${encodeURIComponent(
-    bridgeDeviceId,
+    identity.bridgeDeviceId,
   )}/commands`;
-  const response = await fetch(`${appUrl()}${pathName}`, {
-    headers: await authenticatedHeaders("GET", pathName),
+  const response = await bridgeFetch(`${appUrl()}${pathName}`, {
+    headers: await authenticatedHeaders("GET", pathName, "", identity),
     method: "GET",
   });
   const payload = (await response.json().catch(() => null)) as
@@ -216,37 +372,29 @@ export async function fetchPendingBridgeCommands() {
 }
 
 export async function acknowledgeBridgeCommand(commandId: string) {
-  const bridgeDeviceId = await getPairedBridgeDeviceId();
-
-  if (!bridgeDeviceId) {
-    throw new Error("BRIDGE_NOT_PAIRED");
-  }
+  const identity = await requireCompletePairedBridgeIdentity();
 
   return postJson<{ ok: true }>(
     `/api/bridge/cloud/devices/${encodeURIComponent(
-      bridgeDeviceId,
+      identity.bridgeDeviceId,
     )}/commands/${encodeURIComponent(commandId)}/acknowledge`,
     {},
-    { authenticated: true },
+    { authenticated: true, identity },
   );
 }
 
 export async function reportBridgeCommand(report: BridgeCommandReport) {
-  const bridgeDeviceId = await getPairedBridgeDeviceId();
-
-  if (!bridgeDeviceId) {
-    throw new Error("BRIDGE_NOT_PAIRED");
-  }
+  const identity = await requireCompletePairedBridgeIdentity();
 
   return postJson<{ ok: true }>(
     `/api/bridge/cloud/devices/${encodeURIComponent(
-      bridgeDeviceId,
+      identity.bridgeDeviceId,
     )}/commands/${encodeURIComponent(report.commandId)}/complete`,
     {
       result: report.result ?? null,
       safeErrorCategory: report.safeErrorCategory ?? null,
       status: report.status,
     },
-    { authenticated: true },
+    { authenticated: true, identity },
   );
 }

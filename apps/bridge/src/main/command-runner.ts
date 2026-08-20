@@ -35,8 +35,9 @@ import {
 
 import {
   acknowledgeBridgeCommand,
+  bridgeIdentityCanAuthenticate,
   fetchPendingBridgeCommands,
-  getPairedBridgeDeviceId,
+  getCompletePairedBridgeIdentity,
   reportBridgeCommand,
 } from "./cloud-client";
 import {
@@ -342,12 +343,13 @@ async function rejectCommand(
 export async function processPendingBridgeCommands(
   runtime: BridgeCommandRuntime = {},
 ) {
-  const bridgeDeviceId = await getPairedBridgeDeviceId();
+  const identity = await getCompletePairedBridgeIdentity();
 
-  if (!bridgeDeviceId) {
+  if (!bridgeIdentityCanAuthenticate(identity)) {
     return [];
   }
 
+  const { bridgeDeviceId } = identity;
   const deliveredReports = await flushPendingReports();
   const commands = await fetchPendingBridgeCommands();
   const replayKeys = new Set(await loadReplayKeys());

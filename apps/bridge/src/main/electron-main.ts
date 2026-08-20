@@ -11,13 +11,18 @@ import { processPendingBridgeCommands } from "./command-runner";
 import { bridgeRendererHtml } from "./renderer-html";
 import { loadElectronRuntime } from "./electron-runtime";
 import {
+  bridgeIdentityCanAuthenticate,
   bridgeRuntimeAppVersion,
-  getPairedBridgeDeviceId,
+  getCompletePairedBridgeIdentity,
   pairBridgeWithCloud,
   sendBridgeHeartbeat,
   setBridgeRuntimeAppVersion,
   syncBridgeRoots,
 } from "./cloud-client";
+import {
+  createBridgeCloudState,
+  safeCloudErrorCategory,
+} from "./cloud-state";
 import { createBridgeUpdateManager } from "./update-manager";
 import {
   folderSelectionIpcResult,
@@ -109,6 +114,7 @@ export async function startElectronBridgeApp() {
   let isQuitting = false;
   let commandPollInFlight = false;
   let lastRootSyncAt = 0;
+  const cloudState = createBridgeCloudState();
 
   function createMainWindow() {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -194,29 +200,80 @@ export async function startElectronBridgeApp() {
 
   async function syncLocalRoots(force = false) {
     if (!force && Date.now() - lastRootSyncAt < rootSyncIntervalMs) {
-      return null;
+      return { ok: true, skipped: true };
     }
 
     const roots = await listRoots();
-    const result = await syncBridgeRoots(roots);
 
-    if (result) {
+    try {
+      await syncBridgeRoots(roots);
       lastRootSyncAt = Date.now();
+      cloudState.recordRootSyncSuccess();
+
+      return { ok: true };
+    } catch (error) {
+      cloudState.recordRootSyncFailure(error);
+
+      return {
+        ok: false,
+        safeErrorCategory: safeCloudErrorCategory(error),
+      };
+    }
+  }
+
+  async function safeBridgePairingStateForConnection() {
+    const identity = await getCompletePairedBridgeIdentity();
+
+    if (bridgeIdentityCanAuthenticate(identity)) {
+      return { status: "COMPLETE" as const };
     }
 
-    return result;
+    return {
+      safeErrorCategory:
+        identity.status === "UNAVAILABLE"
+          ? identity.safeErrorCategory
+          : "PAIRING_INCOMPLETE",
+      status: identity.status,
+    };
+  }
+
+  function safeDesktopPairingState(
+    identity: Awaited<ReturnType<typeof getCompletePairedBridgeIdentity>>,
+  ) {
+    if (bridgeIdentityCanAuthenticate(identity)) {
+      return "PAIRED_AND_READY";
+    }
+
+    if (identity.status === "UNAVAILABLE") {
+      return "KEYCHAIN_UNAVAILABLE";
+    }
+
+    if (
+      identity.bridgeDeviceId ||
+      identity.bridgeDeviceIdStatus === "PRESENT" ||
+      identity.privateKeyStatus === "PRESENT"
+    ) {
+      return "PAIRING_NEEDS_ATTENTION";
+    }
+
+    return "NOT_PAIRED";
   }
 
   async function desktopStatus() {
-    const [bridgeDeviceId, roots] = await Promise.all([
-      getPairedBridgeDeviceId(),
+    const [identity, roots] = await Promise.all([
+      getCompletePairedBridgeIdentity(),
       listRoots(),
     ]);
+    const bridgeDeviceId = bridgeIdentityCanAuthenticate(identity)
+      ? identity.bridgeDeviceId
+      : identity.bridgeDeviceId;
 
     return {
       appVersion: bridgeRuntimeAppVersion(),
       bridgeDeviceId,
-      paired: Boolean(bridgeDeviceId),
+      cloud: cloudState.getState(),
+      paired: bridgeIdentityCanAuthenticate(identity),
+      pairingState: safeDesktopPairingState(identity),
       roots,
     };
   }
@@ -244,7 +301,7 @@ export async function startElectronBridgeApp() {
       results.push(await pauseBridgeWatcher(root.id));
     }
 
-    await syncLocalRoots(true).catch(() => null);
+    await syncLocalRoots(true);
     return results;
   }
 
@@ -260,8 +317,42 @@ export async function startElectronBridgeApp() {
       results.push(await resumeBridgeWatcher(root.id));
     }
 
-    await syncLocalRoots(true).catch(() => null);
+    await syncLocalRoots(true);
     return results;
+  }
+
+  async function recoverCloudConnection(forceRootSync = false) {
+    const identity = await getCompletePairedBridgeIdentity();
+
+    if (!bridgeIdentityCanAuthenticate(identity)) {
+      cloudState.recordAuthenticationUnavailable(
+        identity.status === "UNAVAILABLE"
+          ? identity.safeErrorCategory
+          : "PAIRING_INCOMPLETE",
+      );
+
+      return {
+        ok: false,
+        safeErrorCategory:
+          identity.status === "UNAVAILABLE"
+            ? identity.safeErrorCategory
+            : "PAIRING_INCOMPLETE",
+      };
+    }
+
+    try {
+      await sendBridgeHeartbeat();
+      cloudState.recordHeartbeatSuccess();
+    } catch (error) {
+      cloudState.recordHeartbeatFailure(error);
+
+      return {
+        ok: false,
+        safeErrorCategory: safeCloudErrorCategory(error),
+      };
+    }
+
+    return syncLocalRoots(forceRootSync);
   }
 
   async function pollCloud() {
@@ -272,14 +363,25 @@ export async function startElectronBridgeApp() {
     commandPollInFlight = true;
 
     try {
-      await sendBridgeHeartbeat().catch(() => null);
-      await syncLocalRoots().catch(() => null);
-      const reports = await processPendingBridgeCommands({
-        selectFolders: chooseFolders,
-      });
+      const recovery = await recoverCloudConnection(false);
+
+      if (!recovery.ok) {
+        return [];
+      }
+
+      let reports: Awaited<ReturnType<typeof processPendingBridgeCommands>> = [];
+
+      try {
+        reports = await processPendingBridgeCommands({
+          selectFolders: chooseFolders,
+        });
+      } catch (error) {
+        cloudState.recordCloudFailure(error);
+        return [];
+      }
 
       if (reports.length > 0) {
-        await syncLocalRoots(true).catch(() => null);
+        await syncLocalRoots(true);
         mainWindow?.webContents.send("nsn-bridge:commands-completed", reports);
       }
 
@@ -342,7 +444,7 @@ export async function startElectronBridgeApp() {
     }
 
     const device = await pairBridgeWithCloud(code);
-    await syncLocalRoots(true).catch(() => null);
+    await recoverCloudConnection(true);
     void pollCloud();
     return device;
   });
@@ -387,7 +489,7 @@ export async function startElectronBridgeApp() {
       return folderConnectionIpcResult(() =>
         connectSelectedBridgeFolders({
           folders,
-          getPairedBridgeDeviceId,
+          getBridgePairingState: safeBridgePairingStateForConnection,
           permissions: {
             organizationPlanPermission: true,
             readPermission: true,
@@ -417,7 +519,9 @@ export async function startElectronBridgeApp() {
   buildMenu();
   createMainWindow();
 
-  void pollCloud().catch(() => undefined);
+  void recoverCloudConnection(true)
+    .then(() => pollCloud())
+    .catch(() => undefined);
   setTimeout(() => {
     void checkForUpdatesAndNotify().catch(() => undefined);
   }, 5_000);

@@ -43,8 +43,11 @@ type FolderConnectionIpcResult =
       ok: false;
     }
   | {
+      cloudSyncStatus?: unknown;
+      message?: unknown;
       ok: true;
       roots?: unknown[];
+      safeCloudErrorCategory?: unknown;
     };
 
 const runtimeRequire = eval("require") as NodeRequire;

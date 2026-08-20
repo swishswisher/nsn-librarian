@@ -75,6 +75,7 @@ async function createRendererHarness(options: {
   openDownloadedUpdate?: () => Promise<unknown>;
   pairFails?: boolean;
   pairedInitially?: boolean;
+  statusOverride?: () => Promise<Record<string, unknown>>;
 } = {}): Promise<RendererHarness> {
   const ids = [
     "chooseButton",
@@ -151,8 +152,23 @@ async function createRendererHarness(options: {
         getStatus: async () => {
           statusCallCount += 1;
 
+          if (options.statusOverride) {
+            return options.statusOverride();
+          }
+
           return {
+            cloud: {
+              cloudConnectionState: paired ? "ONLINE" : "UNKNOWN",
+              lastSuccessfulHeartbeatAt: paired
+                ? "2026-08-19T10:00:00.000Z"
+                : null,
+              lastSuccessfulRootSyncAt: paired
+                ? "2026-08-19T10:00:00.000Z"
+                : null,
+              latestSafeCloudErrorCategory: null,
+            },
             paired,
+            pairingState: paired ? "PAIRED_AND_READY" : "NOT_PAIRED",
             roots: [],
           };
         },
@@ -276,6 +292,55 @@ describe("Bridge desktop renderer", () => {
     assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
   });
 
+  it("shows pairing attention when saved credentials are incomplete", async () => {
+    const harness = await createRendererHarness({
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState: "AUTH_UNAVAILABLE",
+          latestSafeCloudErrorCategory: "PAIRING_INCOMPLETE",
+        },
+        paired: false,
+        pairingState: "PAIRING_NEEDS_ATTENTION",
+        roots: [],
+      }),
+    });
+
+    assert.equal(harness.elements.statusBadge.textContent, "Pairing needs attention");
+    assert.equal(harness.elements.pairButton.textContent, "Pair Again");
+    assert.equal(
+      harness.elements.stateCopy.textContent,
+      "NSN Bridge cannot access its saved device credentials. Pair this Mac again.",
+    );
+  });
+
+  it("shows connection unavailable when pairing is complete but cloud contact fails", async () => {
+    const harness = await createRendererHarness({
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState: "ROOT_SYNC_FAILED",
+          latestSafeCloudErrorCategory: "ROOT_SYNC_FAILED",
+        },
+        paired: true,
+        pairingState: "PAIRED_AND_READY",
+        roots: [
+          {
+            displayName: "Inbox",
+            watcherState: "STOPPED",
+          },
+        ],
+      }),
+    });
+
+    assert.equal(
+      harness.elements.statusBadge.textContent,
+      "Paired, connection unavailable",
+    );
+    assert.match(
+      harness.elements.stateCopy.textContent,
+      /NSN Librarian has not received the latest folder update/,
+    );
+  });
+
   it("clears and hides the pairing code on cancellation", async () => {
     const harness = await createRendererHarness();
 
@@ -397,7 +462,7 @@ describe("Bridge desktop renderer", () => {
     assert.equal(harness.elements.folderList.children.length, 0);
     assert.equal(
       harness.elements.notice.textContent,
-      "The selected folders are connected. Nothing will move without approval.",
+      "The selected folders are connected to NSN Librarian. Nothing will move without approval.",
     );
   });
 
@@ -525,8 +590,38 @@ describe("Bridge desktop app lifecycle", () => {
     assert.match(preloadSource, /connectSelectedFolders: async/);
     assert.match(preloadSource, /ROOT_REGISTRATION_FAILED/);
     assert.match(mainSource, /folderConnectionIpcResult/);
-    assert.match(mainSource, /getPairedBridgeDeviceId/);
+    assert.match(mainSource, /getCompletePairedBridgeIdentity/);
     assert.equal(preloadSource.includes("actualPath"), false);
+  });
+
+  it("recovers cloud heartbeat and root sync immediately on startup", async () => {
+    const source = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
+
+    assert.match(source, /void recoverCloudConnection\(true\)/);
+    assert.match(source, /await sendBridgeHeartbeat\(\);/);
+    assert.match(source, /cloudState\.recordHeartbeatSuccess\(\);/);
+    assert.match(source, /return syncLocalRoots\(forceRootSync\);/);
+  });
+
+  it("pairs again without clearing existing local roots", async () => {
+    const source = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
+    const pairHandler =
+      /ipcMain\.handle\("nsn-bridge:pair"[\s\S]*?return device;\s+\}\);/;
+    const match = pairHandler.exec(source);
+
+    assert.ok(match, "Pair handler should remain present.");
+    assert.match(match[0], /pairBridgeWithCloud\(code\)/);
+    assert.match(match[0], /recoverCloudConnection\(true\)/);
+    assert.equal(match[0].includes("disconnectRoot"), false);
+    assert.equal(match[0].includes("registerRootFromSelection"), false);
+  });
+
+  it("does not expose private keys through desktop status or renderer copy", async () => {
+    const mainSource = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
+    const rendererSource = bridgeRendererHtml();
+
+    assert.equal(/privateKey/.test(rendererSource), false);
+    assert.equal(/privateKey/.test(mainSource.replace(/identity\.privateKey/g, "")), false);
   });
 
   it("checks for updates after startup without automatically downloading", async () => {
