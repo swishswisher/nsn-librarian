@@ -707,7 +707,7 @@ export function ConnectedLibraryBatchPanel({
                       <span>{row.progress.filesDiscovered} found</span>
                       <span>{row.progress.filesProcessed} examined</span>
                       <span>
-                        {row.progress.filesWithSuggestions} recommendations
+                        {row.progress.filesWithSuggestions} files with recommendations
                       </span>
                       <span>{row.progress.unsupportedFiles} unsupported</span>
                       <span>{row.progress.failedFiles} need attention</span>

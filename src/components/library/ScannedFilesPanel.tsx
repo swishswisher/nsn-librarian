@@ -393,6 +393,7 @@ export function ScannedFilesPanel({
   const [observeState, setObserveState] = useState<ObserveState>(null);
   const [preview, setPreview] = useState<BridgeReadPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  const [readNotice, setReadNotice] = useState<string | null>(null);
   const [suggestionNotice, setSuggestionNotice] = useState<string | null>(null);
   const [suggestionError, setSuggestionError] = useState<string | null>(null);
   const [isExamining, setIsExamining] = useState(false);
@@ -456,6 +457,7 @@ export function ScannedFilesPanel({
     setLoadingFileId(file.id);
     setPreview(null);
     setPreviewError(null);
+    setReadNotice(null);
     setObserveState(null);
 
     try {
@@ -469,6 +471,13 @@ export function ScannedFilesPanel({
 
       if (!payload.ok) {
         setPreviewError(payload.error);
+        return;
+      }
+
+      if (payload.queued) {
+        updateFile(payload.file);
+        setReadNotice(payload.message);
+        router.refresh();
         return;
       }
 
@@ -657,8 +666,13 @@ export function ScannedFilesPanel({
           })}
         </div>
 
-        {suggestionNotice || suggestionError ? (
+        {readNotice || suggestionNotice || suggestionError ? (
           <div aria-live="polite" className="grid gap-2">
+            {readNotice ? (
+              <p className="rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3 text-sm leading-6 text-[var(--nsn-teal-dark)]">
+                {readNotice}
+              </p>
+            ) : null}
             {suggestionNotice ? (
               <p className="rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3 text-sm leading-6 text-[var(--nsn-teal-dark)]">
                 {suggestionNotice}
@@ -793,7 +807,7 @@ export function ScannedFilesPanel({
                       variant="primary"
                     >
                       {loadingFileId === file.id
-                        ? "Retrying..."
+                        ? "Reading again..."
                         : "Retry Reading"}
                     </NsnButton>
                   ) : file.processingStage === "FAILED" &&

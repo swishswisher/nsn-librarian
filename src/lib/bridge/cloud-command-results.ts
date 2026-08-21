@@ -1,7 +1,5 @@
 import path from "node:path";
 
-import type { Prisma } from "@prisma/client";
-
 import type {
   BridgeCommandReport,
   BridgeJson,
@@ -18,6 +16,7 @@ import {
   getBridgeScanSessionDetail,
 } from "./scan-sessions";
 import { createObservationSessionForScannedFileReadResult } from "./scanned-file-observations";
+import { markRemoteReadFailure } from "./remote-read-commands";
 import type {
   BridgeAudioMetadataDraft,
   BridgeFolderScanResult,
@@ -491,22 +490,10 @@ async function applyFailedRead(commandPayload: unknown, safeErrorCategory: strin
     return;
   }
 
-  const unsupported = safeErrorCategory === "UNSUPPORTED_FILE_TYPE";
-  const prisma = getPrismaClient();
-  await prisma.scannedFile.updateMany({
-    data: {
-      extractedAt: new Date(),
-      extractionErrorCategory: safeErrorCategory ?? "BRIDGE_READ_FAILED",
-      extractionStatus: unsupported ? "UNSUPPORTED" : "FAILED",
-      processedAt: new Date(),
-      processingErrorCategory: safeErrorCategory ?? "BRIDGE_READ_FAILED",
-      processingStage: unsupported ? "UNSUPPORTED" : "FAILED",
-      readingStatus: unsupported ? "UNSUPPORTED" : "FAILED",
-    },
-    where: {
-      id: scannedFileId,
-      sessionId: scanSessionId,
-    },
+  await markRemoteReadFailure({
+    safeErrorCategory,
+    scanSessionId,
+    scannedFileId,
   });
   await finalizeScanSessionIfComplete(scanSessionId);
 }

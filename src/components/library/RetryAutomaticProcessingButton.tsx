@@ -14,7 +14,7 @@ type RetryAutomaticProcessingButtonProps = {
 };
 
 function summaryText(progress: BridgeScanProcessingProgress) {
-  return `${progress.filesProcessed} examined, ${progress.filesWithSuggestions} recommendations prepared, ${progress.failedFiles} needing attention, ${progress.remainingFiles} remaining.`;
+  return `${progress.filesProcessed} examined, ${progress.filesWithSuggestions} files with recommendations, ${progress.failedFiles} needing attention, ${progress.remainingFiles} remaining.`;
 }
 
 export function RetryAutomaticProcessingButton({

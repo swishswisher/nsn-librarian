@@ -926,17 +926,29 @@ export type BridgeReadPreview = {
 
 export type BridgeReadFileApiSuccess = {
   ok: true;
+  queued?: false;
   file: BridgeScannedFileSummary;
   preview: BridgeReadPreview;
+};
+
+export type BridgeReadFileApiQueued = {
+  ok: true;
+  queued: true;
+  file: BridgeScannedFileSummary;
+  message: string;
+  progress: BridgeScanProcessingProgress;
+  session: BridgeScanSessionSummary;
 };
 
 export type BridgeReadFileApiFailure = {
   ok: false;
   error: string;
+  category?: string;
 };
 
 export type BridgeReadFileApiResponse =
   | BridgeReadFileApiSuccess
+  | BridgeReadFileApiQueued
   | BridgeReadFileApiFailure;
 
 export type BridgeObserveScannedFileApiSuccess = {

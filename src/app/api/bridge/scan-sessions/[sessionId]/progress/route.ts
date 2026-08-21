@@ -1,4 +1,5 @@
 import { getBridgeScanSessionProgress } from "@/lib/bridge/scan-sessions";
+import { expireRemoteReadCommandsForSession } from "@/lib/bridge/remote-read-commands";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -8,6 +9,9 @@ export async function GET(
   context: { params: Promise<{ sessionId: string }> },
 ) {
   const { sessionId } = await context.params;
+
+  await expireRemoteReadCommandsForSession(sessionId);
+
   const result = await getBridgeScanSessionProgress(sessionId);
 
   if (!result) {

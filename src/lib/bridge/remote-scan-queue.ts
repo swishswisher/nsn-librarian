@@ -13,6 +13,7 @@ import {
 } from "@/lib/bridge/cloud-coordinator";
 
 import { getBridgeScanSessionProgress } from "./scan-sessions";
+import { queueRemoteReadCommand } from "./remote-read-commands";
 import type {
   BridgeAudioMetadataDraft,
   BridgeFolderScanResult,
@@ -31,7 +32,6 @@ const activeScanStatuses = [
 ] as const;
 const maxScanFiles = 20_000;
 const onlineWindowMs = 90_000;
-const readCommandLifetimeMs = 24 * 60 * 60 * 1000;
 
 function objectValue(value: unknown) {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -467,22 +467,14 @@ async function queueRemoteReads(input: {
   });
 
   for (const file of files) {
-    await createBridgeCloudCommand({
-      authorizationContext: {
-        purpose:
-          "Temporarily read a discovered file so the Librarian can prepare reviewable observations and recommendations.",
-      },
+    await queueRemoteReadCommand({
       bridgeDeviceId: input.bridgeDeviceId,
       bridgeRootId: input.bridgeRootId,
-      commandType: "READ_FILE_TEMPORARILY",
       connectedLibraryId: input.connectedLibraryId,
-      expiresAt: new Date(Date.now() + readCommandLifetimeMs),
       idempotencyKey: `read-file:${input.scanSessionId}:${file.id}:${file.checksum ?? "no-checksum"}`,
-      payload: {
-        relativePath: file.relativePath,
-        scanSessionId: input.scanSessionId,
-        scannedFileId: file.id,
-      },
+      relativePath: file.relativePath,
+      scanSessionId: input.scanSessionId,
+      scannedFileId: file.id,
     });
   }
 

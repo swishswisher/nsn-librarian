@@ -162,7 +162,7 @@ function buildAttentionTasks({
   if (activeProgress?.isActive) {
     tasks.push({
       actionLabel: "View Scan Session",
-      description: `${activeProgress.filesDiscovered} files found, ${activeProgress.filesWithSuggestions} recommendations prepared, ${activeProgress.failedFiles} needing attention.`,
+      description: `${activeProgress.filesDiscovered} files found, ${activeProgress.filesWithSuggestions} files with recommendations, ${activeProgress.failedFiles} needing attention.`,
       href: getScanSessionRoute(activeProgress.sessionId),
       id: "active-scan",
       tone: "migration",
@@ -280,7 +280,7 @@ function buildRecentActivity({
   if (activeProgress) {
     activity.push({
       at: activeProgress.lastActivityAt,
-      description: `The Librarian is examining ${activeProgress.folderDisplayName}: ${activeProgress.filesProcessed} files examined, ${activeProgress.filesWithSuggestions} recommendations prepared.`,
+      description: `The Librarian is examining ${activeProgress.folderDisplayName}: ${activeProgress.filesProcessed} files examined, ${activeProgress.filesWithSuggestions} files with recommendations.`,
       href: getScanSessionRoute(activeProgress.sessionId),
       id: "activity-active-scan",
       tone: "migration",

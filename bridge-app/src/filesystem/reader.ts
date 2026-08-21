@@ -55,48 +55,88 @@ function fileTypeForExtension(extension: string) {
 
 async function extractText(filePath: string, extension: string) {
   if (extension === ".txt" || extension === ".md" || extension === ".markdown") {
-    return {
-      text: await readFile(filePath, "utf8"),
-      warnings: [] as string[],
-    };
+    try {
+      return {
+        text: await readFile(filePath, "utf8"),
+        warnings: [] as string[],
+      };
+    } catch {
+      throw new BridgeAppError(
+        "This file could not be read safely.",
+        "FILE_UNREADABLE",
+        422,
+      );
+    }
   }
 
   if (extension === ".html" || extension === ".htm") {
-    return {
-      text: htmlToText(await readFile(filePath, "utf8")),
-      warnings: [] as string[],
-    };
+    try {
+      return {
+        text: htmlToText(await readFile(filePath, "utf8")),
+        warnings: [] as string[],
+      };
+    } catch {
+      throw new BridgeAppError(
+        "This file could not be read safely.",
+        "FILE_UNREADABLE",
+        422,
+      );
+    }
   }
 
   if (extension === ".pdf") {
-    // Keep the PDF runtime out of the Vercel web application's startup path.
-    // It is needed only by the local Bridge when Deanne explicitly reads a PDF.
-    const [{ CanvasFactory }, { PDFParse }] = await Promise.all([
-      import("pdf-parse/worker"),
-      import("pdf-parse"),
-    ]);
-    const buffer = await readFile(filePath);
-    const parser = new PDFParse({
-      CanvasFactory,
-      data: new Uint8Array(buffer),
-      isEvalSupported: false,
-      useWorkerFetch: false,
-    });
+    let parser: {
+      destroy: () => Promise<void>;
+      getText: () => Promise<{ text: string }>;
+    } | null = null;
 
     try {
+      // Keep the PDF runtime out of the Vercel web application's startup path.
+      // It is needed only by the local Bridge when Deanne explicitly reads a PDF.
+      const [{ CanvasFactory }, { PDFParse }] = await Promise.all([
+        import("pdf-parse/worker"),
+        import("pdf-parse"),
+      ]);
+      const buffer = await readFile(filePath);
+      parser = new PDFParse({
+        CanvasFactory,
+        data: new Uint8Array(buffer),
+        isEvalSupported: false,
+        useWorkerFetch: false,
+      });
       const pdf = await parser.getText();
 
       return {
         text: pdf.text,
         warnings: [] as string[],
       };
+    } catch (error) {
+      if (error instanceof BridgeAppError) {
+        throw error;
+      }
+
+      throw new BridgeAppError(
+        "This PDF appears damaged or could not be read safely.",
+        "PDF_PARSE_FAILED",
+        422,
+      );
     } finally {
-      await parser.destroy().catch(() => undefined);
+      await parser?.destroy().catch(() => undefined);
     }
   }
 
   if (extension === ".docx") {
-    const result = await mammoth.extractRawText({ path: filePath });
+    let result;
+
+    try {
+      result = await mammoth.extractRawText({ path: filePath });
+    } catch {
+      throw new BridgeAppError(
+        "This file appears damaged or could not be read safely.",
+        "FILE_CORRUPT",
+        422,
+      );
+    }
 
     return {
       text: result.value,
@@ -130,9 +170,13 @@ export async function readBridgeRootFile(
   const extractedText = result.text.trim();
 
   if (!extractedText) {
+    const emptyFile = safeFile.sizeBytes === BigInt(0);
+
     throw new BridgeAppError(
-      "The Bridge could not find readable text in this file.",
-      "NO_TEXT_EXTRACTED",
+      emptyFile
+        ? "This file is empty."
+        : "The Bridge could not find readable text in this file.",
+      emptyFile ? "FILE_EMPTY" : "FILE_UNREADABLE",
       422,
     );
   }

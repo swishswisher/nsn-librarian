@@ -71,7 +71,7 @@ function stageLabel(status: BridgeScanSessionStatus) {
 }
 
 function scanSummaryText(progress: BridgeScanProcessingProgress) {
-  return `${progress.filesDiscovered} found, ${progress.filesProcessed} examined, ${progress.filesWithSuggestions} recommendations prepared, ${progress.unsupportedFiles} unsupported, ${progress.failedFiles} needing attention, ${progress.remainingFiles} remaining.`;
+  return `${progress.filesDiscovered} found, ${progress.filesProcessed} examined, ${progress.filesWithSuggestions} files with recommendations, ${progress.unsupportedFiles} unsupported, ${progress.failedFiles} needing attention, ${progress.remainingFiles} remaining.`;
 }
 
 function hasReviewableSuggestions(progress: BridgeScanProcessingProgress | null) {
@@ -487,7 +487,7 @@ export function BridgeScanControl({
             <div className="grid grid-cols-2 gap-2 text-[var(--nsn-navy)] sm:grid-cols-3">
               <span>{progress.filesDiscovered} found</span>
               <span>{progress.filesProcessed} examined</span>
-              <span>{progress.filesWithSuggestions} recommendations</span>
+              <span>{progress.filesWithSuggestions} files with recommendations</span>
               <span>{progress.unsupportedFiles} unsupported</span>
               <span>{progress.failedFiles} need attention</span>
               <span>{progress.remainingFiles} remaining</span>

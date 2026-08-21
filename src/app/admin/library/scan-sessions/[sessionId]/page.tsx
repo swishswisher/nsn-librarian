@@ -198,7 +198,7 @@ export default async function ScanSessionDetailPage({
           <SummaryTile label="Files Found" value={session.totalFiles} />
           <SummaryTile label="Files Examined" value={filesProcessed} />
           <SummaryTile
-            label="Recommendations Ready"
+            label="Files With Recommendations"
             value={filesWithSuggestions}
           />
           <SummaryTile label="Documents" value={categoryCounts.documents} />
