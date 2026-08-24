@@ -111,6 +111,15 @@ export function bridgeRendererHtml() {
       }
       .folder strong { overflow-wrap: anywhere; }
       .folder small { color: var(--muted); overflow-wrap: anywhere; }
+      .folder-actions { display: grid; gap: 8px; margin-top: 6px; }
+      .folder-group-label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      button.danger { border-color: #d9b8b8; color: var(--danger); }
       .update-panel { display: grid; gap: 10px; }
       .update-notes, .update-steps {
         display: grid;
@@ -422,7 +431,7 @@ export function bridgeRendererHtml() {
         updateSteps.hidden = state !== "READY_TO_OPEN";
       }
 
-      function renderFolders() {
+      function renderFoldersLegacy() {
         folderList.innerHTML = "";
         selectedFolders.forEach((folder) => {
           const item = document.createElement("div");
@@ -446,6 +455,147 @@ export function bridgeRendererHtml() {
           item.appendChild(detail);
           folderList.appendChild(item);
         });
+        connectButton.disabled = selectedFolders.length === 0;
+      }
+
+      function folderRootId(folder) {
+        return folder && typeof folder === "object" && typeof folder.rootId === "string"
+          ? folder.rootId
+          : "";
+      }
+
+      function activeConnectedRootForSelection(folder) {
+        const rootId = folderRootId(folder);
+
+        return connectedRoots.find((root) =>
+          root &&
+          root.id === rootId &&
+          root.status !== "DISCONNECTED"
+        );
+      }
+
+      function selectionAlreadyPending(folder) {
+        const rootId = folderRootId(folder);
+        const token = folder && typeof folder === "object" && typeof folder.selectionToken === "string"
+          ? folder.selectionToken
+          : "";
+
+        return selectedFolders.some((selected) => {
+          const selectedToken = selected && typeof selected === "object" && typeof selected.selectionToken === "string"
+            ? selected.selectionToken
+            : "";
+
+          return (
+            (rootId && folderRootId(selected) === rootId) ||
+            (token && selectedToken === token)
+          );
+        });
+      }
+
+      function appendFolderGroupLabel(label) {
+        const item = document.createElement("small");
+        item.className = "folder-group-label";
+        item.textContent = label;
+        folderList.appendChild(item);
+      }
+
+      function renderFolders() {
+        folderList.innerHTML = "";
+        selectedFolders.forEach((folder, index) => {
+          const item = document.createElement("div");
+          item.className = "folder";
+          const title = document.createElement("strong");
+          title.textContent = folder.suggestedDisplayName || folder.displayName || "Selected folder";
+          const detail = document.createElement("small");
+          const actions = document.createElement("div");
+          const removeButton = document.createElement("button");
+          detail.textContent = folder.safeLocation || "Folder selected on this Mac";
+          actions.className = "folder-actions";
+          removeButton.type = "button";
+          removeButton.textContent = "Remove selection";
+          removeButton.addEventListener("click", () => {
+            selectedFolders.splice(index, 1);
+            renderFolders();
+            showNotice("Selection removed. No folder was changed.", false);
+          });
+          actions.appendChild(removeButton);
+          item.appendChild(title);
+          item.appendChild(detail);
+          item.appendChild(actions);
+          folderList.appendChild(item);
+        });
+
+        const activeRoots = connectedRoots.filter((root) => root && root.status !== "DISCONNECTED");
+        const disconnectedRoots = connectedRoots.filter((root) => root && root.status === "DISCONNECTED");
+
+        if (activeRoots.length > 0) {
+          appendFolderGroupLabel("Connected folders");
+        }
+
+        activeRoots.forEach((root) => {
+          const item = document.createElement("div");
+          item.className = "folder";
+          const title = document.createElement("strong");
+          title.textContent = root.displayName;
+          const detail = document.createElement("small");
+          const actions = document.createElement("div");
+          const disconnectButton = document.createElement("button");
+          detail.textContent = (root.safeLocation || "Connected folder") + " - " + root.watcherState;
+          actions.className = "folder-actions";
+          disconnectButton.type = "button";
+          disconnectButton.className = "danger";
+          disconnectButton.textContent = "Disconnect Folder";
+          disconnectButton.addEventListener("click", async () => {
+            disconnectButton.disabled = true;
+            try {
+              const result = await window.nsnBridge.disconnectFolder(root.id);
+
+              if (result && result.ok === false) {
+                showNotice(
+                  typeof result.message === "string"
+                    ? result.message
+                    : "The Bridge could not disconnect that folder safely.",
+                  true,
+                );
+                return;
+              }
+
+              await refreshStatus();
+              showNotice(
+                result && typeof result.message === "string"
+                  ? result.message
+                  : "The folder is disconnected from NSN Librarian. No local files were deleted.",
+                false,
+              );
+            } catch {
+              showNotice("The Bridge could not disconnect that folder safely.", true);
+            } finally {
+              disconnectButton.disabled = false;
+            }
+          });
+          actions.appendChild(disconnectButton);
+          item.appendChild(title);
+          item.appendChild(detail);
+          item.appendChild(actions);
+          folderList.appendChild(item);
+        });
+
+        if (disconnectedRoots.length > 0) {
+          appendFolderGroupLabel("Disconnected folders");
+        }
+
+        disconnectedRoots.forEach((root) => {
+          const item = document.createElement("div");
+          item.className = "folder";
+          const title = document.createElement("strong");
+          title.textContent = root.displayName;
+          const detail = document.createElement("small");
+          detail.textContent = (root.safeLocation || "Disconnected folder") + " - Disconnected";
+          item.appendChild(title);
+          item.appendChild(detail);
+          folderList.appendChild(item);
+        });
+
         connectButton.disabled = selectedFolders.length === 0;
       }
 
@@ -513,7 +663,8 @@ export function bridgeRendererHtml() {
         try {
           const status = await window.nsnBridge.getStatus();
           connectedRoots = status && Array.isArray(status.roots) ? status.roots : [];
-          const watchingCount = connectedRoots.filter((root) => root.watcherState === "WATCHING").length;
+          const connectedRootCount = connectedRoots.filter((root) => root && root.status !== "DISCONNECTED").length;
+          const watchingCount = connectedRoots.filter((root) => root && root.watcherState === "WATCHING").length;
           const pairingState = statusPairingState(status);
           const cloudConnectionState = statusCloudState(status);
           const latestSafeCloudErrorCategory = statusLatestCloudErrorCategory(status);
@@ -534,7 +685,7 @@ export function bridgeRendererHtml() {
               statusBadge.textContent = "Paired, connection unavailable";
               statusBadge.className = "badge warning";
             }
-            stateCopy.textContent = pairedStateCopy(connectedRoots.length, cloudConnectionState, latestSafeCloudErrorCategory);
+            stateCopy.textContent = pairedStateCopy(connectedRootCount, cloudConnectionState, latestSafeCloudErrorCategory);
             pairButton.textContent = "Pair Again";
             pairingFormDismissed = false;
             hidePairingForm();
@@ -578,9 +729,35 @@ export function bridgeRendererHtml() {
         try {
           const result = await window.nsnBridge.chooseFolders();
           if (result && result.length) {
-            selectedFolders.push(...result);
+            let addedCount = 0;
+            let connectedDuplicateCount = 0;
+            let pendingDuplicateCount = 0;
+
+            result.forEach((folder) => {
+              if (activeConnectedRootForSelection(folder)) {
+                connectedDuplicateCount += 1;
+                return;
+              }
+
+              if (selectionAlreadyPending(folder)) {
+                pendingDuplicateCount += 1;
+                return;
+              }
+
+              selectedFolders.push(folder);
+              addedCount += 1;
+            });
+
             renderFolders();
-            showNotice("Review the selected folders, then connect them.", false);
+            if (connectedDuplicateCount > 0 && addedCount === 0) {
+              showNotice("This folder is already connected.", false);
+            } else if (pendingDuplicateCount > 0 && addedCount === 0) {
+              showNotice("This folder is already selected.", false);
+            } else if (connectedDuplicateCount > 0) {
+              showNotice("Some selected folders are already connected. New selections were added.", false);
+            } else {
+              showNotice("Review the selected folders, then connect them.", false);
+            }
           } else {
             showNotice("No folder was selected.", false);
           }

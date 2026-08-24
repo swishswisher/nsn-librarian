@@ -3,10 +3,12 @@ import { getBridgeReleaseManifest } from "@/lib/bridge/release-manifest";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function buildBridgeReleaseManifestResponse(
+  loadManifest = getBridgeReleaseManifest,
+) {
   try {
     return Response.json({
-      manifest: await getBridgeReleaseManifest(),
+      manifest: await loadManifest(),
       ok: true,
     });
   } catch {
@@ -18,4 +20,8 @@ export async function GET() {
       { status: 503 },
     );
   }
+}
+
+export async function GET() {
+  return buildBridgeReleaseManifestResponse();
 }

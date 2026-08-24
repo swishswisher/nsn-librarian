@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { NextRequest } from "next/server";
 
 import { authConfigurationStatus } from "../../src/lib/auth/config";
 import {
@@ -9,6 +10,7 @@ import {
 import { createGoogleAuthorizationUrl } from "../../src/lib/auth/google-oidc";
 import { requestIsSameOrigin, safeInternalPath } from "../../src/lib/auth/http";
 import {
+  isBridgeReleaseManifestPath,
   isHumanApiPath,
   isPublicMachinePath,
 } from "../../src/lib/auth/route-policy";
@@ -16,6 +18,7 @@ import {
   createHumanSessionToken,
   verifyHumanSessionToken,
 } from "../../src/lib/auth/token";
+import { proxy } from "../../src/proxy";
 
 const originalEnvironment = {
   AUTH_GOOGLE_ID: process.env.AUTH_GOOGLE_ID,
@@ -47,6 +50,19 @@ function configureAuth() {
   process.env.AUTH_GOOGLE_ID = "google-client-id.apps.googleusercontent.com";
   process.env.AUTH_GOOGLE_SECRET = "google-client-secret";
   process.env.NSN_AUTH_ALLOWED_USERS_JSON = JSON.stringify(approvedUsers());
+}
+
+function proxyRequest(pathname: string, method = "GET"): NextRequest {
+  const url = new URL(`https://nsn-librarian.vercel.app${pathname}`);
+
+  return {
+    cookies: {
+      get: () => undefined,
+    },
+    method,
+    nextUrl: url,
+    url: url.toString(),
+  } as unknown as NextRequest;
 }
 
 test.after(() => {
@@ -160,6 +176,18 @@ test("protects human APIs but exempts signed Bridge device traffic", () => {
     isPublicMachinePath("/api/bridge/cloud/pairing-codes/redeem"),
     true,
   );
+  assert.equal(
+    isBridgeReleaseManifestPath("/api/download/bridge/manifest"),
+    true,
+  );
+  assert.equal(
+    isPublicMachinePath("/api/download/bridge/manifest"),
+    true,
+  );
+  assert.equal(
+    isPublicMachinePath("/api/download/bridge/anything-else"),
+    false,
+  );
   assert.equal(isHumanApiPath("/api/bridge/scan"), true);
   assert.equal(
     isHumanApiPath("/api/bridge/organization-plans/plan-1/execute"),
@@ -167,6 +195,24 @@ test("protects human APIs but exempts signed Bridge device traffic", () => {
   );
   assert.equal(isHumanApiPath("/api/library/review"), true);
   assert.equal(isHumanApiPath("/api/database/health"), true);
+  assert.equal(isHumanApiPath("/api/download/bridge/anything-else"), true);
+});
+
+test("allows only the exact Bridge release manifest through proxy without human auth", async () => {
+  const manifestResponse = proxy(proxyRequest("/api/download/bridge/manifest"));
+  const protectedDownloadResponse = proxy(
+    proxyRequest("/api/download/bridge/anything-else"),
+  );
+  const protectedHumanResponse = proxy(proxyRequest("/api/library/review"));
+
+  assert.equal(manifestResponse.status, 200);
+  assert.equal(protectedDownloadResponse.status, 401);
+  assert.equal(protectedHumanResponse.status, 401);
+
+  assert.deepEqual(await protectedDownloadResponse.json(), {
+    error: "Authentication is required.",
+    ok: false,
+  });
 });
 
 test("blocks open redirects and cross-origin state-changing requests", () => {

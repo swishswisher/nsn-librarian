@@ -14,12 +14,14 @@ import {
   connectSelectedBridgeFolders,
   folderConnectionIpcResult,
 } from "../../apps/bridge/src/main/folder-connection";
+import { disconnectBridgeFolder } from "../../apps/bridge/src/main/folder-disconnection";
 import { selectFoldersFromDialog } from "../../apps/bridge/src/main/folder-selection";
 import { validateRootPath } from "../src/filesystem/safety";
 import {
   createFolderSelection,
   listRoots,
   registerRootFromSelection,
+  updateRoot,
 } from "../src/main/registry";
 import { BridgeAppError, type FolderSelectionRecord } from "../src/types";
 
@@ -353,5 +355,122 @@ describe("Bridge folder connection pipeline", () => {
         }),
       "SELECTION_EXPIRED",
     );
+  });
+
+  it("cancels folder disconnect without changing the root", async () => {
+    const folder = await makeFolder("Users", "test", "Documents", "Cancel Disconnect");
+    const selection = await createFolderSelection(folder);
+    const root = await registerRootFromSelection({
+      selectionToken: selection.selectionToken,
+    });
+    let syncCalls = 0;
+    const result = await disconnectBridgeFolder({
+      confirmDisconnect: async () => false,
+      rootId: root.id,
+      syncRoots: async () => {
+        syncCalls += 1;
+
+        return { ok: true };
+      },
+    });
+    const roots = await listRoots();
+
+    assert.equal(result.ok, true);
+    assert.equal(result.ok ? result.cancelled : false, true);
+    assert.equal(roots[0]?.status, "CONNECTED");
+    assert.equal(syncCalls, 0);
+  });
+
+  it("disconnects a folder by rootId, stops watching, syncs roots, and preserves local files", async () => {
+    const folder = await makeFolder("Users", "test", "Documents", "Disconnect");
+    const filePath = path.join(folder, "history.txt");
+    const selection = await createFolderSelection(folder);
+    const root = await registerRootFromSelection({
+      permissions: {
+        readPermission: true,
+        watchPermission: true,
+      },
+      selectionToken: selection.selectionToken,
+    });
+    const lastScanAt = "2026-08-24T10:00:00.000Z";
+    const stoppedRootIds: string[] = [];
+    let syncCalls = 0;
+
+    await writeFile(filePath, "keep this file");
+    await updateRoot(root.id, {
+      lastScanAt,
+      watcherState: "WATCHING",
+    });
+
+    const result = await disconnectBridgeFolder({
+      rootId: root.id,
+      stopWatcher: async (rootId) => {
+        stoppedRootIds.push(rootId);
+
+        return updateRoot(rootId, {
+          watcherState: "STOPPED",
+        });
+      },
+      syncRoots: async () => {
+        syncCalls += 1;
+
+        return { ok: true };
+      },
+    });
+    const roots = await listRoots();
+
+    assert.equal(result.ok, true);
+    assert.equal(result.ok ? result.root.status : null, "DISCONNECTED");
+    assert.equal(result.ok ? result.root.watcherState : null, "STOPPED");
+    assert.deepEqual(stoppedRootIds, [root.id]);
+    assert.equal(syncCalls, 1);
+    assert.equal(await readFile(filePath, "utf8"), "keep this file");
+    assert.equal(roots.length, 1);
+    assert.equal(roots[0]?.lastScanAt, lastScanAt);
+  });
+
+  it("rejects arbitrary paths for disconnect IPC input", async () => {
+    const folder = await makeFolder("Users", "test", "Documents", "Path Input");
+    const result = await disconnectBridgeFolder({
+      rootId: folder,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? null : result.code, "INVALID_ROOT_ID");
+  });
+
+  it("does not create duplicate roots when an already-connected folder is selected again", async () => {
+    const folder = await makeFolder("Users", "test", "Documents", "Duplicate");
+    const first = await registerRootFromSelection({
+      selectionToken: (await createFolderSelection(folder)).selectionToken,
+    });
+    const second = await registerRootFromSelection({
+      selectionToken: (await createFolderSelection(folder)).selectionToken,
+    });
+    const roots = await listRoots();
+
+    assert.equal(second.id, first.id);
+    assert.equal(second.status, "CONNECTED");
+    assert.equal(roots.length, 1);
+  });
+
+  it("reconnects a disconnected folder through the same deterministic root", async () => {
+    const folder = await makeFolder("Users", "test", "Documents", "Reconnect");
+    const first = await registerRootFromSelection({
+      selectionToken: (await createFolderSelection(folder)).selectionToken,
+    });
+
+    await disconnectBridgeFolder({
+      rootId: first.id,
+    });
+
+    const reconnected = await registerRootFromSelection({
+      selectionToken: (await createFolderSelection(folder)).selectionToken,
+    });
+    const roots = await listRoots();
+
+    assert.equal(reconnected.id, first.id);
+    assert.equal(reconnected.status, "CONNECTED");
+    assert.equal(roots.length, 1);
   });
 });

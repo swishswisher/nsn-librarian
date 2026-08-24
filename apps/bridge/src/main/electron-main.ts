@@ -32,6 +32,7 @@ import {
   connectSelectedBridgeFolders,
   folderConnectionIpcResult,
 } from "./folder-connection";
+import { disconnectBridgeFolder } from "./folder-disconnection";
 
 let localServer: Server | null = null;
 const currentDir = __dirname;
@@ -349,6 +350,20 @@ export async function startElectronBridgeApp() {
     return results;
   }
 
+  async function confirmFolderDisconnect(root: { displayName: string }) {
+    const choice = await electron.dialog.showMessageBox(createMainWindow(), {
+      buttons: ["Cancel", "Disconnect Folder"],
+      cancelId: 0,
+      defaultId: 0,
+      message:
+        `${root.displayName} will stop scanning and watching in NSN Librarian. No local files will be deleted. Scan and history records remain available, and the folder can be reconnected later.`,
+      title: "Disconnect this folder from NSN Librarian?",
+      type: "question",
+    });
+
+    return choice.response === 1;
+  }
+
   async function recoverCloudConnection(forceRootSync = false) {
     const identity = await getCompletePairedBridgeIdentity();
 
@@ -508,6 +523,15 @@ export async function startElectronBridgeApp() {
   });
   electron.ipcMain.handle("nsn-bridge:pause-watching", pauseAllWatching);
   electron.ipcMain.handle("nsn-bridge:resume-watching", resumeAllWatching);
+  electron.ipcMain.handle(
+    "nsn-bridge:disconnect-folder",
+    async (_event: unknown, rootId: unknown) =>
+      disconnectBridgeFolder({
+        confirmDisconnect: confirmFolderDisconnect,
+        rootId,
+        syncRoots: () => syncLocalRoots(true),
+      }),
+  );
   electron.ipcMain.handle("nsn-bridge:open-librarian", () =>
     electron.shell.openExternal(
       process.env.NSN_LIBRARIAN_APP_URL ?? "http://localhost:3000",

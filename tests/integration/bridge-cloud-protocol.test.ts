@@ -27,6 +27,38 @@ import {
   bridgeHomeShellStatus,
 } from "../../src/lib/bridge/home-health";
 import type { LocalBridgeHealth } from "../../src/lib/bridge/local-bridge-client";
+import { buildBridgeReleaseManifestResponse } from "../../src/app/api/download/bridge/manifest/route";
+
+function testBridgeReleaseManifest(version = "0.1.108"): BridgeReleaseManifest {
+  return {
+    assets: [
+      {
+        architecture: "arm64",
+        available: true,
+        fileName: `NSN-Bridge-v${version}-mac-arm64-unsigned.dmg`,
+        kind: "dmg",
+        sha256: "a".repeat(64),
+        sizeBytes: 2048,
+        url: "https://downloads.example/NSN-Bridge-arm64.dmg",
+      },
+      {
+        architecture: "x64",
+        available: true,
+        fileName: `NSN-Bridge-v${version}-mac-x64-unsigned.dmg`,
+        kind: "dmg",
+        sha256: "b".repeat(64),
+        sizeBytes: 2048,
+        url: "https://downloads.example/NSN-Bridge-x64.dmg",
+      },
+    ],
+    minimumMacOSVersion: "13.0",
+    privacySummary: ["Folders stay on this Mac."],
+    releaseDate: "2026-08-24T00:00:00.000Z",
+    releaseNotes: ["Bridge update test release."],
+    systemRequirements: ["macOS 13 or newer."],
+    version,
+  };
+}
 
 describe("Bridge cloud protocol", () => {
   const pairingSecret = "test-pairing-secret";
@@ -324,6 +356,59 @@ describe("Bridge cloud protocol", () => {
       ),
       null,
     );
+  });
+
+  it("serves a safe public Bridge release manifest response", async () => {
+    const originalGitHubToken = process.env.NSN_BRIDGE_GITHUB_TOKEN;
+    const originalDatabaseUrl = process.env.DATABASE_URL;
+
+    process.env.NSN_BRIDGE_GITHUB_TOKEN = "ghp_secret_token_should_not_leak";
+    process.env.DATABASE_URL = "postgresql://user:password@db.example/nsn";
+
+    const response = await buildBridgeReleaseManifestResponse(async () =>
+      testBridgeReleaseManifest(),
+    );
+    const text = await response.text();
+    const payload = JSON.parse(text) as {
+      manifest?: BridgeReleaseManifest;
+      ok?: boolean;
+    };
+
+    if (originalGitHubToken === undefined) {
+      delete process.env.NSN_BRIDGE_GITHUB_TOKEN;
+    } else {
+      process.env.NSN_BRIDGE_GITHUB_TOKEN = originalGitHubToken;
+    }
+
+    if (originalDatabaseUrl === undefined) {
+      delete process.env.DATABASE_URL;
+    } else {
+      process.env.DATABASE_URL = originalDatabaseUrl;
+    }
+
+    assert.equal(response.status, 200);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.manifest?.version, "0.1.108");
+    assert.equal(validateBridgeReleaseManifest(payload.manifest!).ok, true);
+    assert.equal(text.includes("ghp_secret_token_should_not_leak"), false);
+    assert.equal(text.includes("password@db.example"), false);
+    assert.equal(text.includes("DATABASE_URL"), false);
+  });
+
+  it("serves a safe 503 when Bridge release discovery fails", async () => {
+    const response = await buildBridgeReleaseManifestResponse(async () => {
+      throw new Error("raw GitHub or token detail");
+    });
+    const text = await response.text();
+    const payload = JSON.parse(text) as { error?: string; ok?: boolean };
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(payload, {
+      error: "The Bridge download information is not available right now.",
+      ok: false,
+    });
+    assert.equal(text.includes("raw GitHub"), false);
+    assert.equal(text.includes("token"), false);
   });
 });
 

@@ -98,8 +98,8 @@ describe("Bridge assisted update manager", () => {
     const manager = createBridgeUpdateManager({
       appUrl: "https://nsn.example",
       architecture: "x64",
-      currentVersion: "0.1.98",
-      fetchImpl: fetchForManifest({}),
+      currentVersion: "0.1.108",
+      fetchImpl: fetchForManifest({ manifest: manifest("0.1.108") }),
       updateDirectory: tempRoot,
     });
     const result = await manager.checkForUpdates();
@@ -153,6 +153,30 @@ describe("Bridge assisted update manager", () => {
 
     assert.equal(result.state, "UP_TO_DATE");
     assert.equal(result.available, false);
+  });
+
+  it("keeps unsupported Mac architectures out of update installation", async () => {
+    let fetchCalls = 0;
+    const manager = createBridgeUpdateManager({
+      appUrl: "https://nsn.example",
+      architecture: "ia32",
+      currentVersion: "0.1.97",
+      fetchImpl: async () => {
+        fetchCalls += 1;
+
+        return Response.json({
+          manifest: manifest("0.1.98"),
+          ok: true,
+        });
+      },
+      updateDirectory: tempRoot,
+    });
+    const result = await manager.checkForUpdates();
+
+    assert.equal(result.state, "UP_TO_DATE");
+    assert.equal(result.available, false);
+    assert.equal(result.architecture, "unsupported");
+    assert.equal(fetchCalls, 0);
   });
 
   it("rejects unavailable, non-HTTPS, and unsafe release assets", async () => {

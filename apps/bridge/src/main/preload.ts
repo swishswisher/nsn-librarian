@@ -12,6 +12,7 @@ type NsnBridgeApi = {
     }>
   >;
   connectSelectedFolders: (folders: unknown[]) => Promise<unknown>;
+  disconnectFolder: (rootId: string) => Promise<unknown>;
   downloadUpdate: () => Promise<unknown>;
   getStatus: () => Promise<unknown>;
   getUpdateStatus: () => Promise<unknown>;
@@ -130,6 +131,8 @@ contextBridge.exposeInMainWorld("nsnBridge", {
 
     return response;
   },
+  disconnectFolder: (rootId: string) =>
+    ipcRenderer.invoke("nsn-bridge:disconnect-folder", rootId),
   downloadUpdate: () => ipcRenderer.invoke("nsn-bridge:download-update"),
   getStatus: () => ipcRenderer.invoke("nsn-bridge:status"),
   getUpdateStatus: () => ipcRenderer.invoke("nsn-bridge:update-status"),

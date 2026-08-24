@@ -45,6 +45,7 @@ class FakeElement {
 
 type RendererHarness = {
   connectSelectedFoldersCalls: () => unknown[][];
+  disconnectFolderCalls: () => string[];
   elements: Record<string, FakeElement>;
   fallbackRefreshMs: () => number | null;
   runFallbackRefresh: () => Promise<void>;
@@ -71,10 +72,18 @@ function rendererScript() {
   return match[1];
 }
 
+function elementsWithText(root: FakeElement, text: string): FakeElement[] {
+  return [
+    ...(root.textContent === text ? [root] : []),
+    ...root.children.flatMap((child) => elementsWithText(child, text)),
+  ];
+}
+
 async function createRendererHarness(options: {
   chooseFolders?: () => Promise<unknown>;
   checkForUpdates?: () => Promise<unknown>;
   connectSelectedFolders?: (folders: unknown[]) => Promise<unknown>;
+  disconnectFolder?: (rootId: string) => Promise<unknown>;
   downloadUpdate?: () => Promise<unknown>;
   getUpdateStatus?: () => Promise<unknown>;
   openDownloadedUpdate?: () => Promise<unknown>;
@@ -113,6 +122,7 @@ async function createRendererHarness(options: {
   ) as Record<string, FakeElement>;
   const pairWithCodeCalls: string[] = [];
   const connectSelectedFoldersCalls: unknown[][] = [];
+  const disconnectFolderCalls: string[] = [];
   const statusChangedListeners: Array<(payload: unknown) => unknown> = [];
   const windowListeners = new Map<string, Array<() => unknown>>();
   let openDownloadedUpdateCalls = 0;
@@ -150,6 +160,17 @@ async function createRendererHarness(options: {
           (async (folders: unknown[]) => {
             connectSelectedFoldersCalls.push(folders);
             return { ok: true, roots: [] };
+          }),
+        disconnectFolder:
+          options.disconnectFolder ??
+          (async (rootId: string) => {
+            disconnectFolderCalls.push(rootId);
+
+            return {
+              message:
+                "The folder is disconnected from NSN Librarian. No local files were deleted.",
+              ok: true,
+            };
           }),
         downloadUpdate:
           options.downloadUpdate ??
@@ -252,6 +273,7 @@ async function createRendererHarness(options: {
 
   return {
     connectSelectedFoldersCalls: () => connectSelectedFoldersCalls,
+    disconnectFolderCalls: () => disconnectFolderCalls,
     elements,
     fallbackRefreshMs: () => fallbackRefreshMs,
     runFallbackRefresh: async () => {
@@ -394,6 +416,159 @@ describe("Bridge desktop renderer", () => {
     assert.match(
       harness.elements.stateCopy.textContent,
       /Folder sync is still pending/,
+    );
+  });
+
+  it("shows Disconnect Folder for active connected roots", async () => {
+    const rootId = "root_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const harness = await createRendererHarness({
+      pairedInitially: true,
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState: "ONLINE",
+          latestSafeCloudErrorCategory: null,
+        },
+        paired: true,
+        pairingState: "PAIRED_AND_READY",
+        roots: [
+          {
+            displayName: "SCAN_ROOT_A_GENERAL_INBOX",
+            id: rootId,
+            safeLocation: "SCAN_ROOT_A_GENERAL_INBOX",
+            status: "CONNECTED",
+            watcherState: "STOPPED",
+          },
+        ],
+      }),
+    });
+    const disconnectButtons = elementsWithText(
+      harness.elements.folderList,
+      "Disconnect Folder",
+    );
+
+    assert.equal(disconnectButtons.length, 1);
+
+    await disconnectButtons[0]!.dispatch("click");
+
+    assert.deepEqual(harness.disconnectFolderCalls(), [rootId]);
+    assert.equal(
+      harness.elements.notice.textContent,
+      "The folder is disconnected from NSN Librarian. No local files were deleted.",
+    );
+  });
+
+  it("removes a temporary selected folder before connecting", async () => {
+    const harness = await createRendererHarness({
+      chooseFolders: async () => [
+        {
+          rootId: "root_bbbbbbbbbbbbbbbbbbbbbbbb",
+          safeLocation: "Documents/Inbox",
+          selectionToken: "selection-token",
+          suggestedDisplayName: "Inbox",
+        },
+      ],
+    });
+
+    await harness.elements.chooseButton.dispatch("click");
+
+    assert.equal(harness.elements.connectButton.disabled, false);
+    assert.equal(elementsWithText(harness.elements.folderList, "Inbox").length, 1);
+
+    const removeButtons = elementsWithText(
+      harness.elements.folderList,
+      "Remove selection",
+    );
+
+    assert.equal(removeButtons.length, 1);
+
+    await removeButtons[0]!.dispatch("click");
+
+    assert.equal(harness.elements.connectButton.disabled, true);
+    assert.equal(elementsWithText(harness.elements.folderList, "Inbox").length, 0);
+    assert.equal(
+      harness.elements.notice.textContent,
+      "Selection removed. No folder was changed.",
+    );
+  });
+
+  it("does not add a duplicate pending selection for an active connected folder", async () => {
+    const rootId = "root_cccccccccccccccccccccccc";
+    const harness = await createRendererHarness({
+      chooseFolders: async () => [
+        {
+          rootId,
+          safeLocation: "Documents/Inbox",
+          selectionToken: "duplicate-selection-token",
+          suggestedDisplayName: "Inbox",
+        },
+      ],
+      pairedInitially: true,
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState: "ONLINE",
+          latestSafeCloudErrorCategory: null,
+        },
+        paired: true,
+        pairingState: "PAIRED_AND_READY",
+        roots: [
+          {
+            displayName: "Inbox",
+            id: rootId,
+            safeLocation: "Documents/Inbox",
+            status: "CONNECTED",
+            watcherState: "STOPPED",
+          },
+        ],
+      }),
+    });
+
+    await harness.elements.chooseButton.dispatch("click");
+
+    assert.equal(harness.elements.connectButton.disabled, true);
+    assert.equal(
+      elementsWithText(harness.elements.folderList, "Remove selection").length,
+      0,
+    );
+    assert.equal(harness.elements.notice.textContent, "This folder is already connected.");
+  });
+
+  it("allows a disconnected root to be selected again for reconnect", async () => {
+    const rootId = "root_dddddddddddddddddddddddd";
+    const harness = await createRendererHarness({
+      chooseFolders: async () => [
+        {
+          rootId,
+          safeLocation: "Documents/Inbox",
+          selectionToken: "reconnect-selection-token",
+          suggestedDisplayName: "Inbox",
+        },
+      ],
+      pairedInitially: true,
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState: "ONLINE",
+          latestSafeCloudErrorCategory: null,
+        },
+        paired: true,
+        pairingState: "PAIRED_AND_READY",
+        roots: [
+          {
+            displayName: "Inbox",
+            id: rootId,
+            safeLocation: "Documents/Inbox",
+            status: "DISCONNECTED",
+            watcherState: "STOPPED",
+          },
+        ],
+      }),
+    });
+
+    await harness.elements.chooseButton.dispatch("click");
+
+    assert.equal(harness.elements.connectButton.disabled, false);
+    assert.equal(
+      elementsWithText(harness.elements.folderList, "Remove selection").length,
+      1,
     );
   });
 
@@ -784,6 +959,30 @@ describe("Bridge desktop app lifecycle", () => {
     assert.match(mainSource, /folderConnectionIpcResult/);
     assert.match(mainSource, /getCompletePairedBridgeIdentity/);
     assert.equal(preloadSource.includes("actualPath"), false);
+  });
+
+  it("keeps folder disconnect IPC rootId-only and confirmation-gated", async () => {
+    const preloadSource = await readFile("apps/bridge/src/main/preload.ts", "utf8");
+    const mainSource = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
+    const disconnectSource = await readFile(
+      "apps/bridge/src/main/folder-disconnection.ts",
+      "utf8",
+    );
+    const rendererSource = bridgeRendererHtml();
+
+    assert.match(preloadSource, /disconnectFolder: \(rootId: string\)/);
+    assert.match(preloadSource, /"nsn-bridge:disconnect-folder", rootId/);
+    assert.match(mainSource, /"nsn-bridge:disconnect-folder"/);
+    assert.match(mainSource, /title: "Disconnect this folder from NSN Librarian\?"/);
+    assert.match(mainSource, /buttons: \["Cancel", "Disconnect Folder"\]/);
+    assert.match(mainSource, /defaultId: 0/);
+    assert.match(mainSource, /cancelId: 0/);
+    assert.match(mainSource, /syncRoots: \(\) => syncLocalRoots\(true\)/);
+    assert.match(disconnectSource, /rootId: unknown/);
+    assert.match(disconnectSource, /stopBridgeWatcher/);
+    assert.match(disconnectSource, /disconnectRoot/);
+    assert.match(rendererSource, /Disconnect Folder/);
+    assert.equal(disconnectSource.includes("actualPath"), false);
   });
 
   it("keeps native status-change IPC narrow and renderer-driven", async () => {
