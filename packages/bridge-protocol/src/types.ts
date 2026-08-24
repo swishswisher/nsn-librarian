@@ -40,6 +40,7 @@ export const bridgeCommandTypes = [
   "PREVIEW_UNDO",
   "EXECUTE_UNDO",
   "RECONCILE_LIBRARY",
+  "UPDATE_ROOT_PERMISSIONS",
   "REVOKE_ROOT_ACCESS",
 ] as const;
 export type BridgeCommandType = (typeof bridgeCommandTypes)[number];

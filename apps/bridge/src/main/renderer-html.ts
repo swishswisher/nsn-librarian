@@ -131,6 +131,16 @@ export function bridgeRendererHtml() {
       }
       .update-notes:empty, .update-steps[hidden] { display: none; }
       .update-notes li, .update-steps li { overflow-wrap: anywhere; }
+      .update-progress {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        display: grid;
+        gap: 6px;
+        padding: 10px;
+      }
+      .update-progress[hidden] { display: none; }
+      .update-progress progress { width: 100%; }
+      .update-progress small { color: var(--muted); overflow-wrap: anywhere; }
       @media (min-width: 720px) {
         main { padding: 28px; }
         .actions, .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -201,6 +211,10 @@ export function bridgeRendererHtml() {
         <div class="update-panel">
           <span class="badge warning" id="updateBadge">Not checked</span>
           <p id="updateCopy">NSN Bridge can check for a verified update.</p>
+          <div class="update-progress" id="updateProgress" hidden>
+            <progress id="updateProgressBar" max="100" value="0"></progress>
+            <small id="updateProgressCopy">Waiting to download.</small>
+          </div>
           <ul class="update-notes" id="updateNotes"></ul>
           <ol class="update-steps" id="updateSteps" hidden>
             <li>Quit NSN Bridge.</li>
@@ -236,6 +250,9 @@ export function bridgeRendererHtml() {
       const updateBadge = document.getElementById("updateBadge");
       const updateCopy = document.getElementById("updateCopy");
       const updateNotes = document.getElementById("updateNotes");
+      const updateProgress = document.getElementById("updateProgress");
+      const updateProgressBar = document.getElementById("updateProgressBar");
+      const updateProgressCopy = document.getElementById("updateProgressCopy");
       const updateSteps = document.getElementById("updateSteps");
       const updatesButton = document.getElementById("updatesButton");
       const downloadUpdateButton = document.getElementById("downloadUpdateButton");
@@ -243,6 +260,7 @@ export function bridgeRendererHtml() {
       const cancelUpdateButton = document.getElementById("cancelUpdateButton");
       let pairingFormDismissed = false;
       let removeStatusChangedListener = null;
+      let removeUpdateStatusListener = null;
       let statusRefreshInterval = null;
       const statusFallbackRefreshMs = 20 * 1000;
 
@@ -402,6 +420,53 @@ export function bridgeRendererHtml() {
         return "Update information is not available right now.";
       }
 
+      function formatBytes(value) {
+        if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+          return null;
+        }
+        const units = ["B", "KB", "MB", "GB"];
+        let size = value;
+        let unitIndex = 0;
+        while (size >= 1024 && unitIndex < units.length - 1) {
+          size = size / 1024;
+          unitIndex += 1;
+        }
+        return (unitIndex === 0 ? Math.round(size) : size.toFixed(1)) + " " + units[unitIndex];
+      }
+
+      function renderUpdateProgress(result, state) {
+        const progress = result && typeof result.downloadProgressPercent === "number"
+          ? Math.max(0, Math.min(100, result.downloadProgressPercent))
+          : null;
+        const downloaded = formatBytes(result && result.downloadedBytes);
+        const total = formatBytes(result && result.sizeBytes);
+
+        updateProgress.hidden = state !== "DOWNLOADING" && state !== "VERIFYING" && state !== "READY_TO_OPEN";
+
+        if (state === "DOWNLOADING") {
+          if (progress === null) {
+            updateProgressBar.removeAttribute("value");
+            updateProgressCopy.textContent = downloaded && total
+              ? downloaded + " of " + total
+              : "Downloading update.";
+            return;
+          }
+
+          updateProgressBar.value = String(progress);
+          updateProgressCopy.textContent = downloaded && total
+            ? progress + "% - " + downloaded + " of " + total
+            : progress + "%";
+          return;
+        }
+
+        updateProgressBar.value = state === "VERIFYING" || state === "READY_TO_OPEN" ? "100" : "0";
+        updateProgressCopy.textContent = state === "VERIFYING"
+          ? "Verifying downloaded update..."
+          : state === "READY_TO_OPEN"
+            ? "The download was verified successfully."
+            : "Waiting to download.";
+      }
+
       function renderUpdateResult(result) {
         const state = result && typeof result === "object" && typeof result.state === "string"
           ? result.state
@@ -410,6 +475,7 @@ export function bridgeRendererHtml() {
         updateBadge.className = state === "FAILED" ? "badge warning" : "badge";
         updateCopy.textContent = updateMessage(result);
         updateNotes.innerHTML = "";
+        renderUpdateProgress(result, state);
 
         if (result && Array.isArray(result.releaseNotes)) {
           result.releaseNotes.slice(0, 6).forEach((note) => {
@@ -876,7 +942,7 @@ export function bridgeRendererHtml() {
       });
       document.getElementById("quitButton").addEventListener("click", () => window.nsnBridge.quit());
       if (typeof window.nsnBridge.onUpdateStatus === "function") {
-        window.nsnBridge.onUpdateStatus(renderUpdateResult);
+        removeUpdateStatusListener = window.nsnBridge.onUpdateStatus(renderUpdateResult);
       }
       if (typeof window.nsnBridge.onStatusChanged === "function") {
         removeStatusChangedListener = window.nsnBridge.onStatusChanged(() => {
@@ -900,6 +966,9 @@ export function bridgeRendererHtml() {
           }
           if (typeof removeStatusChangedListener === "function") {
             removeStatusChangedListener();
+          }
+          if (typeof removeUpdateStatusListener === "function") {
+            removeUpdateStatusListener();
           }
         });
       }

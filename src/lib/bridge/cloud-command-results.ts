@@ -48,6 +48,24 @@ function booleanValue(value: unknown) {
   return typeof value === "boolean" ? value : null;
 }
 
+function bridgeRootWatcherState(value: unknown) {
+  return value === "WATCHING" ||
+    value === "PAUSED" ||
+    value === "STOPPED" ||
+    value === "NEEDS_ATTENTION"
+    ? value
+    : "STOPPED";
+}
+
+function connectedLibraryStatus(value: unknown) {
+  return value === "CONNECTED" ||
+    value === "PAUSED" ||
+    value === "NEEDS_ATTENTION" ||
+    value === "DISCONNECTED"
+    ? value
+    : "CONNECTED";
+}
+
 function dateValue(value: unknown) {
   if (typeof value !== "string" && !(value instanceof Date)) {
     return null;
@@ -498,6 +516,107 @@ async function applyFailedRead(commandPayload: unknown, safeErrorCategory: strin
   await finalizeScanSessionIfComplete(scanSessionId);
 }
 
+async function applyCompletedPermissionUpdate(input: {
+  bridgeRootId: string;
+  commandPayload: unknown;
+  connectedLibraryId: string;
+  result: unknown;
+}) {
+  const payload = objectValue(input.commandPayload);
+  const root = objectValue(input.result);
+  const rootId = stringValue(root?.id, 100);
+
+  if (!root || rootId !== input.bridgeRootId) {
+    throw new BridgeCloudError(
+      "The Bridge returned a result for a different connected folder.",
+      422,
+      "ROOT_RESULT_MISMATCH",
+    );
+  }
+
+  const readPermission =
+    booleanValue(root.readPermission) ??
+    booleanValue(payload?.readPermission) ??
+    true;
+  const watchPermission = readPermission
+    ? (booleanValue(root.watchPermission) ??
+      booleanValue(payload?.watchPermission) ??
+      false)
+    : false;
+  const watcherState = bridgeRootWatcherState(root.watcherState);
+  const status = connectedLibraryStatus(root.status);
+  const now = new Date();
+
+  await getPrismaClient().connectedLibrary.update({
+    data: {
+      bridgeRootId: input.bridgeRootId,
+      createFolderPermission:
+        booleanValue(root.createFolderPermission) ??
+        booleanValue(payload?.createFolderPermission) ??
+        false,
+      disconnectedAt: status === "DISCONNECTED" ? now : null,
+      isEnabled: status !== "DISCONNECTED",
+      lastBridgeCheckAt: now,
+      monitoringErrorCategory: readPermission ? null : "READ_PERMISSION_REQUIRED",
+      monitoringState: watcherState,
+      monitoringStoppedAt: watcherState === "STOPPED" ? now : undefined,
+      moveFilePermission:
+        booleanValue(root.moveFilePermission) ??
+        booleanValue(payload?.moveFilePermission) ??
+        false,
+      organizationPlanPermission:
+        booleanValue(root.organizationPlanPermission) ??
+        booleanValue(payload?.organizationPlanPermission) ??
+        true,
+      readPermission,
+      recommendationPermission:
+        booleanValue(root.recommendationPermission) ??
+        booleanValue(payload?.recommendationPermission) ??
+        true,
+      renameFilePermission:
+        booleanValue(root.renameFilePermission) ??
+        booleanValue(payload?.renameFilePermission) ??
+        false,
+      safeLocalLocation: stringValue(root.safeLocation, 500) ?? undefined,
+      status,
+      watchPermission,
+    },
+    where: {
+      id: input.connectedLibraryId,
+    },
+  });
+
+  return {
+    bridgeRootId: input.bridgeRootId,
+    permissions: {
+      createFolderPermission:
+        booleanValue(root.createFolderPermission) ??
+        booleanValue(payload?.createFolderPermission) ??
+        false,
+      moveFilePermission:
+        booleanValue(root.moveFilePermission) ??
+        booleanValue(payload?.moveFilePermission) ??
+        false,
+      organizationPlanPermission:
+        booleanValue(root.organizationPlanPermission) ??
+        booleanValue(payload?.organizationPlanPermission) ??
+        true,
+      readPermission,
+      recommendationPermission:
+        booleanValue(root.recommendationPermission) ??
+        booleanValue(payload?.recommendationPermission) ??
+        true,
+      renameFilePermission:
+        booleanValue(root.renameFilePermission) ??
+        booleanValue(payload?.renameFilePermission) ??
+        false,
+      watchPermission,
+    },
+    status,
+    watcherState,
+  } satisfies BridgeJson;
+}
+
 export async function prepareBridgeCommandReportForPersistence(
   bridgeDeviceId: string,
   report: BridgeCommandReport,
@@ -549,6 +668,32 @@ export async function prepareBridgeCommandReportForPersistence(
         connectedLibraryId: command.connectedLibraryId,
         result: report.result,
       }),
+    };
+  }
+
+  if (command.commandType === "UPDATE_ROOT_PERMISSIONS") {
+    if (report.status === "COMPLETED") {
+      if (!command.connectedLibraryId || !command.bridgeRootId) {
+        throw new BridgeCloudError(
+          "The permission command is missing its connected folder.",
+          422,
+        );
+      }
+
+      return {
+        ...report,
+        result: await applyCompletedPermissionUpdate({
+          bridgeRootId: command.bridgeRootId,
+          commandPayload: command.payload,
+          connectedLibraryId: command.connectedLibraryId,
+          result: report.result,
+        }),
+      };
+    }
+
+    return {
+      ...report,
+      result: null,
     };
   }
 

@@ -72,16 +72,22 @@ export async function PATCH(
       }
     }
 
-    let library = await updateConnectedLibrary(libraryId, update);
+    const result = await updateConnectedLibrary(libraryId, update);
+    let library = result.library;
 
-    if (body?.watchPermission === false || body?.readPermission === false) {
+    if (
+      !result.permissionUpdate &&
+      (body?.watchPermission === false || body?.readPermission === false)
+    ) {
       await stopMonitoringForFolder(libraryId);
       library = (await getConnectedLibrary(libraryId)) ?? library;
     }
 
     return Response.json({
+      action: result.action,
       ok: true,
       library,
+      permissionUpdate: result.permissionUpdate,
     });
   } catch (error) {
     return errorResponse(error);

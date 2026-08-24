@@ -224,6 +224,37 @@ describe("Bridge assisted update manager", () => {
     assert.equal(files.some((fileName) => fileName.endsWith(".download")), false);
   });
 
+  it("emits intermediate progress before reporting a verified update ready", async () => {
+    const events: Array<ReturnType<
+      ReturnType<typeof createBridgeUpdateManager>["getState"]
+    >> = [];
+    const manager = createBridgeUpdateManager({
+      appUrl: "https://nsn.example",
+      architecture: "arm64",
+      currentVersion: "0.1.97",
+      fetchImpl: fetchForManifest({}),
+      onStateChange: (result) => {
+        events.push(result);
+      },
+      updateDirectory: tempRoot,
+    });
+
+    await manager.checkForUpdates();
+    const result = await manager.downloadUpdate();
+    const states = events.map((event) => event.state);
+    const progress = events.find(
+      (event) => event.state === "DOWNLOADING" && event.downloadedBytes !== null,
+    );
+
+    assert.equal(result.state, "READY_TO_OPEN");
+    assert.ok(progress);
+    assert.equal(progress.downloadedBytes, 9);
+    assert.equal(progress.sizeBytes, 9);
+    assert.equal(progress.downloadProgressPercent, 99);
+    assert.ok(states.indexOf("VERIFYING") > states.indexOf("DOWNLOADING"));
+    assert.ok(states.indexOf("READY_TO_OPEN") > states.indexOf("VERIFYING"));
+  });
+
   it("deletes checksum mismatches and refuses to open them", async () => {
     let openCalls = 0;
     const manager = createBridgeUpdateManager({
@@ -247,6 +278,7 @@ describe("Bridge assisted update manager", () => {
     assert.deepEqual(await updateFiles(), []);
     assert.equal(openResult.state, "FAILED");
     assert.equal(openCalls, 0);
+    assert.equal(manager.getState().state, "FAILED");
   });
 
   it("removes partial downloads on cancellation", async () => {

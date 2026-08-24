@@ -17,6 +17,7 @@ import { scanBridgeRoot } from "../../../../bridge-app/src/filesystem/scanner";
 import {
   disconnectRoot,
   registerRootFromSelection,
+  updateRoot,
 } from "../../../../bridge-app/src/main/registry";
 import {
   BridgeAppError,
@@ -180,6 +181,24 @@ function permissionPatch(payload: Record<string, BridgeJson>) {
   return permissions;
 }
 
+function requiredPermissionPatch(payload: Record<string, BridgeJson>) {
+  const permissions = permissionPatch(payload);
+
+  if (Object.keys(permissions).length === 0) {
+    throw new BridgeAppError(
+      "This Bridge command did not contain any permission changes.",
+      "NO_PERMISSION_CHANGES",
+      422,
+    );
+  }
+
+  if (permissions.readPermission === false) {
+    permissions.watchPermission = false;
+  }
+
+  return permissions;
+}
+
 async function loadReplayKeys() {
   const raw = await readBridgeSecret(replayCacheSecret);
 
@@ -276,6 +295,19 @@ async function executeCommand(
       const events = await takeBridgeWatcherEvents(rootId);
 
       return { events, scan };
+    }
+    case "UPDATE_ROOT_PERMISSIONS": {
+      const rootId = requiredRootId(command);
+      const permissions = requiredPermissionPatch(payload);
+      let root = await updateRoot(rootId, {
+        permissions,
+      });
+
+      if (!root.watchPermission || permissions.readPermission === false) {
+        root = await stopBridgeWatcher(rootId);
+      }
+
+      return root;
     }
     case "REVOKE_ROOT_ACCESS": {
       const rootId = requiredRootId(command);

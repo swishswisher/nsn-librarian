@@ -639,6 +639,10 @@ export type ConnectedLibraryMutationSuccess = {
   alreadyConnected?: boolean;
   ok: true;
   library: ConnectedLibrarySummary;
+  permissionUpdate?: {
+    commandId: string;
+    status: "PENDING";
+  };
 };
 
 export type ConnectedLibraryListResponse =

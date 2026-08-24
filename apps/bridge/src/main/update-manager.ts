@@ -36,6 +36,7 @@ export type BridgeUpdateResult = {
   architecture: "arm64" | "x64" | "unsupported";
   available: boolean;
   currentVersion: string;
+  downloadedBytes: number | null;
   downloadProgressPercent: number | null;
   fileName: string | null;
   latestVersion: string;
@@ -55,6 +56,7 @@ type UpdateManagerOptions = {
   architecture?: string;
   currentVersion?: string;
   fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
+  onStateChange?: (result: BridgeUpdateResult) => void;
   openPath?: (filePath: string) => Promise<string | void>;
   updateDirectory?: string;
 };
@@ -93,6 +95,7 @@ function initialResult(options: {
     architecture: options.architecture,
     available: false,
     currentVersion: options.currentVersion,
+    downloadedBytes: null,
     downloadProgressPercent: null,
     fileName: null,
     latestVersion: options.currentVersion,
@@ -128,6 +131,7 @@ function safeHttpsUrl(value: string | null) {
 function createResult(
   options: {
     candidate?: UpdateCandidate | null;
+    downloadedBytes?: number | null;
     message: string;
     progress?: number | null;
     state: BridgeUpdateState;
@@ -143,6 +147,7 @@ function createResult(
     architecture: base.architecture,
     available: Boolean(candidate),
     currentVersion: base.currentVersion,
+    downloadedBytes: options.downloadedBytes ?? null,
     downloadProgressPercent: options.progress ?? null,
     fileName: candidate?.asset.fileName ?? null,
     latestVersion: candidate?.manifest.version ?? base.currentVersion,
@@ -206,7 +211,11 @@ async function cleanupStaleUpdates(updateDirectory: string) {
 async function writeResponseBodyToFile(
   response: Response,
   filePath: string,
-  onProgress: (progress: number | null) => void,
+  onProgress: (progress: {
+    downloadedBytes: number;
+    progress: number | null;
+    totalBytes: number | null;
+  }) => void,
 ) {
   const body = response.body;
 
@@ -240,11 +249,14 @@ async function writeResponseBodyToFile(
         await once(file, "drain");
       }
 
-      onProgress(
-        totalBytes === null
-          ? null
-          : Math.min(99, Math.floor((downloadedBytes / totalBytes) * 100)),
-      );
+      onProgress({
+        downloadedBytes,
+        progress:
+          totalBytes === null
+            ? null
+            : Math.min(99, Math.floor((downloadedBytes / totalBytes) * 100)),
+        totalBytes,
+      });
     }
   } catch (error) {
     file.destroy();
@@ -270,6 +282,45 @@ export function createBridgeUpdateManager(options: UpdateManagerOptions = {}) {
   let updateCandidate: UpdateCandidate | null = null;
   let verifiedDownloadPath: string | null = null;
   let partialDownloadPath: string | null = null;
+  let lastNotifiedKey = "";
+  let lastProgressNotificationAt = 0;
+
+  function notifyStateChange(result: BridgeUpdateResult, stateChanged: boolean) {
+    if (!options.onStateChange) {
+      return;
+    }
+
+    const now = Date.now();
+    const key = [
+      result.state,
+      result.downloadProgressPercent ?? "",
+      result.downloadedBytes ?? "",
+      result.fileName ?? "",
+    ].join(":");
+    const progressState = result.state === "DOWNLOADING";
+    const hasProgressDetail =
+      result.downloadedBytes !== null ||
+      result.downloadProgressPercent !== null;
+    const shouldThrottle =
+      progressState &&
+      hasProgressDetail &&
+      !stateChanged &&
+      lastProgressNotificationAt > 0 &&
+      now - lastProgressNotificationAt < 500 &&
+      result.downloadProgressPercent !== 100;
+
+    if (key === lastNotifiedKey || shouldThrottle) {
+      return;
+    }
+
+    lastNotifiedKey = key;
+
+    if (progressState && hasProgressDetail) {
+      lastProgressNotificationAt = now;
+    }
+
+    options.onStateChange(result);
+  }
 
   async function fetchManifest() {
     const response = await fetchImpl(
@@ -293,7 +344,9 @@ export function createBridgeUpdateManager(options: UpdateManagerOptions = {}) {
   }
 
   function setResult(result: BridgeUpdateResult) {
+    const stateChanged = result.state !== lastResult.state;
     lastResult = result;
+    notifyStateChange(result, stateChanged);
     return result;
   }
 
@@ -494,11 +547,12 @@ export function createBridgeUpdateManager(options: UpdateManagerOptions = {}) {
           createResult(
             {
               candidate,
+              downloadedBytes: progress.downloadedBytes,
               message:
-                progress === null
+                progress.progress === null
                   ? "Downloading update."
-                  : `Downloading update... ${progress}%`,
-              progress,
+                  : `Downloading update... ${progress.progress}%`,
+              progress: progress.progress,
               state: "DOWNLOADING",
             },
             base,

@@ -17,6 +17,7 @@ let getConnectedLibraries: typeof import("../../src/lib/bridge/connected-librari
 let hideConnectedLibrary: typeof import("../../src/lib/bridge/connected-libraries").hideConnectedLibrary;
 let reconcileDuplicateConnectedLibraries: typeof import("../../src/lib/bridge/connected-libraries").reconcileDuplicateConnectedLibraries;
 let stableFolderFingerprintForLocalPath: typeof import("../../src/lib/bridge/connected-libraries").stableFolderFingerprintForLocalPath;
+let syncBridgeDeviceRoots: typeof import("../../src/lib/bridge/device-root-sync").syncBridgeDeviceRoots;
 let testDatabaseUrl: string;
 let testDirectDatabaseUrl: string;
 
@@ -110,6 +111,7 @@ before(async () => {
 
   const prismaModule = await import("../../src/lib/db/prisma");
   const connectedLibraries = await import("../../src/lib/bridge/connected-libraries");
+  const deviceRootSync = await import("../../src/lib/bridge/device-root-sync");
 
   prisma = prismaModule.getPrismaClient();
   connectBridgeLibrary = connectedLibraries.connectBridgeLibrary;
@@ -120,6 +122,7 @@ before(async () => {
     connectedLibraries.reconcileDuplicateConnectedLibraries;
   stableFolderFingerprintForLocalPath =
     connectedLibraries.stableFolderFingerprintForLocalPath;
+  syncBridgeDeviceRoots = deviceRootSync.syncBridgeDeviceRoots;
 });
 
 beforeEach(async () => {
@@ -309,4 +312,127 @@ test("hidden historical connection does not appear in the normal connected libra
 
   assert.equal(stored.status, "HIDDEN_FROM_ACTIVE_LIST");
   assert.equal(libraries.some((library) => library.id === connected.library.id), false);
+});
+
+async function createBridgeDevice(bridgeDeviceId: string) {
+  return prisma.bridgeDevice.create({
+    data: {
+      appVersion: "0.1.108",
+      architecture: "x64",
+      bridgeDeviceId,
+      deviceDisplayName: "Deanne's Intel Mac",
+      lastSeenAt: new Date(),
+      pairedAt: new Date(),
+      platform: "MACOS",
+      publicKey: "test-public-key",
+      status: "ONLINE",
+    },
+  });
+}
+
+test("cloud root sync reactivates a disconnected canonical record without duplicating history", async () => {
+  const bridgeDeviceId = "bridge-sync-reconnect";
+  const rootId = "root_aaaaaaaaaaaaaaaaaaaaaaaa";
+  await createBridgeDevice(bridgeDeviceId);
+  const connected = await connectBridgeLibrary({
+    root: rootSummary(rootId, {
+      displayName: "SCAN_ROOT_A_GENERAL_INBOX",
+      platform: "MACOS",
+    }),
+  });
+
+  await prisma.connectedLibrary.update({
+    data: {
+      bridgeDeviceId,
+    },
+    where: {
+      id: connected.library.id,
+    },
+  });
+  await prisma.scanSession.create({
+    data: {
+      connectedFolderId: connected.library.id,
+      filesScanned: 1,
+      status: "COMPLETED",
+    },
+  });
+  await disconnectConnectedLibrary(connected.library.id);
+
+  await syncBridgeDeviceRoots(bridgeDeviceId, [
+    {
+      ...rootSummary(rootId, {
+        displayName: "SCAN_ROOT_A_GENERAL_INBOX",
+        platform: "MACOS",
+        safeLocation: "SCAN_ROOT_A_GENERAL_INBOX",
+      }),
+      id: rootId,
+    },
+  ]);
+
+  const current = await getConnectedLibraries();
+  const rows = await prisma.connectedLibrary.findMany({
+    where: {
+      OR: [{ bridgeRootId: rootId }, { folderFingerprint: rootId }],
+    },
+  });
+  const sessions = await prisma.scanSession.findMany();
+
+  assert.equal(current.filter((library) => library.bridgeRootId === rootId).length, 1);
+  assert.equal(rows.filter((row) => row.status !== "MERGED").length, 1);
+  assert.equal(rows[0]?.id, connected.library.id);
+  assert.equal(rows[0]?.status, "CONNECTED");
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0]?.connectedFolderId, connected.library.id);
+});
+
+test("repeated cloud root sync merges stale duplicates and leaves one current library", async () => {
+  const bridgeDeviceId = "bridge-sync-duplicates";
+  const rootId = "root_bbbbbbbbbbbbbbbbbbbbbbbb";
+  await createBridgeDevice(bridgeDeviceId);
+  const canonical = await prisma.connectedLibrary.create({
+    data: {
+      bridgeDeviceId,
+      bridgeRootId: rootId,
+      connectedAt: new Date("2026-08-01T00:00:00.000Z"),
+      displayName: "SCAN_ROOT_A_GENERAL_INBOX",
+      localPath: `bridge://${rootId}`,
+      platform: "MACOS",
+      safeLocalLocation: "SCAN_ROOT_A_GENERAL_INBOX",
+      status: "CONNECTED",
+    },
+  });
+  const duplicate = await prisma.connectedLibrary.create({
+    data: {
+      bridgeDeviceId,
+      connectedAt: new Date("2026-08-02T00:00:00.000Z"),
+      displayName: "SCAN_ROOT_A_GENERAL_INBOX duplicate",
+      folderFingerprint: rootId,
+      localPath: `bridge://${rootId}/duplicate`,
+      platform: "MACOS",
+      safeLocalLocation: "SCAN_ROOT_A_GENERAL_INBOX",
+      status: "CONNECTED",
+    },
+  });
+  await prisma.scanSession.create({
+    data: {
+      connectedFolderId: duplicate.id,
+      filesScanned: 3,
+      status: "COMPLETED",
+    },
+  });
+
+  await syncBridgeDeviceRoots(bridgeDeviceId, [rootSummary(rootId, { platform: "MACOS" })]);
+  await syncBridgeDeviceRoots(bridgeDeviceId, [rootSummary(rootId, { platform: "MACOS" })]);
+
+  const rows = await prisma.connectedLibrary.findMany({
+    orderBy: { connectedAt: "asc" },
+  });
+  const sessions = await prisma.scanSession.findMany();
+  const current = await getConnectedLibraries();
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows.find((row) => row.id === canonical.id)?.status, "CONNECTED");
+  assert.equal(rows.find((row) => row.id === duplicate.id)?.status, "MERGED");
+  assert.equal(sessions[0]?.connectedFolderId, canonical.id);
+  assert.equal(current.filter((library) => library.bridgeRootId === rootId).length, 1);
 });

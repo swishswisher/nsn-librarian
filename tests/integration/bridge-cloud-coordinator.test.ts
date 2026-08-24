@@ -14,8 +14,12 @@ import { cloudBridgeHealth } from "../../src/lib/bridge/effective-health";
 let createBridgePairingCode: typeof import("../../src/lib/bridge/cloud-coordinator").createBridgePairingCode;
 let pairBridgeDevice: typeof import("../../src/lib/bridge/cloud-coordinator").pairBridgeDevice;
 let recordBridgeHeartbeat: typeof import("../../src/lib/bridge/cloud-coordinator").recordBridgeHeartbeat;
+let completeBridgeCloudCommand: typeof import("../../src/lib/bridge/cloud-coordinator").completeBridgeCloudCommand;
+let acknowledgeBridgeCloudCommand: typeof import("../../src/lib/bridge/cloud-coordinator").acknowledgeBridgeCloudCommand;
 let BridgeCloudError: typeof import("../../src/lib/bridge/cloud-coordinator").BridgeCloudError;
 let prepareBridgeCommandReportForPersistence: typeof import("../../src/lib/bridge/cloud-command-results").prepareBridgeCommandReportForPersistence;
+let updateConnectedLibrary: typeof import("../../src/lib/bridge/connected-libraries").updateConnectedLibrary;
+let getConnectedLibraryPermissionUpdateStatus: typeof import("../../src/lib/bridge/connected-libraries").getConnectedLibraryPermissionUpdateStatus;
 let expireRemoteReadCommandsForSession: typeof import("../../src/lib/bridge/remote-read-commands").expireRemoteReadCommandsForSession;
 let markRemoteReadFailure: typeof import("../../src/lib/bridge/remote-read-commands").markRemoteReadFailure;
 let queueRemoteReadRetryForScannedFile: typeof import("../../src/lib/bridge/remote-read-commands").queueRemoteReadRetryForScannedFile;
@@ -87,9 +91,15 @@ before(async () => {
   createBridgePairingCode = coordinator.createBridgePairingCode;
   pairBridgeDevice = coordinator.pairBridgeDevice;
   recordBridgeHeartbeat = coordinator.recordBridgeHeartbeat;
+  completeBridgeCloudCommand = coordinator.completeBridgeCloudCommand;
+  acknowledgeBridgeCloudCommand = coordinator.acknowledgeBridgeCloudCommand;
   BridgeCloudError = coordinator.BridgeCloudError;
+  const connectedLibraries = await import("../../src/lib/bridge/connected-libraries");
   prepareBridgeCommandReportForPersistence =
     commandResults.prepareBridgeCommandReportForPersistence;
+  updateConnectedLibrary = connectedLibraries.updateConnectedLibrary;
+  getConnectedLibraryPermissionUpdateStatus =
+    connectedLibraries.getConnectedLibraryPermissionUpdateStatus;
   expireRemoteReadCommandsForSession =
     remoteReadCommands.expireRemoteReadCommandsForSession;
   markRemoteReadFailure = remoteReadCommands.markRemoteReadFailure;
@@ -491,4 +501,207 @@ test("Retry Reading reports real offline, disconnected, unsupported, missing, an
 
   assert.equal(timedOutFile.processingErrorCategory, "READ_COMMAND_TIMEOUT");
   assert.equal(timedOutSession.status, "COMPLETED_WITH_ERRORS");
+});
+
+test("cloud-owned permission updates queue a Bridge command instead of using localhost", async () => {
+  process.env.NSN_LOCAL_BRIDGE_URL = "http://127.0.0.1:9";
+  const { bridgeRootId, device, library } = await createCloudScannedFile({
+    relativePath: "Notes/permission.txt",
+  });
+  const result = await updateConnectedLibrary(library.id, {
+    watchPermission: true,
+  });
+  const command = await prisma.bridgeCommand.findFirstOrThrow({
+    where: {
+      commandType: "UPDATE_ROOT_PERMISSIONS",
+    },
+  });
+  const storedLibrary = await prisma.connectedLibrary.findUniqueOrThrow({
+    where: {
+      id: library.id,
+    },
+  });
+  const payload = command.payload as Record<string, unknown>;
+
+  assert.equal(result.permissionUpdate?.status, "PENDING");
+  assert.equal(result.permissionUpdate?.commandId, command.commandId);
+  assert.equal(result.library.watchPermission, false);
+  assert.equal(storedLibrary.watchPermission, false);
+  assert.equal(command.bridgeDeviceId, device.bridgeDeviceId);
+  assert.equal(command.bridgeRootId, bridgeRootId);
+  assert.equal(command.connectedLibraryId, library.id);
+  assert.equal(payload.bridgeRootId, bridgeRootId);
+  assert.equal(payload.watchPermission, true);
+  assert.equal(payload.localPath, undefined);
+  assert.equal(payload.actualPath, undefined);
+  assert.doesNotMatch(JSON.stringify(payload), /127\.0\.0\.1|localhost|D:\\|\/Users\//);
+});
+
+test("permission updates persist only after the Bridge confirms completion", async () => {
+  const { bridgeRootId, device, library } = await createCloudScannedFile({
+    relativePath: "Notes/confirmed-permission.txt",
+  });
+  const queued = await updateConnectedLibrary(library.id, {
+    watchPermission: true,
+  });
+  const commandId = queued.permissionUpdate?.commandId;
+
+  assert.ok(commandId);
+  await acknowledgeBridgeCloudCommand(device.bridgeDeviceId, commandId);
+  assert.equal(
+    (await prisma.connectedLibrary.findUniqueOrThrow({
+      where: { id: library.id },
+    })).watchPermission,
+    false,
+  );
+
+  const prepared = await prepareBridgeCommandReportForPersistence(
+    device.bridgeDeviceId,
+    {
+      commandId,
+      result: {
+        bridgeRootId,
+        createFolderPermission: false,
+        displayName: library.displayName,
+        id: bridgeRootId,
+        moveFilePermission: false,
+        organizationPlanPermission: true,
+        readPermission: true,
+        recommendationPermission: true,
+        renameFilePermission: false,
+        safeLocation: library.safeLocalLocation,
+        status: "CONNECTED",
+        watcherState: "PAUSED",
+        watchPermission: true,
+      },
+      safeErrorCategory: null,
+      status: "COMPLETED",
+    },
+  );
+  await completeBridgeCloudCommand(device.bridgeDeviceId, prepared);
+
+  const status = await getConnectedLibraryPermissionUpdateStatus(
+    library.id,
+    commandId,
+  );
+  const updated = await prisma.connectedLibrary.findUniqueOrThrow({
+    where: { id: library.id },
+  });
+
+  assert.equal(status.status, "COMPLETED");
+  assert.equal(updated.watchPermission, true);
+  assert.equal(updated.readPermission, true);
+  assert.equal(updated.monitoringState, "PAUSED");
+});
+
+test("failed cloud permission command leaves the prior permission state", async () => {
+  const { device, library } = await createCloudScannedFile({
+    relativePath: "Notes/failed-permission.txt",
+  });
+  const queued = await updateConnectedLibrary(library.id, {
+    watchPermission: true,
+  });
+  const commandId = queued.permissionUpdate?.commandId;
+
+  assert.ok(commandId);
+  await acknowledgeBridgeCloudCommand(device.bridgeDeviceId, commandId);
+  await completeBridgeCloudCommand(device.bridgeDeviceId, {
+    commandId,
+    result: null,
+    safeErrorCategory: "ROOT_NOT_FOUND",
+    status: "FAILED",
+  });
+
+  const status = await getConnectedLibraryPermissionUpdateStatus(
+    library.id,
+    commandId,
+  );
+  const unchanged = await prisma.connectedLibrary.findUniqueOrThrow({
+    where: { id: library.id },
+  });
+
+  assert.equal(status.status, "FAILED");
+  assert.equal("error" in status, true);
+  assert.equal(unchanged.watchPermission, false);
+});
+
+test("watch permission requires read permission and disabling read disables watch", async () => {
+  const noRead = await createCloudScannedFile({
+    relativePath: "Notes/no-read.txt",
+  });
+  await prisma.connectedLibrary.update({
+    data: {
+      readPermission: false,
+    },
+    where: {
+      id: noRead.library.id,
+    },
+  });
+
+  await assert.rejects(
+    () => updateConnectedLibrary(noRead.library.id, { watchPermission: true }),
+    /Reading permission is required/i,
+  );
+
+  const watched = await createCloudScannedFile({
+    relativePath: "Notes/disable-read.txt",
+  });
+  await prisma.connectedLibrary.update({
+    data: {
+      readPermission: true,
+      watchPermission: true,
+    },
+    where: {
+      id: watched.library.id,
+    },
+  });
+  const queued = await updateConnectedLibrary(watched.library.id, {
+    readPermission: false,
+  });
+  const commandId = queued.permissionUpdate?.commandId;
+
+  assert.ok(commandId);
+  await acknowledgeBridgeCloudCommand(watched.device.bridgeDeviceId, commandId);
+  const command = await prisma.bridgeCommand.findUniqueOrThrow({
+    where: {
+      commandId,
+    },
+  });
+  const payload = command.payload as Record<string, unknown>;
+
+  assert.equal(payload.readPermission, false);
+  assert.equal(payload.watchPermission, false);
+
+  const prepared = await prepareBridgeCommandReportForPersistence(
+    watched.device.bridgeDeviceId,
+    {
+      commandId,
+      result: {
+        bridgeRootId: watched.bridgeRootId,
+        createFolderPermission: false,
+        displayName: watched.library.displayName,
+        id: watched.bridgeRootId,
+        moveFilePermission: false,
+        organizationPlanPermission: true,
+        readPermission: false,
+        recommendationPermission: true,
+        renameFilePermission: false,
+        safeLocation: watched.library.safeLocalLocation,
+        status: "CONNECTED",
+        watcherState: "STOPPED",
+        watchPermission: false,
+      },
+      safeErrorCategory: null,
+      status: "COMPLETED",
+    },
+  );
+  await completeBridgeCloudCommand(watched.device.bridgeDeviceId, prepared);
+
+  const updated = await prisma.connectedLibrary.findUniqueOrThrow({
+    where: { id: watched.library.id },
+  });
+
+  assert.equal(updated.readPermission, false);
+  assert.equal(updated.watchPermission, false);
+  assert.equal(updated.monitoringState, "STOPPED");
 });

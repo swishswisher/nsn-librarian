@@ -231,6 +231,28 @@ function isPreviousConnection(library: ConnectedLibrarySummary) {
   );
 }
 
+function currentLibraryIdentity(library: ConnectedLibrarySummary) {
+  return library.bridgeRootId ?? library.id;
+}
+
+function uniqueCurrentLibraries(libraries: ConnectedLibrarySummary[]) {
+  const seen = new Set<string>();
+  const unique: ConnectedLibrarySummary[] = [];
+
+  for (const library of libraries) {
+    const identity = currentLibraryIdentity(library);
+
+    if (seen.has(identity)) {
+      continue;
+    }
+
+    seen.add(identity);
+    unique.push(library);
+  }
+
+  return unique;
+}
+
 function permissionsFromLibrary(
   library: ConnectedLibrarySummary,
 ): ConnectedLibraryPermissions {
@@ -243,6 +265,43 @@ function permissionsFromLibrary(
     renameFilePermission: library.renameFilePermission,
     watchPermission: library.watchPermission,
   };
+}
+
+function isPermissionPatch(body: Record<string, unknown>) {
+  return permissionGroups.some((permission) => permission.key in body);
+}
+
+function wait(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+async function readPermissionUpdateStatus(response: Response) {
+  try {
+    return (await response.json()) as
+      | {
+          done: boolean;
+          library: ConnectedLibrarySummary | null;
+          ok: true;
+          status: string;
+        }
+      | {
+          done: boolean;
+          error: string;
+          library: ConnectedLibrarySummary | null;
+          ok: false;
+          status: string;
+        };
+  } catch {
+    return {
+      done: true,
+      error: "The Bridge could not read the permission update response.",
+      library: null,
+      ok: false,
+      status: "FAILED",
+    } as const;
+  }
 }
 
 async function readLibraryMutation(response: Response) {
@@ -358,7 +417,9 @@ export function ConnectedLibrariesManager({
   const visibleLibraries = libraries.filter(
     (library) => !library.isHiddenFromActiveList && !library.isMergedDuplicate,
   );
-  const currentLibraries = visibleLibraries.filter(isCurrentConnectedLibrary);
+  const currentLibraries = uniqueCurrentLibraries(
+    visibleLibraries.filter(isCurrentConnectedLibrary),
+  );
   const activeLibraries = currentLibraries.filter(isActiveConnectedLibrary);
   const watchingLibraries = currentLibraries.filter(
     (library) => library.monitoringState === "WATCHING",
@@ -712,9 +773,10 @@ export function ConnectedLibrariesManager({
     body: Record<string, unknown>,
     successMessage: string,
   ) {
+    const updatesPermissions = isPermissionPatch(body);
     setBusyId(libraryId);
     setError(null);
-    setNotice(null);
+    setNotice(updatesPermissions ? "Updating permission..." : null);
 
     try {
       const response = await fetch(
@@ -735,6 +797,46 @@ export function ConnectedLibrariesManager({
       }
 
       replaceLibrary(payload.library);
+
+      if (payload.permissionUpdate?.status === "PENDING") {
+        for (let attempt = 0; attempt < 24; attempt += 1) {
+          await wait(2_000);
+
+          const statusResponse = await fetch(
+            `/api/bridge/connected-libraries/${encodeURIComponent(
+              libraryId,
+            )}/permission-updates/${encodeURIComponent(
+              payload.permissionUpdate.commandId,
+            )}`,
+          );
+          const statusPayload = await readPermissionUpdateStatus(statusResponse);
+
+          if (statusPayload.library) {
+            replaceLibrary(statusPayload.library);
+          }
+
+          if (!statusResponse.ok || !statusPayload.ok) {
+            setError(
+              "error" in statusPayload
+                ? statusPayload.error
+                : "The Bridge could not update that permission.",
+            );
+            return;
+          }
+
+          if (statusPayload.done) {
+            setNotice(successMessage);
+            router.refresh();
+            return;
+          }
+        }
+
+        setError(
+          "The permission update is still waiting for the Bridge. Refresh this page in a moment.",
+        );
+        return;
+      }
+
       setNotice(successMessage);
       router.refresh();
     } catch {

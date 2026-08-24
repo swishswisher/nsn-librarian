@@ -17,7 +17,7 @@ type NsnBridgeApi = {
   getStatus: () => Promise<unknown>;
   getUpdateStatus: () => Promise<unknown>;
   onStatusChanged: (listener: (payload: unknown) => void) => () => void;
-  onUpdateStatus: (listener: (payload: unknown) => void) => void;
+  onUpdateStatus: (listener: (payload: unknown) => void) => () => void;
   openDownloadedUpdate: () => Promise<unknown>;
   openLibrarian: () => Promise<unknown>;
   pairWithCode: (code: string) => Promise<unknown>;
@@ -153,12 +153,18 @@ contextBridge.exposeInMainWorld("nsnBridge", {
   },
   onUpdateStatus: (listener: (payload: unknown) => void) => {
     if (typeof listener !== "function") {
-      return;
+      return () => undefined;
     }
 
-    ipcRenderer.on("nsn-bridge:update-status", (_event, payload) => {
+    const ipcListener = (_event: unknown, payload: unknown) => {
       listener(payload);
-    });
+    };
+
+    ipcRenderer.on("nsn-bridge:update-status", ipcListener);
+
+    return () => {
+      ipcRenderer.removeListener("nsn-bridge:update-status", ipcListener);
+    };
   },
   openDownloadedUpdate: () =>
     ipcRenderer.invoke("nsn-bridge:open-downloaded-update"),

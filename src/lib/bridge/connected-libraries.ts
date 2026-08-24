@@ -7,6 +7,10 @@ import path from "node:path";
 import type { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
+import {
+  BridgeCloudError,
+  createBridgeCloudCommand,
+} from "@/lib/bridge/cloud-coordinator";
 
 import type {
   ConnectedLibraryPermissions,
@@ -89,6 +93,15 @@ export type ConnectedLibraryConnectionResult = {
 type UpdateLibraryInput = Partial<ConnectedLibraryPermissions> & {
   displayName?: string;
   status?: ConnectedLibraryStatus;
+};
+
+type ConnectedLibraryUpdateResult = {
+  action: "UPDATED";
+  library: ConnectedLibrarySummary;
+  permissionUpdate?: {
+    commandId: string;
+    status: "PENDING";
+  };
 };
 
 export class ConnectedLibraryError extends Error {
@@ -268,6 +281,38 @@ function permissionUpdateInput(input: Partial<ConnectedLibraryPermissions>) {
   }
 
   return data;
+}
+
+function hasPermissionChanges(input: Partial<ConnectedLibraryPermissions>) {
+  return (Object.keys(
+    defaultConnectedLibraryPermissions,
+  ) as ConnectedLibraryPermission[]).some(
+    (permission) => typeof input[permission] === "boolean",
+  );
+}
+
+function onlineBridgeDevice(device: { lastSeenAt: Date | null; status: string } | null) {
+  if (!device || device.status !== "ONLINE" || !device.lastSeenAt) {
+    return false;
+  }
+
+  return Date.now() - device.lastSeenAt.getTime() <= 90_000;
+}
+
+function safePermissionCommandPayload(
+  bridgeRootId: string,
+  input: Partial<ConnectedLibraryPermissions>,
+) {
+  const permissions = permissionUpdateInput(input);
+
+  if (input.readPermission === false) {
+    permissions.watchPermission = false;
+  }
+
+  return {
+    bridgeRootId,
+    ...permissions,
+  };
 }
 
 function safeLocation(localPath: string) {
@@ -659,6 +704,18 @@ async function reconcileFingerprint(
   await mergeDuplicateConnectedLibraries(tx, canonical.id, duplicates);
 
   return canonical;
+}
+
+export async function reconcileConnectedLibraryFingerprint(
+  fingerprint: string,
+): Promise<{ id: string } | null> {
+  const prisma = getPrismaClient();
+
+  const canonical = await prisma.$transaction((tx) =>
+    reconcileFingerprint(tx, fingerprint),
+  );
+
+  return canonical ? { id: canonical.id } : null;
 }
 
 export async function reconcileDuplicateConnectedLibraries() {
@@ -1233,7 +1290,7 @@ export async function rootForConnectedLibrary(
 export async function updateConnectedLibrary(
   libraryId: string,
   input: UpdateLibraryInput,
-) {
+): Promise<ConnectedLibraryUpdateResult> {
   const prisma = getPrismaClient();
   const normalizedInput = {
     ...input,
@@ -1244,6 +1301,14 @@ export async function updateConnectedLibrary(
   }
 
   const existing = await prisma.connectedLibrary.findUnique({
+    include: {
+      bridgeDevice: {
+        select: {
+          lastSeenAt: true,
+          status: true,
+        },
+      },
+    },
     where: {
       id: libraryId,
     },
@@ -1254,6 +1319,62 @@ export async function updateConnectedLibrary(
       "The Librarian could not find that connected library.",
       404,
     );
+  }
+
+  const permissionChangesRequested = hasPermissionChanges(normalizedInput);
+
+  if (existing.bridgeRootId && existing.bridgeDeviceId && permissionChangesRequested) {
+    if (
+      normalizedInput.watchPermission === true &&
+      normalizedInput.readPermission !== true &&
+      !existing.readPermission
+    ) {
+      throw new ConnectedLibraryError(
+        "Reading permission is required before this folder can be watched.",
+        400,
+      );
+    }
+
+    if (!onlineBridgeDevice(existing.bridgeDevice)) {
+      throw new ConnectedLibraryError(
+        "Open NSN Bridge on the paired Mac before changing this permission.",
+        409,
+      );
+    }
+
+    let command;
+
+    try {
+      command = await createBridgeCloudCommand({
+        authorizationContext: {
+          approvedBy: "Deanne",
+          reason: "Connected library permission update",
+        },
+        bridgeDeviceId: existing.bridgeDeviceId,
+        bridgeRootId: existing.bridgeRootId,
+        commandType: "UPDATE_ROOT_PERMISSIONS",
+        connectedLibraryId: existing.id,
+        payload: safePermissionCommandPayload(
+          existing.bridgeRootId,
+          normalizedInput,
+        ),
+      });
+    } catch (error) {
+      if (error instanceof BridgeCloudError) {
+        throw new ConnectedLibraryError(error.message, error.statusCode);
+      }
+
+      throw error;
+    }
+
+    return {
+      action: "UPDATED",
+      library: librarySummary(existing, 0, true),
+      permissionUpdate: {
+        commandId: command.commandId,
+        status: "PENDING",
+      },
+    };
   }
 
   if (existing.bridgeRootId) {
@@ -1335,7 +1456,63 @@ export async function updateConnectedLibrary(
     },
   });
 
-  return librarySummary(library, 0, Boolean(existing.bridgeRootId));
+  return {
+    action: "UPDATED",
+    library: librarySummary(library, 0, Boolean(existing.bridgeRootId)),
+  };
+}
+
+export async function getConnectedLibraryPermissionUpdateStatus(
+  libraryId: string,
+  commandId: string,
+) {
+  const prisma = getPrismaClient();
+  const command = await prisma.bridgeCommand.findUnique({
+    where: {
+      commandId,
+    },
+  });
+
+  if (
+    !command ||
+    command.connectedLibraryId !== libraryId ||
+    command.commandType !== "UPDATE_ROOT_PERMISSIONS"
+  ) {
+    throw new ConnectedLibraryError(
+      "The Librarian could not find that permission update.",
+      404,
+    );
+  }
+
+  const library = await getConnectedLibrary(libraryId);
+
+  if (command.status === "COMPLETED") {
+    return {
+      done: true,
+      library,
+      status: "COMPLETED" as const,
+    };
+  }
+
+  if (
+    command.status === "FAILED" ||
+    command.status === "REJECTED" ||
+    command.status === "EXPIRED" ||
+    command.status === "CANCELLED"
+  ) {
+    return {
+      done: true,
+      error: "The Bridge could not update that permission. The previous setting is still in place.",
+      library,
+      status: command.status,
+    };
+  }
+
+  return {
+    done: false,
+    library,
+    status: command.status,
+  };
 }
 
 export async function disconnectConnectedLibrary(libraryId: string) {

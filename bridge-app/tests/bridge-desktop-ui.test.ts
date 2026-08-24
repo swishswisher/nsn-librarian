@@ -28,6 +28,12 @@ class FakeElement {
     this.children.push(child);
   }
 
+  removeAttribute(name: string) {
+    if (name === "value") {
+      this.value = "";
+    }
+  }
+
   addEventListener(type: string, handler: EventHandler) {
     this.listeners.set(type, [...(this.listeners.get(type) ?? []), handler]);
   }
@@ -54,7 +60,9 @@ type RendererHarness = {
   statusCallCount: () => number;
   statusChangedSubscriptionRemoved: () => boolean;
   triggerStatusChanged: () => Promise<void>;
+  triggerUpdateStatus: (payload: unknown) => Promise<void>;
   unload: () => Promise<void>;
+  updateStatusSubscriptionRemoved: () => boolean;
 };
 
 async function settleRenderer() {
@@ -113,6 +121,9 @@ async function createRendererHarness(options: {
     "updateBadge",
     "updateCopy",
     "updateNotes",
+    "updateProgress",
+    "updateProgressBar",
+    "updateProgressCopy",
     "updateSteps",
     "updatesButton",
     "watchingCopy",
@@ -124,6 +135,7 @@ async function createRendererHarness(options: {
   const connectSelectedFoldersCalls: unknown[][] = [];
   const disconnectFolderCalls: string[] = [];
   const statusChangedListeners: Array<(payload: unknown) => unknown> = [];
+  const updateStatusListeners: Array<(payload: unknown) => unknown> = [];
   const windowListeners = new Map<string, Array<() => unknown>>();
   let openDownloadedUpdateCalls = 0;
   let paired = options.pairedInitially === true;
@@ -131,6 +143,7 @@ async function createRendererHarness(options: {
   let fallbackRefreshCallback: (() => unknown) | null = null;
   let fallbackRefreshMs: number | null = null;
   let statusChangedSubscriptionRemoved = false;
+  let updateStatusSubscriptionRemoved = false;
   const document = {
     createElement: (tagName: string) => new FakeElement(tagName),
     getElementById: (id: string) => {
@@ -223,7 +236,18 @@ async function createRendererHarness(options: {
             }
           };
         },
-        onUpdateStatus: () => undefined,
+        onUpdateStatus: (listener: (payload: unknown) => unknown) => {
+          updateStatusListeners.push(listener);
+
+          return () => {
+            updateStatusSubscriptionRemoved = true;
+            const index = updateStatusListeners.indexOf(listener);
+
+            if (index >= 0) {
+              updateStatusListeners.splice(index, 1);
+            }
+          };
+        },
         openDownloadedUpdate:
           options.openDownloadedUpdate ??
           (async () => {
@@ -290,12 +314,19 @@ async function createRendererHarness(options: {
       }
       await settleRenderer();
     },
+    triggerUpdateStatus: async (payload: unknown) => {
+      for (const listener of updateStatusListeners) {
+        await listener(payload);
+      }
+      await settleRenderer();
+    },
     unload: async () => {
       for (const listener of windowListeners.get("beforeunload") ?? []) {
         await listener();
       }
       await settleRenderer();
     },
+    updateStatusSubscriptionRemoved: () => updateStatusSubscriptionRemoved,
   };
 }
 
@@ -909,6 +940,83 @@ describe("Bridge desktop renderer", () => {
     assert.equal(harness.elements.updateSteps.hidden, false);
     assert.equal(harness.openDownloadedUpdateCalls(), 1);
   });
+
+  it("renders live update progress and verifying states from main process events", async () => {
+    const harness = await createRendererHarness();
+
+    await harness.triggerUpdateStatus({
+      currentVersion: "0.1.108",
+      downloadedBytes: 187 * 1024 * 1024,
+      downloadProgressPercent: 73,
+      latestVersion: "0.1.109",
+      releaseNotes: [],
+      sizeBytes: 256 * 1024 * 1024,
+      state: "DOWNLOADING",
+    });
+
+    assert.equal(harness.elements.updateBadge.textContent, "Downloading");
+    assert.equal(harness.elements.updateProgress.hidden, false);
+    assert.equal(harness.elements.updateProgressBar.value, "73");
+    assert.equal(
+      harness.elements.updateProgressCopy.textContent,
+      "73% - 187.0 MB of 256.0 MB",
+    );
+    assert.equal(harness.elements.updatesButton.disabled, true);
+
+    await harness.triggerUpdateStatus({
+      currentVersion: "0.1.108",
+      downloadedBytes: 256 * 1024 * 1024,
+      downloadProgressPercent: 100,
+      latestVersion: "0.1.109",
+      releaseNotes: [],
+      sizeBytes: 256 * 1024 * 1024,
+      state: "VERIFYING",
+    });
+
+    assert.equal(harness.elements.updateBadge.textContent, "Verifying");
+    assert.equal(
+      harness.elements.updateProgressCopy.textContent,
+      "Verifying downloaded update...",
+    );
+
+    await harness.triggerUpdateStatus({
+      currentVersion: "0.1.108",
+      downloadedBytes: 256 * 1024 * 1024,
+      downloadProgressPercent: 100,
+      latestVersion: "0.1.109",
+      releaseNotes: [],
+      sizeBytes: 256 * 1024 * 1024,
+      state: "READY_TO_OPEN",
+    });
+
+    assert.equal(harness.elements.updateBadge.textContent, "Update ready");
+    assert.equal(harness.elements.openUpdateButton.hidden, false);
+    assert.equal(
+      harness.elements.updateProgressCopy.textContent,
+      "The download was verified successfully.",
+    );
+  });
+
+  it("restores update progress from current manager state when the window opens", async () => {
+    const harness = await createRendererHarness({
+      getUpdateStatus: async () => ({
+        currentVersion: "0.1.108",
+        downloadedBytes: 64 * 1024 * 1024,
+        downloadProgressPercent: 25,
+        latestVersion: "0.1.109",
+        releaseNotes: [],
+        sizeBytes: 256 * 1024 * 1024,
+        state: "DOWNLOADING",
+      }),
+    });
+
+    assert.equal(harness.elements.updateBadge.textContent, "Downloading");
+    assert.equal(harness.elements.updateProgressBar.value, "25");
+    assert.equal(
+      harness.elements.updateProgressCopy.textContent,
+      "25% - 64.0 MB of 256.0 MB",
+    );
+  });
 });
 
 describe("Bridge desktop app lifecycle", () => {
@@ -1022,6 +1130,7 @@ describe("Bridge desktop app lifecycle", () => {
     assert.match(rendererSource, /window\.addEventListener\("beforeunload"/);
     assert.match(rendererSource, /window\.clearInterval\(statusRefreshInterval\)/);
     assert.match(rendererSource, /removeStatusChangedListener\(\)/);
+    assert.match(rendererSource, /removeUpdateStatusListener\(\)/);
   });
 
   it("recovers cloud heartbeat and root sync immediately on startup", async () => {

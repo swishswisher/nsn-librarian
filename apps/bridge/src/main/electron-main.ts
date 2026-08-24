@@ -108,6 +108,9 @@ export async function startElectronBridgeApp() {
   const updateManager = createBridgeUpdateManager({
     architecture: process.arch,
     currentVersion: bridgeRuntimeAppVersion(),
+    onStateChange: (result) => {
+      mainWindow?.webContents.send("nsn-bridge:update-status", result);
+    },
     openPath: electron.shell.openPath,
     updateDirectory: path.join(electron.app.getPath("temp"), "nsn-bridge-updates"),
   });

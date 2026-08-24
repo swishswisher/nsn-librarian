@@ -2,6 +2,7 @@ import type { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { BridgeCloudError } from "@/lib/bridge/cloud-coordinator";
+import { reconcileConnectedLibraryFingerprint } from "@/lib/bridge/connected-libraries";
 
 type BridgeRootSyncInput = {
   connectedAt: string;
@@ -154,15 +155,18 @@ export async function syncBridgeDeviceRoots(
   const synced = [];
 
   for (const root of roots) {
-    const existing = await prisma.connectedLibrary.findFirst({
-      where: {
-        OR: [
-          { bridgeRootId: root.id },
-          { folderFingerprint: root.id },
-          { localPath: bridgeRootUri(root.id) },
-        ],
-      },
-    });
+    const canonical = await reconcileConnectedLibraryFingerprint(root.id);
+    const existing =
+      canonical ??
+      (await prisma.connectedLibrary.findFirst({
+        where: {
+          OR: [
+            { bridgeRootId: root.id },
+            { folderFingerprint: root.id },
+            { localPath: bridgeRootUri(root.id) },
+          ],
+        },
+      }));
     const commonData = {
       bridgeDeviceId,
       bridgeRootId: root.id,
@@ -222,6 +226,8 @@ export async function syncBridgeDeviceRoots(
       monitoringState: library.monitoringState,
       status: library.status,
     });
+
+    await reconcileConnectedLibraryFingerprint(root.id);
   }
 
   return synced;
