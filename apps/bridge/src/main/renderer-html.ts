@@ -233,6 +233,9 @@ export function bridgeRendererHtml() {
       const openUpdateButton = document.getElementById("openUpdateButton");
       const cancelUpdateButton = document.getElementById("cancelUpdateButton");
       let pairingFormDismissed = false;
+      let removeStatusChangedListener = null;
+      let statusRefreshInterval = null;
+      const statusFallbackRefreshMs = 20 * 1000;
 
       function showNotice(message, isError) {
         notice.textContent = message;
@@ -698,10 +701,30 @@ export function bridgeRendererHtml() {
       if (typeof window.nsnBridge.onUpdateStatus === "function") {
         window.nsnBridge.onUpdateStatus(renderUpdateResult);
       }
+      if (typeof window.nsnBridge.onStatusChanged === "function") {
+        removeStatusChangedListener = window.nsnBridge.onStatusChanged(() => {
+          refreshStatus();
+        });
+      }
       if (typeof window.nsnBridge.getUpdateStatus === "function") {
         window.nsnBridge.getUpdateStatus()
           .then(renderUpdateResult)
           .catch(() => undefined);
+      }
+      if (typeof window.setInterval === "function") {
+        statusRefreshInterval = window.setInterval(() => {
+          refreshStatus();
+        }, statusFallbackRefreshMs);
+      }
+      if (typeof window.addEventListener === "function") {
+        window.addEventListener("beforeunload", () => {
+          if (statusRefreshInterval !== null && typeof window.clearInterval === "function") {
+            window.clearInterval(statusRefreshInterval);
+          }
+          if (typeof removeStatusChangedListener === "function") {
+            removeStatusChangedListener();
+          }
+        });
       }
       refreshStatus();
     </script>

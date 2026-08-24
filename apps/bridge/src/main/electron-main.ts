@@ -114,7 +114,33 @@ export async function startElectronBridgeApp() {
   let isQuitting = false;
   let commandPollInFlight = false;
   let lastRootSyncAt = 0;
+  let lastBridgeStatusEventKey = "";
   const cloudState = createBridgeCloudState();
+
+  function sendBridgeStatusChanged(reason: string, options?: { force?: boolean }) {
+    const state = cloudState.getState();
+    const eventKey = [
+      state.cloudConnectionState,
+      state.latestSafeCloudErrorCategory ?? "",
+    ].join(":");
+
+    if (!options?.force && eventKey === lastBridgeStatusEventKey) {
+      return;
+    }
+
+    lastBridgeStatusEventKey = eventKey;
+
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return;
+    }
+
+    mainWindow.webContents.send("nsn-bridge:status-changed", {
+      cloudConnectionState: state.cloudConnectionState,
+      latestSafeCloudErrorCategory: state.latestSafeCloudErrorCategory,
+      reason,
+      statusChangedAt: new Date().toISOString(),
+    });
+  }
 
   function createMainWindow() {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -209,10 +235,12 @@ export async function startElectronBridgeApp() {
       await syncBridgeRoots(roots);
       lastRootSyncAt = Date.now();
       cloudState.recordRootSyncSuccess();
+      sendBridgeStatusChanged("root-sync-success");
 
       return { ok: true };
     } catch (error) {
       cloudState.recordRootSyncFailure(error);
+      sendBridgeStatusChanged("root-sync-failure");
 
       return {
         ok: false,
@@ -330,6 +358,7 @@ export async function startElectronBridgeApp() {
           ? identity.safeErrorCategory
           : "PAIRING_INCOMPLETE",
       );
+      sendBridgeStatusChanged("authentication-unavailable");
 
       return {
         ok: false,
@@ -343,8 +372,10 @@ export async function startElectronBridgeApp() {
     try {
       await sendBridgeHeartbeat();
       cloudState.recordHeartbeatSuccess();
+      sendBridgeStatusChanged("heartbeat-success");
     } catch (error) {
       cloudState.recordHeartbeatFailure(error);
+      sendBridgeStatusChanged("heartbeat-failure");
 
       return {
         ok: false,
@@ -377,6 +408,7 @@ export async function startElectronBridgeApp() {
         });
       } catch (error) {
         cloudState.recordCloudFailure(error);
+        sendBridgeStatusChanged("command-poll-failure");
         return [];
       }
 
@@ -445,6 +477,7 @@ export async function startElectronBridgeApp() {
 
     const device = await pairBridgeWithCloud(code);
     await recoverCloudConnection(true);
+    sendBridgeStatusChanged("pairing-complete", { force: true });
     void pollCloud();
     return device;
   });

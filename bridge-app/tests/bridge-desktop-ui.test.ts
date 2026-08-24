@@ -46,9 +46,14 @@ class FakeElement {
 type RendererHarness = {
   connectSelectedFoldersCalls: () => unknown[][];
   elements: Record<string, FakeElement>;
+  fallbackRefreshMs: () => number | null;
+  runFallbackRefresh: () => Promise<void>;
   openDownloadedUpdateCalls: () => number;
   pairWithCodeCalls: string[];
   statusCallCount: () => number;
+  statusChangedSubscriptionRemoved: () => boolean;
+  triggerStatusChanged: () => Promise<void>;
+  unload: () => Promise<void>;
 };
 
 async function settleRenderer() {
@@ -108,9 +113,14 @@ async function createRendererHarness(options: {
   ) as Record<string, FakeElement>;
   const pairWithCodeCalls: string[] = [];
   const connectSelectedFoldersCalls: unknown[][] = [];
+  const statusChangedListeners: Array<(payload: unknown) => unknown> = [];
+  const windowListeners = new Map<string, Array<() => unknown>>();
   let openDownloadedUpdateCalls = 0;
   let paired = options.pairedInitially === true;
   let statusCallCount = 0;
+  let fallbackRefreshCallback: (() => unknown) | null = null;
+  let fallbackRefreshMs: number | null = null;
+  let statusChangedSubscriptionRemoved = false;
   const document = {
     createElement: (tagName: string) => new FakeElement(tagName),
     getElementById: (id: string) => {
@@ -180,6 +190,18 @@ async function createRendererHarness(options: {
             releaseNotes: [],
             state: "IDLE",
           })),
+        onStatusChanged: (listener: (payload: unknown) => unknown) => {
+          statusChangedListeners.push(listener);
+
+          return () => {
+            statusChangedSubscriptionRemoved = true;
+            const index = statusChangedListeners.indexOf(listener);
+
+            if (index >= 0) {
+              statusChangedListeners.splice(index, 1);
+            }
+          };
+        },
         onUpdateStatus: () => undefined,
         openDownloadedUpdate:
           options.openDownloadedUpdate ??
@@ -207,6 +229,21 @@ async function createRendererHarness(options: {
         quit: () => undefined,
         resumeWatching: async () => undefined,
       },
+      addEventListener: (type: string, listener: () => unknown) => {
+        windowListeners.set(type, [
+          ...(windowListeners.get(type) ?? []),
+          listener,
+        ]);
+      },
+      clearInterval: () => {
+        fallbackRefreshCallback = null;
+      },
+      setInterval: (listener: () => unknown, ms: number) => {
+        fallbackRefreshCallback = listener;
+        fallbackRefreshMs = ms;
+
+        return 1;
+      },
     },
   };
 
@@ -216,9 +253,27 @@ async function createRendererHarness(options: {
   return {
     connectSelectedFoldersCalls: () => connectSelectedFoldersCalls,
     elements,
+    fallbackRefreshMs: () => fallbackRefreshMs,
+    runFallbackRefresh: async () => {
+      await fallbackRefreshCallback?.();
+      await settleRenderer();
+    },
     openDownloadedUpdateCalls: () => openDownloadedUpdateCalls,
     pairWithCodeCalls,
     statusCallCount: () => statusCallCount,
+    statusChangedSubscriptionRemoved: () => statusChangedSubscriptionRemoved,
+    triggerStatusChanged: async () => {
+      for (const listener of statusChangedListeners) {
+        await listener({ cloudConnectionState: "ONLINE" });
+      }
+      await settleRenderer();
+    },
+    unload: async () => {
+      for (const listener of windowListeners.get("beforeunload") ?? []) {
+        await listener();
+      }
+      await settleRenderer();
+    },
   };
 }
 
@@ -363,6 +418,119 @@ describe("Bridge desktop renderer", () => {
       harness.elements.stateCopy.textContent,
       /date or time appears out of sync/,
     );
+  });
+
+  it("refreshes from checking to ready when the main process reports cloud recovery", async () => {
+    let cloudConnectionState = "UNKNOWN";
+    const harness = await createRendererHarness({
+      pairedInitially: true,
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState,
+          latestSafeCloudErrorCategory: null,
+        },
+        paired: true,
+        pairingState: "PAIRED_AND_READY",
+        roots: [],
+      }),
+    });
+
+    assert.equal(
+      harness.elements.statusBadge.textContent,
+      "Paired, checking connection",
+    );
+
+    cloudConnectionState = "ONLINE";
+    await harness.triggerStatusChanged();
+
+    assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
+    assert.equal(
+      harness.elements.stateCopy.textContent,
+      "This Mac is paired. Choose folders when Deanne is ready.",
+    );
+  });
+
+  it("refreshes from ready to unavailable when heartbeat fails", async () => {
+    let cloudConnectionState = "ONLINE";
+    const harness = await createRendererHarness({
+      pairedInitially: true,
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState,
+          latestSafeCloudErrorCategory: null,
+        },
+        paired: true,
+        pairingState: "PAIRED_AND_READY",
+        roots: [],
+      }),
+    });
+
+    assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
+
+    cloudConnectionState = "NETWORK_UNAVAILABLE";
+    await harness.triggerStatusChanged();
+
+    assert.equal(
+      harness.elements.statusBadge.textContent,
+      "Paired, connection unavailable",
+    );
+  });
+
+  it("refreshes from unavailable back to ready when heartbeat recovers", async () => {
+    let cloudConnectionState = "NETWORK_UNAVAILABLE";
+    const harness = await createRendererHarness({
+      pairedInitially: true,
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState,
+          latestSafeCloudErrorCategory: null,
+        },
+        paired: true,
+        pairingState: "PAIRED_AND_READY",
+        roots: [],
+      }),
+    });
+
+    assert.equal(
+      harness.elements.statusBadge.textContent,
+      "Paired, connection unavailable",
+    );
+
+    cloudConnectionState = "ONLINE";
+    await harness.triggerStatusChanged();
+
+    assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
+  });
+
+  it("uses a low-frequency fallback refresh and removes listeners on unload", async () => {
+    let cloudConnectionState = "UNKNOWN";
+    const harness = await createRendererHarness({
+      pairedInitially: true,
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState,
+          latestSafeCloudErrorCategory: null,
+        },
+        paired: true,
+        pairingState: "PAIRED_AND_READY",
+        roots: [],
+      }),
+    });
+
+    assert.equal(harness.fallbackRefreshMs(), 20_000);
+    assert.equal(
+      harness.elements.statusBadge.textContent,
+      "Paired, checking connection",
+    );
+
+    cloudConnectionState = "ONLINE";
+    await harness.runFallbackRefresh();
+
+    assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
+
+    await harness.unload();
+
+    assert.equal(harness.statusChangedSubscriptionRemoved(), true);
   });
 
   it("clears and hides the pairing code on cancellation", async () => {
@@ -616,6 +784,45 @@ describe("Bridge desktop app lifecycle", () => {
     assert.match(mainSource, /folderConnectionIpcResult/);
     assert.match(mainSource, /getCompletePairedBridgeIdentity/);
     assert.equal(preloadSource.includes("actualPath"), false);
+  });
+
+  it("keeps native status-change IPC narrow and renderer-driven", async () => {
+    const preloadSource = await readFile("apps/bridge/src/main/preload.ts", "utf8");
+    const mainSource = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
+    const rendererSource = bridgeRendererHtml();
+    const statusEventPayload =
+      /mainWindow\.webContents\.send\("nsn-bridge:status-changed", \{[\s\S]*?\}\);/.exec(
+        mainSource,
+      )?.[0] ?? "";
+
+    assert.match(preloadSource, /onStatusChanged/);
+    assert.match(preloadSource, /"nsn-bridge:status-changed"/);
+    assert.match(preloadSource, /removeListener\("nsn-bridge:status-changed"/);
+    assert.match(rendererSource, /window\.nsnBridge\.onStatusChanged/);
+    assert.match(rendererSource, /onStatusChanged\(\(\) => \{\s+refreshStatus\(\);/);
+    assert.match(mainSource, /sendBridgeStatusChanged\("heartbeat-success"\)/);
+    assert.match(mainSource, /sendBridgeStatusChanged\("heartbeat-failure"\)/);
+    assert.match(
+      mainSource,
+      /sendBridgeStatusChanged\("authentication-unavailable"\)/,
+    );
+    assert.match(mainSource, /sendBridgeStatusChanged\("root-sync-success"\)/);
+    assert.match(mainSource, /sendBridgeStatusChanged\("root-sync-failure"\)/);
+    assert.match(mainSource, /sendBridgeStatusChanged\("pairing-complete"/);
+    assert.equal(statusEventPayload.includes("privateKey"), false);
+    assert.equal(statusEventPayload.includes("secret"), false);
+    assert.equal(statusEventPayload.includes("bridgeDeviceId"), false);
+    assert.equal(statusEventPayload.includes("desktopStatus"), false);
+  });
+
+  it("uses a slow fallback status refresh without leaving renderer timers behind", () => {
+    const rendererSource = bridgeRendererHtml();
+
+    assert.match(rendererSource, /statusFallbackRefreshMs = 20 \* 1000/);
+    assert.match(rendererSource, /window\.setInterval\(\(\) => \{\s+refreshStatus\(\);/);
+    assert.match(rendererSource, /window\.addEventListener\("beforeunload"/);
+    assert.match(rendererSource, /window\.clearInterval\(statusRefreshInterval\)/);
+    assert.match(rendererSource, /removeStatusChangedListener\(\)/);
   });
 
   it("recovers cloud heartbeat and root sync immediately on startup", async () => {

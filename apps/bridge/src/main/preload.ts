@@ -15,6 +15,7 @@ type NsnBridgeApi = {
   downloadUpdate: () => Promise<unknown>;
   getStatus: () => Promise<unknown>;
   getUpdateStatus: () => Promise<unknown>;
+  onStatusChanged: (listener: (payload: unknown) => void) => () => void;
   onUpdateStatus: (listener: (payload: unknown) => void) => void;
   openDownloadedUpdate: () => Promise<unknown>;
   openLibrarian: () => Promise<unknown>;
@@ -58,6 +59,10 @@ const { contextBridge, ipcRenderer } = runtimeRequire("electron") as {
   ipcRenderer: {
     invoke: (channel: string, ...args: unknown[]) => Promise<unknown>;
     on: (
+      channel: string,
+      listener: (_event: unknown, payload: unknown) => void,
+    ) => void;
+    removeListener: (
       channel: string,
       listener: (_event: unknown, payload: unknown) => void,
     ) => void;
@@ -128,6 +133,21 @@ contextBridge.exposeInMainWorld("nsnBridge", {
   downloadUpdate: () => ipcRenderer.invoke("nsn-bridge:download-update"),
   getStatus: () => ipcRenderer.invoke("nsn-bridge:status"),
   getUpdateStatus: () => ipcRenderer.invoke("nsn-bridge:update-status"),
+  onStatusChanged: (listener: (payload: unknown) => void) => {
+    if (typeof listener !== "function") {
+      return () => undefined;
+    }
+
+    const ipcListener = (_event: unknown, payload: unknown) => {
+      listener(payload);
+    };
+
+    ipcRenderer.on("nsn-bridge:status-changed", ipcListener);
+
+    return () => {
+      ipcRenderer.removeListener("nsn-bridge:status-changed", ipcListener);
+    };
+  },
   onUpdateStatus: (listener: (payload: unknown) => void) => {
     if (typeof listener !== "function") {
       return;
