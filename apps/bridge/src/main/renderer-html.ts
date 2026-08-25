@@ -111,7 +111,7 @@ export function bridgeRendererHtml() {
       }
       .folder strong { overflow-wrap: anywhere; }
       .folder small { color: var(--muted); overflow-wrap: anywhere; }
-      .folder-actions { display: grid; gap: 8px; margin-top: 6px; }
+      .folder-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
       .folder-group-label {
         color: var(--muted);
         font-size: 12px;
@@ -184,7 +184,7 @@ export function bridgeRendererHtml() {
 
       <section>
         <h2>Connected Folders</h2>
-        <p>Choose folders through the native macOS picker. No manual path entry is shown here.</p>
+        <p>Choose folders through the native macOS picker. Each connected folder can be paused or resumed independently.</p>
         <div class="actions">
           <button id="chooseButton">Choose Folders</button>
           <button id="connectButton" disabled>Connect Selected Folders</button>
@@ -196,8 +196,8 @@ export function bridgeRendererHtml() {
         <h2>Watching</h2>
         <p id="watchingCopy">Watching remains read-only. File changes still require an approved plan.</p>
         <div class="actions">
-          <button id="pauseButton">Pause All Watching</button>
-          <button id="resumeButton">Resume Watching</button>
+          <button id="pauseButton">Pause All Folders</button>
+          <button id="resumeButton">Resume All Eligible Folders</button>
         </div>
       </section>
 
@@ -608,6 +608,51 @@ export function bridgeRendererHtml() {
           const disconnectButton = document.createElement("button");
           detail.textContent = (root.safeLocation || "Connected folder") + " - " + root.watcherState;
           actions.className = "folder-actions";
+
+          if (root.watchPermission) {
+            const watchButton = document.createElement("button");
+            const watching = root.watcherState === "WATCHING";
+            watchButton.type = "button";
+            watchButton.textContent = watching
+              ? "Pause Watching"
+              : root.watcherState === "PAUSED"
+                ? "Resume Watching"
+                : "Start Watching";
+            watchButton.addEventListener("click", async () => {
+              watchButton.disabled = true;
+              try {
+                const result = watching
+                  ? await window.nsnBridge.pauseFolderWatching(root.id)
+                  : await window.nsnBridge.resumeFolderWatching(root.id);
+
+                if (result && result.ok === false) {
+                  showNotice(
+                    typeof result.message === "string"
+                      ? result.message
+                      : "The Bridge could not update watching for that folder.",
+                    true,
+                  );
+                  return;
+                }
+
+                await refreshStatus();
+                showNotice(
+                  result && typeof result.message === "string"
+                    ? result.message
+                    : watching
+                      ? root.displayName + " is paused. Local files were not changed."
+                      : root.displayName + " is watching for changes again.",
+                  false,
+                );
+              } catch {
+                showNotice("The Bridge could not update watching for that folder.", true);
+              } finally {
+                watchButton.disabled = false;
+              }
+            });
+            actions.appendChild(watchButton);
+          }
+
           disconnectButton.type = "button";
           disconnectButton.className = "danger";
           disconnectButton.textContent = "Disconnect Folder";
@@ -781,8 +826,8 @@ export function bridgeRendererHtml() {
             }
           }
           watchingCopy.textContent = watchingCount > 0
-            ? "Watching " + watchingCount + " connected folder" + (watchingCount === 1 ? "." : "s.")
-            : "Watching is paused or has not been enabled for any connected folder.";
+            ? "Watching " + watchingCount + " connected folder" + (watchingCount === 1 ? ". Use each folder card above to pause or resume it independently." : "s. Use each folder card above to pause or resume them independently.")
+            : "No folder is actively watching. Resume an eligible connected folder from its card above.";
           renderFolders();
           return status;
         } catch {
@@ -892,12 +937,12 @@ export function bridgeRendererHtml() {
       document.getElementById("pauseButton").addEventListener("click", async () => {
         await window.nsnBridge.pauseWatching();
         await refreshStatus();
-        showNotice("Watching is paused. Local files were not changed.", false);
+        showNotice("Watching is paused for all eligible folders. Local files were not changed.", false);
       });
       document.getElementById("resumeButton").addEventListener("click", async () => {
         await window.nsnBridge.resumeWatching();
         await refreshStatus();
-        showNotice("Watching resumed for folders that permit it.", false);
+        showNotice("Watching resumed for all folders that permit it.", false);
       });
       updatesButton.addEventListener("click", async () => {
         renderUpdateResult({ state: "CHECKING", currentVersion: "", latestVersion: "", releaseNotes: [] });
