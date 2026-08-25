@@ -18,7 +18,8 @@ const watchingRefreshDelayMs = 4_000;
 const idleRefreshDelayMs = 10_000;
 
 function monitoringSignature(libraries: ConnectedLibrarySummary[]) {
-  return libraries
+  return [...libraries]
+    .sort((left, right) => left.id.localeCompare(right.id))
     .map((library) =>
       [
         library.id,
@@ -27,7 +28,6 @@ function monitoringSignature(libraries: ConnectedLibrarySummary[]) {
         library.monitoringState,
         library.recentChangeCount,
         library.itemsNeedingAttention,
-        library.monitoringHeartbeatAt ?? "",
         library.lastDetectedChangeAt ?? "",
       ].join(":"),
     )
