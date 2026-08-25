@@ -11,6 +11,68 @@ import { BridgeCloudError } from "@/lib/bridge/cloud-coordinator";
 
 const nonceRetentionMs = 10 * 60 * 1000;
 
+function isMissingBridgeRequestNonceTable(error: unknown) {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+
+  const record = error as {
+    code?: unknown;
+    message?: unknown;
+    meta?: unknown;
+  };
+  const meta =
+    typeof record.meta === "object" && record.meta !== null
+      ? (record.meta as { code?: unknown; message?: unknown })
+      : null;
+  const message = [record.message, meta?.message]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+
+  return (
+    meta?.code === "42P01" ||
+    (record.code === "P2010" &&
+      /BridgeRequestNonce/iu.test(message) &&
+      /does not exist/iu.test(message))
+  );
+}
+
+async function createBridgeRequestNonceTable() {
+  const prisma = getPrismaClient();
+
+  await prisma.$executeRawUnsafe(`
+    CREATE TABLE IF NOT EXISTS "BridgeRequestNonce" (
+      "id" TEXT NOT NULL,
+      "bridgeDeviceId" TEXT NOT NULL,
+      "nonceHash" TEXT NOT NULL,
+      "expiresAt" TIMESTAMP(3) NOT NULL,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "BridgeRequestNonce_pkey" PRIMARY KEY ("id")
+    )
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE UNIQUE INDEX IF NOT EXISTS "BridgeRequestNonce_nonceHash_key"
+      ON "BridgeRequestNonce"("nonceHash")
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "BridgeRequestNonce_bridgeDeviceId_idx"
+      ON "BridgeRequestNonce"("bridgeDeviceId")
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "BridgeRequestNonce_expiresAt_idx"
+      ON "BridgeRequestNonce"("expiresAt")
+  `);
+}
+
+async function deleteExpiredBridgeRequestNonces(now: Date) {
+  const prisma = getPrismaClient();
+
+  await prisma.$executeRaw`
+    DELETE FROM "BridgeRequestNonce"
+    WHERE "expiresAt" <= ${now}
+  `;
+}
+
 async function consumeBridgeRequestNonce(
   bridgeDeviceId: string,
   nonce: string,
@@ -22,10 +84,21 @@ async function consumeBridgeRequestNonce(
     .update(`${bridgeDeviceId}:${nonce}`)
     .digest("hex");
 
-  await prisma.$executeRaw`
-    DELETE FROM "BridgeRequestNonce"
-    WHERE "expiresAt" <= ${now}
-  `;
+  try {
+    await deleteExpiredBridgeRequestNonces(now);
+  } catch (error) {
+    if (!isMissingBridgeRequestNonceTable(error)) {
+      throw error;
+    }
+
+    // Production receives this table through Prisma migrations. Integration
+    // tests build isolated schemas with `prisma db push`, which does not replay
+    // the legacy raw-SQL repair migration. Recreate only when PostgreSQL reports
+    // that the replay-protection table is actually missing.
+    await createBridgeRequestNonceTable();
+    await deleteExpiredBridgeRequestNonces(now);
+  }
+
   const inserted = await prisma.$queryRaw<Array<{ id: string }>>`
     INSERT INTO "BridgeRequestNonce"
       ("id", "bridgeDeviceId", "nonceHash", "expiresAt", "createdAt")
