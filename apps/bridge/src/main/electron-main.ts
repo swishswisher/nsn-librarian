@@ -397,6 +397,61 @@ export async function startElectronBridgeApp() {
     return results;
   }
 
+  async function updateSingleFolderWatching(
+    rootId: unknown,
+    action: "pause" | "resume",
+  ) {
+    if (typeof rootId !== "string" || rootId.trim().length === 0) {
+      return {
+        code: "INVALID_ROOT_ID",
+        message: "The connected folder could not be identified.",
+        ok: false,
+      };
+    }
+
+    const roots = await listRoots();
+    const root = roots.find(
+      (candidate) =>
+        candidate.id === rootId && candidate.status !== "DISCONNECTED",
+    );
+
+    if (!root) {
+      return {
+        code: "ROOT_NOT_CONNECTED",
+        message: "That folder is no longer connected to NSN Librarian.",
+        ok: false,
+      };
+    }
+
+    if (!root.watchPermission) {
+      return {
+        code: "WATCH_PERMISSION_REQUIRED",
+        message: "Enable Watch for changes for this folder in NSN Librarian first.",
+        ok: false,
+      };
+    }
+
+    const updatedRoot =
+      action === "pause"
+        ? await pauseBridgeWatcher(root.id)
+        : await resumeBridgeWatcher(root.id);
+
+    await syncLocalRoots(true);
+    sendBridgeStatusChanged(
+      action === "pause" ? "single-folder-watcher-paused" : "single-folder-watcher-resumed",
+      { force: true },
+    );
+
+    return {
+      message:
+        action === "pause"
+          ? `${root.displayName} is paused. Local files were not changed.`
+          : `${root.displayName} is watching for changes again.`,
+      ok: true,
+      root: updatedRoot,
+    };
+  }
+
   async function confirmFolderDisconnect(root: { displayName: string }) {
     const choice = await electron.dialog.showMessageBox(createMainWindow(), {
       buttons: ["Cancel", "Disconnect Folder"],
@@ -606,6 +661,16 @@ export async function startElectronBridgeApp() {
   });
   electron.ipcMain.handle("nsn-bridge:pause-watching", pauseAllWatching);
   electron.ipcMain.handle("nsn-bridge:resume-watching", resumeAllWatching);
+  electron.ipcMain.handle(
+    "nsn-bridge:pause-folder-watching",
+    (_event: unknown, rootId: unknown) =>
+      updateSingleFolderWatching(rootId, "pause"),
+  );
+  electron.ipcMain.handle(
+    "nsn-bridge:resume-folder-watching",
+    (_event: unknown, rootId: unknown) =>
+      updateSingleFolderWatching(rootId, "resume"),
+  );
   electron.ipcMain.handle(
     "nsn-bridge:disconnect-folder",
     async (_event: unknown, rootId: unknown) =>
