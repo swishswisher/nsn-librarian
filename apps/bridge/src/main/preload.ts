@@ -21,8 +21,10 @@ type NsnBridgeApi = {
   openDownloadedUpdate: () => Promise<unknown>;
   openLibrarian: () => Promise<unknown>;
   pairWithCode: (code: string) => Promise<unknown>;
+  pauseFolderWatching: (rootId: string) => Promise<unknown>;
   pauseWatching: () => Promise<unknown>;
   quit: () => Promise<unknown>;
+  resumeFolderWatching: (rootId: string) => Promise<unknown>;
   resumeWatching: () => Promise<unknown>;
 };
 
@@ -170,8 +172,12 @@ contextBridge.exposeInMainWorld("nsnBridge", {
     ipcRenderer.invoke("nsn-bridge:open-downloaded-update"),
   openLibrarian: () => ipcRenderer.invoke("nsn-bridge:open-librarian"),
   pairWithCode: (code: string) => ipcRenderer.invoke("nsn-bridge:pair", code),
+  pauseFolderWatching: (rootId: string) =>
+    ipcRenderer.invoke("nsn-bridge:pause-folder-watching", rootId),
   pauseWatching: () => ipcRenderer.invoke("nsn-bridge:pause-watching"),
   quit: () => ipcRenderer.invoke("nsn-bridge:quit"),
+  resumeFolderWatching: (rootId: string) =>
+    ipcRenderer.invoke("nsn-bridge:resume-folder-watching", rootId),
   resumeWatching: () => ipcRenderer.invoke("nsn-bridge:resume-watching"),
 });
 
