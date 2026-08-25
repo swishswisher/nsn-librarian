@@ -1,6 +1,7 @@
 import { headers } from "next/headers";
 import Link from "next/link";
 
+import { LibraryQuickNav } from "@/components/library/LibraryQuickNav";
 import { NsnBadge } from "@/components/library/NsnBadge";
 import { NsnCard } from "@/components/library/NsnCard";
 import { getBridgeReleaseManifest } from "@/lib/bridge/release-manifest";
@@ -95,6 +96,8 @@ export default async function BridgeDownloadPage() {
   return (
     <main className="min-h-screen bg-[var(--nsn-cream)] px-4 py-8 text-[var(--nsn-navy)] sm:px-6 lg:px-8">
       <div className="mx-auto grid w-full max-w-5xl gap-8">
+        <LibraryQuickNav />
+
         <header className="grid min-w-0 gap-5 rounded-xl border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] px-4 py-6 sm:px-6 lg:px-8">
           <div className="flex flex-wrap gap-2">
             <NsnBadge tone="approved">Mac companion app</NsnBadge>
