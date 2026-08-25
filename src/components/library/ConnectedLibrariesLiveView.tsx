@@ -69,10 +69,6 @@ export function ConnectedLibrariesLiveView({
   const signature = useMemo(() => monitoringSignature(libraries), [libraries]);
 
   useEffect(() => {
-    setLibraries(initialLibraries);
-  }, [initialLibraries]);
-
-  useEffect(() => {
     let cancelled = false;
 
     const refresh = async () => {
