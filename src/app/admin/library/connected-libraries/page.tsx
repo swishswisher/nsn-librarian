@@ -1,4 +1,4 @@
-import { ConnectedLibrariesManager } from "@/components/library/ConnectedLibrariesManager";
+import { ConnectedLibrariesLiveView } from "@/components/library/ConnectedLibrariesLiveView";
 import { LibraryShell } from "@/components/library/LibraryShell";
 import { NsnPageHeader } from "@/components/library/NsnPageHeader";
 import { getBridgeCloudStatus } from "@/lib/bridge/cloud-coordinator";
@@ -69,7 +69,7 @@ export default async function ConnectedLibrariesPage() {
           title="Connected Libraries"
         />
 
-        <ConnectedLibrariesManager
+        <ConnectedLibrariesLiveView
           initialBridgeHealth={bridgeHealth}
           initialLibraries={libraries}
         />
