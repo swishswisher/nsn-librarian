@@ -14,7 +14,8 @@ type ConnectedLibrariesLiveViewProps = {
   initialLibraries: ConnectedLibrarySummary[];
 };
 
-const liveRefreshDelayMs = 4_000;
+const watchingRefreshDelayMs = 4_000;
+const idleRefreshDelayMs = 10_000;
 
 function monitoringSignature(libraries: ConnectedLibrarySummary[]) {
   return libraries
@@ -62,6 +63,9 @@ export function ConnectedLibrariesLiveView({
   const hasWatchingLibrary = libraries.some(
     (library) => library.monitoringState === "WATCHING",
   );
+  const refreshDelayMs = hasWatchingLibrary
+    ? watchingRefreshDelayMs
+    : idleRefreshDelayMs;
   const signature = useMemo(() => monitoringSignature(libraries), [libraries]);
 
   useEffect(() => {
@@ -69,10 +73,6 @@ export function ConnectedLibrariesLiveView({
   }, [initialLibraries]);
 
   useEffect(() => {
-    if (!hasWatchingLibrary) {
-      return;
-    }
-
     let cancelled = false;
 
     const refresh = async () => {
@@ -101,7 +101,7 @@ export function ConnectedLibrariesLiveView({
 
     const interval = window.setInterval(() => {
       void refresh();
-    }, liveRefreshDelayMs);
+    }, refreshDelayMs);
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") {
         void refresh();
@@ -115,7 +115,7 @@ export function ConnectedLibrariesLiveView({
       window.clearInterval(interval);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [hasWatchingLibrary]);
+  }, [refreshDelayMs]);
 
   return (
     <ConnectedLibrariesManager
