@@ -1,6 +1,7 @@
 import Link from "next/link";
 
 import { BridgePairingPanel } from "@/components/library/BridgePairingPanel";
+import { LibraryQuickNav } from "@/components/library/LibraryQuickNav";
 import { NsnBadge } from "@/components/library/NsnBadge";
 import { NsnCard } from "@/components/library/NsnCard";
 
@@ -10,6 +11,8 @@ export default function ConnectThisMacPage() {
   return (
     <main className="min-h-screen bg-[var(--nsn-cream)] px-4 py-8 text-[var(--nsn-navy)] sm:px-6 lg:px-8">
       <div className="mx-auto grid w-full max-w-4xl gap-6">
+        <LibraryQuickNav />
+
         <header className="grid min-w-0 gap-4 rounded-xl border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] px-4 py-6 sm:px-6 lg:px-8">
           <NsnBadge tone="approved">Secure pairing</NsnBadge>
           <h1 className="nsn-display break-words text-4xl leading-tight [overflow-wrap:anywhere] sm:text-5xl">
