@@ -16,6 +16,7 @@ import {
 } from "../../../../packages/bridge-protocol/src";
 import {
   BridgeAppError,
+  type BridgeChangeEvent,
   type BridgeRootSummary,
 } from "../../../../bridge-app/src/types";
 
@@ -27,7 +28,11 @@ import {
 } from "./keychain";
 
 let runtimeAppVersion = process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0";
-type BridgeCloudDiagnosticOperation = "commands" | "heartbeat" | "root-sync";
+type BridgeCloudDiagnosticOperation =
+  | "commands"
+  | "heartbeat"
+  | "root-sync"
+  | "watch-events";
 type BridgeCloudDiagnosticStage =
   | "COMPLETE_IDENTITY_LOADED"
   | "FETCH_RESPONSE_RECEIVED"
@@ -629,6 +634,32 @@ export async function syncBridgeRoots(roots: BridgeRootSummary[]) {
       roots,
     },
     { authenticated: true, diagnosticOperation: "root-sync", identity },
+  );
+}
+
+export async function sendBridgeWatchEvents(events: BridgeChangeEvent[]) {
+  if (events.length === 0) {
+    return {
+      acceptedEventIds: [],
+      duplicateEventIds: [],
+      ok: true,
+    };
+  }
+
+  const identity = await requireCompletePairedBridgeIdentity();
+
+  return postJson<{
+    acceptedEventIds: string[];
+    duplicateEventIds: string[];
+    ok: true;
+  }>(
+    `/api/bridge/cloud/devices/${encodeURIComponent(
+      identity.bridgeDeviceId,
+    )}/watch-events`,
+    {
+      events,
+    },
+    { authenticated: true, diagnosticOperation: "watch-events", identity },
   );
 }
 

@@ -20,9 +20,13 @@ import {
 } from "../src/main/registry";
 import { getOrCreatePairingSecret } from "../src/security/pairing";
 import {
+  acknowledgeBridgeWatcherEvents,
   isWatching,
+  listBridgeWatcherEvents,
   pauseBridgeWatcher,
   resumeBridgeWatcher,
+  resetBridgeWatcherRuntimeForTests,
+  restorePersistedBridgeWatchers,
   startBridgeWatcher,
   stopBridgeWatcher,
   takeBridgeWatcherEvents,
@@ -241,6 +245,97 @@ describe("NSN Bridge core", () => {
     );
 
     await stopBridgeWatcher(root.id);
+  });
+
+  it("keeps watcher events until cloud delivery acknowledges them", async () => {
+    const folder = await makeSafeFolder("library-c-outbox");
+    const root = await connectFolder(folder, {
+      watchPermission: true,
+    });
+
+    await startBridgeWatcher(root.id);
+    await writeFile(path.join(folder, "outbox-test.txt"), "version 1");
+
+    const drainedForLocalClient = await waitForWatcherEvents(root.id);
+
+    assert.equal(drainedForLocalClient.length > 0, true);
+
+    await writeFile(path.join(folder, "outbox-test.txt"), "version 2");
+
+    const pending = await waitForWatcherEvents(root.id);
+
+    assert.equal(pending.length > 0, true);
+    assert.equal(
+      (await listBridgeWatcherEvents({ rootId: root.id })).length,
+      0,
+    );
+
+    await writeFile(path.join(folder, "outbox-cloud-test.txt"), "version 1");
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    const cloudPending = await listBridgeWatcherEvents({ rootId: root.id });
+
+    assert.equal(cloudPending.length > 0, true);
+
+    const firstEventId = cloudPending[0]?.id;
+
+    assert.ok(firstEventId);
+    assert.equal(
+      (await listBridgeWatcherEvents({ rootId: root.id })).some(
+        (event) => event.id === firstEventId,
+      ),
+      true,
+    );
+
+    await acknowledgeBridgeWatcherEvents([firstEventId]);
+
+    assert.equal(
+      (await listBridgeWatcherEvents({ rootId: root.id })).some(
+        (event) => event.id === firstEventId,
+      ),
+      false,
+    );
+
+    await stopBridgeWatcher(root.id);
+  });
+
+  it("restores only persisted WATCHING roots after Bridge restart", async () => {
+    const watchingFolder = await makeSafeFolder("library-c-restore-watching");
+    const pausedFolder = await makeSafeFolder("library-c-restore-paused");
+    const watchingRoot = await connectFolder(watchingFolder, {
+      watchPermission: true,
+    });
+    const pausedRoot = await connectFolder(pausedFolder, {
+      watchPermission: true,
+    });
+
+    await startBridgeWatcher(watchingRoot.id);
+    await startBridgeWatcher(pausedRoot.id);
+    await pauseBridgeWatcher(pausedRoot.id);
+
+    assert.equal(isWatching(watchingRoot.id), true);
+    assert.equal(isWatching(pausedRoot.id), false);
+
+    resetBridgeWatcherRuntimeForTests();
+
+    assert.equal(isWatching(watchingRoot.id), false);
+    assert.equal(isWatching(pausedRoot.id), false);
+
+    await restorePersistedBridgeWatchers();
+
+    assert.equal(isWatching(watchingRoot.id), true);
+    assert.equal(isWatching(pausedRoot.id), false);
+
+    await writeFile(path.join(watchingFolder, "after-restore.txt"), "restored");
+
+    const events = await waitForWatcherEvents(watchingRoot.id);
+
+    assert.equal(
+      events.some((event) => event.relativePath === "after-restore.txt"),
+      true,
+    );
+
+    await stopBridgeWatcher(watchingRoot.id);
   });
 
   it("reports an unavailable root safely when watching starts", async () => {

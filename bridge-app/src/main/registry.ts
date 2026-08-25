@@ -293,6 +293,12 @@ export async function getRoot(rootId: string) {
   return root;
 }
 
+export async function listRootRecords() {
+  const registry = await readRegistry();
+
+  return registry.roots.map((root) => ({ ...root }));
+}
+
 export async function getRootSummary(rootId: string) {
   return summarizeBridgeRoot(await getRoot(rootId));
 }

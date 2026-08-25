@@ -5,7 +5,10 @@ import { createBridgeServer } from "../../../../bridge-app/src/api/server";
 import { listRoots } from "../../../../bridge-app/src/main/registry";
 import {
   pauseBridgeWatcher,
+  acknowledgeBridgeWatcherEvents,
+  listBridgeWatcherEvents,
   resumeBridgeWatcher,
+  restorePersistedBridgeWatchers,
 } from "../../../../bridge-app/src/watcher/watcher";
 import { processPendingBridgeCommands } from "./command-runner";
 import { bridgeRendererHtml } from "./renderer-html";
@@ -16,6 +19,7 @@ import {
   getCompletePairedBridgeIdentity,
   pairBridgeWithCloud,
   sendBridgeHeartbeat,
+  sendBridgeWatchEvents,
   setBridgeRuntimeAppVersion,
   syncBridgeRoots,
 } from "./cloud-client";
@@ -275,6 +279,24 @@ export async function startElectronBridgeApp() {
     }
   }
 
+  async function deliverWatcherEvents() {
+    const events = await listBridgeWatcherEvents({ limit: 100 });
+
+    if (events.length === 0) {
+      return { delivered: 0 };
+    }
+
+    const result = await sendBridgeWatchEvents(events);
+    const acknowledgedIds = [
+      ...(Array.isArray(result.acceptedEventIds) ? result.acceptedEventIds : []),
+      ...(Array.isArray(result.duplicateEventIds) ? result.duplicateEventIds : []),
+    ];
+
+    await acknowledgeBridgeWatcherEvents(acknowledgedIds);
+
+    return { delivered: acknowledgedIds.length };
+  }
+
   async function safeBridgePairingStateForConnection() {
     const identity = await getCompletePairedBridgeIdentity();
 
@@ -438,6 +460,13 @@ export async function startElectronBridgeApp() {
 
       if (!recovery.ok) {
         return [];
+      }
+
+      try {
+        await deliverWatcherEvents();
+      } catch (error) {
+        cloudState.recordCloudFailure(error);
+        sendBridgeStatusChanged("watch-event-delivery-failure");
       }
 
       let reports: Awaited<ReturnType<typeof processPendingBridgeCommands>> = [];
@@ -630,7 +659,9 @@ export async function startElectronBridgeApp() {
   buildMenu();
   createMainWindow();
 
-  void recoverCloudConnection(true)
+  void restorePersistedBridgeWatchers()
+    .catch(() => undefined)
+    .then(() => recoverCloudConnection(true))
     .then(() => pollCloud())
     .catch(() => undefined)
     .finally(() => scheduleCommandPoll());

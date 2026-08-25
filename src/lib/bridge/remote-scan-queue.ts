@@ -14,6 +14,7 @@ import {
 
 import { getBridgeScanSessionProgress } from "./scan-sessions";
 import { queueRemoteReadCommand } from "./remote-read-commands";
+import { ingestBridgeWatchEvents } from "./monitor";
 import type {
   BridgeAudioMetadataDraft,
   BridgeFolderScanResult,
@@ -238,6 +239,12 @@ function scanResultFromReport(
     totalFiles: files.length,
     unsupportedFiles,
   };
+}
+
+function watchEventsFromReport(rawResult: unknown) {
+  const outer = objectValue(rawResult);
+
+  return Array.isArray(outer?.events) ? outer.events : [];
 }
 
 function initialReadingStatus(file: BridgeScannedFileDraft) {
@@ -640,6 +647,12 @@ export async function importRemoteBridgeScanReport(input: {
       safeErrorCategory:
         input.report.safeErrorCategory ?? "BRIDGE_SCAN_FAILED",
     };
+  }
+
+  const watchEvents = watchEventsFromReport(input.report.result);
+
+  if (watchEvents.length > 0) {
+    await ingestBridgeWatchEvents(input.bridgeDeviceId, watchEvents);
   }
 
   const scan = scanResultFromReport(input.report.result, input.bridgeRootId);

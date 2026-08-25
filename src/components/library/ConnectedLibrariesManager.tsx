@@ -278,6 +278,17 @@ function permissionsFromLibrary(
   };
 }
 
+function monitoringEndpointForLibrary(
+  library: ConnectedLibrarySummary,
+  action: "pause" | "resume" | "start",
+) {
+  const encodedId = encodeURIComponent(library.id);
+
+  return library.bridgeDeviceId
+    ? `/api/bridge/cloud-monitor/${encodedId}/${action}`
+    : `/api/bridge/monitor/${encodedId}/${action}`;
+}
+
 function wait(ms: number) {
   return new Promise<void>((resolve) => {
     window.setTimeout(resolve, ms);
@@ -1030,6 +1041,42 @@ export function ConnectedLibrariesManager({
 
       if (payload.library) {
         replaceLibrary(payload.library);
+      }
+
+      if (payload.commandId && library.bridgeDeviceId) {
+        for (let attempt = 0; attempt < 30; attempt += 1) {
+          await wait(2_000);
+
+          const statusResponse = await fetch(
+            `/api/bridge/cloud-monitor/${encodeURIComponent(
+              library.id,
+            )}/commands/${encodeURIComponent(payload.commandId)}`,
+          );
+          const statusPayload = await readPermissionUpdateStatus(
+            statusResponse,
+          );
+
+          if (statusPayload.library) {
+            replaceLibrary(statusPayload.library);
+          }
+
+          if (!statusPayload.ok && statusPayload.done) {
+            setError(statusPayload.error);
+            router.refresh();
+            return;
+          }
+
+          if (statusPayload.done) {
+            setNotice(message);
+            router.refresh();
+            return;
+          }
+        }
+
+        setError(
+          "The watching update is still waiting for the Bridge. Refresh this page in a moment.",
+        );
+        return;
       }
 
       setNotice(payload.message ?? message);
@@ -1891,9 +1938,7 @@ export function ConnectedLibrariesManager({
                       onClick={() =>
                         monitoringCommand(
                           library,
-                          `/api/bridge/monitor/${encodeURIComponent(
-                            library.id,
-                          )}/pause`,
+                          monitoringEndpointForLibrary(library, "pause"),
                           "Watching paused.",
                           "pause",
                         )
@@ -1911,13 +1956,12 @@ export function ConnectedLibrariesManager({
                       onClick={() =>
                         monitoringCommand(
                           library,
-                          `/api/bridge/monitor/${encodeURIComponent(
-                            library.id,
-                          )}/${
+                          monitoringEndpointForLibrary(
+                            library,
                             library.monitoringState === "PAUSED"
                               ? "resume"
-                              : "start"
-                          }`,
+                              : "start",
+                          ),
                           library.monitoringState === "PAUSED"
                             ? "Watching resumed."
                             : "Watching started.",

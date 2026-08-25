@@ -6,6 +6,7 @@ import { after, before, beforeEach, test } from "node:test";
 import { PrismaClient } from "@prisma/client";
 
 import {
+  createBridgeDeviceRequestHeaders,
   createBridgeDeviceId,
   createBridgeKeyPair,
 } from "../../packages/bridge-protocol/src";
@@ -21,7 +22,12 @@ let BridgeCloudError: typeof import("../../src/lib/bridge/cloud-coordinator").Br
 let prepareBridgeCommandReportForPersistence: typeof import("../../src/lib/bridge/cloud-command-results").prepareBridgeCommandReportForPersistence;
 let updateConnectedLibrary: typeof import("../../src/lib/bridge/connected-libraries").updateConnectedLibrary;
 let getConnectedLibraryPermissionUpdateStatus: typeof import("../../src/lib/bridge/connected-libraries").getConnectedLibraryPermissionUpdateStatus;
+let getConnectedLibrary: typeof import("../../src/lib/bridge/connected-libraries").getConnectedLibrary;
 let syncBridgeDeviceRoots: typeof import("../../src/lib/bridge/device-root-sync").syncBridgeDeviceRoots;
+let queueRemoteMonitoringAction: typeof import("../../src/lib/bridge/remote-monitoring").queueRemoteMonitoringAction;
+let getRemoteMonitoringActionStatus: typeof import("../../src/lib/bridge/remote-monitoring").getRemoteMonitoringActionStatus;
+let ingestBridgeWatchEvents: typeof import("../../src/lib/bridge/monitor").ingestBridgeWatchEvents;
+let getMonitoringDashboardData: typeof import("../../src/lib/bridge/monitor").getMonitoringDashboardData;
 let expireRemoteReadCommandsForSession: typeof import("../../src/lib/bridge/remote-read-commands").expireRemoteReadCommandsForSession;
 let markRemoteReadFailure: typeof import("../../src/lib/bridge/remote-read-commands").markRemoteReadFailure;
 let queueRemoteReadRetryForScannedFile: typeof import("../../src/lib/bridge/remote-read-commands").queueRemoteReadRetryForScannedFile;
@@ -98,12 +104,20 @@ before(async () => {
   acknowledgeBridgeCloudCommand = coordinator.acknowledgeBridgeCloudCommand;
   BridgeCloudError = coordinator.BridgeCloudError;
   const connectedLibraries = await import("../../src/lib/bridge/connected-libraries");
+  const remoteMonitoring = await import("../../src/lib/bridge/remote-monitoring");
+  const bridgeMonitor = await import("../../src/lib/bridge/monitor");
   prepareBridgeCommandReportForPersistence =
     commandResults.prepareBridgeCommandReportForPersistence;
   updateConnectedLibrary = connectedLibraries.updateConnectedLibrary;
+  getConnectedLibrary = connectedLibraries.getConnectedLibrary;
   getConnectedLibraryPermissionUpdateStatus =
     connectedLibraries.getConnectedLibraryPermissionUpdateStatus;
   syncBridgeDeviceRoots = deviceRootSync.syncBridgeDeviceRoots;
+  queueRemoteMonitoringAction = remoteMonitoring.queueRemoteMonitoringAction;
+  getRemoteMonitoringActionStatus =
+    remoteMonitoring.getRemoteMonitoringActionStatus;
+  ingestBridgeWatchEvents = bridgeMonitor.ingestBridgeWatchEvents;
+  getMonitoringDashboardData = bridgeMonitor.getMonitoringDashboardData;
   expireRemoteReadCommandsForSession =
     remoteReadCommands.expireRemoteReadCommandsForSession;
   markRemoteReadFailure = remoteReadCommands.markRemoteReadFailure;
@@ -241,7 +255,7 @@ async function createCloudScannedFile(
     },
   });
 
-  return { bridgeRootId, device, library, scannedFile, session };
+  return { bridgeRootId, device, keys, library, scannedFile, session };
 }
 
 function cloudRootSummary(
@@ -865,4 +879,340 @@ test("watch permission requires read permission and disabling read disables watc
   assert.equal(updated.readPermission, false);
   assert.equal(updated.watchPermission, false);
   assert.equal(updated.monitoringState, "STOPPED");
+});
+
+test("watch permission does not imply an active cloud watcher", async () => {
+  const bridgeRootId = "root_aaaaaaaaaaaaaaaaaaaaaaaa";
+  const { device, library } = await createCloudScannedFile({
+    bridgeRootId,
+    relativePath: "Notes/watcher-paused.txt",
+  });
+
+  await prisma.connectedLibrary.update({
+    data: {
+      monitoringHeartbeatAt: new Date(),
+      monitoringState: "WATCHING",
+      readPermission: true,
+      watchPermission: true,
+    },
+    where: { id: library.id },
+  });
+
+  await syncBridgeDeviceRoots(device.bridgeDeviceId, [
+    cloudRootSummary(bridgeRootId, {
+      lastWatchingAt: null,
+      updatedAt: "2026-08-01T00:00:05.000Z",
+      watcherState: "PAUSED",
+      watchPermission: true,
+    }),
+  ]);
+
+  const updated = await prisma.connectedLibrary.findUniqueOrThrow({
+    where: { id: library.id },
+  });
+
+  assert.equal(updated.watchPermission, true);
+  assert.equal(updated.monitoringState, "PAUSED");
+  assert.equal(updated.monitoringHeartbeatAt, null);
+});
+
+test("remote monitoring commands persist only after native watcher confirmation", async () => {
+  const bridgeRootId = "root_bbbbbbbbbbbbbbbbbbbbbbbb";
+  const { device, library } = await createCloudScannedFile({
+    bridgeRootId,
+    relativePath: "Notes/start-watching.txt",
+  });
+
+  await prisma.connectedLibrary.update({
+    data: {
+      monitoringState: "PAUSED",
+      readPermission: true,
+      watchPermission: true,
+    },
+    where: { id: library.id },
+  });
+
+  const queued = await queueRemoteMonitoringAction(library.id, "start");
+  const afterQueue = await prisma.connectedLibrary.findUniqueOrThrow({
+    where: { id: library.id },
+  });
+
+  assert.equal(afterQueue.monitoringState, "PAUSED");
+  assert.equal(queued.library.monitoringState, "PAUSED");
+
+  await acknowledgeBridgeCloudCommand(device.bridgeDeviceId, queued.commandId);
+  const prepared = await prepareBridgeCommandReportForPersistence(
+    device.bridgeDeviceId,
+    {
+      commandId: queued.commandId,
+      result: cloudRootSummary(bridgeRootId, {
+        lastWatchingAt: "2026-08-01T00:01:00.000Z",
+        updatedAt: "2026-08-01T00:01:00.000Z",
+        watcherState: "WATCHING",
+        watchPermission: true,
+      }),
+      safeErrorCategory: null,
+      status: "COMPLETED",
+    },
+  );
+  await completeBridgeCloudCommand(device.bridgeDeviceId, prepared);
+
+  const status = await getRemoteMonitoringActionStatus(
+    library.id,
+    queued.commandId,
+  );
+  const afterComplete = await prisma.connectedLibrary.findUniqueOrThrow({
+    where: { id: library.id },
+  });
+
+  assert.equal(status.status, "COMPLETED");
+  assert.equal(afterComplete.monitoringState, "WATCHING");
+  assert.notEqual(afterComplete.monitoringStartedAt, null);
+  assert.notEqual(afterComplete.monitoringHeartbeatAt, null);
+});
+
+test("failed remote monitoring command keeps the previous confirmed watcher state", async () => {
+  const bridgeRootId = "root_eeeeeeeeeeeeeeeeeeeeeeee";
+  const { device, library } = await createCloudScannedFile({
+    bridgeRootId,
+    relativePath: "Notes/failed-start.txt",
+  });
+
+  await prisma.connectedLibrary.update({
+    data: {
+      monitoringState: "PAUSED",
+      readPermission: true,
+      watchPermission: true,
+    },
+    where: { id: library.id },
+  });
+
+  const queued = await queueRemoteMonitoringAction(library.id, "start");
+
+  await acknowledgeBridgeCloudCommand(device.bridgeDeviceId, queued.commandId);
+  await completeBridgeCloudCommand(device.bridgeDeviceId, {
+    commandId: queued.commandId,
+    result: null,
+    safeErrorCategory: "WATCHER_START_FAILED",
+    status: "FAILED",
+  });
+
+  const status = await getRemoteMonitoringActionStatus(
+    library.id,
+    queued.commandId,
+  );
+  const unchanged = await prisma.connectedLibrary.findUniqueOrThrow({
+    where: { id: library.id },
+  });
+
+  assert.equal(status.status, "FAILED");
+  assert.equal("error" in status, true);
+  assert.equal(unchanged.monitoringState, "PAUSED");
+});
+
+test("completed pause command marks the cloud watcher paused from native truth", async () => {
+  const bridgeRootId = "root_ffffffffffffffffffffffff";
+  const { device, library } = await createCloudScannedFile({
+    bridgeRootId,
+    relativePath: "Notes/pause-watching.txt",
+  });
+
+  await prisma.connectedLibrary.update({
+    data: {
+      monitoringHeartbeatAt: new Date(),
+      monitoringStartedAt: new Date(),
+      monitoringState: "WATCHING",
+      readPermission: true,
+      watchPermission: true,
+    },
+    where: { id: library.id },
+  });
+
+  const queued = await queueRemoteMonitoringAction(library.id, "pause");
+
+  await acknowledgeBridgeCloudCommand(device.bridgeDeviceId, queued.commandId);
+  const prepared = await prepareBridgeCommandReportForPersistence(
+    device.bridgeDeviceId,
+    {
+      commandId: queued.commandId,
+      result: cloudRootSummary(bridgeRootId, {
+        updatedAt: "2026-08-01T00:02:00.000Z",
+        watcherState: "PAUSED",
+        watchPermission: true,
+      }),
+      safeErrorCategory: null,
+      status: "COMPLETED",
+    },
+  );
+  await completeBridgeCloudCommand(device.bridgeDeviceId, prepared);
+
+  const paused = await prisma.connectedLibrary.findUniqueOrThrow({
+    where: { id: library.id },
+  });
+
+  assert.equal(paused.monitoringState, "PAUSED");
+  assert.equal(paused.monitoringHeartbeatAt, null);
+  assert.notEqual(paused.monitoringPausedAt, null);
+});
+
+test("cloud watch event ingestion is idempotent and updates monitoring summary", async () => {
+  const bridgeRootId = "root_111111111111111111111111";
+  const { device, library } = await createCloudScannedFile({
+    bridgeRootId,
+    relativePath: "Notes/event-source.txt",
+  });
+
+  await prisma.connectedLibrary.update({
+    data: {
+      monitoringState: "WATCHING",
+      readPermission: true,
+      watchPermission: true,
+    },
+    where: { id: library.id },
+  });
+
+  const first = await ingestBridgeWatchEvents(device.bridgeDeviceId, [
+    {
+      detectedAt: new Date().toISOString(),
+      eventId: "evt_cloud_create",
+      eventType: "FILE_ADDED",
+      relativePath: "Inbox/watching-test.txt",
+      rootId: bridgeRootId,
+    },
+  ]);
+  const second = await ingestBridgeWatchEvents(device.bridgeDeviceId, [
+    {
+      detectedAt: new Date().toISOString(),
+      eventId: "evt_cloud_create",
+      eventType: "FILE_ADDED",
+      relativePath: "Inbox/watching-test.txt",
+      rootId: bridgeRootId,
+    },
+  ]);
+  const storedEvents = await prisma.monitoringEvent.findMany();
+  const summary = await getConnectedLibrary(library.id);
+
+  assert.deepEqual(first.acceptedEventIds, ["evt_cloud_create"]);
+  assert.deepEqual(second.duplicateEventIds, ["evt_cloud_create"]);
+  assert.equal(storedEvents.length, 1);
+  assert.equal(storedEvents[0]?.eventType, "FILE_ADDED");
+  assert.equal(summary.recentChangeCount, 1);
+  assert.notEqual(summary.lastDetectedChangeAt, null);
+});
+
+test("cloud watch events reject unsafe paths and cross-root delivery", async () => {
+  const rootA = "root_222222222222222222222222";
+  const rootB = "root_333333333333333333333333";
+  const first = await createCloudScannedFile({
+    bridgeRootId: rootA,
+    relativePath: "Notes/root-a.txt",
+  });
+  const second = await createCloudScannedFile({
+    bridgeRootId: rootB,
+    relativePath: "Notes/root-b.txt",
+  });
+
+  await assert.rejects(
+    () =>
+      ingestBridgeWatchEvents(first.device.bridgeDeviceId, [
+        {
+          detectedAt: new Date().toISOString(),
+          eventId: "evt_bad_path",
+          eventType: "FILE_MODIFIED",
+          relativePath: "../outside.txt",
+          rootId: rootA,
+        },
+      ]),
+    /watch event/i,
+  );
+  await assert.rejects(
+    () =>
+      ingestBridgeWatchEvents(first.device.bridgeDeviceId, [
+        {
+          detectedAt: new Date().toISOString(),
+          eventId: "evt_cross_root",
+          eventType: "FILE_MODIFIED",
+          relativePath: "Inbox/file.txt",
+          rootId: rootB,
+        },
+      ]),
+    /does not belong/i,
+  );
+
+  assert.notEqual(first.device.bridgeDeviceId, second.device.bridgeDeviceId);
+});
+
+test("signed watch-events route accepts device events without exposing localhost", async () => {
+  const bridgeRootId = "root_444444444444444444444444";
+  const { device, keys } = await createCloudScannedFile({
+    bridgeRootId,
+    relativePath: "Notes/route-event.txt",
+  });
+  const route = await import(
+    "../../src/app/api/bridge/cloud/devices/[deviceId]/watch-events/route"
+  );
+  const pathname = `/api/bridge/cloud/devices/${device.bridgeDeviceId}/watch-events`;
+  const bodyText = JSON.stringify({
+    events: [
+      {
+        detectedAt: new Date().toISOString(),
+        eventId: "evt_route_create",
+        eventType: "FILE_MODIFIED",
+        relativePath: "Inbox/watching-test.txt",
+        rootId: bridgeRootId,
+      },
+    ],
+  });
+  const headers = createBridgeDeviceRequestHeaders({
+    bodyText,
+    bridgeDeviceId: device.bridgeDeviceId,
+    method: "POST",
+    pathname,
+    privateKey: keys.privateKey,
+  });
+  const response = await route.POST(
+    new Request(`http://localhost${pathname}`, {
+      body: bodyText,
+      headers,
+      method: "POST",
+    }),
+    {
+      params: Promise.resolve({ deviceId: device.bridgeDeviceId }),
+    },
+  );
+  const payload = (await response.json()) as {
+    acceptedEventIds: string[];
+    ok: boolean;
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.ok, true);
+  assert.deepEqual(payload.acceptedEventIds, ["evt_route_create"]);
+});
+
+test("production cloud monitoring dashboard does not drain localhost events", async () => {
+  process.env.NSN_LOCAL_BRIDGE_URL = "http://127.0.0.1:9";
+  const bridgeRootId = "root_555555555555555555555555";
+  const { library } = await createCloudScannedFile({
+    bridgeRootId,
+    relativePath: "Notes/no-localhost.txt",
+  });
+
+  await prisma.connectedLibrary.update({
+    data: {
+      monitoringState: "WATCHING",
+      readPermission: true,
+      watchPermission: true,
+    },
+    where: { id: library.id },
+  });
+
+  await getMonitoringDashboardData();
+
+  const afterDashboard = await prisma.connectedLibrary.findUniqueOrThrow({
+    where: { id: library.id },
+  });
+
+  assert.equal(afterDashboard.monitoringState, "WATCHING");
+  assert.equal(afterDashboard.monitoringErrorCategory, null);
 });

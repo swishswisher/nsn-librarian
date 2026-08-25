@@ -1,5 +1,7 @@
 import path from "node:path";
 
+import type { BridgeMonitoringState } from "@prisma/client";
+
 import type {
   BridgeCommandReport,
   BridgeJson,
@@ -65,6 +67,52 @@ function connectedLibraryStatus(value: unknown) {
     value === "DISCONNECTED"
     ? value
     : "CONNECTED";
+}
+
+function monitoringDataFromNativeRoot(
+  existing: {
+    lastMonitoringAt: Date | null;
+    monitoringPausedAt: Date | null;
+    monitoringStartedAt: Date | null;
+    monitoringState: BridgeMonitoringState;
+    monitoringStoppedAt: Date | null;
+  },
+  watcherState: ReturnType<typeof bridgeRootWatcherState>,
+  now: Date,
+) {
+  const nativeWatching = watcherState === "WATCHING";
+  const previousState = existing.monitoringState;
+
+  return {
+    lastMonitoringAt: nativeWatching ? now : existing.lastMonitoringAt,
+    monitoringErrorCategory:
+      watcherState === "NEEDS_ATTENTION" ? "WATCHER_NEEDS_ATTENTION" : null,
+    monitoringHeartbeatAt: nativeWatching ? now : null,
+    monitoringLastCheckAt: now,
+    monitoringLastSuccessfulCheckAt: now,
+    monitoringPausedAt:
+      watcherState === "PAUSED"
+        ? previousState === "PAUSED"
+          ? existing.monitoringPausedAt ?? now
+          : now
+        : nativeWatching
+          ? null
+          : existing.monitoringPausedAt,
+    monitoringStartedAt: nativeWatching
+      ? previousState === "WATCHING"
+        ? existing.monitoringStartedAt ?? now
+        : now
+      : existing.monitoringStartedAt,
+    monitoringState: watcherState as BridgeMonitoringState,
+    monitoringStoppedAt:
+      watcherState === "STOPPED"
+        ? previousState === "STOPPED"
+          ? existing.monitoringStoppedAt ?? now
+          : now
+        : nativeWatching || watcherState === "PAUSED"
+          ? null
+          : existing.monitoringStoppedAt,
+  };
 }
 
 function dateValue(value: unknown) {
@@ -588,6 +636,11 @@ async function applyCompletedPermissionUpdate(input: {
       existing.renameFilePermission,
     watchPermission,
   };
+  const monitoringData = monitoringDataFromNativeRoot(
+    existing,
+    watcherState,
+    now,
+  );
 
   await prisma.connectedLibrary.update({
     data: {
@@ -596,9 +649,10 @@ async function applyCompletedPermissionUpdate(input: {
       disconnectedAt: status === "DISCONNECTED" ? now : null,
       isEnabled: status !== "DISCONNECTED",
       lastBridgeCheckAt: now,
-      monitoringErrorCategory: readPermission ? null : "READ_PERMISSION_REQUIRED",
-      monitoringState: watcherState,
-      monitoringStoppedAt: watcherState === "STOPPED" ? now : undefined,
+      ...monitoringData,
+      monitoringErrorCategory: readPermission
+        ? monitoringData.monitoringErrorCategory
+        : "READ_PERMISSION_REQUIRED",
       moveFilePermission: permissions.moveFilePermission,
       organizationPlanPermission: permissions.organizationPlanPermission,
       readPermission: permissions.readPermission,
@@ -626,6 +680,85 @@ async function applyCompletedPermissionUpdate(input: {
     bridgeRootId: input.bridgeRootId,
     permissions,
     rootUpdatedAt,
+    status,
+    watcherState,
+  } satisfies BridgeJson;
+}
+
+async function applyCompletedMonitoringCommand(input: {
+  bridgeRootId: string;
+  connectedLibraryId: string;
+  result: unknown;
+}) {
+  const prisma = getPrismaClient();
+  const root = objectValue(input.result);
+  const rootId = stringValue(root?.id, 100);
+
+  if (!root || rootId !== input.bridgeRootId) {
+    throw new BridgeCloudError(
+      "The Bridge returned a result for a different connected folder.",
+      422,
+      "ROOT_RESULT_MISMATCH",
+    );
+  }
+
+  const existing = await prisma.connectedLibrary.findUnique({
+    where: {
+      id: input.connectedLibraryId,
+    },
+  });
+
+  if (!existing) {
+    throw new BridgeCloudError(
+      "The Librarian could not find that connected folder.",
+      404,
+      "CONNECTED_LIBRARY_NOT_FOUND",
+    );
+  }
+
+  const watcherState = bridgeRootWatcherState(root.watcherState);
+  const status = connectedLibraryStatus(root.status);
+  const now = new Date();
+  const monitoringData = monitoringDataFromNativeRoot(
+    existing,
+    watcherState,
+    now,
+  );
+
+  await prisma.connectedLibrary.update({
+    data: {
+      bridgeRootId: input.bridgeRootId,
+      createFolderPermission:
+        booleanValue(root.createFolderPermission) ??
+        existing.createFolderPermission,
+      disconnectedAt: status === "DISCONNECTED" ? now : null,
+      isEnabled: status !== "DISCONNECTED",
+      lastBridgeCheckAt: now,
+      ...monitoringData,
+      moveFilePermission:
+        booleanValue(root.moveFilePermission) ?? existing.moveFilePermission,
+      organizationPlanPermission:
+        booleanValue(root.organizationPlanPermission) ??
+        existing.organizationPlanPermission,
+      readPermission: booleanValue(root.readPermission) ?? existing.readPermission,
+      recommendationPermission:
+        booleanValue(root.recommendationPermission) ??
+        existing.recommendationPermission,
+      renameFilePermission:
+        booleanValue(root.renameFilePermission) ??
+        existing.renameFilePermission,
+      safeLocalLocation: stringValue(root.safeLocation, 500) ?? undefined,
+      status,
+      watchPermission:
+        booleanValue(root.watchPermission) ?? existing.watchPermission,
+    },
+    where: {
+      id: input.connectedLibraryId,
+    },
+  });
+
+  return {
+    bridgeRootId: input.bridgeRootId,
     status,
     watcherState,
   } satisfies BridgeJson;
@@ -700,6 +833,36 @@ export async function prepareBridgeCommandReportForPersistence(
           bridgeRootId: command.bridgeRootId,
           commandId: command.commandId,
           commandPayload: command.payload,
+          connectedLibraryId: command.connectedLibraryId,
+          result: report.result,
+        }),
+      };
+    }
+
+    return {
+      ...report,
+      result: null,
+    };
+  }
+
+  if (
+    command.commandType === "START_WATCHING" ||
+    command.commandType === "PAUSE_WATCHING" ||
+    command.commandType === "RESUME_WATCHING" ||
+    command.commandType === "STOP_WATCHING"
+  ) {
+    if (report.status === "COMPLETED") {
+      if (!command.connectedLibraryId || !command.bridgeRootId) {
+        throw new BridgeCloudError(
+          "The monitoring command is missing its connected folder.",
+          422,
+        );
+      }
+
+      return {
+        ...report,
+        result: await applyCompletedMonitoringCommand({
+          bridgeRootId: command.bridgeRootId,
           connectedLibraryId: command.connectedLibraryId,
           result: report.result,
         }),

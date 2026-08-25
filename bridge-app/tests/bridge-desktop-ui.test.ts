@@ -1136,7 +1136,8 @@ describe("Bridge desktop app lifecycle", () => {
   it("recovers cloud heartbeat and root sync immediately on startup", async () => {
     const source = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
 
-    assert.match(source, /void recoverCloudConnection\(true\)/);
+    assert.match(source, /void restorePersistedBridgeWatchers\(\)/);
+    assert.match(source, /\.then\(\(\) => recoverCloudConnection\(true\)\)/);
     assert.match(source, /await sendBridgeHeartbeat\(\);/);
     assert.match(source, /cloudState\.recordHeartbeatSuccess\(\);/);
     assert.match(source, /return syncLocalRoots\(forceRootSync\);/);

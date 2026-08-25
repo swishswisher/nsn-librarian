@@ -257,8 +257,13 @@ export async function syncBridgeDeviceRoots(
 
   for (const root of roots) {
     const canonical = await reconcileConnectedLibraryFingerprint(root.id);
+    const canonicalLibrary = canonical
+      ? await prisma.connectedLibrary.findUnique({
+          where: { id: canonical.id },
+        })
+      : null;
     const existing =
-      canonical ??
+      canonicalLibrary ??
       (await prisma.connectedLibrary.findFirst({
         where: {
           OR: [
@@ -297,6 +302,33 @@ export async function syncBridgeDeviceRoots(
       rootUpdatedAt: root.updatedAt,
     });
 
+    const nextMonitoringState = monitoringState(root);
+    const previousMonitoringState = existing?.monitoringState ?? "STOPPED";
+    const nativeWatching = nextMonitoringState === "WATCHING";
+    const transitionIntoWatching =
+      nativeWatching && previousMonitoringState !== "WATCHING";
+    const lastWatchingAt = dateOrNull(root.lastWatchingAt);
+    const monitoringStartedAt = nativeWatching
+      ? transitionIntoWatching
+        ? lastWatchingAt ?? now
+        : existing?.monitoringStartedAt ?? lastWatchingAt ?? now
+      : existing?.monitoringStartedAt ?? null;
+    const monitoringPausedAt =
+      nextMonitoringState === "PAUSED"
+        ? previousMonitoringState === "PAUSED"
+          ? existing?.monitoringPausedAt ?? now
+          : now
+        : nativeWatching
+          ? null
+          : existing?.monitoringPausedAt ?? null;
+    const monitoringStoppedAt =
+      nextMonitoringState === "STOPPED"
+        ? previousMonitoringState === "STOPPED"
+          ? existing?.monitoringStoppedAt ?? now
+          : now
+        : nativeWatching || nextMonitoringState === "PAUSED"
+          ? null
+          : existing?.monitoringStoppedAt ?? null;
     const commonData = {
       bridgeDeviceId,
       bridgeRootId: root.id,
@@ -310,22 +342,21 @@ export async function syncBridgeDeviceRoots(
       isEnabled: root.status !== "DISCONNECTED",
       isLegacyConnection: false,
       lastBridgeCheckAt: now,
-      lastMonitoringAt: dateOrNull(root.lastWatchingAt),
+      lastMonitoringAt: nativeWatching
+        ? lastWatchingAt ?? now
+        : existing?.lastMonitoringAt ?? null,
       lastScanAt: dateOrNull(root.lastScanAt),
       legacyReason: null,
       localPath: bridgeRootUri(root.id),
       mergedAt: null,
       monitoringHeartbeatAt:
-        root.watcherState === "WATCHING" ? now : null,
-      monitoringLastCheckAt: dateOrNull(root.lastWatchingAt),
-      monitoringLastSuccessfulCheckAt: dateOrNull(root.lastWatchingAt),
-      monitoringPausedAt:
-        root.watcherState === "PAUSED" ? now : null,
-      monitoringStartedAt:
-        root.watcherState === "WATCHING" ? now : null,
-      monitoringState: monitoringState(root),
-      monitoringStoppedAt:
-        root.watcherState === "STOPPED" ? now : null,
+        nativeWatching ? now : null,
+      monitoringLastCheckAt: now,
+      monitoringLastSuccessfulCheckAt: now,
+      monitoringPausedAt,
+      monitoringStartedAt,
+      monitoringState: nextMonitoringState,
+      monitoringStoppedAt,
       moveFilePermission: effectivePermissions.moveFilePermission,
       organizationPlanPermission:
         effectivePermissions.organizationPlanPermission,

@@ -4,7 +4,7 @@ import {
   createBridgeCloudCommand,
 } from "@/lib/bridge/cloud-coordinator";
 
-import { getConnectedLibraries } from "./connected-libraries";
+import { getConnectedLibraries, getConnectedLibrary } from "./connected-libraries";
 
 type RemoteMonitoringAction = "start" | "pause" | "resume";
 
@@ -79,22 +79,6 @@ export async function queueRemoteMonitoringAction(
     idempotencyKey: `monitor:${connectedLibraryId}:${action}:${Date.now()}`,
     payload: {},
   });
-  const now = new Date();
-  const monitoringState = action === "pause" ? "PAUSED" : "WATCHING";
-
-  await prisma.connectedLibrary.update({
-    data: {
-      monitoringHeartbeatAt:
-        action === "pause" ? library.monitoringHeartbeatAt : now,
-      monitoringPausedAt: action === "pause" ? now : null,
-      monitoringStartedAt:
-        action === "start" ? now : library.monitoringStartedAt ?? now,
-      monitoringState,
-      monitoringStoppedAt: null,
-      status: action === "pause" ? "PAUSED" : "CONNECTED",
-    },
-    where: { id: connectedLibraryId },
-  });
   const libraries = await getConnectedLibraries();
   const updatedLibrary = libraries.find(
     (item) => item.id === connectedLibraryId,
@@ -118,6 +102,61 @@ export async function queueRemoteMonitoringAction(
         ? "Watching pause sent to this Mac."
         : action === "resume"
           ? "Watching resume sent to this Mac."
-          : "Watching start sent to this Mac.",
+        : "Watching start sent to this Mac.",
+  };
+}
+
+export async function getRemoteMonitoringActionStatus(
+  connectedLibraryId: string,
+  commandId: string,
+) {
+  const prisma = getPrismaClient();
+  const command = await prisma.bridgeCommand.findUnique({
+    where: { commandId },
+  });
+
+  if (
+    !command ||
+    command.connectedLibraryId !== connectedLibraryId ||
+    (command.commandType !== "START_WATCHING" &&
+      command.commandType !== "PAUSE_WATCHING" &&
+      command.commandType !== "RESUME_WATCHING" &&
+      command.commandType !== "STOP_WATCHING")
+  ) {
+    throw new BridgeCloudError(
+      "The Librarian could not find that watching update.",
+      404,
+    );
+  }
+
+  const library = await getConnectedLibrary(connectedLibraryId);
+
+  if (command.status === "COMPLETED") {
+    return {
+      done: true,
+      library,
+      status: "COMPLETED" as const,
+    };
+  }
+
+  if (
+    command.status === "FAILED" ||
+    command.status === "REJECTED" ||
+    command.status === "EXPIRED" ||
+    command.status === "CANCELLED"
+  ) {
+    return {
+      done: true,
+      error:
+        "The Bridge could not update watching. The previous confirmed state is still in place.",
+      library,
+      status: command.status,
+    };
+  }
+
+  return {
+    done: false,
+    library,
+    status: command.status,
   };
 }

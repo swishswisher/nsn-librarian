@@ -852,6 +852,7 @@ export type BridgeMonitoringDashboard = {
 
 export type BridgeMonitoringApiSuccess = {
   ok: true;
+  commandId?: string;
   dashboard: BridgeMonitoringDashboard;
   library?: ConnectedLibrarySummary | null;
   message?: string;

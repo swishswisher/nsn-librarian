@@ -2,16 +2,26 @@ import { constants as fsConstants, watch, type FSWatcher } from "node:fs";
 import { access, lstat } from "node:fs/promises";
 import path from "node:path";
 
-import { getRoot, requireWatchPermission, updateRoot } from "../main/registry";
+import {
+  getRoot,
+  listRootRecords,
+  requireWatchPermission,
+  updateRoot,
+} from "../main/registry";
 import {
   BridgeAppError,
   type BridgeChangeEvent,
   type BridgeRootSummary,
 } from "../types";
 import { pathKey } from "../filesystem/safety";
+import {
+  acknowledgeBridgeWatcherEvents,
+  listBridgeWatcherEvents,
+  queueBridgeWatcherEvent,
+  takeBridgeWatcherEventsFromOutbox,
+} from "./event-outbox";
 
 type WatchHandle = {
-  events: BridgeChangeEvent[];
   rootId: string;
   timers: Map<string, ReturnType<typeof setTimeout>>;
   watcher: FSWatcher;
@@ -34,14 +44,27 @@ function relativePathFor(rootPath: string, changedPath: string) {
   return relative.split(path.sep).join(path.posix.sep);
 }
 
-async function classifyChange(rootId: string, rootPath: string, fileName: string) {
+async function classifyChange(
+  rootId: string,
+  rootPath: string,
+  fileName: string,
+  eventName: string,
+) {
   const changedPath = path.resolve(rootPath, fileName);
   const relativePath = relativePathFor(rootPath, changedPath);
   const stats = await lstat(changedPath).catch(() => null);
+  const addedEventType = stats?.isDirectory() ? "FOLDER_ADDED" : "FILE_ADDED";
+  const modifiedEventType = stats?.isDirectory()
+    ? "FOLDER_ADDED"
+    : "FILE_MODIFIED";
 
   return {
     detectedAt: new Date().toISOString(),
-    eventType: stats?.isDirectory() ? "FOLDER_ADDED" : stats ? "FILE_MODIFIED" : "FILE_DELETED",
+    eventType: stats
+      ? eventName === "rename"
+        ? addedEventType
+        : modifiedEventType
+      : "FILE_DELETED",
     id: `evt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`,
     relativePath,
     rootId,
@@ -82,14 +105,13 @@ export async function startBridgeWatcher(rootId: string): Promise<BridgeRootSumm
   });
 
   const handle: WatchHandle = {
-    events: [],
     rootId: root.id,
     timers: new Map(),
     watcher: undefined as unknown as FSWatcher,
   };
 
   try {
-    handle.watcher = watch(root.actualPath, { recursive: true }, (_event, fileName) => {
+    handle.watcher = watch(root.actualPath, { recursive: true }, (eventName, fileName) => {
       if (!fileName) {
         return;
       }
@@ -105,9 +127,9 @@ export async function startBridgeWatcher(rootId: string): Promise<BridgeRootSumm
         key,
         setTimeout(() => {
           handle.timers.delete(key);
-          void classifyChange(root.id, root.actualPath, String(fileName))
+          void classifyChange(root.id, root.actualPath, String(fileName), eventName)
             .then((event) => {
-              handle.events.push(event);
+              void queueBridgeWatcherEvent(event);
             })
             .catch(() => undefined);
         }, debounceMs),
@@ -188,12 +210,45 @@ export async function takeBridgeWatcherEvents(rootId: string) {
     return [] as BridgeChangeEvent[];
   }
 
-  const events = [...handle.events];
-  handle.events = [];
-
-  return events;
+  return takeBridgeWatcherEventsFromOutbox(rootId);
 }
 
 export function isWatching(rootId: string) {
   return watcherRegistry.has(rootId);
+}
+
+export { acknowledgeBridgeWatcherEvents, listBridgeWatcherEvents };
+
+export async function restorePersistedBridgeWatchers() {
+  const roots = await listRootRecords();
+  const restored: BridgeRootSummary[] = [];
+
+  for (const root of roots) {
+    if (
+      root.status !== "CONNECTED" ||
+      root.watcherState !== "WATCHING" ||
+      !root.readPermission ||
+      !root.watchPermission ||
+      watcherRegistry.has(root.id)
+    ) {
+      continue;
+    }
+
+    try {
+      restored.push(await startBridgeWatcher(root.id));
+    } catch {
+      await updateRoot(root.id, {
+        status: "NEEDS_ATTENTION",
+        watcherState: "NEEDS_ATTENTION",
+      }).catch(() => undefined);
+    }
+  }
+
+  return restored;
+}
+
+export function resetBridgeWatcherRuntimeForTests() {
+  for (const rootId of [...watcherRegistry.keys()]) {
+    stopWatcherHandle(rootId);
+  }
 }

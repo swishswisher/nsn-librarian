@@ -97,6 +97,8 @@ type MonitoringEventInput = {
   checksumBefore?: string | null;
   connectedFolderId: string;
   currentRelativePath?: string | null;
+  detectedAt?: Date;
+  eventKey?: string | null;
   eventType: BridgeMonitoringEventType;
   modifiedAtAfter?: Date | null;
   modifiedAtBefore?: Date | null;
@@ -808,6 +810,10 @@ function renameOrMoveType(previousPath: string, currentPath: string) {
 }
 
 function eventIdentityKey(input: MonitoringEventInput) {
+  if (input.eventKey) {
+    return input.eventKey;
+  }
+
   const contentKey =
     input.checksumAfter ??
     input.checksumBefore ??
@@ -838,6 +844,7 @@ async function enqueueMonitoringEvent(input: MonitoringEventInput) {
         checksumBefore: input.checksumBefore ?? null,
         connectedFolderId: input.connectedFolderId,
         currentRelativePath: input.currentRelativePath ?? null,
+        detectedAt: input.detectedAt ?? new Date(),
         eventKey,
         eventType: input.eventType,
         modifiedAtAfter: input.modifiedAtAfter ?? null,
@@ -858,7 +865,7 @@ async function enqueueMonitoringEvent(input: MonitoringEventInput) {
 
     return prisma.monitoringEvent.update({
       data: {
-        detectedAt: new Date(),
+        detectedAt: input.detectedAt ?? new Date(),
         safeErrorCategory: input.safeErrorCategory ?? null,
         stabilizedAt: new Date(),
       },
@@ -1091,6 +1098,7 @@ async function drainLocalBridgeWatcherEvents(connectedFolderId?: string) {
   const prisma = getPrismaClient();
   const folders = await prisma.connectedLibrary.findMany({
     where: {
+      bridgeDeviceId: null,
       bridgeRootId: {
         not: null,
       },
@@ -1144,6 +1152,220 @@ async function drainLocalBridgeWatcherEvents(connectedFolderId?: string) {
       });
     }
   }
+}
+
+function cloudWatchEventId(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+
+  return trimmed.length > 0 && trimmed.length <= 200 ? trimmed : null;
+}
+
+function cloudWatchEventType(value: unknown): BridgeMonitoringEventType | null {
+  return typeof value === "string" &&
+    [
+      "FILE_ADDED",
+      "FILE_MODIFIED",
+      "FILE_RENAMED",
+      "FILE_MOVED",
+      "FILE_DELETED",
+      "FOLDER_ADDED",
+      "FOLDER_RENAMED",
+      "FOLDER_MOVED",
+      "FOLDER_DELETED",
+    ].includes(value)
+    ? (value as BridgeMonitoringEventType)
+    : null;
+}
+
+function cloudWatchEventDate(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  const maxFutureMs = 5 * 60 * 1000;
+
+  if (date.getTime() - Date.now() > maxFutureMs) {
+    return null;
+  }
+
+  return date;
+}
+
+function cloudWatchRelativePath(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const raw = value.trim().replaceAll("\\", "/");
+
+  if (
+    !raw ||
+    raw.includes("\0") ||
+    path.posix.isAbsolute(raw) ||
+    /^[A-Za-z]:\//u.test(raw)
+  ) {
+    return null;
+  }
+
+  const parts = raw.split("/").filter(Boolean);
+
+  if (parts.some((part) => part === "." || part === "..")) {
+    return null;
+  }
+
+  const normalized = parts.join("/");
+
+  if (!normalized) {
+    return null;
+  }
+
+  return normalized;
+}
+
+export async function ingestBridgeWatchEvents(
+  bridgeDeviceId: string,
+  input: unknown,
+) {
+  const rawEvents = Array.isArray(input) ? input : [];
+
+  if (rawEvents.length > 100) {
+    throw new BridgeMonitoringError(
+      "Too many watch events were sent at once.",
+      413,
+      "WATCH_EVENT_BATCH_TOO_LARGE",
+    );
+  }
+
+  const prisma = getPrismaClient();
+  const acceptedEventIds: string[] = [];
+  const duplicateEventIds: string[] = [];
+  const now = new Date();
+
+  for (const rawEvent of rawEvents) {
+    const event =
+      typeof rawEvent === "object" &&
+      rawEvent !== null &&
+      !Array.isArray(rawEvent)
+        ? (rawEvent as Record<string, unknown>)
+        : null;
+    const eventId = cloudWatchEventId(event?.eventId ?? event?.id);
+    const bridgeRootId =
+      typeof event?.bridgeRootId === "string"
+        ? event.bridgeRootId
+        : typeof event?.rootId === "string"
+          ? event.rootId
+          : null;
+    const eventType = cloudWatchEventType(event?.eventType);
+    const relativePath = cloudWatchRelativePath(event?.relativePath);
+    const detectedAt = cloudWatchEventDate(event?.detectedAt);
+
+    if (
+      !eventId ||
+      !bridgeRootId ||
+      !eventType ||
+      !relativePath ||
+      !detectedAt
+    ) {
+      throw new BridgeMonitoringError(
+        "The Bridge sent a watch event that could not be accepted safely.",
+        400,
+        "INVALID_WATCH_EVENT",
+      );
+    }
+
+    const folder = await prisma.connectedLibrary.findFirst({
+      where: {
+        bridgeDeviceId,
+        bridgeRootId,
+        isEnabled: true,
+        status: {
+          not: "DISCONNECTED",
+        },
+      },
+    });
+
+    if (!folder) {
+      throw new BridgeMonitoringError(
+        "That watch event does not belong to this Bridge device.",
+        404,
+        "WATCH_EVENT_ROOT_NOT_FOUND",
+      );
+    }
+
+    if (shouldIgnorePath(relativePath)) {
+      acceptedEventIds.push(eventId);
+      continue;
+    }
+
+    const eventKey = `bridge:${bridgeDeviceId}:${eventId}`;
+    const existed = Boolean(
+      await prisma.monitoringEvent.findUnique({
+        select: { id: true },
+        where: { eventKey },
+      }),
+    );
+
+    await enqueueMonitoringEvent({
+      connectedFolderId: folder.id,
+      currentRelativePath:
+        eventType === "FILE_DELETED" || eventType === "FOLDER_DELETED"
+          ? null
+          : relativePath,
+      detectedAt,
+      eventKey,
+      eventType,
+      modifiedAtAfter:
+        eventType === "FILE_DELETED" || eventType === "FOLDER_DELETED"
+          ? null
+          : detectedAt,
+      modifiedAtBefore:
+        eventType === "FILE_DELETED" || eventType === "FOLDER_DELETED"
+          ? detectedAt
+          : null,
+      previousRelativePath:
+        eventType === "FILE_DELETED" || eventType === "FOLDER_DELETED"
+          ? relativePath
+          : null,
+      processingStatus: "QUEUED",
+    });
+
+    await prisma.connectedLibrary.update({
+      data: {
+        lastMonitoringAt: detectedAt,
+        monitoringErrorCategory: null,
+        monitoringHeartbeatAt: now,
+        monitoringLastCheckAt: now,
+        monitoringLastSuccessfulCheckAt: now,
+        monitoringReconciliationRequired: true,
+        monitoringStartedAt:
+          folder.monitoringStartedAt ??
+          (folder.monitoringState === "WATCHING" ? now : undefined),
+        monitoringState: "WATCHING",
+      },
+      where: { id: folder.id },
+    });
+
+    if (existed) {
+      duplicateEventIds.push(eventId);
+    } else {
+      acceptedEventIds.push(eventId);
+    }
+  }
+
+  return {
+    acceptedEventIds,
+    duplicateEventIds,
+  };
 }
 
 async function enqueuePathChange(
@@ -1407,6 +1629,7 @@ async function restoreMonitoringAfterRestart() {
 
   const watchingFolders = await prisma.connectedLibrary.findMany({
     where: {
+      bridgeDeviceId: null,
       isEnabled: true,
       monitoringState: "WATCHING",
       status: "CONNECTED",
@@ -1633,6 +1856,14 @@ export async function startMonitoringForConnectedLibrary(folderId: string) {
     "watch this folder",
   );
 
+  if (folder.bridgeDeviceId && folder.bridgeRootId) {
+    throw new BridgeMonitoringError(
+      "Use the paired Mac to start watching this cloud-connected folder.",
+      409,
+      "REMOTE_MONITORING_REQUIRED",
+    );
+  }
+
   if (folder.bridgeRootId) {
     try {
       await startLocalBridgeWatcher(folder.bridgeRootId);
@@ -1728,6 +1959,14 @@ export async function pauseMonitoringForFolder(folderId: string) {
 
   closeWatcher(folderId);
 
+  if (folder.bridgeDeviceId && folder.bridgeRootId) {
+    throw new BridgeMonitoringError(
+      "Use the paired Mac to pause watching this cloud-connected folder.",
+      409,
+      "REMOTE_MONITORING_REQUIRED",
+    );
+  }
+
   if (folder.bridgeRootId) {
     await pauseLocalBridgeWatcher(folder.bridgeRootId).catch(() => undefined);
   }
@@ -1758,6 +1997,14 @@ export async function resumeMonitoringForFolder(folderId: string) {
     "watchPermission",
     "watch this folder",
   );
+
+  if (folder.bridgeDeviceId && folder.bridgeRootId) {
+    throw new BridgeMonitoringError(
+      "Use the paired Mac to resume watching this cloud-connected folder.",
+      409,
+      "REMOTE_MONITORING_REQUIRED",
+    );
+  }
 
   if (folder.bridgeRootId) {
     try {
@@ -1852,6 +2099,14 @@ export async function stopMonitoringForFolder(folderId: string) {
   }
 
   closeWatcher(folderId);
+
+  if (folder.bridgeDeviceId && folder.bridgeRootId) {
+    throw new BridgeMonitoringError(
+      "Use the paired Mac to stop watching this cloud-connected folder.",
+      409,
+      "REMOTE_MONITORING_REQUIRED",
+    );
+  }
 
   if (folder.bridgeRootId) {
     await stopLocalBridgeWatcher(folder.bridgeRootId).catch(() => undefined);

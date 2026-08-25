@@ -31,7 +31,7 @@ import {
   resumeBridgeWatcher,
   startBridgeWatcher,
   stopBridgeWatcher,
-  takeBridgeWatcherEvents,
+  listBridgeWatcherEvents,
 } from "../../../../bridge-app/src/watcher/watcher";
 
 import {
@@ -330,7 +330,7 @@ async function executeCommand(
     case "RECONCILE_LIBRARY": {
       const rootId = requiredRootId(command);
       const scan = await scanBridgeRoot(rootId);
-      const events = await takeBridgeWatcherEvents(rootId);
+      const events = await listBridgeWatcherEvents({ rootId });
 
       return { events, scan };
     }
