@@ -45,7 +45,7 @@ const navItems: Array<{ label: string; href: string; section: LibrarySection }> 
 
 export function NsnSidebar({ active }: NsnSidebarProps) {
   return (
-    <aside className="border-r border-[var(--nsn-border)] bg-[var(--nsn-card)] px-5 py-6 lg:sticky lg:top-0 lg:min-h-screen">
+    <aside className="border-r border-[var(--nsn-border)] bg-[var(--nsn-card)] px-5 py-6 lg:sticky lg:top-0 lg:h-screen lg:overflow-y-auto">
       <div className="flex min-h-full flex-col gap-8">
         <div>
           <div className="flex h-11 w-11 items-center justify-center rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-soft-aqua)] text-sm font-semibold text-[var(--nsn-teal-dark)]">
