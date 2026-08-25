@@ -1142,6 +1142,23 @@ describe("Bridge desktop app lifecycle", () => {
     assert.match(source, /return syncLocalRoots\(forceRootSync\);/);
   });
 
+  it("polls commands faster while foregrounded and keeps background polling reasonable", async () => {
+    const source = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
+
+    assert.match(source, /foregroundCommandPollIntervalMs = 2_500/);
+    assert.match(source, /backgroundCommandPollIntervalMs = 15_000/);
+    assert.match(source, /mainWindowForegrounded/);
+    assert.match(source, /return foregroundCommandPollIntervalMs/);
+    assert.match(source, /return backgroundCommandPollIntervalMs/);
+    assert.match(source, /mainWindow\.on\("focus", \(\) => \{/);
+    assert.match(source, /mainWindow\.on\("blur", \(\) => \{/);
+    assert.match(source, /clearCommandPollTimer\(\)/);
+    assert.equal(
+      /setInterval\(\(\) => \{\s+void pollCloud\(\)\.catch/.test(source),
+      false,
+    );
+  });
+
   it("pairs again without clearing existing local roots", async () => {
     const source = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
     const pairHandler =
@@ -1166,9 +1183,10 @@ describe("Bridge desktop app lifecycle", () => {
   it("checks for updates after startup without automatically downloading", async () => {
     const source = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
     const startupCheck = /setTimeout\(\(\) => \{\s+void checkForUpdatesAndNotify\(\)\.catch\(\(\) => undefined\);\s+\}, 5_000\);/s;
+    const startupCheckBlock = startupCheck.exec(source)?.[0] ?? "";
 
     assert.match(source, startupCheck);
-    assert.equal(/setTimeout[\s\S]*downloadUpdate/.test(source), false);
+    assert.equal(startupCheckBlock.includes("downloadUpdate"), false);
   });
 
   it("keeps unsigned updates as assisted DMG installation only", async () => {

@@ -15,6 +15,17 @@ import {
   selectionHasBlockingOverlaps,
 } from "@/lib/bridge/folder-selection";
 import {
+  confirmedCanStartWatching,
+  disabledPermissionKeys,
+  pendingPermissionsWithPatch,
+  permissionInlineStatus,
+  permissionPatchFromBody,
+  permissionPatchKeys,
+  visiblePermissionValue,
+  type PendingPermissionMap,
+  type PermissionFeedbackMap,
+} from "@/lib/bridge/permission-ux";
+import {
   getBridgeMonitoringRoute,
   getScanSessionsRoute,
 } from "@/lib/library/routes";
@@ -267,10 +278,6 @@ function permissionsFromLibrary(
   };
 }
 
-function isPermissionPatch(body: Record<string, unknown>) {
-  return permissionGroups.some((permission) => permission.key in body);
-}
-
 function wait(ms: number) {
   return new Promise<void>((resolve) => {
     window.setTimeout(resolve, ms);
@@ -411,9 +418,16 @@ export function ConnectedLibrariesManager({
     useState<ConnectedLibrarySummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [pendingPermissions, setPendingPermissions] = useState<
+    Record<string, PendingPermissionMap>
+  >({});
+  const [permissionFeedback, setPermissionFeedback] = useState<
+    Record<string, PermissionFeedbackMap>
+  >({});
   const disconnectCancelRef = useRef<HTMLButtonElement>(null);
   const lastFocusedControlRef = useRef<HTMLElement | null>(null);
   const pendingLibraryPatchKeysRef = useRef<Set<string>>(new Set());
+  const permissionFeedbackTimersRef = useRef<number[]>([]);
 
   const visibleLibraries = libraries.filter(
     (library) => !library.isHiddenFromActiveList && !library.isMergedDuplicate,
@@ -448,6 +462,16 @@ export function ConnectedLibrariesManager({
     lastFocusedControlRef.current?.focus();
   }, [disconnectCandidate]);
 
+  useEffect(() => {
+    const timers = permissionFeedbackTimersRef.current;
+
+    return () => {
+      for (const timer of timers) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, []);
+
   function replaceLibrary(nextLibrary: ConnectedLibrarySummary) {
     setLibraries((current) => {
       if (nextLibrary.isHiddenFromActiveList || nextLibrary.isMergedDuplicate) {
@@ -464,6 +488,82 @@ export function ConnectedLibrariesManager({
         library.id === nextLibrary.id ? nextLibrary : library,
       );
     });
+  }
+
+  function clearPendingPermissions(libraryId: string, keys: PermissionKey[]) {
+    setPendingPermissions((current) => {
+      const currentLibrary = current[libraryId] ?? {};
+      const nextLibrary = { ...currentLibrary };
+
+      for (const key of keys) {
+        delete nextLibrary[key];
+      }
+
+      if (Object.keys(nextLibrary).length === 0) {
+        const remaining = { ...current };
+        delete remaining[libraryId];
+
+        return remaining;
+      }
+
+      return {
+        ...current,
+        [libraryId]: nextLibrary,
+      };
+    });
+  }
+
+  function clearPermissionFeedback(libraryId: string, keys: PermissionKey[]) {
+    setPermissionFeedback((current) => {
+      const currentLibrary = current[libraryId] ?? {};
+      const nextLibrary = { ...currentLibrary };
+
+      for (const key of keys) {
+        delete nextLibrary[key];
+      }
+
+      if (Object.keys(nextLibrary).length === 0) {
+        const remaining = { ...current };
+        delete remaining[libraryId];
+
+        return remaining;
+      }
+
+      return {
+        ...current,
+        [libraryId]: nextLibrary,
+      };
+    });
+  }
+
+  function setPermissionFeedbackForKeys(
+    libraryId: string,
+    keys: PermissionKey[],
+    status: "failed" | "saved",
+  ) {
+    setPermissionFeedback((current) => ({
+      ...current,
+      [libraryId]: {
+        ...(current[libraryId] ?? {}),
+        ...Object.fromEntries(
+          keys.map((key) => [
+            key,
+            {
+              message: status === "saved" ? "Saved" : "Could not update",
+              status,
+            },
+          ]),
+        ),
+      },
+    }));
+
+    if (status === "saved") {
+      const timer = window.setTimeout(() => {
+        clearPermissionFeedback(libraryId, keys);
+      }, 2_500);
+
+      permissionFeedbackTimersRef.current.push(timer);
+    }
   }
 
   async function refreshBridgeStatus() {
@@ -774,23 +874,40 @@ export function ConnectedLibrariesManager({
     body: Record<string, unknown>,
     successMessage: string,
   ) {
-    const updatesPermissions = isPermissionPatch(body);
-    const patchKey = `${libraryId}:${updatesPermissions ? "permissions" : "details"}`;
+    const permissionPatch = permissionPatchFromBody(body);
+    const permissionKeys = permissionPatchKeys(permissionPatch);
+    const updatesPermissions = permissionKeys.length > 0;
+    const mutationBody = updatesPermissions ? permissionPatch : body;
+    const patchKey = updatesPermissions
+      ? `${libraryId}:permissions:${permissionKeys.join(",")}`
+      : `${libraryId}:details`;
 
     if (pendingLibraryPatchKeysRef.current.has(patchKey)) {
       return;
     }
 
     pendingLibraryPatchKeysRef.current.add(patchKey);
-    setBusyId(libraryId);
+    if (updatesPermissions) {
+      setPendingPermissions((current) => ({
+        ...current,
+        [libraryId]: pendingPermissionsWithPatch(
+          current[libraryId] ?? {},
+          permissionPatch,
+        ),
+      }));
+      clearPermissionFeedback(libraryId, permissionKeys);
+    } else {
+      setBusyId(libraryId);
+    }
+
     setError(null);
-    setNotice(updatesPermissions ? "Updating permission..." : null);
+    setNotice(null);
 
     try {
       const response = await fetch(
         `/api/bridge/connected-libraries/${encodeURIComponent(libraryId)}`,
         {
-          body: JSON.stringify(body),
+          body: JSON.stringify(mutationBody),
           headers: {
             "Content-Type": "application/json",
           },
@@ -800,6 +917,11 @@ export function ConnectedLibrariesManager({
       const payload = await readLibraryMutation(response);
 
       if (!response.ok || !payload.ok) {
+        if (updatesPermissions) {
+          clearPendingPermissions(libraryId, permissionKeys);
+          setPermissionFeedbackForKeys(libraryId, permissionKeys, "failed");
+        }
+
         setError(payload.ok ? "The Bridge could not update this folder." : payload.error);
         return;
       }
@@ -824,6 +946,8 @@ export function ConnectedLibrariesManager({
           }
 
           if (!statusResponse.ok || !statusPayload.ok) {
+            clearPendingPermissions(libraryId, permissionKeys);
+            setPermissionFeedbackForKeys(libraryId, permissionKeys, "failed");
             setError(
               "error" in statusPayload
                 ? statusPayload.error
@@ -833,25 +957,41 @@ export function ConnectedLibrariesManager({
           }
 
           if (statusPayload.done) {
+            clearPendingPermissions(libraryId, permissionKeys);
+            setPermissionFeedbackForKeys(libraryId, permissionKeys, "saved");
             setNotice(successMessage);
             router.refresh();
             return;
           }
         }
 
+        clearPendingPermissions(libraryId, permissionKeys);
+        setPermissionFeedbackForKeys(libraryId, permissionKeys, "failed");
         setError(
           "The permission update is still waiting for the Bridge. Refresh this page in a moment.",
         );
         return;
       }
 
+      if (updatesPermissions) {
+        clearPendingPermissions(libraryId, permissionKeys);
+        setPermissionFeedbackForKeys(libraryId, permissionKeys, "saved");
+      }
+
       setNotice(successMessage);
       router.refresh();
     } catch {
+      if (updatesPermissions) {
+        clearPendingPermissions(libraryId, permissionKeys);
+        setPermissionFeedbackForKeys(libraryId, permissionKeys, "failed");
+      }
+
       setError("The Bridge could not update this folder right now.");
     } finally {
       pendingLibraryPatchKeysRef.current.delete(patchKey);
-      setBusyId(null);
+      if (!updatesPermissions) {
+        setBusyId(null);
+      }
     }
   }
 
@@ -1455,12 +1595,25 @@ export function ConnectedLibrariesManager({
         {section.libraries.map((library) => {
           const isBusy = busyId === library.id;
           const isPrevious = section.title === "Previous Connections";
+          const confirmedPermissions = permissionsFromLibrary(library);
+          const libraryPendingPermissions = pendingPermissions[library.id] ?? {};
+          const libraryPermissionFeedback =
+            permissionFeedback[library.id] ?? {};
+          const disabledPermissions = disabledPermissionKeys({
+            pending: libraryPendingPermissions,
+            requiresReconnect: library.requiresReconnect,
+          });
           const canUse =
             library.bridgeReachable &&
             !library.requiresReconnect &&
             library.status === "CONNECTED";
           const canScan = canUse && library.readPermission;
-          const canWatch = canUse && library.readPermission && library.watchPermission;
+          const canWatch =
+            canUse &&
+            confirmedCanStartWatching({
+              confirmed: library,
+              pending: libraryPendingPermissions,
+            });
           const monitoringBusy = monitoringAction?.libraryId === library.id;
 
           return (
@@ -1624,38 +1777,65 @@ export function ConnectedLibrariesManager({
                         <h4 className="text-sm font-semibold text-[var(--nsn-navy)]">
                           {section.title}
                         </h4>
-                        {section.permissions.map((permission) => (
-                          <label
-                            className="grid min-w-0 gap-2 text-sm text-[var(--nsn-navy)]"
-                            key={permission.key}
-                          >
-                            <span className="flex min-w-0 items-start gap-3">
-                              <input
-                                checked={library[permission.key]}
-                                className="mt-1 h-4 w-4 shrink-0"
-                                disabled={isBusy || library.requiresReconnect}
-                                onChange={(event) =>
-                                  patchLibrary(
-                                    library.id,
-                                    {
-                                      [permission.key]: event.target.checked,
-                                    },
-                                    "Permissions updated.",
-                                  )
-                                }
-                                type="checkbox"
-                              />
-                              <span className="min-w-0">
-                                <span className="block break-words font-semibold [overflow-wrap:anywhere]">
-                                  {permission.label}
-                                </span>
-                                <span className="mt-1 block break-words text-xs leading-5 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                                  {permission.description}
+                        {section.permissions.map((permission) => {
+                          const inlineStatus = permissionInlineStatus({
+                            feedback: libraryPermissionFeedback,
+                            key: permission.key,
+                            pending: libraryPendingPermissions,
+                          });
+                          const inlineTone =
+                            libraryPermissionFeedback[permission.key]
+                              ?.status === "failed"
+                              ? "text-[var(--nsn-warning)]"
+                              : "text-[var(--nsn-warm-gray)]";
+
+                          return (
+                            <label
+                              className="grid min-w-0 gap-2 text-sm text-[var(--nsn-navy)]"
+                              key={permission.key}
+                            >
+                              <span className="flex min-w-0 items-start gap-3">
+                                <input
+                                  checked={visiblePermissionValue({
+                                    confirmed: confirmedPermissions,
+                                    key: permission.key,
+                                    pending: libraryPendingPermissions,
+                                  })}
+                                  className="mt-1 h-4 w-4 shrink-0"
+                                  disabled={disabledPermissions.has(
+                                    permission.key,
+                                  )}
+                                  onChange={(event) =>
+                                    patchLibrary(
+                                      library.id,
+                                      {
+                                        [permission.key]: event.target.checked,
+                                      },
+                                      "Permissions updated.",
+                                    )
+                                  }
+                                  type="checkbox"
+                                />
+                                <span className="min-w-0">
+                                  <span className="block break-words font-semibold [overflow-wrap:anywhere]">
+                                    {permission.label}
+                                  </span>
+                                  <span className="mt-1 block break-words text-xs leading-5 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                                    {permission.description}
+                                  </span>
+                                  {inlineStatus ? (
+                                    <span
+                                      aria-live="polite"
+                                      className={`mt-1 block break-words text-xs font-semibold leading-5 [overflow-wrap:anywhere] ${inlineTone}`}
+                                    >
+                                      {inlineStatus}
+                                    </span>
+                                  ) : null}
                                 </span>
                               </span>
-                            </span>
-                          </label>
-                        ))}
+                            </label>
+                          );
+                        })}
                       </div>
                     ))}
                   </div>

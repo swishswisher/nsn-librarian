@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import assert from "node:assert/strict";
 import path from "node:path";
 import { after, before, beforeEach, test } from "node:test";
@@ -7,6 +8,15 @@ import { PrismaClient } from "@prisma/client";
 
 import type { LocalBridgeRootSummary } from "../../src/lib/bridge/local-bridge-client";
 import type { connectBridgeLibrary as connectBridgeLibraryType } from "../../src/lib/bridge/connected-libraries";
+import {
+  confirmedCanStartWatching,
+  disabledPermissionKeys,
+  pendingPermissionsWithPatch,
+  permissionInlineStatus,
+  permissionPatchFromBody,
+  visiblePermissionValue,
+} from "../../src/lib/bridge/permission-ux";
+import type { ConnectedLibraryPermissions } from "../../src/lib/bridge/types";
 
 type ConnectBridgeLibrary = typeof connectBridgeLibraryType;
 
@@ -435,4 +445,169 @@ test("repeated cloud root sync merges stale duplicates and leaves one current li
   assert.equal(rows.find((row) => row.id === duplicate.id)?.status, "MERGED");
   assert.equal(sessions[0]?.connectedFolderId, canonical.id);
   assert.equal(current.filter((library) => library.bridgeRootId === rootId).length, 1);
+});
+
+test("permission UX shows immediate pending state without disabling unrelated controls", () => {
+  const confirmed: ConnectedLibraryPermissions = {
+    createFolderPermission: false,
+    moveFilePermission: false,
+    organizationPlanPermission: true,
+    readPermission: true,
+    recommendationPermission: true,
+    renameFilePermission: false,
+    watchPermission: false,
+  };
+  const pending = pendingPermissionsWithPatch(
+    {},
+    permissionPatchFromBody({ watchPermission: true }),
+  );
+  const disabled = disabledPermissionKeys({
+    pending,
+    requiresReconnect: false,
+  });
+
+  assert.equal(
+    visiblePermissionValue({
+      confirmed,
+      key: "watchPermission",
+      pending,
+    }),
+    true,
+  );
+  assert.equal(
+    permissionInlineStatus({
+      feedback: {},
+      key: "watchPermission",
+      pending,
+    }),
+    "Turning on...",
+  );
+  assert.equal(disabled.has("watchPermission"), true);
+  assert.equal(disabled.has("readPermission"), true);
+  assert.equal(disabled.has("recommendationPermission"), false);
+  assert.equal(disabled.has("organizationPlanPermission"), false);
+  assert.equal(disabled.has("moveFilePermission"), false);
+  assert.equal(
+    confirmedCanStartWatching({
+      confirmed,
+      pending,
+    }),
+    false,
+  );
+});
+
+test("permission UX turns dependent watch permission off while read is pending off", () => {
+  const confirmed: ConnectedLibraryPermissions = {
+    createFolderPermission: false,
+    moveFilePermission: false,
+    organizationPlanPermission: true,
+    readPermission: true,
+    recommendationPermission: true,
+    renameFilePermission: false,
+    watchPermission: true,
+  };
+  const pending = pendingPermissionsWithPatch(
+    {},
+    permissionPatchFromBody({ readPermission: false }),
+  );
+  const disabled = disabledPermissionKeys({
+    pending,
+    requiresReconnect: false,
+  });
+
+  assert.equal(
+    visiblePermissionValue({
+      confirmed,
+      key: "readPermission",
+      pending,
+    }),
+    false,
+  );
+  assert.equal(
+    visiblePermissionValue({
+      confirmed,
+      key: "watchPermission",
+      pending,
+    }),
+    false,
+  );
+  assert.equal(
+    permissionInlineStatus({
+      feedback: {},
+      key: "watchPermission",
+      pending,
+    }),
+    "Turning off...",
+  );
+  assert.equal(disabled.has("readPermission"), true);
+  assert.equal(disabled.has("watchPermission"), true);
+  assert.equal(disabled.has("recommendationPermission"), false);
+  assert.equal(
+    confirmedCanStartWatching({
+      confirmed,
+      pending,
+    }),
+    false,
+  );
+});
+
+test("permission UX restores confirmed state after failure and reports saved state after confirmation", () => {
+  const confirmed: ConnectedLibraryPermissions = {
+    createFolderPermission: false,
+    moveFilePermission: false,
+    organizationPlanPermission: true,
+    readPermission: true,
+    recommendationPermission: true,
+    renameFilePermission: false,
+    watchPermission: false,
+  };
+
+  assert.equal(
+    visiblePermissionValue({
+      confirmed,
+      key: "watchPermission",
+      pending: {},
+    }),
+    false,
+  );
+  assert.equal(
+    permissionInlineStatus({
+      feedback: {
+        watchPermission: {
+          message: "Could not update",
+          status: "failed",
+        },
+      },
+      key: "watchPermission",
+      pending: {},
+    }),
+    "Could not update",
+  );
+  assert.equal(
+    permissionInlineStatus({
+      feedback: {
+        watchPermission: {
+          message: "Saved",
+          status: "saved",
+        },
+      },
+      key: "watchPermission",
+      pending: {},
+    }),
+    "Saved",
+  );
+});
+
+test("Connected Libraries permission UI keeps duplicate guard and confirmed Start Watching gate", async () => {
+  const source = await readFile(
+    "src/components/library/ConnectedLibrariesManager.tsx",
+    "utf8",
+  );
+
+  assert.match(source, /pendingLibraryPatchKeysRef\.current\.has\(patchKey\)/);
+  assert.match(source, /permissions:\$\{permissionKeys\.join\(","\)\}/);
+  assert.match(source, /pendingPermissionsWithPatch/);
+  assert.match(source, /disabledPermissionKeys/);
+  assert.match(source, /confirmedCanStartWatching/);
+  assert.match(source, /disabled=\{isBusy \|\| !canWatch\}/);
 });

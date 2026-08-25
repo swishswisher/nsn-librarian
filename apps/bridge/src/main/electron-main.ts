@@ -36,6 +36,8 @@ import { disconnectBridgeFolder } from "./folder-disconnection";
 
 let localServer: Server | null = null;
 const currentDir = __dirname;
+const foregroundCommandPollIntervalMs = 2_500;
+const backgroundCommandPollIntervalMs = 15_000;
 const rootSyncIntervalMs = 60_000;
 const updateCheckIntervalMs = 6 * 60 * 60 * 1000;
 
@@ -117,6 +119,8 @@ export async function startElectronBridgeApp() {
   let mainWindow: InstanceType<typeof electron.BrowserWindow> | null = null;
   let isQuitting = false;
   let commandPollInFlight = false;
+  let commandPollTimer: ReturnType<typeof setTimeout> | null = null;
+  let mainWindowForegrounded = false;
   let lastRootSyncAt = 0;
   let lastBridgeStatusEventKey = "";
   const cloudState = createBridgeCloudState();
@@ -150,6 +154,8 @@ export async function startElectronBridgeApp() {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.show();
       mainWindow.focus();
+      mainWindowForegrounded = true;
+      scheduleCommandPoll(250);
       return mainWindow;
     }
 
@@ -171,6 +177,22 @@ export async function startElectronBridgeApp() {
       `data:text/html;charset=utf-8,${encodeURIComponent(bridgeRendererHtml())}`,
     );
     mainWindow.on("ready-to-show", () => mainWindow?.show());
+    mainWindow.on("focus", () => {
+      mainWindowForegrounded = true;
+      scheduleCommandPoll(250);
+    });
+    mainWindow.on("show", () => {
+      mainWindowForegrounded = true;
+      scheduleCommandPoll(250);
+    });
+    mainWindow.on("blur", () => {
+      mainWindowForegrounded = false;
+      scheduleCommandPoll();
+    });
+    mainWindow.on("hide", () => {
+      mainWindowForegrounded = false;
+      scheduleCommandPoll();
+    });
     mainWindow.on("close", (event: unknown) => {
       if (isQuitting) {
         return;
@@ -441,6 +463,35 @@ export async function startElectronBridgeApp() {
     }
   }
 
+  function commandPollIntervalMs() {
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindowForegrounded) {
+      return foregroundCommandPollIntervalMs;
+    }
+
+    return backgroundCommandPollIntervalMs;
+  }
+
+  function clearCommandPollTimer() {
+    if (commandPollTimer) {
+      clearTimeout(commandPollTimer);
+      commandPollTimer = null;
+    }
+  }
+
+  function scheduleCommandPoll(delayMs = commandPollIntervalMs()) {
+    if (isQuitting) {
+      return;
+    }
+
+    clearCommandPollTimer();
+    commandPollTimer = setTimeout(() => {
+      commandPollTimer = null;
+      void pollCloud()
+        .catch(() => undefined)
+        .finally(() => scheduleCommandPoll());
+    }, delayMs);
+  }
+
   const trayImage = electron.nativeImage.createFromDataURL(
     `data:image/svg+xml;base64,${Buffer.from(
       '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18"><path fill="black" d="M3 2h8l4 4v10H3z"/><path fill="white" d="M10 2v5h5"/><circle cx="7" cy="11" r="2" fill="white"/></svg>',
@@ -581,20 +632,18 @@ export async function startElectronBridgeApp() {
 
   void recoverCloudConnection(true)
     .then(() => pollCloud())
-    .catch(() => undefined);
+    .catch(() => undefined)
+    .finally(() => scheduleCommandPoll());
   setTimeout(() => {
     void checkForUpdatesAndNotify().catch(() => undefined);
   }, 5_000);
-  const pollInterval = setInterval(() => {
-    void pollCloud().catch(() => undefined);
-  }, 15_000);
   const updateCheckInterval = setInterval(() => {
     void checkForUpdatesAndNotify().catch(() => undefined);
   }, updateCheckIntervalMs);
 
   electron.app.on("before-quit", () => {
     isQuitting = true;
-    clearInterval(pollInterval);
+    clearCommandPollTimer();
     clearInterval(updateCheckInterval);
     localServer?.close();
   });
