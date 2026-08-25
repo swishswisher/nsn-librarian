@@ -3,6 +3,11 @@ import type { Prisma } from "@prisma/client";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { BridgeCloudError } from "@/lib/bridge/cloud-coordinator";
 import { reconcileConnectedLibraryFingerprint } from "@/lib/bridge/connected-libraries";
+import {
+  bridgePermissionSnapshot,
+  logBridgePermissionDiagnostic,
+} from "@/lib/bridge/permission-diagnostics";
+import type { ConnectedLibraryPermissions } from "@/lib/bridge/types";
 
 type BridgeRootSyncInput = {
   connectedAt: string;
@@ -19,9 +24,22 @@ type BridgeRootSyncInput = {
   renameFilePermission: boolean;
   safeLocation: string;
   status: "CONNECTED" | "PAUSED" | "NEEDS_ATTENTION" | "DISCONNECTED";
+  updatedAt: string | null;
   watcherState: "WATCHING" | "PAUSED" | "STOPPED" | "NEEDS_ATTENTION";
   watchPermission: boolean;
 };
+
+type PermissionSnapshot = ConnectedLibraryPermissions;
+
+const permissionKeys: Array<keyof ConnectedLibraryPermissions> = [
+  "readPermission",
+  "watchPermission",
+  "recommendationPermission",
+  "organizationPlanPermission",
+  "createFolderPermission",
+  "moveFilePermission",
+  "renameFilePermission",
+];
 
 function bridgeRootUri(rootId: string) {
   return `bridge://${rootId}`;
@@ -70,6 +88,88 @@ function dateOrNull(value: string | null) {
 
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function objectValue(value: unknown) {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function permissionSnapshotFromRoot(root: BridgeRootSyncInput): PermissionSnapshot {
+  return {
+    createFolderPermission: root.createFolderPermission,
+    moveFilePermission: root.moveFilePermission,
+    organizationPlanPermission: root.organizationPlanPermission,
+    readPermission: root.readPermission,
+    recommendationPermission: root.recommendationPermission,
+    renameFilePermission: root.renameFilePermission,
+    watchPermission: root.watchPermission,
+  };
+}
+
+function permissionSnapshotFromCommandResult(result: Prisma.JsonValue | null) {
+  const value = objectValue(result);
+  const permissionsValue = objectValue(value?.permissions);
+
+  if (!value || !permissionsValue) {
+    return null;
+  }
+
+  const permissions: Partial<PermissionSnapshot> = {};
+
+  for (const key of permissionKeys) {
+    if (typeof permissionsValue[key] === "boolean") {
+      permissions[key] = permissionsValue[key];
+    }
+  }
+
+  if (permissionKeys.some((key) => typeof permissions[key] !== "boolean")) {
+    return null;
+  }
+
+  return {
+    permissions: permissions as PermissionSnapshot,
+    rootUpdatedAt:
+      typeof value.rootUpdatedAt === "string" ? value.rootUpdatedAt : null,
+  };
+}
+
+async function latestConfirmedPermissionUpdate(
+  prisma: ReturnType<typeof getPrismaClient>,
+  input: {
+    bridgeDeviceId: string;
+    bridgeRootId: string;
+  },
+) {
+  const command = await prisma.bridgeCommand.findFirst({
+    orderBy: {
+      completedAt: "desc",
+    },
+    where: {
+      bridgeDeviceId: input.bridgeDeviceId,
+      bridgeRootId: input.bridgeRootId,
+      commandType: "UPDATE_ROOT_PERMISSIONS",
+      status: "COMPLETED",
+    },
+  });
+
+  return command ? permissionSnapshotFromCommandResult(command.result) : null;
+}
+
+function stalePermissionSync(input: {
+  confirmedRootUpdatedAt: string | null;
+  incomingRootUpdatedAt: string | null;
+}) {
+  const confirmed = dateOrNull(input.confirmedRootUpdatedAt);
+
+  if (!confirmed) {
+    return false;
+  }
+
+  const incoming = dateOrNull(input.incomingRootUpdatedAt);
+
+  return !incoming || incoming.getTime() < confirmed.getTime();
 }
 
 function validatedRoot(value: unknown): BridgeRootSyncInput | null {
@@ -130,6 +230,7 @@ function validatedRoot(value: unknown): BridgeRootSyncInput | null {
     renameFilePermission: root.renameFilePermission === true,
     safeLocation: root.safeLocation.trim().slice(0, 500),
     status,
+    updatedAt: typeof root.updatedAt === "string" ? root.updatedAt : null,
     watcherState,
     watchPermission: root.watchPermission === true,
   };
@@ -167,11 +268,40 @@ export async function syncBridgeDeviceRoots(
           ],
         },
       }));
+    const confirmedPermissionUpdate = await latestConfirmedPermissionUpdate(
+      prisma,
+      {
+        bridgeDeviceId,
+        bridgeRootId: root.id,
+      },
+    );
+    const rootPermissions = permissionSnapshotFromRoot(root);
+    const stalePermissions = confirmedPermissionUpdate
+      ? stalePermissionSync({
+          confirmedRootUpdatedAt: confirmedPermissionUpdate.rootUpdatedAt,
+          incomingRootUpdatedAt: root.updatedAt,
+        })
+      : false;
+    const effectivePermissions = stalePermissions
+      ? confirmedPermissionUpdate?.permissions ?? rootPermissions
+      : rootPermissions;
+
+    logBridgePermissionDiagnostic({
+      bridgeRootId: root.id,
+      commandType: "UPDATE_ROOT_PERMISSIONS",
+      confirmedRootUpdatedAt:
+        confirmedPermissionUpdate?.rootUpdatedAt ?? null,
+      event: "root-sync",
+      ignoredBecause: stalePermissions ? "STALE_ROOT_SYNC" : null,
+      permissions: bridgePermissionSnapshot(effectivePermissions),
+      rootUpdatedAt: root.updatedAt,
+    });
+
     const commonData = {
       bridgeDeviceId,
       bridgeRootId: root.id,
       canonicalConnectedLibraryId: null,
-      createFolderPermission: root.createFolderPermission,
+      createFolderPermission: effectivePermissions.createFolderPermission,
       disconnectedAt:
         root.status === "DISCONNECTED" ? now : null,
       displayName: root.displayName,
@@ -196,15 +326,16 @@ export async function syncBridgeDeviceRoots(
       monitoringState: monitoringState(root),
       monitoringStoppedAt:
         root.watcherState === "STOPPED" ? now : null,
-      moveFilePermission: root.moveFilePermission,
-      organizationPlanPermission: root.organizationPlanPermission,
+      moveFilePermission: effectivePermissions.moveFilePermission,
+      organizationPlanPermission:
+        effectivePermissions.organizationPlanPermission,
       platform: root.platform,
-      readPermission: root.readPermission,
-      recommendationPermission: root.recommendationPermission,
-      renameFilePermission: root.renameFilePermission,
+      readPermission: effectivePermissions.readPermission,
+      recommendationPermission: effectivePermissions.recommendationPermission,
+      renameFilePermission: effectivePermissions.renameFilePermission,
       safeLocalLocation: root.safeLocation,
       status: connectedLibraryStatus(root),
-      watchPermission: root.watchPermission,
+      watchPermission: effectivePermissions.watchPermission,
     } satisfies Prisma.ConnectedLibraryUncheckedUpdateInput;
 
     const library = existing

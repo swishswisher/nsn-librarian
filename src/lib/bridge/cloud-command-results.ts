@@ -9,6 +9,7 @@ import {
   BridgeCloudError,
   createBridgeCloudCommand,
 } from "@/lib/bridge/cloud-coordinator";
+import { logBridgePermissionDiagnostic } from "@/lib/bridge/permission-diagnostics";
 
 import { generateOrganizationSuggestionsForScannedFileWithText } from "./organization-suggestions";
 import {
@@ -518,10 +519,12 @@ async function applyFailedRead(commandPayload: unknown, safeErrorCategory: strin
 
 async function applyCompletedPermissionUpdate(input: {
   bridgeRootId: string;
+  commandId: string;
   commandPayload: unknown;
   connectedLibraryId: string;
   result: unknown;
 }) {
+  const prisma = getPrismaClient();
   const payload = objectValue(input.commandPayload);
   const root = objectValue(input.result);
   const rootId = stringValue(root?.id, 100);
@@ -534,84 +537,95 @@ async function applyCompletedPermissionUpdate(input: {
     );
   }
 
+  const existing = await prisma.connectedLibrary.findUnique({
+    where: {
+      id: input.connectedLibraryId,
+    },
+  });
+
+  if (!existing) {
+    throw new BridgeCloudError(
+      "The Librarian could not find that connected folder.",
+      404,
+      "CONNECTED_LIBRARY_NOT_FOUND",
+    );
+  }
+
   const readPermission =
     booleanValue(root.readPermission) ??
     booleanValue(payload?.readPermission) ??
-    true;
+    existing.readPermission;
   const watchPermission = readPermission
     ? (booleanValue(root.watchPermission) ??
       booleanValue(payload?.watchPermission) ??
-      false)
+      existing.watchPermission)
     : false;
   const watcherState = bridgeRootWatcherState(root.watcherState);
   const status = connectedLibraryStatus(root.status);
+  const rootUpdatedAt = stringValue(root.updatedAt, 100);
   const now = new Date();
+  const permissions = {
+    createFolderPermission:
+      booleanValue(root.createFolderPermission) ??
+      booleanValue(payload?.createFolderPermission) ??
+      existing.createFolderPermission,
+    moveFilePermission:
+      booleanValue(root.moveFilePermission) ??
+      booleanValue(payload?.moveFilePermission) ??
+      existing.moveFilePermission,
+    organizationPlanPermission:
+      booleanValue(root.organizationPlanPermission) ??
+      booleanValue(payload?.organizationPlanPermission) ??
+      existing.organizationPlanPermission,
+    readPermission,
+    recommendationPermission:
+      booleanValue(root.recommendationPermission) ??
+      booleanValue(payload?.recommendationPermission) ??
+      existing.recommendationPermission,
+    renameFilePermission:
+      booleanValue(root.renameFilePermission) ??
+      booleanValue(payload?.renameFilePermission) ??
+      existing.renameFilePermission,
+    watchPermission,
+  };
 
-  await getPrismaClient().connectedLibrary.update({
+  await prisma.connectedLibrary.update({
     data: {
       bridgeRootId: input.bridgeRootId,
-      createFolderPermission:
-        booleanValue(root.createFolderPermission) ??
-        booleanValue(payload?.createFolderPermission) ??
-        false,
+      createFolderPermission: permissions.createFolderPermission,
       disconnectedAt: status === "DISCONNECTED" ? now : null,
       isEnabled: status !== "DISCONNECTED",
       lastBridgeCheckAt: now,
       monitoringErrorCategory: readPermission ? null : "READ_PERMISSION_REQUIRED",
       monitoringState: watcherState,
       monitoringStoppedAt: watcherState === "STOPPED" ? now : undefined,
-      moveFilePermission:
-        booleanValue(root.moveFilePermission) ??
-        booleanValue(payload?.moveFilePermission) ??
-        false,
-      organizationPlanPermission:
-        booleanValue(root.organizationPlanPermission) ??
-        booleanValue(payload?.organizationPlanPermission) ??
-        true,
-      readPermission,
-      recommendationPermission:
-        booleanValue(root.recommendationPermission) ??
-        booleanValue(payload?.recommendationPermission) ??
-        true,
-      renameFilePermission:
-        booleanValue(root.renameFilePermission) ??
-        booleanValue(payload?.renameFilePermission) ??
-        false,
+      moveFilePermission: permissions.moveFilePermission,
+      organizationPlanPermission: permissions.organizationPlanPermission,
+      readPermission: permissions.readPermission,
+      recommendationPermission: permissions.recommendationPermission,
+      renameFilePermission: permissions.renameFilePermission,
       safeLocalLocation: stringValue(root.safeLocation, 500) ?? undefined,
       status,
-      watchPermission,
+      watchPermission: permissions.watchPermission,
     },
     where: {
       id: input.connectedLibraryId,
     },
   });
 
+  logBridgePermissionDiagnostic({
+    bridgeRootId: input.bridgeRootId,
+    commandId: input.commandId,
+    commandType: "UPDATE_ROOT_PERMISSIONS",
+    event: "completed-persisted",
+    permissions,
+    rootUpdatedAt,
+  });
+
   return {
     bridgeRootId: input.bridgeRootId,
-    permissions: {
-      createFolderPermission:
-        booleanValue(root.createFolderPermission) ??
-        booleanValue(payload?.createFolderPermission) ??
-        false,
-      moveFilePermission:
-        booleanValue(root.moveFilePermission) ??
-        booleanValue(payload?.moveFilePermission) ??
-        false,
-      organizationPlanPermission:
-        booleanValue(root.organizationPlanPermission) ??
-        booleanValue(payload?.organizationPlanPermission) ??
-        true,
-      readPermission,
-      recommendationPermission:
-        booleanValue(root.recommendationPermission) ??
-        booleanValue(payload?.recommendationPermission) ??
-        true,
-      renameFilePermission:
-        booleanValue(root.renameFilePermission) ??
-        booleanValue(payload?.renameFilePermission) ??
-        false,
-      watchPermission,
-    },
+    permissions,
+    rootUpdatedAt,
     status,
     watcherState,
   } satisfies BridgeJson;
@@ -684,6 +698,7 @@ export async function prepareBridgeCommandReportForPersistence(
         ...report,
         result: await applyCompletedPermissionUpdate({
           bridgeRootId: command.bridgeRootId,
+          commandId: command.commandId,
           commandPayload: command.payload,
           connectedLibraryId: command.connectedLibraryId,
           result: report.result,

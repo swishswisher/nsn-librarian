@@ -413,6 +413,7 @@ export function ConnectedLibrariesManager({
   const [notice, setNotice] = useState<string | null>(null);
   const disconnectCancelRef = useRef<HTMLButtonElement>(null);
   const lastFocusedControlRef = useRef<HTMLElement | null>(null);
+  const pendingLibraryPatchKeysRef = useRef<Set<string>>(new Set());
 
   const visibleLibraries = libraries.filter(
     (library) => !library.isHiddenFromActiveList && !library.isMergedDuplicate,
@@ -774,6 +775,13 @@ export function ConnectedLibrariesManager({
     successMessage: string,
   ) {
     const updatesPermissions = isPermissionPatch(body);
+    const patchKey = `${libraryId}:${updatesPermissions ? "permissions" : "details"}`;
+
+    if (pendingLibraryPatchKeysRef.current.has(patchKey)) {
+      return;
+    }
+
+    pendingLibraryPatchKeysRef.current.add(patchKey);
     setBusyId(libraryId);
     setError(null);
     setNotice(updatesPermissions ? "Updating permission..." : null);
@@ -842,6 +850,7 @@ export function ConnectedLibrariesManager({
     } catch {
       setError("The Bridge could not update this folder right now.");
     } finally {
+      pendingLibraryPatchKeysRef.current.delete(patchKey);
       setBusyId(null);
     }
   }

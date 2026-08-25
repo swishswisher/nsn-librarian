@@ -16,6 +16,7 @@ import {
   registerRootFromSelection,
   requireExecutionPermissions,
   requireRootPermission,
+  updateRoot,
 } from "../src/main/registry";
 import { getOrCreatePairingSecret } from "../src/security/pairing";
 import {
@@ -320,6 +321,23 @@ describe("NSN Bridge core", () => {
         }),
       /Watching requires/i,
     );
+  });
+
+  it("preserves read permission when a watch-only update is applied", async () => {
+    const folder = await makeSafeFolder("library-d-watch-update");
+    const root = await connectFolder(folder, {
+      readPermission: true,
+      watchPermission: false,
+    });
+
+    const updated = await updateRoot(root.id, {
+      permissions: {
+        watchPermission: true,
+      },
+    });
+
+    assert.equal(updated.readPermission, true);
+    assert.equal(updated.watchPermission, true);
   });
 
   it("rejects traversal and cross-library relative paths", async () => {

@@ -11,6 +11,10 @@ import {
   BridgeCloudError,
   createBridgeCloudCommand,
 } from "@/lib/bridge/cloud-coordinator";
+import {
+  bridgePermissionSnapshot,
+  logBridgePermissionDiagnostic,
+} from "@/lib/bridge/permission-diagnostics";
 
 import type {
   ConnectedLibraryPermissions,
@@ -1342,6 +1346,10 @@ export async function updateConnectedLibrary(
       );
     }
 
+    const commandPayload = safePermissionCommandPayload(
+      existing.bridgeRootId,
+      normalizedInput,
+    );
     let command;
 
     try {
@@ -1354,10 +1362,7 @@ export async function updateConnectedLibrary(
         bridgeRootId: existing.bridgeRootId,
         commandType: "UPDATE_ROOT_PERMISSIONS",
         connectedLibraryId: existing.id,
-        payload: safePermissionCommandPayload(
-          existing.bridgeRootId,
-          normalizedInput,
-        ),
+        payload: commandPayload,
       });
     } catch (error) {
       if (error instanceof BridgeCloudError) {
@@ -1366,6 +1371,14 @@ export async function updateConnectedLibrary(
 
       throw error;
     }
+
+    logBridgePermissionDiagnostic({
+      bridgeRootId: existing.bridgeRootId,
+      commandId: command.commandId,
+      commandType: "UPDATE_ROOT_PERMISSIONS",
+      event: "queued",
+      permissions: bridgePermissionSnapshot(commandPayload),
+    });
 
     return {
       action: "UPDATED",

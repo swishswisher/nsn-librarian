@@ -51,6 +51,15 @@ import { readBridgeSecret, saveBridgeSecret } from "./keychain";
 const replayCacheSecret = "processed-command-replay-keys";
 const replayCacheLimit = 500;
 const privatePathKeys = new Set(["actualPath", "localPath", "rootPath"]);
+const permissionKeys: Array<keyof BridgePermissions> = [
+  "readPermission",
+  "watchPermission",
+  "recommendationPermission",
+  "organizationPlanPermission",
+  "createFolderPermission",
+  "moveFilePermission",
+  "renameFilePermission",
+];
 
 export type BridgeCommandRuntime = {
   selectFolders?: () => Promise<FolderSelectionResult[]>;
@@ -60,6 +69,35 @@ function payloadObject(payload: BridgeJson) {
   return typeof payload === "object" && payload !== null && !Array.isArray(payload)
     ? (payload as Record<string, BridgeJson>)
     : {};
+}
+
+function permissionSnapshot(value: Partial<Record<keyof BridgePermissions, unknown>>) {
+  const permissions: Partial<Record<keyof BridgePermissions, boolean>> = {};
+
+  for (const key of permissionKeys) {
+    if (typeof value[key] === "boolean") {
+      permissions[key] = value[key];
+    }
+  }
+
+  return permissions;
+}
+
+function logPermissionDiagnostic(input: {
+  bridgeRootId: string;
+  commandId: string;
+  event: string;
+  permissions: Partial<Record<keyof BridgePermissions, unknown>>;
+  rootUpdatedAt?: string | null;
+}) {
+  console.info("[NSN Bridge] permission-update", {
+    bridgeRootId: input.bridgeRootId,
+    commandId: input.commandId,
+    commandType: "UPDATE_ROOT_PERMISSIONS",
+    event: input.event,
+    permissions: permissionSnapshot(input.permissions),
+    rootUpdatedAt: input.rootUpdatedAt ?? null,
+  });
 }
 
 function jsonSafe(value: unknown): BridgeJson {
@@ -306,6 +344,14 @@ async function executeCommand(
       if (!root.watchPermission || permissions.readPermission === false) {
         root = await stopBridgeWatcher(rootId);
       }
+
+      logPermissionDiagnostic({
+        bridgeRootId: rootId,
+        commandId: command.commandId,
+        event: "native-returned",
+        permissions: root,
+        rootUpdatedAt: root.updatedAt,
+      });
 
       return root;
     }
