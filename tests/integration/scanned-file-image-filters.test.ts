@@ -60,6 +60,23 @@ function scannedFile(
 }
 
 describe("scanned image classification and filters", () => {
+  it("includes exact duplicate audio recordings in Possible Duplicates", () => {
+    const audioDuplicate = scannedFile(
+      "Media/Voice_Intro_Copy.mp3",
+      {
+        audioMetadata: {
+          duplicateKind: "EXACT_DUPLICATE",
+        } as BridgeScannedFileSummary["audioMetadata"],
+        fileType: "AUDIO_MP3",
+      },
+    );
+
+    assert.equal(
+      fileMatchesScannedFileFilter(audioDuplicate, "POSSIBLE_DUPLICATES"),
+      true,
+    );
+  });
+
   it("classifies JPG, PNG, and WEBP file names as IMAGE", () => {
     assert.equal(
       mediaCategoryForFileType(
