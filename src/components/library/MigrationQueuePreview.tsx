@@ -1,5 +1,10 @@
+"use client";
+
+import { useMemo, useState } from "react";
+
 import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
+import { NsnSearchField } from "@/components/library/NsnSearchField";
 import { NsnTableShell } from "@/components/library/NsnTableShell";
 import type { MigrationQueueRow } from "@/types/library";
 
@@ -64,6 +69,20 @@ function migrationActionLabel(actionType: string) {
 }
 
 export function MigrationQueuePreview({ items }: MigrationQueuePreviewProps) {
+  const [searchQuery, setSearchQuery] = useState("");
+  const filteredItems = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+
+    return query
+      ? items.filter((item) =>
+          [item.fileName, item.destinationPath, item.actionType, item.status]
+            .join(" ")
+            .toLowerCase()
+            .includes(query),
+        )
+      : items;
+  }, [items, searchQuery]);
+
   if (items.length === 0) {
     return (
       <NsnEmptyState
@@ -87,7 +106,16 @@ export function MigrationQueuePreview({ items }: MigrationQueuePreviewProps) {
         </p>
       </div>
 
-      <NsnTableShell>
+      <div className="mb-4">
+        <NsnSearchField
+          label="Search organization plans"
+          onChange={setSearchQuery}
+          resultCount={filteredItems.length}
+          value={searchQuery}
+        />
+      </div>
+
+      {filteredItems.length > 0 ? <NsnTableShell>
         <table className="nsn-table">
           <thead>
             <tr>
@@ -98,7 +126,7 @@ export function MigrationQueuePreview({ items }: MigrationQueuePreviewProps) {
             </tr>
           </thead>
           <tbody>
-            {items.map((item) => (
+            {filteredItems.map((item) => (
               <tr key={item.id}>
                 <td className="font-semibold text-[var(--nsn-navy)]">
                   {item.fileName}
@@ -119,6 +147,12 @@ export function MigrationQueuePreview({ items }: MigrationQueuePreviewProps) {
           </tbody>
         </table>
       </NsnTableShell>
+      : (
+        <NsnEmptyState
+          description="Try another file name, destination, action, or status."
+          title="No organization plans match your search"
+        />
+      )}
     </section>
   );
 }

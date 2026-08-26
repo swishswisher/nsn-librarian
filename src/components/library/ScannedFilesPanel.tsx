@@ -8,6 +8,7 @@ import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
 import { NsnButton } from "@/components/library/NsnButton";
 import { NsnCard } from "@/components/library/NsnCard";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
+import { NsnSearchField } from "@/components/library/NsnSearchField";
 import {
   getScanSessionRoute,
   getScannedFileExamineRoute,
@@ -254,6 +255,24 @@ function fileNameFromPath(relativePath: string) {
   return relativePath.split("/").filter(Boolean).at(-1) ?? relativePath;
 }
 
+function fileSearchText(file: BridgeScannedFileSummary) {
+  return [
+    file.relativePath,
+    file.fileType,
+    file.previewText,
+    file.scanError,
+    file.audioMetadata?.summary,
+    file.audioMetadata?.transcriptSnippet,
+    file.imageMetadata?.summary,
+    file.imageMetadata?.textSnippet,
+    file.videoMetadata?.summary,
+    file.videoMetadata?.transcriptSnippet,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
 function observeModeLabel(observerType: string) {
   return observerType === "OPENAI"
     ? "Observed with AI assistance"
@@ -385,6 +404,7 @@ export function ScannedFilesPanel({
 }: ScannedFilesPanelProps) {
   const router = useRouter();
   const [activeFilter, setActiveFilter] = useState<ScannedFileFilter>("ALL");
+  const [searchQuery, setSearchQuery] = useState("");
   const [fileOverrides, setFileOverrides] = useState<
     Record<string, BridgeScannedFileSummary>
   >({});
@@ -406,9 +426,15 @@ export function ScannedFilesPanel({
     () => scannedFileCategoryCounts(fileRows),
     [fileRows],
   );
-  const filteredFiles = fileRows.filter((file) =>
-    fileMatchesScannedFileFilter(file, activeFilter),
-  );
+  const filteredFiles = fileRows.filter((file) => {
+    if (!fileMatchesScannedFileFilter(file, activeFilter)) {
+      return false;
+    }
+
+    const query = searchQuery.trim().toLowerCase();
+
+    return !query || fileSearchText(file).includes(query);
+  });
 
   useEffect(() => {
     if (preview || previewError) {
@@ -666,6 +692,13 @@ export function ScannedFilesPanel({
           })}
         </div>
 
+        <NsnSearchField
+          label="Search scanned files"
+          onChange={setSearchQuery}
+          resultCount={filteredFiles.length}
+          value={searchQuery}
+        />
+
         {readNotice || suggestionNotice || suggestionError ? (
           <div aria-live="polite" className="grid gap-2">
             {readNotice ? (
@@ -699,7 +732,7 @@ export function ScannedFilesPanel({
 
       {fileRows.length > 0 && filteredFiles.length === 0 ? (
         <NsnEmptyState
-          description="No scanned files match this filter."
+          description="No scanned files match this filter or search."
           title="Nothing in this view"
         />
       ) : null}

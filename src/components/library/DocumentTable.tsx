@@ -1,7 +1,12 @@
+"use client";
+
+import { useMemo, useState } from "react";
+
 import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
 import { MindPreviewButton } from "@/components/library/MindPreviewButton";
 import { NsnTableShell } from "@/components/library/NsnTableShell";
+import { NsnSearchField } from "@/components/library/NsnSearchField";
 import type { LibraryDocumentSummary } from "@/types/library";
 
 type DocumentTableProps = {
@@ -142,6 +147,30 @@ export function DocumentTable({
   documents,
   highlightedDocumentId = null,
 }: DocumentTableProps) {
+  const [searchQuery, setSearchQuery] = useState("");
+  const filteredDocuments = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+
+    if (!query) {
+      return documents;
+    }
+
+    return documents.filter((document) =>
+      [
+        document.originalFileName,
+        document.scanSessionName,
+        document.extension,
+        document.mimeType,
+        document.previewText,
+        document.suggestedDestination,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(query),
+    );
+  }, [documents, searchQuery]);
+
   if (documents.length === 0) {
     return (
       <NsnEmptyState
@@ -171,9 +200,25 @@ export function DocumentTable({
         </span>
       </div>
 
+      <div className="mb-4">
+        <NsnSearchField
+          label="Search My Library"
+          onChange={setSearchQuery}
+          resultCount={filteredDocuments.length}
+          value={searchQuery}
+        />
+      </div>
+
+      {filteredDocuments.length === 0 ? (
+        <NsnEmptyState
+          description="Try another file name, scan session, or keyword."
+          title="No library items match your search"
+        />
+      ) : null}
+
       {/* No feature is complete if it breaks responsive behavior. */}
       <div className="grid min-w-0 gap-3 xl:hidden">
-        {documents.map((document) => (
+        {filteredDocuments.map((document) => (
           <DocumentMobileCard
             document={document}
             isHighlighted={document.id === highlightedDocumentId}
@@ -182,6 +227,7 @@ export function DocumentTable({
         ))}
       </div>
 
+      {filteredDocuments.length > 0 ? (
       <NsnTableShell className="hidden xl:block">
         <table className="nsn-table">
           <colgroup>
@@ -205,7 +251,7 @@ export function DocumentTable({
             </tr>
           </thead>
           <tbody>
-            {documents.map((document) => (
+            {filteredDocuments.map((document) => (
               <tr
                 className={
                   document.id === highlightedDocumentId
@@ -254,6 +300,7 @@ export function DocumentTable({
           </tbody>
         </table>
       </NsnTableShell>
+      ) : null}
     </section>
   );
 }

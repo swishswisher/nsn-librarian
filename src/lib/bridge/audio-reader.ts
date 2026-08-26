@@ -348,7 +348,6 @@ async function detectAudioDuplicate(
         id: {
           not: scannedFile.id,
         },
-        readStatus: "SUPPORTED",
       },
     });
 
@@ -608,6 +607,22 @@ async function upsertAudioMetadata(input: {
       scannedFileId: input.scannedFile.id,
     },
   });
+
+  if (
+    input.duplicate.duplicateKind === "EXACT_DUPLICATE" &&
+    input.duplicate.duplicateOfScannedFileId
+  ) {
+    await prisma.audioRecordingMetadata.updateMany({
+      data: {
+        duplicateConfidence: 0.98,
+        duplicateKind: "EXACT_DUPLICATE",
+        duplicateOfScannedFileId: input.scannedFile.id,
+      },
+      where: {
+        scannedFileId: input.duplicate.duplicateOfScannedFileId,
+      },
+    });
+  }
 }
 
 export async function readScannedAudioFile(

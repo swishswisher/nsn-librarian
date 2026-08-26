@@ -9,6 +9,7 @@ import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
 import { NsnButton } from "@/components/library/NsnButton";
 import { NsnCard } from "@/components/library/NsnCard";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
+import { NsnSearchField } from "@/components/library/NsnSearchField";
 import { getRecommendationExamineRoute } from "@/lib/library/routes";
 import type {
   BridgeOrganizationSuggestionMutationResponse,
@@ -450,6 +451,7 @@ export function OrganizationSuggestionsReviewPanel({
   const lastFocusedElementRef = useRef<HTMLElement | null>(null);
   const [rows, setRows] = useState(suggestions);
   const [activeFilter, setActiveFilter] = useState<FilterValue>("ALL");
+  const [searchQuery, setSearchQuery] = useState("");
   const [editState, setEditState] = useState<EditState>(null);
   const [expandedDetails, setExpandedDetails] = useState<Record<string, boolean>>(
     {},
@@ -478,10 +480,39 @@ export function OrganizationSuggestionsReviewPanel({
   );
   const filteredRows = useMemo(
     () =>
-      rows.filter((suggestion) =>
-        filterMatches(suggestion, activeFilter, libraryIdBySuggestionId),
-      ),
-    [activeFilter, libraryIdBySuggestionId, rows],
+      rows.filter((suggestion) => {
+        if (!filterMatches(suggestion, activeFilter, libraryIdBySuggestionId)) {
+          return false;
+        }
+
+        const query = searchQuery.trim().toLowerCase();
+
+        if (!query) {
+          return true;
+        }
+
+        return [
+          suggestion.title,
+          suggestion.currentRelativePath,
+          suggestion.proposedRelativePath,
+          suggestion.proposedFileName,
+          suggestion.explanation,
+          suggestion.whySuggested.join(" "),
+          suggestion.supportingInformation.join(" "),
+          libraryNameBySuggestionId[suggestion.id],
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase()
+          .includes(query);
+      }),
+    [
+      activeFilter,
+      libraryIdBySuggestionId,
+      libraryNameBySuggestionId,
+      rows,
+      searchQuery,
+    ],
   );
   const groups = useMemo(() => buildGroups(filteredRows), [filteredRows]);
   const groupsExpandedByDefault = groups.length <= 4;
@@ -739,6 +770,13 @@ export function OrganizationSuggestionsReviewPanel({
           ))}
         </div>
 
+        <NsnSearchField
+          label="Search organization recommendations"
+          onChange={setSearchQuery}
+          resultCount={filteredRows.length}
+          value={searchQuery}
+        />
+
         <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
           <NsnButton onClick={expandAllGroups} type="button" variant="secondary">
             Expand all
@@ -767,7 +805,7 @@ export function OrganizationSuggestionsReviewPanel({
 
       {filteredRows.length === 0 ? (
         <NsnEmptyState
-          description="No recommendations match this filter. Change the filter to see the rest of the review queue."
+          description="No recommendations match this filter or search. Change either one to see the rest of the review queue."
           title="Nothing in this view"
         />
       ) : null}

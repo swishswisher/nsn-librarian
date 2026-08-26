@@ -1,8 +1,12 @@
+"use client";
+
 import Link from "next/link";
+import { useMemo, useState } from "react";
 
 import { NsnBadge } from "@/components/library/NsnBadge";
 import { NsnCard } from "@/components/library/NsnCard";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
+import { NsnSearchField } from "@/components/library/NsnSearchField";
 import type { ReviewQueueItem } from "@/types/library";
 
 type ReviewQueueProps = {
@@ -43,6 +47,22 @@ function relatedContextLabel(count: number) {
 }
 
 export function ReviewQueue({ items }: ReviewQueueProps) {
+  const [searchQuery, setSearchQuery] = useState("");
+  const filteredItems = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+
+    if (!query) {
+      return items;
+    }
+
+    return items.filter((item) =>
+      [item.documentName, item.summary, item.observerType, item.status]
+        .join(" ")
+        .toLowerCase()
+        .includes(query),
+    );
+  }, [items, searchQuery]);
+
   if (items.length === 0) {
     return (
       <NsnEmptyState
@@ -66,8 +86,17 @@ export function ReviewQueue({ items }: ReviewQueueProps) {
         </p>
       </div>
 
+      <div className="mb-4">
+        <NsnSearchField
+          label="Search observation recommendations"
+          onChange={setSearchQuery}
+          resultCount={filteredItems.length}
+          value={searchQuery}
+        />
+      </div>
+
       <div className="grid gap-3">
-        {items.map((item) => (
+        {filteredItems.map((item) => (
           <NsnCard key={item.id}>
             <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
               <div className="min-w-0">
@@ -106,6 +135,12 @@ export function ReviewQueue({ items }: ReviewQueueProps) {
           </NsnCard>
         ))}
       </div>
+      {filteredItems.length === 0 ? (
+        <NsnEmptyState
+          description="Try another file name or recommendation keyword."
+          title="No recommendations match your search"
+        />
+      ) : null}
     </section>
   );
 }

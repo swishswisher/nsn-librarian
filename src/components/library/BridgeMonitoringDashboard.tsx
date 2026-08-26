@@ -2,12 +2,13 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
 import { NsnButton } from "@/components/library/NsnButton";
 import { NsnCard } from "@/components/library/NsnCard";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
+import { NsnSearchField } from "@/components/library/NsnSearchField";
 import {
   getConnectedLibrariesRoute,
   getNotebookEntryRoute,
@@ -442,8 +443,42 @@ export function BridgeMonitoringDashboard({
   const [commandName, setCommandName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
   const [stopTarget, setStopTarget] =
     useState<BridgeMonitoringFolderSummary | null>(null);
+  const normalizedSearch = searchQuery.trim().toLowerCase();
+  const matchingFolders = useMemo(
+    () =>
+      dashboard.folders.filter((folder) =>
+        !normalizedSearch
+          ? true
+          : [
+              folder.displayName,
+              ...folder.recentEvents.flatMap((event) => [
+                event.currentRelativePath,
+                event.previousRelativePath,
+              ]),
+            ]
+              .filter(Boolean)
+              .join(" ")
+              .toLowerCase()
+              .includes(normalizedSearch),
+      ),
+    [dashboard.folders, normalizedSearch],
+  );
+  const matchingEvents = useMemo(
+    () =>
+      dashboard.recentEvents.filter((event) =>
+        !normalizedSearch
+          ? true
+          : [event.currentRelativePath, event.previousRelativePath, event.eventType]
+              .filter(Boolean)
+              .join(" ")
+              .toLowerCase()
+              .includes(normalizedSearch),
+      ),
+    [dashboard.recentEvents, normalizedSearch],
+  );
 
   const runCommand = useCallback(
     async (endpoint: string, label: string, body?: unknown) => {
@@ -549,6 +584,14 @@ export function BridgeMonitoringDashboard({
     <div className="grid min-w-0 gap-6" aria-live="polite">
       <QueueTiles dashboard={dashboard} />
 
+      <NsnSearchField
+        label="Search monitoring"
+        onChange={setSearchQuery}
+        placeholder="Search folders, file names, or paths"
+        resultCount={matchingEvents.length}
+        value={searchQuery}
+      />
+
       {commandName ? (
         <p className="rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3 text-sm leading-6 text-[var(--nsn-teal-dark)]">
           {commandName}
@@ -592,7 +635,7 @@ export function BridgeMonitoringDashboard({
         </NsnCard>
       ) : (
         <div className="grid min-w-0 gap-4">
-          {dashboard.folders.map((folder) => (
+          {matchingFolders.map((folder) => (
             <FolderCard
               commandName={commandName}
               folder={folder}
@@ -675,7 +718,7 @@ export function BridgeMonitoringDashboard({
           >
             Recent Changes Across Watched Folders
           </h2>
-          <RecentEventList events={dashboard.recentEvents} />
+          <RecentEventList events={matchingEvents} />
         </section>
       ) : null}
 
