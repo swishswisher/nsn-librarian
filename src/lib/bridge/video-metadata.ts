@@ -321,6 +321,12 @@ function readUInt64BEAsNumber(buffer: Buffer, offset: number) {
 function parseMp4Like(buffer: Buffer, fallbackContainer: string): ParsedVideoMetadata {
   let offset = 0;
   let durationSeconds: number | null = null;
+  const trackText = buffer.toString("ascii");
+  const hasAudioTrack = trackText.includes("soun")
+    ? true
+    : trackText.includes("vide")
+      ? false
+      : null;
 
   while (offset + 8 <= buffer.length) {
     const size = buffer.readUInt32BE(offset);
@@ -359,7 +365,13 @@ function parseMp4Like(buffer: Buffer, fallbackContainer: string): ParsedVideoMet
       );
 
       if (child.durationSeconds) {
-        return child;
+        return normalizeMetadata(
+          {
+            ...child,
+            hasAudioTrack: child.hasAudioTrack ?? hasAudioTrack,
+          },
+          fallbackContainer,
+        );
       }
     }
 
@@ -370,6 +382,7 @@ function parseMp4Like(buffer: Buffer, fallbackContainer: string): ParsedVideoMet
     {
       container: fallbackContainer,
       durationSeconds,
+      hasAudioTrack,
     },
     fallbackContainer,
   );

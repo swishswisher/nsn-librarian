@@ -128,6 +128,7 @@ function hasPossibleDuplicateSignal(file: BridgeScannedFileSummary) {
 
   return Boolean(
     file.audioMetadata?.duplicateKind ||
+      file.hasPossibleDuplicateSuggestion ||
       file.imageMetadata?.duplicateKind ||
       file.imageMetadata?.humanLabels.includes("DUPLICATE_CANDIDATE") ||
       file.videoMetadata?.duplicateKind ||

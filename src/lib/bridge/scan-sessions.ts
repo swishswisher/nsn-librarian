@@ -33,6 +33,7 @@ import type {
   ScannedFileProcessingStage,
   ScannedFileReadStatus,
 } from "./types";
+import { recordChecksumDuplicateSuggestionsForSession } from "./checksum-duplicates";
 
 type StoredScanSession = {
   connectedFolderId: string;
@@ -80,6 +81,7 @@ export type StoredScannedFile = {
   } | null;
   organizationSuggestions?: {
     status: string;
+    suggestionType?: string | null;
   }[];
 };
 
@@ -378,6 +380,10 @@ export function scannedFileSummary(
       file.libraryDocument?.observationSessions.some((session) =>
         reviewedObservationStatus(session.status),
       ) ?? false,
+    hasPossibleDuplicateSuggestion:
+      file.organizationSuggestions?.some(
+        (suggestion) => suggestion.suggestionType === "POSSIBLE_DUPLICATE",
+      ) ?? false,
     organizationSuggestionCounts: organizationSuggestionCounts(
       file.organizationSuggestions,
     ),
@@ -658,6 +664,7 @@ export async function createBridgeScanSessionFromScan(
         id: connectedFolder.id,
       },
     });
+    await recordChecksumDuplicateSuggestionsForSession(reusableSession.id);
 
     return scanSessionSummary(reusableSession);
   }
@@ -672,6 +679,7 @@ export async function createBridgeScanSessionFromScan(
 
   try {
     await storeScannedFiles(session.id, scan.files);
+    await recordChecksumDuplicateSuggestionsForSession(session.id);
 
     const terminalStatus =
       scan.supportedFiles > 0
@@ -1092,6 +1100,7 @@ export async function getBridgeScanSessionProgress(sessionId: string) {
           organizationSuggestions: {
             select: {
               status: true,
+              suggestionType: true,
             },
           },
         },
@@ -1172,6 +1181,7 @@ export async function getBridgeScanSessionDetail(
           organizationSuggestions: {
             select: {
               status: true,
+              suggestionType: true,
             },
           },
         },

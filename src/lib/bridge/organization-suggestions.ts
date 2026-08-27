@@ -1537,6 +1537,7 @@ async function refreshedScannedFileSummary(
       organizationSuggestions: {
         select: {
           status: true,
+          suggestionType: true,
         },
       },
     },

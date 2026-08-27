@@ -75,6 +75,42 @@ async function waitForWatcherEvents(rootId: string, timeoutMs = 2500) {
   return [] as Awaited<ReturnType<typeof takeBridgeWatcherEvents>>;
 }
 
+function mp3FrameBuffer() {
+  return Buffer.concat([
+    Buffer.from([0xff, 0xfb, 0x90, 0x64]),
+    Buffer.alloc(2048),
+  ]);
+}
+
+function atom(type: string, payload: Buffer) {
+  const buffer = Buffer.alloc(8 + payload.length);
+
+  buffer.writeUInt32BE(buffer.length, 0);
+  buffer.write(type, 4, 4, "ascii");
+  payload.copy(buffer, 8);
+
+  return buffer;
+}
+
+function mp4VideoBuffer(options: { hasAudioTrack?: boolean } = {}) {
+  const mvhdPayload = Buffer.alloc(100);
+
+  mvhdPayload.writeUInt32BE(1000, 12);
+  mvhdPayload.writeUInt32BE(5000, 16);
+
+  return Buffer.concat([
+    atom("ftyp", Buffer.from("isom0000isommp42", "ascii")),
+    atom(
+      "moov",
+      Buffer.concat([
+        atom("mvhd", mvhdPayload),
+        Buffer.from(options.hasAudioTrack ? "vide soun" : "vide", "ascii"),
+      ]),
+    ),
+    Buffer.alloc(128),
+  ]);
+}
+
 beforeEach(async () => {
   tempRoot = await mkdtemp(path.join(os.tmpdir(), "nsn-bridge-test-"));
   process.env.NSN_BRIDGE_DATA_DIR = path.join(tempRoot, ".bridge-data");
@@ -502,6 +538,69 @@ describe("NSN Bridge core", () => {
       path.normalize(resolvedWav.localPath),
       path.normalize(wavPath),
     );
+  });
+
+  it("reads supported audio and video as temporary media review material", async () => {
+    const folder = await makeSafeFolder("library-media-read");
+    const root = await connectFolder(folder);
+
+    await mkdir(path.join(folder, "Audio"), { recursive: true });
+    await mkdir(path.join(folder, "Video"), { recursive: true });
+    await writeFile(path.join(folder, "Audio", "session.mp3"), mp3FrameBuffer());
+    await writeFile(
+      path.join(folder, "Video", "silent-workshop.mp4"),
+      mp4VideoBuffer({ hasAudioTrack: false }),
+    );
+
+    const audio = await readBridgeRootFile(root.id, "Audio/session.mp3");
+    const video = await readBridgeRootFile(root.id, "Video/silent-workshop.mp4");
+
+    assert.equal(audio.fileType, "AUDIO_MP3");
+    assert.match(audio.extractedText, /Audio review material/);
+    assert.equal(audio.audioMetadata?.transcriptionStatus, "UNAVAILABLE");
+    assert.equal(audio.audioMetadata?.transcriptSnippet, null);
+    assert.equal(video.fileType, "VIDEO_MP4");
+    assert.match(video.extractedText, /Video review material/);
+    assert.equal(video.videoMetadata?.hasAudioTrack, false);
+    assert.equal(video.videoMetadata?.transcriptionStatus, "UNAVAILABLE");
+    assert.equal(video.videoMetadata?.transcriptSnippet, null);
+  });
+
+  it("keeps damaged supported media in media-specific failure categories", async () => {
+    const folder = await makeSafeFolder("library-media-damaged");
+    const root = await connectFolder(folder);
+
+    await writeFile(path.join(folder, "broken.mp3"), "not really audio");
+    await writeFile(path.join(folder, "broken.mp4"), "not really video");
+
+    await assert.rejects(
+      () => readBridgeRootFile(root.id, "broken.mp3"),
+      (error) =>
+        error instanceof BridgeAppError &&
+        error.code === "AUDIO_DECODE_FAILED",
+    );
+    await assert.rejects(
+      () => readBridgeRootFile(root.id, "broken.mp4"),
+      (error) =>
+        error instanceof BridgeAppError &&
+        error.code === "VIDEO_DECODE_FAILED",
+    );
+  });
+
+  it("classifies FLAC and OGG files as supported audio during scanning", async () => {
+    const folder = await makeSafeFolder("library-audio-extensions");
+    const root = await connectFolder(folder);
+
+    await writeFile(path.join(folder, "voice.flac"), Buffer.from("fLaC"));
+    await writeFile(path.join(folder, "voice.ogg"), Buffer.from("OggS"));
+
+    const scan = await scanBridgeRoot(root.id);
+    const byPath = new Map(scan.files.map((file) => [file.relativePath, file]));
+
+    assert.equal(byPath.get("voice.flac")?.fileType, "AUDIO_FLAC");
+    assert.equal(byPath.get("voice.ogg")?.fileType, "AUDIO_OGG");
+    assert.equal(byPath.get("voice.flac")?.readStatus, "SUPPORTED");
+    assert.equal(byPath.get("voice.ogg")?.readStatus, "SUPPORTED");
   });
 
   it("classifies scanned JPG, PNG, and WEBP files as images", async () => {

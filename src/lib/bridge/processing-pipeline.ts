@@ -195,7 +195,7 @@ function fileNeedsProcessing(
     libraryDocument: {
       observationSessions: { id: string }[];
     } | null;
-    organizationSuggestions: { id: string }[];
+    organizationSuggestions: { id: string; suggestionType: string }[];
     processedAt: Date | null;
     processingStage: string;
     readingStatus: string;
@@ -226,7 +226,9 @@ function fileNeedsProcessing(
     return true;
   }
 
-  return file.organizationSuggestions.length === 0;
+  return file.organizationSuggestions.every(
+    (suggestion) => suggestion.suggestionType === "POSSIBLE_DUPLICATE",
+  );
 }
 
 async function nextSupportedFileForProcessing(
@@ -254,8 +256,8 @@ async function nextSupportedFileForProcessing(
       organizationSuggestions: {
         select: {
           id: true,
+          suggestionType: true,
         },
-        take: 1,
       },
       processedAt: true,
       processingStage: true,
@@ -347,6 +349,9 @@ async function fileAlreadyHasSuggestions(scannedFileId: string) {
   const count = await prisma.organizationSuggestion.count({
     where: {
       scannedFileId,
+      suggestionType: {
+        not: "POSSIBLE_DUPLICATE",
+      },
     },
   });
 
@@ -451,9 +456,11 @@ async function reconcileCompletedFiles(sessionId: string) {
     organizationSuggestions: {
       some: {},
     },
+    extractionStatus: "COMPLETED",
     processingStage: {
       notIn: ["SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"],
     },
+    readingStatus: "READ",
     readStatus: "SUPPORTED",
     sessionId,
   };

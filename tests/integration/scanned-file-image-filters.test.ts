@@ -37,6 +37,7 @@ function scannedFile(
     extractionStatus: "PENDING",
     fileType: "IMAGE_JPG",
     hasObservation: false,
+    hasPossibleDuplicateSuggestion: false,
     hasReviewedObservation: false,
     id: relativePath,
     imageMetadata: null,

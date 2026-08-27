@@ -1,6 +1,11 @@
 import path from "node:path";
 
-import type { BridgeMonitoringState } from "@prisma/client";
+import type {
+  AudioTranscriptionStatus,
+  BridgeMonitoringState,
+  Prisma,
+  VideoProcessingStatus,
+} from "@prisma/client";
 
 import type {
   BridgeCommandReport,
@@ -203,6 +208,105 @@ function videoMetadata(value: unknown): BridgeVideoMetadataDraft | null {
     sourceModifiedAt: dateValue(metadata.sourceModifiedAt),
     videoFingerprint: stringValue(metadata.videoFingerprint, 500),
     width: numberValue(metadata.width),
+  };
+}
+
+type RemoteAudioReadMetadata = BridgeAudioMetadataDraft & {
+  transcriptSnippet: string | null;
+  summary: string | null;
+  transcriptionConfidence: number | null;
+  transcriptionStatus: ReturnType<typeof audioTranscriptionStatus>;
+  transcriptionErrorCategory: string | null;
+  machineLabels: string[];
+  provisionalTopics: string[];
+  provisionalPeople: string[];
+  provisionalProjects: string[];
+  provisionalActionItems: string[];
+  provisionalQuestions: string[];
+};
+
+type RemoteVideoReadMetadata = BridgeVideoMetadataDraft & {
+  transcriptSnippet: string | null;
+  summary: string | null;
+  transcriptionConfidence: number | null;
+  transcriptionStatus: ReturnType<typeof videoProcessingStatus>;
+  transcriptionErrorCategory: string | null;
+  frameAnalysisStatus: ReturnType<typeof videoProcessingStatus>;
+  frameAnalysisErrorCategory: string | null;
+  machineLabels: string[];
+  provisionalTopics: string[];
+  provisionalPeople: string[];
+  provisionalProjects: string[];
+  provisionalQuestions: string[];
+  selectedFrameDescriptions: unknown[];
+  chapterSuggestions: unknown[];
+  relatedSignals: string[];
+};
+
+function remoteAudioReadMetadata(value: unknown): RemoteAudioReadMetadata | null {
+  const metadata = objectValue(value);
+  const baseMetadata = audioMetadata(value);
+
+  if (!metadata || !baseMetadata) {
+    return null;
+  }
+
+  return {
+    ...baseMetadata,
+    machineLabels: stringArrayValue(metadata.machineLabels),
+    provisionalActionItems: stringArrayValue(metadata.provisionalActionItems),
+    provisionalPeople: stringArrayValue(metadata.provisionalPeople),
+    provisionalProjects: stringArrayValue(metadata.provisionalProjects),
+    provisionalQuestions: stringArrayValue(metadata.provisionalQuestions),
+    provisionalTopics: stringArrayValue(metadata.provisionalTopics),
+    summary: stringValue(metadata.summary, 2_000),
+    transcriptSnippet: stringValue(metadata.transcriptSnippet, 2_000),
+    transcriptionConfidence: numberValue(metadata.transcriptionConfidence),
+    transcriptionErrorCategory: stringValue(
+      metadata.transcriptionErrorCategory,
+      200,
+    ),
+    transcriptionStatus: audioTranscriptionStatus(
+      metadata.transcriptionStatus,
+    ),
+  };
+}
+
+function remoteVideoReadMetadata(value: unknown): RemoteVideoReadMetadata | null {
+  const metadata = objectValue(value);
+  const baseMetadata = videoMetadata(value);
+
+  if (!metadata || !baseMetadata) {
+    return null;
+  }
+
+  return {
+    ...baseMetadata,
+    chapterSuggestions: Array.isArray(metadata.chapterSuggestions)
+      ? metadata.chapterSuggestions.slice(0, 20)
+      : [],
+    frameAnalysisErrorCategory: stringValue(
+      metadata.frameAnalysisErrorCategory,
+      200,
+    ),
+    frameAnalysisStatus: videoProcessingStatus(metadata.frameAnalysisStatus),
+    machineLabels: stringArrayValue(metadata.machineLabels),
+    provisionalPeople: stringArrayValue(metadata.provisionalPeople),
+    provisionalProjects: stringArrayValue(metadata.provisionalProjects),
+    provisionalQuestions: stringArrayValue(metadata.provisionalQuestions),
+    provisionalTopics: stringArrayValue(metadata.provisionalTopics),
+    relatedSignals: stringArrayValue(metadata.relatedSignals),
+    selectedFrameDescriptions: Array.isArray(metadata.selectedFrameDescriptions)
+      ? metadata.selectedFrameDescriptions.slice(0, 20)
+      : [],
+    summary: stringValue(metadata.summary, 2_000),
+    transcriptSnippet: stringValue(metadata.transcriptSnippet, 2_000),
+    transcriptionConfidence: numberValue(metadata.transcriptionConfidence),
+    transcriptionErrorCategory: stringValue(
+      metadata.transcriptionErrorCategory,
+      200,
+    ),
+    transcriptionStatus: videoProcessingStatus(metadata.transcriptionStatus),
   };
 }
 
@@ -410,11 +514,13 @@ function remoteReadResult(value: unknown) {
   }
 
   return {
+    audioMetadata: remoteAudioReadMetadata(result.audioMetadata),
     characterCount: extractedText.length,
     extractedText,
     fileName: stringValue(result.fileName, 500) ?? path.posix.basename(relativePath),
     fileType: stringValue(result.fileType, 100) ?? "DOCUMENT",
     relativePath,
+    videoMetadata: remoteVideoReadMetadata(result.videoMetadata),
     warnings: Array.isArray(result.warnings)
       ? result.warnings
           .filter((warning): warning is string => typeof warning === "string")
@@ -465,6 +571,105 @@ async function finalizeScanSessionIfComplete(sessionId: string) {
   });
 }
 
+async function storeRemoteReadAudioMetadata(
+  scannedFileId: string,
+  metadata: RemoteAudioReadMetadata,
+) {
+  const prisma = getPrismaClient();
+  const data = {
+    audioFingerprint: metadata.audioFingerprint,
+    bitrateKbps: metadata.bitrateKbps,
+    channels: metadata.channels,
+    codec: metadata.codec,
+    container: metadata.container,
+    durationSeconds: metadata.durationSeconds,
+    machineLabels: jsonInput(metadata.machineLabels),
+    provisionalActionItems: jsonInput(metadata.provisionalActionItems),
+    provisionalPeople: jsonInput(metadata.provisionalPeople),
+    provisionalProjects: jsonInput(metadata.provisionalProjects),
+    provisionalQuestions: jsonInput(metadata.provisionalQuestions),
+    provisionalTopics: jsonInput(metadata.provisionalTopics),
+    sampleRateHz: metadata.sampleRateHz,
+    sourceCreatedAt: metadata.sourceCreatedAt,
+    sourceModifiedAt: metadata.sourceModifiedAt,
+    summary: metadata.summary,
+    transcriptSnippet: metadata.transcriptSnippet,
+    transcriptionConfidence: metadata.transcriptionConfidence,
+    transcriptionErrorCategory: metadata.transcriptionErrorCategory,
+    transcriptionStatus: metadata.transcriptionStatus,
+  };
+
+  await prisma.audioRecordingMetadata.upsert({
+    create: {
+      ...data,
+      humanLabels: jsonInput([]),
+      privacyState: "REVIEW_REQUIRED",
+      scannedFileId,
+    },
+    update: data,
+    where: { scannedFileId },
+  });
+}
+
+async function storeRemoteReadVideoMetadata(
+  scannedFileId: string,
+  metadata: RemoteVideoReadMetadata,
+) {
+  const prisma = getPrismaClient();
+  const data = {
+    bitrateKbps: metadata.bitrateKbps,
+    chapterSuggestions: jsonInput(metadata.chapterSuggestions),
+    codec: metadata.codec,
+    container: metadata.container,
+    durationSeconds: metadata.durationSeconds,
+    frameAnalysisErrorCategory: metadata.frameAnalysisErrorCategory,
+    frameAnalysisStatus: metadata.frameAnalysisStatus,
+    frameRate: metadata.frameRate,
+    hasAudioTrack: metadata.hasAudioTrack,
+    height: metadata.height,
+    machineLabels: jsonInput(metadata.machineLabels),
+    provisionalPeople: jsonInput(metadata.provisionalPeople),
+    provisionalProjects: jsonInput(metadata.provisionalProjects),
+    provisionalQuestions: jsonInput(metadata.provisionalQuestions),
+    provisionalTopics: jsonInput(metadata.provisionalTopics),
+    relatedSignals: jsonInput(metadata.relatedSignals),
+    selectedFrameDescriptions: jsonInput(metadata.selectedFrameDescriptions),
+    sourceCreatedAt: metadata.sourceCreatedAt,
+    sourceModifiedAt: metadata.sourceModifiedAt,
+    summary: metadata.summary,
+    transcriptSnippet: metadata.transcriptSnippet,
+    transcriptionConfidence: metadata.transcriptionConfidence,
+    transcriptionErrorCategory: metadata.transcriptionErrorCategory,
+    transcriptionStatus: metadata.transcriptionStatus,
+    videoFingerprint: metadata.videoFingerprint,
+    width: metadata.width,
+  };
+
+  await prisma.videoRecordingMetadata.upsert({
+    create: {
+      ...data,
+      humanLabels: jsonInput([]),
+      privacyState: "REVIEW_REQUIRED",
+      scannedFileId,
+    },
+    update: data,
+    where: { scannedFileId },
+  });
+}
+
+async function storeRemoteReadMediaMetadata(
+  scannedFileId: string,
+  result: ReturnType<typeof remoteReadResult>,
+) {
+  if (result.audioMetadata) {
+    await storeRemoteReadAudioMetadata(scannedFileId, result.audioMetadata);
+  }
+
+  if (result.videoMetadata) {
+    await storeRemoteReadVideoMetadata(scannedFileId, result.videoMetadata);
+  }
+}
+
 async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
   const payload = objectValue(commandPayload);
   const scannedFileId = stringValue(payload?.scannedFileId, 100);
@@ -506,6 +711,7 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
     },
     where: { id: scannedFileId },
   });
+  await storeRemoteReadMediaMetadata(scannedFileId, result);
   const detail = await getBridgeScanSessionDetail(scanSessionId);
   const file = detail?.scannedFiles.find((item) => item.id === scannedFileId);
 
@@ -563,6 +769,38 @@ async function applyFailedRead(commandPayload: unknown, safeErrorCategory: strin
     scannedFileId,
   });
   await finalizeScanSessionIfComplete(scanSessionId);
+}
+
+function jsonInput(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function stringArrayValue(value: unknown, maxItems = 40) {
+  return Array.isArray(value)
+    ? value
+        .filter((item): item is string => typeof item === "string")
+        .slice(0, maxItems)
+    : [];
+}
+
+function audioTranscriptionStatus(value: unknown): AudioTranscriptionStatus {
+  return value === "NOT_REQUESTED" ||
+    value === "TRANSCRIBING" ||
+    value === "COMPLETED" ||
+    value === "UNAVAILABLE" ||
+    value === "FAILED"
+    ? value
+    : "NOT_REQUESTED";
+}
+
+function videoProcessingStatus(value: unknown): VideoProcessingStatus {
+  return value === "NOT_REQUESTED" ||
+    value === "PROCESSING" ||
+    value === "COMPLETED" ||
+    value === "UNAVAILABLE" ||
+    value === "FAILED"
+    ? value
+    : "NOT_REQUESTED";
 }
 
 async function applyCompletedPermissionUpdate(input: {

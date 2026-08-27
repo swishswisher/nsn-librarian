@@ -103,6 +103,69 @@ export type BridgeReadResult = {
   characterCount: number;
   extractedText: string;
   warnings: string[];
+  audioMetadata?: BridgeTemporaryAudioMetadata | null;
+  videoMetadata?: BridgeTemporaryVideoMetadata | null;
+};
+
+export type BridgeTemporaryAudioMetadata = {
+  durationSeconds: number | null;
+  sampleRateHz: number | null;
+  bitrateKbps: number | null;
+  channels: number | null;
+  codec: string | null;
+  container: string | null;
+  sourceCreatedAt: Date | null;
+  sourceModifiedAt: Date | null;
+  audioFingerprint: string | null;
+  transcriptSnippet: string | null;
+  summary: string | null;
+  transcriptionConfidence: number | null;
+  transcriptionStatus: "NOT_REQUESTED" | "TRANSCRIBING" | "COMPLETED" | "UNAVAILABLE" | "FAILED";
+  transcriptionErrorCategory: string | null;
+  machineLabels: string[];
+  provisionalTopics: string[];
+  provisionalPeople: string[];
+  provisionalProjects: string[];
+  provisionalActionItems: string[];
+  provisionalQuestions: string[];
+};
+
+export type BridgeTemporaryVideoMetadata = {
+  durationSeconds: number | null;
+  width: number | null;
+  height: number | null;
+  frameRate: number | null;
+  codec: string | null;
+  container: string | null;
+  bitrateKbps: number | null;
+  hasAudioTrack: boolean | null;
+  sourceCreatedAt: Date | null;
+  sourceModifiedAt: Date | null;
+  videoFingerprint: string | null;
+  transcriptSnippet: string | null;
+  summary: string | null;
+  transcriptionConfidence: number | null;
+  transcriptionStatus: "NOT_REQUESTED" | "PROCESSING" | "COMPLETED" | "UNAVAILABLE" | "FAILED";
+  transcriptionErrorCategory: string | null;
+  frameAnalysisStatus: "NOT_REQUESTED" | "PROCESSING" | "COMPLETED" | "UNAVAILABLE" | "FAILED";
+  frameAnalysisErrorCategory: string | null;
+  machineLabels: string[];
+  provisionalTopics: string[];
+  provisionalPeople: string[];
+  provisionalProjects: string[];
+  provisionalQuestions: string[];
+  selectedFrameDescriptions: Array<{
+    timestampSeconds: number;
+    label: string;
+    description: string;
+    confidence: number;
+  }>;
+  chapterSuggestions: Array<{
+    timestampSeconds: number;
+    title: string;
+    confidence: number;
+  }>;
+  relatedSignals: string[];
 };
 
 export type BridgeResolvedFile = {

@@ -472,6 +472,7 @@ async function markImageReadFailure(
       organizationSuggestions: {
         select: {
           status: true,
+          suggestionType: true,
         },
       },
       videoMetadata: true,
@@ -693,6 +694,7 @@ export async function readScannedImageFile(
         organizationSuggestions: {
           select: {
             status: true,
+            suggestionType: true,
           },
         },
         videoMetadata: true,
@@ -839,6 +841,7 @@ export async function updateScannedImageReviewState(input: {
       organizationSuggestions: {
         select: {
           status: true,
+          suggestionType: true,
         },
       },
       videoMetadata: true,
@@ -914,6 +917,7 @@ export async function updateScannedImageReviewState(input: {
       organizationSuggestions: {
         select: {
           status: true,
+          suggestionType: true,
         },
       },
       videoMetadata: true,

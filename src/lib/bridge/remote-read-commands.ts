@@ -22,6 +22,15 @@ const activeReadCommandStatuses = [
   "ACKNOWLEDGED",
   "RUNNING",
 ] as const;
+const supportedAudioExtensions = new Set([
+  ".aac",
+  ".flac",
+  ".m4a",
+  ".mp3",
+  ".ogg",
+  ".wav",
+]);
+const supportedVideoExtensions = new Set([".m4v", ".mov", ".mp4"]);
 
 type RemoteReadCommandInput = {
   bridgeDeviceId: string;
@@ -87,7 +96,40 @@ export function remoteReadFailureCategoryFor(
   }
 
   if (normalized === "UNSUPPORTED_FILE_TYPE") {
+    if (supportedAudioExtensions.has(extension)) {
+      return "AUDIO_READ_FAILED";
+    }
+
+    if (supportedVideoExtensions.has(extension)) {
+      return "VIDEO_READ_FAILED";
+    }
+
     return "UNSUPPORTED_FILE_TYPE";
+  }
+
+  if (
+    normalized === "AUDIO_DECODE_FAILED" ||
+    normalized === "AUDIO_METADATA_FAILED" ||
+    normalized === "AUDIO_TRANSCRIPTION_FAILED" ||
+    normalized === "AUDIO_TRANSCRIPTION_UNAVAILABLE" ||
+    normalized === "UNSUPPORTED_AUDIO"
+  ) {
+    return normalized === "UNSUPPORTED_AUDIO"
+      ? "AUDIO_READ_FAILED"
+      : normalized;
+  }
+
+  if (
+    normalized === "VIDEO_DECODE_FAILED" ||
+    normalized === "VIDEO_METADATA_FAILED" ||
+    normalized === "VIDEO_TRANSCRIPTION_FAILED" ||
+    normalized === "VIDEO_TRANSCRIPTION_UNAVAILABLE" ||
+    normalized === "AI_TRANSCRIPTION_FAILED" ||
+    normalized === "AI_TRANSCRIPTION_UNAVAILABLE"
+  ) {
+    return normalized.startsWith("AI_")
+      ? normalized.replace(/^AI_/, "VIDEO_")
+      : normalized;
   }
 
   if (
@@ -130,6 +172,32 @@ export function remoteReadFailureMessageFor(
 
   if (category === "UNSUPPORTED_FILE_TYPE") {
     return "Unsupported for reading.";
+  }
+
+  if (category === "AUDIO_DECODE_FAILED") {
+    return "This audio file appears damaged or could not be read safely.";
+  }
+
+  if (category === "VIDEO_DECODE_FAILED") {
+    return "This video file appears damaged or could not be read safely.";
+  }
+
+  if (
+    category === "AUDIO_METADATA_FAILED" ||
+    category === "AUDIO_READ_FAILED" ||
+    category === "AUDIO_TRANSCRIPTION_FAILED" ||
+    category === "AUDIO_TRANSCRIPTION_UNAVAILABLE"
+  ) {
+    return "The Bridge could not finish reading this audio file safely.";
+  }
+
+  if (
+    category === "VIDEO_METADATA_FAILED" ||
+    category === "VIDEO_READ_FAILED" ||
+    category === "VIDEO_TRANSCRIPTION_FAILED" ||
+    category === "VIDEO_TRANSCRIPTION_UNAVAILABLE"
+  ) {
+    return "The Bridge could not finish reading this video file safely.";
   }
 
   if (category === "READ_COMMAND_TIMEOUT") {

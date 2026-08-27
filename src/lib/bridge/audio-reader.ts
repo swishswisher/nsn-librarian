@@ -726,6 +726,7 @@ export async function readScannedAudioFile(
         organizationSuggestions: {
           select: {
             status: true,
+            suggestionType: true,
           },
         },
       },
@@ -857,6 +858,7 @@ export async function updateScannedAudioReviewState(input: {
       organizationSuggestions: {
         select: {
           status: true,
+          suggestionType: true,
         },
       },
     },
@@ -938,6 +940,7 @@ export async function updateScannedAudioReviewState(input: {
       organizationSuggestions: {
         select: {
           status: true,
+          suggestionType: true,
         },
       },
     },

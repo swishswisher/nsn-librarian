@@ -776,6 +776,7 @@ export type BridgeScannedFileSummary = {
   videoMetadata: BridgeVideoMetadataSummary | null;
   hasObservation: boolean;
   hasReviewedObservation: boolean;
+  hasPossibleDuplicateSuggestion: boolean;
   organizationSuggestionCounts: OrganizationSuggestionCounts;
 };
 

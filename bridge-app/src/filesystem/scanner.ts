@@ -33,6 +33,8 @@ const supportedExtensions = new Map<string, string>([
   [".wav", "AUDIO_WAV"],
   [".m4a", "AUDIO_M4A"],
   [".aac", "AUDIO_AAC"],
+  [".flac", "AUDIO_FLAC"],
+  [".ogg", "AUDIO_OGG"],
   [".mp4", "VIDEO_MP4"],
   [".mov", "VIDEO_MOV"],
   [".m4v", "VIDEO_M4V"],

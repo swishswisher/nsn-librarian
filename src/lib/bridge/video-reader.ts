@@ -1021,7 +1021,7 @@ export async function readScannedVideoFile(
           },
         },
         organizationSuggestions: {
-          select: { status: true },
+          select: { status: true, suggestionType: true },
         },
         videoMetadata: true,
       },
@@ -1171,7 +1171,7 @@ export async function updateScannedVideoReviewState(input: {
         },
       },
       organizationSuggestions: {
-        select: { status: true },
+        select: { status: true, suggestionType: true },
       },
       videoMetadata: true,
     },
@@ -1246,7 +1246,7 @@ export async function updateScannedVideoReviewState(input: {
         },
       },
       organizationSuggestions: {
-        select: { status: true },
+        select: { status: true, suggestionType: true },
       },
       videoMetadata: true,
     },

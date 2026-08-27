@@ -15,6 +15,7 @@ import {
 import { getBridgeScanSessionProgress } from "./scan-sessions";
 import { queueRemoteReadCommand } from "./remote-read-commands";
 import { ingestBridgeWatchEvents } from "./monitor";
+import { recordChecksumDuplicateSuggestionsForSession } from "./checksum-duplicates";
 import type {
   BridgeAudioMetadataDraft,
   BridgeFolderScanResult,
@@ -670,6 +671,7 @@ export async function importRemoteBridgeScanReport(input: {
     }
     await storeMediaMetadata(scanSessionId, scan.files);
   }
+  await recordChecksumDuplicateSuggestionsForSession(scanSessionId);
 
   const terminalStatus =
     scan.supportedFiles > 0
