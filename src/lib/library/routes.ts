@@ -10,6 +10,14 @@ export function getScanSessionsRoute() {
   return "/admin/library/scan-sessions";
 }
 
+export function getOrganizationPlansRoute() {
+  return "/admin/library/migration";
+}
+
+export function getOrganizationPlanSessionSelectorRoute() {
+  return `${getOrganizationPlansRoute()}/scan-sessions`;
+}
+
 export function getConnectedLibrariesRoute() {
   return "/admin/library/connected-libraries";
 }

@@ -1,8 +1,10 @@
+import Link from "next/link";
+
 import { LibraryShell } from "@/components/library/LibraryShell";
 import { MigrationQueuePreview } from "@/components/library/MigrationQueuePreview";
-import { NsnButton } from "@/components/library/NsnButton";
 import { NsnPageHeader } from "@/components/library/NsnPageHeader";
 import { getMigrationQueueRows } from "@/lib/library/data";
+import { getOrganizationPlanSessionSelectorRoute } from "@/lib/library/routes";
 
 export const dynamic = "force-dynamic";
 
@@ -17,9 +19,12 @@ export default async function LibraryMigrationPage() {
           eyebrow="Organization Plans"
           title="Organization Plans"
         >
-          <NsnButton disabled type="button" variant="accent">
+          <Link
+            className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-gold)] bg-[var(--nsn-warm-beige)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sand)] [overflow-wrap:anywhere]"
+            href={getOrganizationPlanSessionSelectorRoute()}
+          >
             Choose a Scan Session to Build a Plan
-          </NsnButton>
+          </Link>
         </NsnPageHeader>
 
         <MigrationQueuePreview items={migrationQueueRows} />

@@ -10,7 +10,12 @@ import type {
 } from "@/lib/bridge/types";
 
 type RetryAutomaticProcessingButtonProps = {
+  busyLabel?: string;
+  className?: string;
+  label?: string;
+  retryFailed?: boolean;
   scanSessionId: string;
+  variant?: "primary" | "secondary" | "accent";
 };
 
 function summaryText(progress: BridgeScanProcessingProgress) {
@@ -18,7 +23,12 @@ function summaryText(progress: BridgeScanProcessingProgress) {
 }
 
 export function RetryAutomaticProcessingButton({
+  busyLabel = "Examining...",
+  className = "",
+  label = "Resume Examination",
+  retryFailed = true,
   scanSessionId,
+  variant = "accent",
 }: RetryAutomaticProcessingButtonProps) {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
@@ -46,7 +56,7 @@ export function RetryAutomaticProcessingButton({
           )}/process`,
           {
             body: JSON.stringify({
-              retryFailed: true,
+              retryFailed,
               retryStartedAt,
             }),
             headers: {
@@ -89,14 +99,14 @@ export function RetryAutomaticProcessingButton({
   }
 
   return (
-    <div className="grid min-w-0 gap-3">
+    <div className={["grid min-w-0 gap-3", className].join(" ")}>
       <NsnButton
         disabled={isProcessing}
         onClick={retryProcessing}
         type="button"
-        variant="accent"
+        variant={variant}
       >
-        {isProcessing ? "Examining..." : "Resume Examination"}
+        {isProcessing ? busyLabel : label}
       </NsnButton>
 
       <div aria-live="polite" className="grid gap-2">
