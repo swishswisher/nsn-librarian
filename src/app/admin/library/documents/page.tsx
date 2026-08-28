@@ -1,8 +1,7 @@
-import { DocumentTable } from "@/components/library/DocumentTable";
+import { LibraryExplorer } from "@/components/library/LibraryExplorer";
 import { LibraryShell } from "@/components/library/LibraryShell";
-import { NsnButton } from "@/components/library/NsnButton";
 import { NsnPageHeader } from "@/components/library/NsnPageHeader";
-import { getLibraryDocuments } from "@/lib/library/data";
+import { getLibraryExplorerData } from "@/lib/library/explorer-data";
 
 export const dynamic = "force-dynamic";
 
@@ -19,25 +18,21 @@ function firstSearchParam(value: string | string[] | undefined) {
 export default async function LibraryDocumentsPage({
   searchParams,
 }: LibraryDocumentsPageProps) {
-  const highlightedDocumentId = firstSearchParam((await searchParams).examined);
-  const libraryDocumentRows = await getLibraryDocuments();
+  const highlightedFileId = firstSearchParam((await searchParams).examined);
+  const explorerData = await getLibraryExplorerData();
 
   return (
     <LibraryShell active="documents">
       <div className="grid gap-8">
         <NsnPageHeader
-          description="See what the Librarian has examined, what it could read, and what still needs attention."
-          eyebrow="My Library"
+          description="Browse connected roots, folders, and scanned files without changing anything on the Mac."
+          eyebrow="Connected Libraries"
           title="My Library"
-        >
-          <NsnButton disabled type="button" variant="secondary">
-            Reasoning Coming Later
-          </NsnButton>
-        </NsnPageHeader>
+        />
 
-        <DocumentTable
-          documents={libraryDocumentRows}
-          highlightedDocumentId={highlightedDocumentId}
+        <LibraryExplorer
+          data={explorerData}
+          highlightedFileId={highlightedFileId}
         />
       </div>
     </LibraryShell>
