@@ -5,6 +5,7 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import { useRouter } from "next/navigation";
 
+import { FolderGroupedList } from "@/components/library/FolderGroupedList";
 import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
 import { NsnButton } from "@/components/library/NsnButton";
 import { NsnCard } from "@/components/library/NsnCard";
@@ -1311,8 +1312,17 @@ export function OrganizationPlanReviewPanel({
             </p>
           </NsnCard>
         ) : (
-          <div className="grid gap-4">
-            {currentPlan.actions.map((action) => (
+          <FolderGroupedList
+            getId={(action) => action.id}
+            getRelativePath={(action) =>
+              action.sourceRelativePath ||
+              action.plannedRelativePath ||
+              action.plannedFolderPath ||
+              ""
+            }
+            itemLabel="planned change"
+            items={currentPlan.actions}
+            renderItem={(action) => (
               <NsnCard className="min-w-0" key={action.id}>
                 <div className="grid min-w-0 gap-5">
                   <div className="flex flex-wrap gap-2">
@@ -1394,8 +1404,8 @@ export function OrganizationPlanReviewPanel({
                   </div>
                 </div>
               </NsnCard>
-            ))}
-          </div>
+            )}
+          />
         )}
       </Section>
 

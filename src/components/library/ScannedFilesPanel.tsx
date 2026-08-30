@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
+import { FolderGroupedList } from "@/components/library/FolderGroupedList";
 import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
 import { NsnButton } from "@/components/library/NsnButton";
 import { NsnCard } from "@/components/library/NsnCard";
@@ -738,8 +739,14 @@ export function ScannedFilesPanel({
       ) : null}
 
       {filteredFiles.length > 0 ? (
-        <div className="grid gap-3">
-          {filteredFiles.map((file) => (
+        <FolderGroupedList
+          activeRefinement={
+            activeFilter !== "ALL" || searchQuery.trim().length > 0
+          }
+          getId={(file) => file.id}
+          getRelativePath={(file) => file.relativePath}
+          items={filteredFiles}
+          renderItem={(file) => (
             <NsnCard className="min-w-0" key={file.id}>
               <div className="grid min-w-0 gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
                 <div className="min-w-0">
@@ -891,8 +898,8 @@ export function ScannedFilesPanel({
                 </div>
               </div>
             </NsnCard>
-          ))}
-        </div>
+          )}
+        />
       ) : null}
 
       {preview || previewError ? (

@@ -9,6 +9,10 @@ import {
   type LibraryExplorerFolder,
   type LibraryExplorerRootInput,
 } from "../../src/lib/library/explorer";
+import {
+  buildFolderGrouping,
+  collectFolderGroupIds,
+} from "../../src/lib/library/folder-groups";
 import type { BridgeScannedFileSummary } from "../../src/lib/bridge/types";
 
 function suggestionCounts(
@@ -334,5 +338,106 @@ describe("Library folder explorer", () => {
     assert.match(source, /\[overflow-wrap:anywhere\]/);
     assert.match(source, /min-w-0/);
     assert.match(source, /flex-wrap/);
+  });
+});
+
+describe("shared folder-grouped file views", () => {
+  const items = [
+    { id: "root", path: "root-note.txt" },
+    { id: "alice-intake", path: "Clients/Loose/Alice_Client_Intake.docx" },
+    { id: "alice-notes", path: "Clients/Loose/Alice_Session_Notes.txt" },
+    { id: "workshop", path: "Workshops\\Drafts\\Workshop_Flyer.webp" },
+    { id: "other-notes", path: "Archive/Notes/Alice_Session_Notes.txt" },
+  ];
+
+  it("groups scan results into their nested source folders", () => {
+    const grouping = buildFolderGrouping(
+      items,
+      (item) => item.path,
+      (item) => item.id,
+    );
+
+    assert.equal(grouping.totalItems, 5);
+    assert.deepEqual(
+      grouping.folders.map((folder) => folder.name),
+      ["Archive", "Clients", "Workshops"],
+    );
+    assert.deepEqual(grouping.rootItems.map((item) => item.id), ["root"]);
+
+    const clients = grouping.folders.find((folder) => folder.name === "Clients");
+    const loose = clients?.folders.find((folder) => folder.name === "Loose");
+
+    assert.ok(clients);
+    assert.ok(loose);
+    assert.equal(clients.totalItems, 2);
+    assert.equal(loose.totalItems, 2);
+    assert.deepEqual(
+      loose.items.map((item) => item.id),
+      ["alice-intake", "alice-notes"],
+    );
+  });
+
+  it("keeps duplicate filenames in separate source folders", () => {
+    const grouping = buildFolderGrouping(
+      items,
+      (item) => item.path,
+      (item) => item.id,
+    );
+    const clients = grouping.folders.find((folder) => folder.name === "Clients");
+    const archive = grouping.folders.find((folder) => folder.name === "Archive");
+
+    assert.equal(clients?.folders[0]?.items[1]?.id, "alice-notes");
+    assert.equal(archive?.folders[0]?.items[0]?.id, "other-notes");
+  });
+
+  it("provides every nested folder for expand and collapse controls", () => {
+    const grouping = buildFolderGrouping(
+      items,
+      (item) => item.path,
+      (item) => item.id,
+    );
+
+    assert.deepEqual(collectFolderGroupIds(grouping.folders), [
+      "Archive",
+      "Archive/Notes",
+      "Clients",
+      "Clients/Loose",
+      "Workshops",
+      "Workshops/Drafts",
+    ]);
+  });
+
+  it("wires scan sessions, recommendations, and plans to folder-first views", () => {
+    const scannedFilesSource = readFileSync(
+      "src/components/library/ScannedFilesPanel.tsx",
+      "utf8",
+    );
+    const recommendationsSource = readFileSync(
+      "src/components/library/OrganizationSuggestionsReviewPanel.tsx",
+      "utf8",
+    );
+    const planSource = readFileSync(
+      "src/components/library/OrganizationPlanReviewPanel.tsx",
+      "utf8",
+    );
+
+    assert.match(scannedFilesSource, /FolderGroupedList/);
+    assert.match(scannedFilesSource, /getRelativePath=\{\(file\) => file\.relativePath\}/);
+    assert.match(recommendationsSource, /pathFolder\(suggestion\.currentRelativePath\)/);
+    assert.match(recommendationsSource, /in this source folder/);
+    assert.match(planSource, /FolderGroupedList/);
+    assert.match(planSource, /action\.sourceRelativePath/);
+  });
+
+  it("keeps folder grouping presentational and filesystem read-only", () => {
+    const source = [
+      readFileSync("src/lib/library/folder-groups.ts", "utf8"),
+      readFileSync("src/components/library/FolderGroupedList.tsx", "utf8"),
+    ].join("\n");
+
+    assert.doesNotMatch(source, /\b(unlink|rename|writeFile|mkdir|rm)\s*\(/);
+    assert.doesNotMatch(source, /\bfetch\s*\(/);
+    assert.match(source, /Folder View/);
+    assert.match(source, /All \{pluralTitle\(itemLabel\)\}/);
   });
 });

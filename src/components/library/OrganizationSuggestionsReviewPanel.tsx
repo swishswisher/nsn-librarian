@@ -156,12 +156,6 @@ function pathFolder(relativePath: string) {
   return parts.slice(0, -1).join("/");
 }
 
-function folderLabel(folder: string) {
-  const leaf = folder.split("/").filter(Boolean).at(-1);
-
-  return leaf ? `${leaf} Collection` : "Root Folder";
-}
-
 function latestRevision(suggestion: BridgeOrganizationSuggestionSummary) {
   return suggestion.revisions[0] ?? null;
 }
@@ -282,49 +276,37 @@ function filterMatches(
   return suggestion.suggestionType === "WEBSITE_CANDIDATE";
 }
 
-function groupForSuggestion(suggestion: BridgeOrganizationSuggestionSummary) {
-  if (suggestion.suggestionType === "WEBSITE_CANDIDATE") {
-    return { id: "website-candidates", label: "Website Candidates" };
-  }
-
-  if (suggestion.suggestionType === "POSSIBLE_DUPLICATE") {
-    return { id: "possible-duplicates", label: "Possible Duplicates" };
-  }
-
-  if (suggestion.suggestionType === "KEEP_UNCHANGED") {
-    return { id: "unchanged-items", label: "Unchanged Items" };
-  }
-
-  if (suggestion.suggestionType === "RENAME_FILE") {
-    return { id: "renames", label: "File Renames" };
-  }
-
-  const recommended = recommendedPath(suggestion);
-  const folder =
-    suggestion.suggestionType === "CREATE_FOLDER"
-      ? recommended.replace(/^Create\s+/, "")
-      : pathFolder(recommended);
-
-  if (folder) {
-    const normalizedFolder = folder.toLowerCase().replace(/[^a-z0-9]+/g, "-");
-
-    return {
-      id: `folder-${normalizedFolder}`,
-      label: folderLabel(folder),
-    };
-  }
+function groupForSuggestion(
+  suggestion: BridgeOrganizationSuggestionSummary,
+  libraryIdBySuggestionId: Record<string, string>,
+  libraryNameBySuggestionId: Record<string, string>,
+) {
+  const folder = pathFolder(suggestion.currentRelativePath);
+  const libraryId = libraryIdBySuggestionId[suggestion.id] ?? "current-session";
+  const libraryName = libraryNameBySuggestionId[suggestion.id] ?? null;
+  const folderLabel = folder || "Root Folder";
 
   return {
-    id: `type-${suggestion.suggestionType.toLowerCase()}`,
-    label: `${suggestionTypeLabel(suggestion.suggestionType)} Recommendations`,
+    id: `source-${encodeURIComponent(libraryId)}-${encodeURIComponent(
+      folder || "/",
+    )}`,
+    label: libraryName ? `${libraryName} → ${folderLabel}` : folderLabel,
   };
 }
 
-function buildGroups(suggestions: BridgeOrganizationSuggestionSummary[]) {
+function buildGroups(
+  suggestions: BridgeOrganizationSuggestionSummary[],
+  libraryIdBySuggestionId: Record<string, string>,
+  libraryNameBySuggestionId: Record<string, string>,
+) {
   const groups = new Map<string, RecommendationGroup>();
 
   for (const suggestion of suggestions) {
-    const group = groupForSuggestion(suggestion);
+    const group = groupForSuggestion(
+      suggestion,
+      libraryIdBySuggestionId,
+      libraryNameBySuggestionId,
+    );
     const existing = groups.get(group.id);
 
     if (existing) {
@@ -338,13 +320,12 @@ function buildGroups(suggestions: BridgeOrganizationSuggestionSummary[]) {
     }
   }
 
-  return [...groups.values()].sort((left, right) => {
-    if (right.suggestions.length !== left.suggestions.length) {
-      return right.suggestions.length - left.suggestions.length;
-    }
-
-    return left.label.localeCompare(right.label);
-  });
+  return [...groups.values()].sort((left, right) =>
+    left.label.localeCompare(right.label, undefined, {
+      numeric: true,
+      sensitivity: "base",
+    }),
+  );
 }
 
 function basedOnSummary(suggestion: BridgeOrganizationSuggestionSummary) {
@@ -514,7 +495,15 @@ export function OrganizationSuggestionsReviewPanel({
       searchQuery,
     ],
   );
-  const groups = useMemo(() => buildGroups(filteredRows), [filteredRows]);
+  const groups = useMemo(
+    () =>
+      buildGroups(
+        filteredRows,
+        libraryIdBySuggestionId,
+        libraryNameBySuggestionId,
+      ),
+    [filteredRows, libraryIdBySuggestionId, libraryNameBySuggestionId],
+  );
   const groupsExpandedByDefault = groups.length <= 4;
   const editingSuggestion = useMemo(
     () =>
@@ -842,6 +831,7 @@ export function OrganizationSuggestionsReviewPanel({
                     <span className="mt-1 block text-sm leading-6 text-[var(--nsn-slate)]">
                       {group.suggestions.length} recommendation
                       {group.suggestions.length === 1 ? "" : "s"}
+                      {" in this source folder"}
                     </span>
                   </span>
                   <span className="text-sm font-semibold text-[var(--nsn-teal-dark)]">
