@@ -9,6 +9,7 @@ import {
 import { getPrismaClient } from "@/lib/db/prisma";
 import { sanitizeReadingWarning } from "@/lib/reading-room/utils";
 
+import { findExactChecksumDuplicateForScannedFile } from "./checksum-duplicates";
 import {
   ConnectedLibraryFileResolutionError,
   resolveConnectedLibraryFile,
@@ -337,27 +338,14 @@ async function detectAudioDuplicate(
   metadata: BridgeAudioMetadataDraft,
 ): Promise<AudioDuplicateResult> {
   const prisma = getPrismaClient();
+  const exact = await findExactChecksumDuplicateForScannedFile(scannedFile.id);
 
-  if (scannedFile.checksum) {
-    const exact = await prisma.scannedFile.findFirst({
-      select: {
-        id: true,
-      },
-      where: {
-        checksum: scannedFile.checksum,
-        id: {
-          not: scannedFile.id,
-        },
-      },
-    });
-
-    if (exact) {
-      return {
-        duplicateConfidence: 0.98,
-        duplicateKind: "EXACT_DUPLICATE",
-        duplicateOfScannedFileId: exact.id,
-      };
-    }
+  if (exact) {
+    return {
+      duplicateConfidence: 0.98,
+      duplicateKind: "EXACT_DUPLICATE",
+      duplicateOfScannedFileId: exact.id,
+    };
   }
 
   if (metadata.audioFingerprint) {

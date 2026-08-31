@@ -32,9 +32,14 @@ let updateLocalBridgeRoot: typeof import("../../src/lib/bridge/local-bridge-clie
 let createBridgeScanSessionFromScan: typeof import("../../src/lib/bridge/scan-sessions").createBridgeScanSessionFromScan;
 let generateOrganizationPlanForScanSession: typeof import("../../src/lib/bridge/planner").generateOrganizationPlanForScanSession;
 let approveOrganizationPlan: typeof import("../../src/lib/bridge/planner").approveOrganizationPlan;
+let saveOrganizationPlanSelection: typeof import("../../src/lib/bridge/planner").saveOrganizationPlanSelection;
+let clearOrganizationPlanSelection: typeof import("../../src/lib/bridge/planner").clearOrganizationPlanSelection;
 let executeOrganizationPlan: typeof import("../../src/lib/bridge/executor").executeOrganizationPlan;
 let previewExecutionUndo: typeof import("../../src/lib/bridge/undo").previewExecutionUndo;
 let executeExecutionUndo: typeof import("../../src/lib/bridge/undo").executeExecutionUndo;
+let recordChecksumDuplicateSuggestionsForSession: typeof import("../../src/lib/bridge/checksum-duplicates").recordChecksumDuplicateSuggestionsForSession;
+let resetOrganizationSuggestionDecision: typeof import("../../src/lib/bridge/organization-suggestions").resetOrganizationSuggestionDecision;
+let resetOrganizationSuggestionDecisionsForScanSession: typeof import("../../src/lib/bridge/organization-suggestions").resetOrganizationSuggestionDecisionsForScanSession;
 
 const testSchemaName = `connected_library_execution_${process.pid}_${Date.now()}`;
 
@@ -185,7 +190,13 @@ async function createSuggestion(input: {
   scanSessionId: string;
   status?: "APPROVED" | "MODIFIED" | "REJECTED" | "LEFT_UNCHANGED" | "PENDING";
   suggestionKey: string;
-  suggestionType?: "MOVE_FILE" | "RENAME_FILE" | "KEEP_UNCHANGED";
+  suggestionType?:
+    | "MOVE_FILE"
+    | "RENAME_FILE"
+    | "GROUP_WITH_FILES"
+    | "POSSIBLE_DUPLICATE"
+    | "WEBSITE_CANDIDATE"
+    | "KEEP_UNCHANGED";
 }) {
   return prisma.organizationSuggestion.create({
     data: {
@@ -239,7 +250,18 @@ async function approveMoveAndRenamePlan(
   const draftPlan = await generateOrganizationPlanForScanSession(
     fixture.session.id,
   );
-  const plan = await approveOrganizationPlan(draftPlan.id);
+  const selectedPlan = await saveOrganizationPlanSelection(
+    draftPlan.id,
+    draftPlan.actions
+      .filter(
+        (action) =>
+          action.actionType === "MOVE_FILE" ||
+          action.actionType === "RENAME_FILE" ||
+          action.actionType === "MOVE_AND_RENAME_FILE",
+      )
+      .map((action) => action.id),
+  );
+  const plan = await approveOrganizationPlan(selectedPlan.id);
 
   return {
     ...fixture,
@@ -283,6 +305,10 @@ before(async () => {
   const planner = await import("../../src/lib/bridge/planner");
   const executor = await import("../../src/lib/bridge/executor");
   const undo = await import("../../src/lib/bridge/undo");
+  const duplicates = await import("../../src/lib/bridge/checksum-duplicates");
+  const organizationSuggestions = await import(
+    "../../src/lib/bridge/organization-suggestions"
+  );
 
   prisma = prismaModule.getPrismaClient();
   connectBridgeLibrary = connectedLibraries.connectBridgeLibrary;
@@ -294,9 +320,17 @@ before(async () => {
   generateOrganizationPlanForScanSession =
     planner.generateOrganizationPlanForScanSession;
   approveOrganizationPlan = planner.approveOrganizationPlan;
+  saveOrganizationPlanSelection = planner.saveOrganizationPlanSelection;
+  clearOrganizationPlanSelection = planner.clearOrganizationPlanSelection;
   executeOrganizationPlan = executor.executeOrganizationPlan;
   previewExecutionUndo = undo.previewExecutionUndo;
   executeExecutionUndo = undo.executeExecutionUndo;
+  recordChecksumDuplicateSuggestionsForSession =
+    duplicates.recordChecksumDuplicateSuggestionsForSession;
+  resetOrganizationSuggestionDecision =
+    organizationSuggestions.resetOrganizationSuggestionDecision;
+  resetOrganizationSuggestionDecisionsForScanSession =
+    organizationSuggestions.resetOrganizationSuggestionDecisionsForScanSession;
 });
 
 beforeEach(async () => {
@@ -407,7 +441,22 @@ test("reviewed recommendations produce one folder-specific plan with deduped fol
     suggestionType: "KEEP_UNCHANGED",
   });
 
-  const plan = await generateOrganizationPlanForScanSession(fixture.session.id);
+  const draftPlan = await generateOrganizationPlanForScanSession(fixture.session.id);
+  const draftFileActions = draftPlan.actions.filter(
+    (action) => action.selectableForExecution,
+  );
+
+  assert.equal(draftPlan.summary.estimatedOperations, 0);
+  assert.equal(draftPlan.summary.selectedFileActions, 0);
+  assert.equal(
+    draftPlan.actions.some((action) => action.selectedForExecution),
+    false,
+  );
+
+  const plan = await saveOrganizationPlanSelection(
+    draftPlan.id,
+    draftFileActions.map((action) => action.id),
+  );
   const folderActions = plan.actions.filter(
     (action) => action.actionType === "CREATE_FOLDER",
   );
@@ -437,6 +486,385 @@ test("reviewed recommendations produce one folder-specific plan with deduped fol
       (action) => action.plannedRelativePath === "Knowledge/Attachment/rejected-note.txt",
     ),
   );
+});
+
+test("historical scans do not mark the same physical path as its own duplicate", async () => {
+  const fixture = await createConnectedFixture("historical-identity", {
+    "Documents/Same-File.txt": "same physical file\n",
+  });
+
+  const rescan = await scanLocalBridgeRoot(fixture.root.id);
+  const secondSession = await createBridgeScanSessionFromScan(rescan, {
+    allowReusableSession: false,
+    connectedLibraryId: fixture.connectedLibrary.id,
+  });
+
+  const result = await recordChecksumDuplicateSuggestionsForSession(secondSession.id);
+  const duplicateSuggestions = await prisma.organizationSuggestion.findMany({
+    where: {
+      scanSessionId: secondSession.id,
+      suggestionType: "POSSIBLE_DUPLICATE",
+      confidence: {
+        gte: 0.98,
+      },
+    },
+  });
+
+  assert.equal(result.duplicateFiles, 0);
+  assert.equal(duplicateSuggestions.length, 0);
+});
+
+test("non-empty checksum duplicates remain detectable within and across roots", async () => {
+  const rootA = await createConnectedFixture("duplicate-root-a", {
+    "A/original.txt": "duplicate body\n",
+    "B/copy.txt": "duplicate body\n",
+  });
+
+  await recordChecksumDuplicateSuggestionsForSession(rootA.session.id);
+
+  let sameRootDuplicates = await prisma.organizationSuggestion.findMany({
+    where: {
+      scanSessionId: rootA.session.id,
+      suggestionType: "POSSIBLE_DUPLICATE",
+      confidence: {
+        gte: 0.98,
+      },
+    },
+  });
+
+  assert.equal(sameRootDuplicates.length, 2);
+
+  const rootB = await createConnectedFixture("duplicate-root-b", {
+    "Archive/cross-root-copy.txt": "duplicate body\n",
+  });
+
+  await recordChecksumDuplicateSuggestionsForSession(rootA.session.id);
+  await recordChecksumDuplicateSuggestionsForSession(rootB.session.id);
+
+  sameRootDuplicates = await prisma.organizationSuggestion.findMany({
+    where: {
+      scanSessionId: rootA.session.id,
+      suggestionType: "POSSIBLE_DUPLICATE",
+      confidence: {
+        gte: 0.98,
+      },
+    },
+  });
+  const crossRootDuplicates = await prisma.organizationSuggestion.findMany({
+    where: {
+      scanSessionId: rootB.session.id,
+      suggestionType: "POSSIBLE_DUPLICATE",
+      confidence: {
+        gte: 0.98,
+      },
+    },
+  });
+
+  assert.equal(sameRootDuplicates.length, 2);
+  assert.equal(crossRootDuplicates.length, 1);
+});
+
+test("zero-byte files do not create exact duplicates but media checksum duplicates do", async () => {
+  const audioBytes = "\u0000\u0001not-a-transcribed-audio-fixture";
+  const fixture = await createConnectedFixture("zero-byte-duplicates", {
+    "Empty/one.txt": "",
+    "Empty/two.txt": "",
+    "Media/meeting-a.mp3": audioBytes,
+    "Media/meeting-b.mp3": audioBytes,
+    "Documents/unrelated.txt": "not a duplicate\n",
+  });
+
+  await recordChecksumDuplicateSuggestionsForSession(fixture.session.id);
+
+  const suggestions = await prisma.organizationSuggestion.findMany({
+    orderBy: {
+      currentRelativePath: "asc",
+    },
+    where: {
+      scanSessionId: fixture.session.id,
+      suggestionType: "POSSIBLE_DUPLICATE",
+      confidence: {
+        gte: 0.98,
+      },
+    },
+  });
+
+  assert.deepEqual(
+    suggestions.map((suggestion) => suggestion.currentRelativePath),
+    ["Media/meeting-a.mp3", "Media/meeting-b.mp3"],
+  );
+});
+
+test("plan selection starts empty, derives folder dependencies, and excludes review-only notes", async () => {
+  const source = "Loose/Alice_Client_Intake.docx";
+  const websiteNote = "Website/becoming-hero.jpg";
+  const fixture = await createConnectedFixture("plan-selection", {
+    [source]: "Alice intake\n",
+    [websiteNote]: "image placeholder\n",
+  });
+  const sourceFile = scannedFileByRelativePath(fixture.scannedFiles, source);
+  const websiteFile = scannedFileByRelativePath(fixture.scannedFiles, websiteNote);
+
+  await createSuggestion({
+    currentRelativePath: source,
+    proposedRelativePath: "Clients/Alice/Alice_Client_Intake.docx",
+    scannedFileId: sourceFile.id,
+    scanSessionId: fixture.session.id,
+    suggestionKey: "selectable-move",
+  });
+  await createSuggestion({
+    currentRelativePath: websiteNote,
+    proposedRelativePath: websiteNote,
+    scannedFileId: websiteFile.id,
+    scanSessionId: fixture.session.id,
+    suggestionKey: "website-note",
+    suggestionType: "WEBSITE_CANDIDATE",
+  });
+
+  const draftPlan = await generateOrganizationPlanForScanSession(fixture.session.id);
+  const fileAction = draftPlan.actions.find((action) => action.selectableForExecution);
+  const reviewOnly = draftPlan.actions.find(
+    (action) => action.actionType === "WEBSITE_ACTION",
+  );
+
+  assert.ok(fileAction);
+  assert.ok(reviewOnly);
+  assert.equal(draftPlan.summary.selectedFileActions, 0);
+  assert.equal(draftPlan.summary.estimatedOperations, 0);
+  await assert.rejects(
+    () => approveOrganizationPlan(draftPlan.id),
+    /Select and save at least one file action/,
+  );
+
+  const selectedPlan = await saveOrganizationPlanSelection(draftPlan.id, [
+    fileAction.id,
+  ]);
+
+  assert.equal(selectedPlan.summary.selectedFileActions, 1);
+  assert.equal(selectedPlan.summary.reviewOnlyNotes, 1);
+  assert.deepEqual(
+    selectedPlan.actions
+      .filter((action) => action.requiredForSelectedActions)
+      .map((action) => action.plannedFolderPath)
+      .sort(),
+    ["Clients", "Clients/Alice"],
+  );
+  assert.equal(
+    selectedPlan.actions.some(
+      (action) =>
+        action.actionType === "WEBSITE_ACTION" &&
+        action.selectedForExecution === true,
+    ),
+    false,
+  );
+
+  const clearedPlan = await clearOrganizationPlanSelection(selectedPlan.id);
+
+  assert.equal(clearedPlan.summary.selectedFileActions, 0);
+  assert.equal(clearedPlan.summary.estimatedOperations, 0);
+});
+
+test("conflicting source destinations block selected draft actions server-side", async () => {
+  const source = "Clients/Loose/Alice_Client_Intake.docx";
+  const fixture = await createConnectedFixture("plan-source-conflict", {
+    [source]: "Alice intake\n",
+  });
+  const sourceFile = scannedFileByRelativePath(fixture.scannedFiles, source);
+
+  await createSuggestion({
+    currentRelativePath: source,
+    proposedRelativePath: "Alice/Alice_Client_Intake.docx",
+    scannedFileId: sourceFile.id,
+    scanSessionId: fixture.session.id,
+    suggestionKey: "alice-destination",
+  });
+  await createSuggestion({
+    currentRelativePath: source,
+    proposedRelativePath: "Clinical Tools/Alice_Client_Intake.docx",
+    scannedFileId: sourceFile.id,
+    scanSessionId: fixture.session.id,
+    suggestionKey: "clinical-tools-destination",
+  });
+
+  const draftPlan = await generateOrganizationPlanForScanSession(fixture.session.id);
+  const fileActionIds = draftPlan.actions
+    .filter((action) => action.selectableForExecution)
+    .map((action) => action.id);
+
+  assert.equal(
+    draftPlan.warnings.some(
+      (warning) => warning.warningType === "DUPLICATE_SOURCE",
+    ),
+    true,
+  );
+  await assert.rejects(
+    () => saveOrganizationPlanSelection(draftPlan.id, fileActionIds),
+    /more than one destination/,
+  );
+
+  const selectedPlan = await saveOrganizationPlanSelection(draftPlan.id, [
+    fileActionIds[0] as string,
+  ]);
+
+  assert.equal(selectedPlan.summary.selectedFileActions, 1);
+  assert.equal(selectedPlan.summary.blockingWarnings, 0);
+});
+
+test("malformed plan selection rejects unknown review-only and duplicate destination actions", async () => {
+  const sourceA = "Loose/a.txt";
+  const sourceB = "Loose/b.txt";
+  const sourceC = "Web/hero.jpg";
+  const fixture = await createConnectedFixture("malformed-selection", {
+    [sourceA]: "a\n",
+    [sourceB]: "b\n",
+    [sourceC]: "c\n",
+  });
+  const fileA = scannedFileByRelativePath(fixture.scannedFiles, sourceA);
+  const fileB = scannedFileByRelativePath(fixture.scannedFiles, sourceB);
+  const fileC = scannedFileByRelativePath(fixture.scannedFiles, sourceC);
+
+  await createSuggestion({
+    currentRelativePath: sourceA,
+    proposedRelativePath: "Organized/shared.txt",
+    scannedFileId: fileA.id,
+    scanSessionId: fixture.session.id,
+    suggestionKey: "destination-a",
+  });
+  await createSuggestion({
+    currentRelativePath: sourceB,
+    proposedRelativePath: "Organized/shared.txt",
+    scannedFileId: fileB.id,
+    scanSessionId: fixture.session.id,
+    suggestionKey: "destination-b",
+  });
+  await createSuggestion({
+    currentRelativePath: sourceC,
+    proposedRelativePath: sourceC,
+    scannedFileId: fileC.id,
+    scanSessionId: fixture.session.id,
+    suggestionKey: "review-only",
+    suggestionType: "WEBSITE_CANDIDATE",
+  });
+
+  const draftPlan = await generateOrganizationPlanForScanSession(fixture.session.id);
+  const fileActionIds = draftPlan.actions
+    .filter((action) => action.selectableForExecution)
+    .map((action) => action.id);
+  const reviewOnlyAction = draftPlan.actions.find(
+    (action) => action.actionType === "WEBSITE_ACTION",
+  );
+
+  assert.ok(reviewOnlyAction);
+  await assert.rejects(
+    () => saveOrganizationPlanSelection(draftPlan.id, []),
+    /Select at least one file action/,
+  );
+  await assert.rejects(
+    () => saveOrganizationPlanSelection(draftPlan.id, ["missing-action"]),
+    /could not verify/,
+  );
+  await assert.rejects(
+    () => saveOrganizationPlanSelection(draftPlan.id, [reviewOnlyAction.id]),
+    /Only move and rename file recommendations/,
+  );
+  await assert.rejects(
+    () => saveOrganizationPlanSelection(draftPlan.id, fileActionIds),
+    /proposed by more than one action/,
+  );
+
+  await prisma.organizationPlan.update({
+    data: {
+      actions: [
+        {
+          ...(draftPlan.actions.find((action) => action.selectableForExecution) ?? {}),
+          id: "unsafe-direct-action",
+          plannedRelativePath: "../outside.txt",
+          selectedForExecution: true,
+        },
+      ],
+    },
+    where: {
+      id: draftPlan.id,
+    },
+  });
+
+  await assert.rejects(
+    () => approveOrganizationPlan(draftPlan.id),
+    /safety issues|outside|path/,
+  );
+});
+
+test("resetting recommendation decisions is session-scoped and blocked by active plans", async () => {
+  const sessionA = await createConnectedFixture("reset-session-a", {
+    "Loose/a.txt": "a\n",
+  });
+  const sessionB = await createConnectedFixture("reset-session-b", {
+    "Loose/b.txt": "b\n",
+  });
+  const fileA = scannedFileByRelativePath(sessionA.scannedFiles, "Loose/a.txt");
+  const fileB = scannedFileByRelativePath(sessionB.scannedFiles, "Loose/b.txt");
+  const suggestionA = await createSuggestion({
+    currentRelativePath: "Loose/a.txt",
+    proposedRelativePath: "Organized/a.txt",
+    scannedFileId: fileA.id,
+    scanSessionId: sessionA.session.id,
+    suggestionKey: "reset-a",
+  });
+  await createSuggestion({
+    currentRelativePath: "Loose/b.txt",
+    proposedRelativePath: "Organized/b.txt",
+    scannedFileId: fileB.id,
+    scanSessionId: sessionB.session.id,
+    suggestionKey: "reset-b",
+  });
+  const originalPath = path.join(sessionA.folderPath, "Loose", "a.txt");
+
+  const resetSingle = await resetOrganizationSuggestionDecision(
+    suggestionA.id,
+    sessionA.session.id,
+  );
+
+  assert.equal(resetSingle.status, "PENDING");
+  assert.equal(await exists(originalPath), true);
+
+  await createSuggestion({
+    currentRelativePath: "Loose/a.txt",
+    proposedRelativePath: "Organized/a-2.txt",
+    scannedFileId: fileA.id,
+    scanSessionId: sessionA.session.id,
+    suggestionKey: "reset-a-second",
+  });
+  const activePlan = await generateOrganizationPlanForScanSession(
+    sessionA.session.id,
+  );
+
+  await assert.rejects(
+    () => resetOrganizationSuggestionDecisionsForScanSession(sessionA.session.id),
+    /Cancel the active Organization Plan/,
+  );
+
+  await prisma.organizationPlan.update({
+    data: {
+      status: "CANCELLED",
+    },
+    where: {
+      id: activePlan.id,
+    },
+  });
+
+  const resetBulk = await resetOrganizationSuggestionDecisionsForScanSession(
+    sessionA.session.id,
+  );
+  const sessionBReviewed = await prisma.organizationSuggestion.count({
+    where: {
+      scanSessionId: sessionB.session.id,
+      status: "APPROVED",
+    },
+  });
+
+  assert.ok(resetBulk.resetCount >= 1);
+  assert.equal(sessionBReviewed, 1);
+  assert.equal(await exists(originalPath), true);
 });
 
 test("approved plan executes through the Bridge and refuses repeated execution", async () => {

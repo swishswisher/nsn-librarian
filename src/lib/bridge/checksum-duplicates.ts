@@ -27,9 +27,40 @@ type DuplicateCandidate = {
 };
 
 const exactDuplicateConfidence = 0.98;
+const reusableSnapshotStatuses = [
+  "READING",
+  "EXAMINING",
+  "GENERATING_SUGGESTIONS",
+  "COMPLETED",
+  "COMPLETED_WITH_ERRORS",
+] as const;
 
 function jsonInput(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function normalizeRelativePathKey(value: string) {
+  const normalized = value.trim().replace(/\\/g, "/");
+
+  if (!normalized) {
+    return "";
+  }
+
+  return normalized
+    .split("/")
+    .filter(Boolean)
+    .join("/")
+    .toLowerCase();
+}
+
+function physicalFileIdentity(file: DuplicateCandidate) {
+  return `${file.scanSession.connectedFolder.id}\u001f${normalizeRelativePathKey(
+    file.relativePath,
+  )}`;
+}
+
+function hasUsefulChecksum(file: Pick<DuplicateCandidate, "checksum" | "sizeBytes">) {
+  return Boolean(file.checksum?.trim()) && file.sizeBytes !== BigInt(0);
 }
 
 function formatFromFileType(fileType: string) {
@@ -69,7 +100,11 @@ function suggestionKeyFor(file: DuplicateCandidate) {
 
 function duplicateTargetFor(file: DuplicateCandidate, group: DuplicateCandidate[]) {
   return group
-    .filter((candidate) => candidate.id !== file.id)
+    .filter(
+      (candidate) =>
+        candidate.id !== file.id &&
+        physicalFileIdentity(candidate) !== physicalFileIdentity(file),
+    )
     .sort(
       (left, right) =>
         left.scanSession.connectedFolder.displayName.localeCompare(
@@ -78,6 +113,177 @@ function duplicateTargetFor(file: DuplicateCandidate, group: DuplicateCandidate[
         left.relativePath.localeCompare(right.relativePath) ||
         left.id.localeCompare(right.id),
     )[0];
+}
+
+async function comparableSessionIdsFor(scanSessionId: string) {
+  const prisma = getPrismaClient();
+  const session = await prisma.scanSession.findUnique({
+    select: {
+      connectedFolderId: true,
+      id: true,
+    },
+    where: {
+      id: scanSessionId,
+    },
+  });
+
+  if (!session) {
+    return {
+      currentConnectedFolderId: null,
+      sessionIds: [] as string[],
+    };
+  }
+
+  const otherSessions = await prisma.scanSession.findMany({
+    orderBy: [{ connectedFolderId: "asc" }, { completedAt: "desc" }, { startedAt: "desc" }],
+    select: {
+      connectedFolderId: true,
+      id: true,
+    },
+    where: {
+      connectedFolderId: {
+        not: session.connectedFolderId,
+      },
+      status: {
+        in: [...reusableSnapshotStatuses],
+      },
+    },
+  });
+  const latestByConnectedFolder = new Map<string, string>();
+
+  for (const otherSession of otherSessions) {
+    if (!latestByConnectedFolder.has(otherSession.connectedFolderId)) {
+      latestByConnectedFolder.set(
+        otherSession.connectedFolderId,
+        otherSession.id,
+      );
+    }
+  }
+
+  return {
+    currentConnectedFolderId: session.connectedFolderId,
+    sessionIds: [session.id, ...latestByConnectedFolder.values()],
+  };
+}
+
+function collapseHistoricalPhysicalFiles(
+  candidates: DuplicateCandidate[],
+  currentScanSessionId: string,
+) {
+  const collapsed = new Map<string, DuplicateCandidate>();
+
+  for (const candidate of candidates) {
+    const identity = physicalFileIdentity(candidate);
+    const existing = collapsed.get(identity);
+
+    if (!existing || candidate.sessionId === currentScanSessionId) {
+      collapsed.set(identity, candidate);
+    }
+  }
+
+  return [...collapsed.values()];
+}
+
+async function duplicateCandidatesForChecksums(
+  scanSessionId: string,
+  checksums: string[],
+) {
+  const prisma = getPrismaClient();
+  const { sessionIds } = await comparableSessionIdsFor(scanSessionId);
+
+  if (sessionIds.length === 0 || checksums.length === 0) {
+    return [];
+  }
+
+  const candidates = await prisma.scannedFile.findMany({
+    orderBy: [
+      { checksum: "asc" },
+      { sessionId: "asc" },
+      { relativePath: "asc" },
+    ],
+    select: {
+      checksum: true,
+      fileType: true,
+      id: true,
+      lastModified: true,
+      relativePath: true,
+      scanSession: {
+        select: {
+          connectedFolder: {
+            select: {
+              bridgeRootId: true,
+              displayName: true,
+              id: true,
+            },
+          },
+        },
+      },
+      sessionId: true,
+      sizeBytes: true,
+      sourceCreatedAt: true,
+    },
+    where: {
+      checksum: {
+        in: checksums,
+      },
+      readStatus: {
+        not: "FAILED",
+      },
+      sessionId: {
+        in: sessionIds,
+      },
+    },
+  });
+
+  return collapseHistoricalPhysicalFiles(
+    candidates.filter(hasUsefulChecksum),
+    scanSessionId,
+  );
+}
+
+export async function findExactChecksumDuplicateForScannedFile(
+  scannedFileId: string,
+) {
+  const prisma = getPrismaClient();
+  const file = await prisma.scannedFile.findUnique({
+    select: {
+      checksum: true,
+      fileType: true,
+      id: true,
+      lastModified: true,
+      relativePath: true,
+      scanSession: {
+        select: {
+          connectedFolder: {
+            select: {
+              bridgeRootId: true,
+              displayName: true,
+              id: true,
+            },
+          },
+        },
+      },
+      sessionId: true,
+      sizeBytes: true,
+      sourceCreatedAt: true,
+    },
+    where: {
+      id: scannedFileId,
+    },
+  });
+
+  if (!file || !hasUsefulChecksum(file)) {
+    return null;
+  }
+
+  const candidates = await duplicateCandidatesForChecksums(file.sessionId, [
+    file.checksum as string,
+  ]);
+  const group = candidates.filter(
+    (candidate) => candidate.checksum === file.checksum,
+  );
+
+  return duplicateTargetFor(file, group);
 }
 
 async function markAudioDuplicate(
@@ -306,6 +512,7 @@ export async function recordChecksumDuplicateSuggestionsForSession(
   const sessionFiles = await prisma.scannedFile.findMany({
     select: {
       checksum: true,
+      sizeBytes: true,
     },
     where: {
       checksum: {
@@ -317,47 +524,18 @@ export async function recordChecksumDuplicateSuggestionsForSession(
   const checksums = [
     ...new Set(
       sessionFiles
+        .filter(hasUsefulChecksum)
         .map((file) => file.checksum)
         .filter((checksum): checksum is string => Boolean(checksum)),
     ),
   ];
 
   if (checksums.length === 0) {
+    await reconcileStaleExactDuplicates(scanSessionId, new Set());
     return { duplicateFiles: 0, duplicateGroups: 0 };
   }
 
-  const candidates = await prisma.scannedFile.findMany({
-    orderBy: [{ checksum: "asc" }, { relativePath: "asc" }],
-    select: {
-      checksum: true,
-      fileType: true,
-      id: true,
-      lastModified: true,
-      relativePath: true,
-      scanSession: {
-        select: {
-          connectedFolder: {
-            select: {
-              bridgeRootId: true,
-              displayName: true,
-              id: true,
-            },
-          },
-        },
-      },
-      sessionId: true,
-      sizeBytes: true,
-      sourceCreatedAt: true,
-    },
-    where: {
-      checksum: {
-        in: checksums,
-      },
-      readStatus: {
-        not: "FAILED",
-      },
-    },
-  });
+  const candidates = await duplicateCandidatesForChecksums(scanSessionId, checksums);
   const groups = new Map<string, DuplicateCandidate[]>();
 
   for (const candidate of candidates) {
@@ -373,6 +551,7 @@ export async function recordChecksumDuplicateSuggestionsForSession(
 
   let duplicateFiles = 0;
   let duplicateGroups = 0;
+  const duplicateFileIds = new Set<string>();
 
   for (const group of groups.values()) {
     if (group.length < 2) {
@@ -389,10 +568,97 @@ export async function recordChecksumDuplicateSuggestionsForSession(
       }
 
       duplicateFiles += 1;
+      duplicateFileIds.add(file.id);
       await markMediaDuplicate(file, target);
       await upsertDuplicateSuggestion(file, target);
     }
   }
 
+  await reconcileStaleExactDuplicates(scanSessionId, duplicateFileIds);
+
   return { duplicateFiles, duplicateGroups };
+}
+
+async function reconcileStaleExactDuplicates(
+  scanSessionId: string,
+  duplicateFileIds: Set<string>,
+) {
+  const prisma = getPrismaClient();
+  const staleSuggestionWhere: Prisma.OrganizationSuggestionWhereInput = {
+    scanSessionId,
+    suggestionType: "POSSIBLE_DUPLICATE",
+    confidence: {
+      gte: exactDuplicateConfidence,
+    },
+  };
+
+  if (duplicateFileIds.size > 0) {
+    staleSuggestionWhere.scannedFileId = {
+      notIn: [...duplicateFileIds],
+    };
+  }
+
+  await prisma.organizationSuggestion.updateMany({
+    data: {
+      confidence: 0.35,
+      explanation:
+        "The Librarian rechecked this item against the current scan snapshot and no longer found a useful exact duplicate. Same physical files seen in older scans are not treated as duplicates.",
+      reviewedAt: null,
+      status: "PENDING",
+      suggestionType: "KEEP_UNCHANGED",
+      supportingInformation: jsonInput([
+        "Exact duplicate metadata was rechecked using connected-library identity and relative path.",
+        "No physical files were changed.",
+      ]),
+      title: "No exact duplicate after recheck",
+      whySuggested: jsonInput([
+        "The earlier checksum match appears to have represented the same physical file from an older scan, or a zero-byte file without useful duplicate value.",
+      ]),
+    },
+    where: staleSuggestionWhere,
+  });
+
+  const staleScannedFileWhere: Prisma.ScannedFileWhereInput = {
+    sessionId: scanSessionId,
+  };
+
+  if (duplicateFileIds.size > 0) {
+    staleScannedFileWhere.id = {
+      notIn: [...duplicateFileIds],
+    };
+  }
+
+  await prisma.audioRecordingMetadata.updateMany({
+    data: {
+      duplicateConfidence: null,
+      duplicateKind: null,
+      duplicateOfScannedFileId: null,
+    },
+    where: {
+      duplicateKind: "EXACT_DUPLICATE",
+      scannedFile: staleScannedFileWhere,
+    },
+  });
+  await prisma.imageAssetMetadata.updateMany({
+    data: {
+      duplicateConfidence: null,
+      duplicateKind: null,
+      duplicateOfScannedFileId: null,
+    },
+    where: {
+      duplicateKind: "EXACT_DUPLICATE",
+      scannedFile: staleScannedFileWhere,
+    },
+  });
+  await prisma.videoRecordingMetadata.updateMany({
+    data: {
+      duplicateConfidence: null,
+      duplicateKind: null,
+      duplicateOfScannedFileId: null,
+    },
+    where: {
+      duplicateKind: "EXACT_DUPLICATE",
+      scannedFile: staleScannedFileWhere,
+    },
+  });
 }

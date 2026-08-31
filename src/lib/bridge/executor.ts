@@ -216,6 +216,11 @@ const supportedActionTypes = new Set<OrganizationPlanActionType>([
   "RENAME_FILE",
   "MOVE_AND_RENAME_FILE",
 ]);
+const selectableFileActionTypes = new Set<OrganizationPlanActionType>([
+  "MOVE_FILE",
+  "RENAME_FILE",
+  "MOVE_AND_RENAME_FILE",
+]);
 const executionOrder: Record<ExecutableAction["actionType"], number> = {
   CREATE_FOLDER: 10,
   MOVE_FILE: 30,
@@ -309,36 +314,80 @@ function normalizePlanStatus(value: string): OrganizationPlanStatus {
     : "DRAFT";
 }
 
+function actionIsSelectableForExecution(action: BridgeOrganizationPlanAction) {
+  return (
+    selectableFileActionTypes.has(action.actionType) &&
+    typeof action.sourceRelativePath === "string" &&
+    action.sourceRelativePath.trim().length > 0 &&
+    typeof action.plannedRelativePath === "string" &&
+    action.plannedRelativePath.trim().length > 0
+  );
+}
+
+function actionIsSelectedFileAction(action: BridgeOrganizationPlanAction) {
+  return actionIsSelectableForExecution(action) && action.selectedForExecution === true;
+}
+
+function actionIsRequiredDependency(action: BridgeOrganizationPlanAction) {
+  return (
+    action.actionType === "CREATE_FOLDER" &&
+    action.requiredForSelectedActions === true
+  );
+}
+
+function actionIsExecutableInSavedPlan(action: BridgeOrganizationPlanAction) {
+  return actionIsSelectedFileAction(action) || actionIsRequiredDependency(action);
+}
+
+function actionIsReviewOnly(action: BridgeOrganizationPlanAction) {
+  return (
+    action.actionType === "WEBSITE_ACTION" ||
+    action.actionType === "REVIEW_ONLY" ||
+    (action.actionType === "CREATE_FOLDER" && !actionIsRequiredDependency(action)) ||
+    !supportedActionTypes.has(action.actionType)
+  );
+}
+
 function planSummary(
   actions: BridgeOrganizationPlanAction[],
   warnings: BridgeOrganizationPlanWarning[],
 ) {
+  const selectedFileActions = actions.filter(actionIsSelectedFileAction);
+  const executableActions = actions.filter(actionIsExecutableInSavedPlan);
+  const reviewOnlyActions = actions.filter(actionIsReviewOnly);
+
   return {
-    estimatedOperations: actions.length,
+    blockingWarnings: warnings.length,
+    estimatedOperations: executableActions.length,
     filesAffected: new Set(
-      actions
-        .filter((action) => action.actionType !== "CREATE_FOLDER")
+      selectedFileActions
         .map((action) => action.sourceRelativePath)
         .filter((value) => value.trim().length > 0),
     ).size,
     foldersAffected: new Set(
-      actions
+      executableActions
         .map((action) => action.plannedFolderPath)
         .filter((value): value is string => Boolean(value)),
     ).size,
-    moves: actions.filter(
+    moves: selectedFileActions.filter(
       (action) =>
         action.actionType === "MOVE_FILE" ||
         action.actionType === "MOVE_AND_RENAME_FILE",
     ).length,
-    newFolders: actions.filter(
+    newFolders: executableActions.filter(
       (action) => action.actionType === "CREATE_FOLDER",
     ).length,
-    renames: actions.filter(
+    renames: selectedFileActions.filter(
       (action) =>
         action.actionType === "RENAME_FILE" ||
         action.actionType === "MOVE_AND_RENAME_FILE",
     ).length,
+    requiredFolderCreations: executableActions.filter(
+      (action) => action.actionType === "CREATE_FOLDER",
+    ).length,
+    reviewOnlyNotes: reviewOnlyActions.length,
+    selectableFileActions: actions.filter(actionIsSelectableForExecution).length,
+    selectedFileActions: selectedFileActions.length,
     warnings: warnings.length,
   };
 }
@@ -498,8 +547,26 @@ function executableActionsFor(
     ]),
   );
   const actions = asPlanActions(plan.actions);
+  const selectedActions = actions.filter(actionIsExecutableInSavedPlan);
 
-  return actions
+  for (const action of actions) {
+    if (
+      action.selectedForExecution === true &&
+      !actionIsSelectableForExecution(action) &&
+      !actionIsRequiredDependency(action)
+    ) {
+      issues.push(
+        issue(
+          "UNSUPPORTED_ACTION",
+          "This action cannot be selected for execution",
+          "Only move and rename file recommendations can be selected for filesystem organization.",
+          [action.id],
+        ),
+      );
+    }
+  }
+
+  return selectedActions
     .map((action): ExecutableAction | null => {
       if (!supportedActionTypes.has(action.actionType)) {
         issues.push(
@@ -592,6 +659,61 @@ function executableActionsFor(
       ...action,
       sequence: index + 1,
     }));
+}
+
+function validateExecutableActionSet(
+  actions: ExecutableAction[],
+  issues: BridgeExecutionIssue[],
+) {
+  const sources = new Map<string, Array<{ id: string; destination: string }>>();
+  const destinations = new Map<string, string[]>();
+
+  for (const action of actions) {
+    destinations.set(action.destinationRelativePath, [
+      ...(destinations.get(action.destinationRelativePath) ?? []),
+      action.action.id,
+    ]);
+
+    if (action.sourceRelativePath) {
+      sources.set(action.sourceRelativePath, [
+        ...(sources.get(action.sourceRelativePath) ?? []),
+        {
+          destination: action.destinationRelativePath,
+          id: action.action.id,
+        },
+      ]);
+    }
+  }
+
+  for (const [source, entries] of sources.entries()) {
+    const destinationsForSource = [
+      ...new Set(entries.map((entry) => entry.destination)),
+    ];
+
+    if (destinationsForSource.length > 1) {
+      issues.push(
+        issue(
+          "DUPLICATE_SOURCE",
+          "One source file has more than one destination",
+          `${source} is selected for more than one destination. Choose one destination before approval or execution.`,
+          entries.map((entry) => entry.id),
+        ),
+      );
+    }
+  }
+
+  for (const [destination, actionIds] of destinations.entries()) {
+    if (actionIds.length > 1) {
+      issues.push(
+        issue(
+          "DUPLICATE_DESTINATION",
+          "Multiple actions share one destination",
+          `${destination} is used by more than one selected action.`,
+          actionIds,
+        ),
+      );
+    }
+  }
 }
 
 function previewActionFor(
@@ -1231,12 +1353,12 @@ async function buildExecutionPreview(
     );
   }
 
-  if (plan.totalActions === 0 || planActions.length === 0) {
+  if (planActions.filter(actionIsSelectedFileAction).length === 0) {
     issues.push(
       issue(
         "PLAN_EMPTY",
         "No planned actions are ready to execute",
-        "Review and approve organization recommendations before organizing files.",
+        "Select and save at least one file action before approving or organizing files.",
       ),
     );
   }
@@ -1252,6 +1374,7 @@ async function buildExecutionPreview(
   }
 
   const executableActions = executableActionsFor(plan, issues);
+  validateExecutableActionSet(executableActions, issues);
   validateExecutionPermissions(plan, executableActions, issues);
 
   if (!plan.scanSession.connectedFolder.bridgeRootId) {

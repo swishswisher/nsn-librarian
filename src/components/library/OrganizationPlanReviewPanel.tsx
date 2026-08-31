@@ -135,6 +135,40 @@ function requiredPermissionsFor(actionType: OrganizationPlanActionType) {
   return ["Review only"];
 }
 
+function actionIsSelectableForExecution(action: BridgeOrganizationPlanAction) {
+  return (
+    (action.actionType === "MOVE_FILE" ||
+      action.actionType === "RENAME_FILE" ||
+      action.actionType === "MOVE_AND_RENAME_FILE") &&
+    Boolean(action.plannedRelativePath)
+  );
+}
+
+function actionIsSelectedForExecution(action: BridgeOrganizationPlanAction) {
+  return actionIsSelectableForExecution(action) && action.selectedForExecution === true;
+}
+
+function actionIsRequiredDependency(action: BridgeOrganizationPlanAction) {
+  return (
+    action.actionType === "CREATE_FOLDER" &&
+    action.requiredForSelectedActions === true
+  );
+}
+
+function actionIsReviewOnly(action: BridgeOrganizationPlanAction) {
+  return (
+    action.actionType === "WEBSITE_ACTION" ||
+    action.actionType === "REVIEW_ONLY" ||
+    (action.actionType === "CREATE_FOLDER" && !actionIsRequiredDependency(action))
+  );
+}
+
+function selectedActionIdsFromPlan(plan: BridgeOrganizationPlan) {
+  return plan.actions
+    .filter(actionIsSelectedForExecution)
+    .map((action) => action.id);
+}
+
 function executionActionTypeLabel(actionType: string) {
   if (
     actionType === "CREATE_FOLDER" ||
@@ -316,6 +350,10 @@ function safeErrorLabel(errorCategory: string) {
 }
 
 function warningTypeLabel(warningType: OrganizationPlanWarningType) {
+  if (warningType === "DUPLICATE_SOURCE") {
+    return "Conflicting destinations";
+  }
+
   if (warningType === "DUPLICATE_DESTINATION") {
     return "Duplicate destination";
   }
@@ -893,6 +931,9 @@ export function OrganizationPlanReviewPanel({
   const [undoRun, setUndoRun] = useState<BridgeUndoRunSummary | null>(
     latestExecution?.latestUndoRun ?? null,
   );
+  const [selectedActionIds, setSelectedActionIds] = useState<string[]>(
+    selectedActionIdsFromPlan(plan),
+  );
   const [error, setError] = useState<string | null>(null);
   const [executeConfirmation, setExecuteConfirmation] = useState("");
   const [undoConfirmation, setUndoConfirmation] = useState("");
@@ -900,10 +941,129 @@ export function OrganizationPlanReviewPanel({
   const [isUndoDialogOpen, setIsUndoDialogOpen] = useState(false);
   const [isExecuting, setIsExecuting] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
+  const [isSavingSelection, setIsSavingSelection] = useState(false);
   const [isUndoing, setIsUndoing] = useState(false);
   const [isUndoPreviewing, setIsUndoPreviewing] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<PlanDecision | null>(null);
+
+  function replaceCurrentPlan(nextPlan: BridgeOrganizationPlan) {
+    setCurrentPlan(nextPlan);
+    setSelectedActionIds(selectedActionIdsFromPlan(nextPlan));
+  }
+
+  function toggleSelectedAction(action: BridgeOrganizationPlanAction) {
+    if (
+      currentPlan.status !== "DRAFT" ||
+      !actionIsSelectableForExecution(action) ||
+      isSavingSelection
+    ) {
+      return;
+    }
+
+    setSelectedActionIds((current) => {
+      const alreadySelected = current.includes(action.id);
+      const withoutSameSource = current.filter((id) => {
+        const candidate = currentPlan.actions.find((item) => item.id === id);
+
+        return candidate?.sourceRelativePath !== action.sourceRelativePath;
+      });
+
+      return alreadySelected ? withoutSameSource : [...withoutSameSource, action.id];
+    });
+  }
+
+  async function saveSelection() {
+    if (isSavingSelection || currentPlan.status !== "DRAFT") {
+      return;
+    }
+
+    setError(null);
+    setMessage(null);
+    setIsSavingSelection(true);
+
+    try {
+      const response = await fetch(
+        `/api/bridge/organization-plans/${encodeURIComponent(
+          currentPlan.id,
+        )}/selection`,
+        {
+          body: JSON.stringify({ actionIds: selectedActionIds }),
+          headers: {
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+        },
+      );
+      const payload =
+        (await response.json()) as BridgeOrganizationPlanMutationResponse;
+
+      if (!payload.ok) {
+        setError(payload.error);
+        return;
+      }
+
+      replaceCurrentPlan(payload.plan);
+      setExecutionPreview(null);
+      setMessage(
+        `${payload.plan.summary.selectedFileActions} file action${
+          payload.plan.summary.selectedFileActions === 1 ? "" : "s"
+        } saved for plan approval. Nothing has been changed.`,
+      );
+      router.refresh();
+    } catch {
+      setError("The selected file actions could not be saved right now.");
+    } finally {
+      setIsSavingSelection(false);
+    }
+  }
+
+  async function clearSelection() {
+    if (isSavingSelection || currentPlan.status !== "DRAFT") {
+      return;
+    }
+
+    if (currentPlan.summary.selectedFileActions === 0) {
+      setSelectedActionIds([]);
+      setMessage("The local selection was cleared. Nothing has been changed.");
+      return;
+    }
+
+    setError(null);
+    setMessage(null);
+    setIsSavingSelection(true);
+
+    try {
+      const response = await fetch(
+        `/api/bridge/organization-plans/${encodeURIComponent(
+          currentPlan.id,
+        )}/selection`,
+        {
+          body: JSON.stringify({ action: "CLEAR" }),
+          headers: {
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+        },
+      );
+      const payload =
+        (await response.json()) as BridgeOrganizationPlanMutationResponse;
+
+      if (!payload.ok) {
+        setError(payload.error);
+        return;
+      }
+
+      replaceCurrentPlan(payload.plan);
+      setExecutionPreview(null);
+      setMessage("Selected file actions were cleared. Nothing has been changed.");
+      router.refresh();
+    } catch {
+      setError("The selected file actions could not be cleared right now.");
+    } finally {
+      setIsSavingSelection(false);
+    }
+  }
 
   async function submitDecision(action: PlanDecision) {
     if (pendingAction) {
@@ -937,7 +1097,7 @@ export function OrganizationPlanReviewPanel({
 
       setExecutionPreview(null);
       setUndoPreview(null);
-      setCurrentPlan(payload.plan);
+      replaceCurrentPlan(payload.plan);
       setMessage(
         action === "APPROVE"
           ? "The plan is marked ready for organization. No filesystem action occurred."
@@ -952,8 +1112,8 @@ export function OrganizationPlanReviewPanel({
   }
 
   function downloadPlan() {
-    if (currentPlan.totalActions === 0 || currentPlan.actions.length === 0) {
-      setError("No reviewed recommendations are ready for planning.");
+    if (currentPlan.summary.estimatedOperations === 0) {
+      setError("Save at least one selected file action before downloading a plan.");
       return;
     }
 
@@ -1053,7 +1213,7 @@ export function OrganizationPlanReviewPanel({
         return;
       }
 
-      setCurrentPlan(payload.plan);
+      replaceCurrentPlan(payload.plan);
       setExecutionPreview(payload.preview);
       setExecutionRun(payload.run);
       setUndoPreview(null);
@@ -1172,13 +1332,24 @@ export function OrganizationPlanReviewPanel({
     currentPlan.status === "DRAFT" || currentPlan.status === "READY_FOR_EXECUTION";
   const hasPlanActions =
     currentPlan.totalActions > 0 && currentPlan.actions.length > 0;
+  const hasSavedSelection = currentPlan.summary.selectedFileActions > 0;
+  const selectableActions = currentPlan.actions.filter(actionIsSelectableForExecution);
+  const reviewOnlyActions = currentPlan.actions.filter(actionIsReviewOnly);
+  const filesystemActions = currentPlan.actions.filter(
+    (action) => !actionIsReviewOnly(action),
+  );
+  const selectedFilesystemActions = filesystemActions.filter(
+    (action) =>
+      actionIsSelectedForExecution(action) || actionIsRequiredDependency(action),
+  );
+  const selectedActionCount = selectedActionIds.length;
   const hasExecutionStarted =
     currentPlan.status === "EXECUTED" ||
     executionRun?.status === "COMPLETED" ||
     executionRun?.status === "PARTIALLY_COMPLETED" ||
     executionRun?.status === "RUNNING";
   const canPreviewExecution =
-    hasPlanActions &&
+    currentPlan.summary.estimatedOperations > 0 &&
     currentPlan.status === "READY_FOR_EXECUTION" &&
     !hasExecutionStarted;
   const canExecutePlan =
@@ -1195,7 +1366,13 @@ export function OrganizationPlanReviewPanel({
                 {statusLabel(currentPlan.status)}
               </NsnBadge>
               <NsnBadge tone="source">
-                {currentPlan.totalActions} planned actions
+                {currentPlan.totalActions} plan entries
+              </NsnBadge>
+              <NsnBadge tone="approved">
+                {currentPlan.summary.selectedFileActions} selected
+              </NsnBadge>
+              <NsnBadge tone="migration">
+                {currentPlan.summary.estimatedOperations} executable operations
               </NsnBadge>
               <NsnBadge tone={currentPlan.warnings.length > 0 ? "review" : "approved"}>
                 {currentPlan.warnings.length} warnings
@@ -1210,14 +1387,24 @@ export function OrganizationPlanReviewPanel({
             {hasPlanActions ? (
               <>
                 <NsnButton
-                  disabled={currentPlan.status !== "DRAFT" || pendingAction === "APPROVE"}
+                  disabled={
+                    currentPlan.status !== "DRAFT" ||
+                    !hasSavedSelection ||
+                    currentPlan.summary.blockingWarnings > 0 ||
+                    pendingAction === "APPROVE"
+                  }
                   onClick={() => submitDecision("APPROVE")}
                   type="button"
                   variant="primary"
                 >
                   {pendingAction === "APPROVE" ? "Approving..." : "Approve Plan"}
                 </NsnButton>
-                <NsnButton onClick={downloadPlan} type="button" variant="accent">
+                <NsnButton
+                  disabled={!hasSavedSelection}
+                  onClick={downloadPlan}
+                  type="button"
+                  variant="accent"
+                >
                   Download Plan
                 </NsnButton>
                 {canPreviewExecution ? (
@@ -1286,12 +1473,138 @@ export function OrganizationPlanReviewPanel({
         />
       ) : null}
 
+      <Section title="Choose File Actions">
+        <NsnCard className="min-w-0">
+          <div className="grid min-w-0 gap-4">
+            <div className="flex flex-wrap gap-2">
+              <NsnBadge tone="source">
+                {selectableActions.length} selectable file actions
+              </NsnBadge>
+              <NsnBadge tone={selectedActionCount > 0 ? "approved" : "pending"}>
+                {selectedActionCount} currently checked
+              </NsnBadge>
+              <NsnBadge tone={hasSavedSelection ? "approved" : "pending"}>
+                {currentPlan.summary.selectedFileActions} saved
+              </NsnBadge>
+            </div>
+            <p className="break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+              Nothing executable is selected by default. Choose the file moves or
+              renames Deanne wants in this plan, then save the selection before
+              approving.
+            </p>
+            <div className="grid min-w-0 gap-3 sm:grid-cols-3">
+              <NsnButton
+                disabled={
+                  currentPlan.status !== "DRAFT" ||
+                  selectedActionCount === 0 ||
+                  isSavingSelection
+                }
+                onClick={saveSelection}
+                type="button"
+                variant="primary"
+              >
+                {isSavingSelection ? "Saving..." : "Save Selected Actions"}
+              </NsnButton>
+              <NsnButton
+                disabled={currentPlan.status !== "DRAFT" || isSavingSelection}
+                onClick={clearSelection}
+                type="button"
+                variant="secondary"
+              >
+                Clear Selection
+              </NsnButton>
+              <NsnButton
+                disabled={!canApproveOrCancel || hasExecutionStarted || pendingAction === "CANCEL"}
+                onClick={() => submitDecision("CANCEL")}
+                type="button"
+                variant="secondary"
+              >
+                {pendingAction === "CANCEL" ? "Cancelling..." : "Cancel Plan"}
+              </NsnButton>
+            </div>
+            {!hasSavedSelection ? (
+              <p className="rounded-md border border-[var(--nsn-warm-beige)] bg-[var(--nsn-sand)] p-3 text-sm leading-6 text-[var(--nsn-slate)]">
+                Approve Plan is unavailable until at least one selected file
+                action has been saved.
+              </p>
+            ) : null}
+          </div>
+        </NsnCard>
+
+        {selectableActions.length === 0 ? (
+          <NsnCard>
+            <p className="text-sm leading-6 text-[var(--nsn-slate)]">
+              No reviewed move or rename recommendations are selectable for
+              filesystem organization.
+            </p>
+          </NsnCard>
+        ) : (
+          <FolderGroupedList
+            getId={(action) => action.id}
+            getRelativePath={(action) => action.sourceRelativePath}
+            itemLabel="selectable file action"
+            items={selectableActions}
+            renderItem={(action) => {
+              const checked = selectedActionIds.includes(action.id);
+              const disabled = currentPlan.status !== "DRAFT" || isSavingSelection;
+
+              return (
+                <NsnCard className="min-w-0" key={action.id}>
+                  <label className="grid min-w-0 cursor-pointer gap-4 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-start">
+                    <input
+                      checked={checked}
+                      className="mt-1 h-5 w-5"
+                      disabled={disabled}
+                      onChange={() => toggleSelectedAction(action)}
+                      type="checkbox"
+                    />
+                    <span className="grid min-w-0 gap-3">
+                      <span className="flex flex-wrap gap-2">
+                        <NsnBadge tone={checked ? "approved" : "pending"}>
+                          {checked ? "Selected" : "Not selected"}
+                        </NsnBadge>
+                        <NsnBadge tone="migration">
+                          {actionTypeLabel(action.actionType)}
+                        </NsnBadge>
+                      </span>
+                      <span className="grid min-w-0 gap-2 text-sm leading-6">
+                        <span className="break-words text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                          Current: {action.sourceRelativePath}
+                        </span>
+                        <span className="break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                          Planned: {action.plannedRelativePath}
+                        </span>
+                        <span className="break-words text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                          {action.reason}
+                        </span>
+                      </span>
+                    </span>
+                  </label>
+                </NsnCard>
+              );
+            }}
+          />
+        )}
+      </Section>
+
       <Section title="Summary">
         <div className="grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <SummaryTile label="Files Affected" value={currentPlan.summary.filesAffected} />
           <SummaryTile
             label="Folders Affected"
             value={currentPlan.summary.foldersAffected}
+          />
+          <SummaryTile
+            label="Selectable File Actions"
+            value={currentPlan.summary.selectableFileActions}
+          />
+          <SummaryTile
+            label="Selected File Actions"
+            value={currentPlan.summary.selectedFileActions}
+          />
+          <SummaryTile
+            label="Required Folders"
+            value={currentPlan.summary.requiredFolderCreations}
           />
           <SummaryTile label="Moves" value={currentPlan.summary.moves} />
           <SummaryTile label="Renames" value={currentPlan.summary.renames} />
@@ -1300,15 +1613,23 @@ export function OrganizationPlanReviewPanel({
             label="Estimated Operations"
             value={currentPlan.summary.estimatedOperations}
           />
+          <SummaryTile
+            label="Review-only Notes"
+            value={currentPlan.summary.reviewOnlyNotes}
+          />
           <SummaryTile label="Warnings" value={currentPlan.summary.warnings} />
+          <SummaryTile
+            label="Blocking Warnings"
+            value={currentPlan.summary.blockingWarnings}
+          />
         </div>
       </Section>
 
-      <Section title="Planned Changes">
-        {currentPlan.actions.length === 0 ? (
+      <Section title="Selected Filesystem Actions">
+        {selectedFilesystemActions.length === 0 ? (
           <NsnCard>
             <p className="text-sm leading-6 text-[var(--nsn-slate)]">
-              No approved or modified recommendations are ready for planning yet.
+              No file actions have been saved for execution yet.
             </p>
           </NsnCard>
         ) : (
@@ -1320,8 +1641,8 @@ export function OrganizationPlanReviewPanel({
               action.plannedFolderPath ||
               ""
             }
-            itemLabel="planned change"
-            items={currentPlan.actions}
+            itemLabel="selected filesystem action"
+            items={selectedFilesystemActions}
             renderItem={(action) => (
               <NsnCard className="min-w-0" key={action.id}>
                 <div className="grid min-w-0 gap-5">
@@ -1332,6 +1653,9 @@ export function OrganizationPlanReviewPanel({
                     <NsnBadge tone="source">
                       Confidence {formatConfidence(action.confidence)}
                     </NsnBadge>
+                    {actionIsRequiredDependency(action) ? (
+                      <NsnBadge tone="approved">Required folder</NsnBadge>
+                    ) : null}
                   </div>
 
                   <div className="grid gap-4 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
@@ -1406,6 +1730,38 @@ export function OrganizationPlanReviewPanel({
               </NsnCard>
             )}
           />
+        )}
+      </Section>
+
+      <Section title="Review-only Notes">
+        {reviewOnlyActions.length === 0 ? (
+          <NsnCard>
+            <p className="text-sm leading-6 text-[var(--nsn-slate)]">
+              No review-only notes are attached to this plan.
+            </p>
+          </NsnCard>
+        ) : (
+          <div className="grid min-w-0 gap-3">
+            {reviewOnlyActions.map((action) => (
+              <NsnCard className="min-w-0" key={action.id}>
+                <div className="flex flex-wrap gap-2">
+                  <NsnBadge tone="source">
+                    {actionTypeLabel(action.actionType)}
+                  </NsnBadge>
+                  <NsnBadge tone="pending">Not executable</NsnBadge>
+                </div>
+                <p className="mt-3 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                  {action.sourceRelativePath}
+                </p>
+                <p className="mt-2 break-words text-sm font-semibold leading-6 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                  {action.originatingSuggestion.title}
+                </p>
+                <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                  {action.reason}
+                </p>
+              </NsnCard>
+            ))}
+          </div>
         )}
       </Section>
 

@@ -30,7 +30,12 @@ type OrganizationSuggestionsReviewPanelProps = {
   topicsBySuggestionId?: Record<string, KnowledgeReference[]>;
 };
 
-type ReviewAction = "APPROVE" | "MODIFY" | "REJECT" | "LEAVE_UNCHANGED";
+type ReviewAction =
+  | "APPROVE"
+  | "MODIFY"
+  | "REJECT"
+  | "LEAVE_UNCHANGED"
+  | "RESET";
 
 type PendingReviews = Partial<Record<string, ReviewAction>>;
 
@@ -422,6 +427,7 @@ export function OrganizationSuggestionsReviewPanel({
   libraryNameBySuggestionId = {},
   libraryOptions = [],
   notebookHref = null,
+  scanSessionId,
   showExamineLink = true,
   suggestions,
   topicsBySuggestionId = {},
@@ -444,11 +450,17 @@ export function OrganizationSuggestionsReviewPanel({
     {},
   );
   const [pendingReviews, setPendingReviews] = useState<PendingReviews>({});
+  const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
+  const [resetConfirmation, setResetConfirmation] = useState("");
+  const [isResettingSession, setIsResettingSession] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const counts = useMemo(() => statusCounts(rows), [rows]);
   const eligibleForPlanning =
     (counts.APPROVED ?? 0) + (counts.MODIFIED ?? 0);
+  const hasReviewedRecommendations = rows.some(
+    (suggestion) => suggestion.status !== "PENDING",
+  );
   const allFilterOptions = useMemo(
     () => [
       ...filterOptions,
@@ -702,6 +714,111 @@ export function OrganizationSuggestionsReviewPanel({
     }
   }
 
+  async function changeDecision(suggestion: BridgeOrganizationSuggestionSummary) {
+    if (pendingReviews[suggestion.id]) {
+      return;
+    }
+
+    setPendingReviews((current) => ({
+      ...current,
+      [suggestion.id]: "RESET",
+    }));
+    setMessage(null);
+    setError(null);
+
+    try {
+      const response = await fetch(
+        `/api/bridge/organization-suggestions/${encodeURIComponent(
+          suggestion.id,
+        )}/decision`,
+        {
+          body: JSON.stringify({
+            action: "RESET",
+            scanSessionId: suggestion.scanSessionId,
+          }),
+          headers: {
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+        },
+      );
+      const payload =
+        (await response.json()) as BridgeOrganizationSuggestionMutationResponse;
+
+      if (!payload.ok) {
+        setError(payload.error);
+        return;
+      }
+
+      updateSuggestion(payload.suggestion);
+      setMessage(
+        "The recommendation is pending again. Choose the decision that fits now.",
+      );
+      router.refresh();
+    } catch {
+      setError("The recommendation could not be reopened right now.");
+    } finally {
+      setPendingReviews((current) => {
+        const remaining = { ...current };
+
+        delete remaining[suggestion.id];
+
+        return remaining;
+      });
+    }
+  }
+
+  async function resetSessionDecisions() {
+    if (!scanSessionId || isResettingSession || resetConfirmation !== "RESET") {
+      return;
+    }
+
+    setError(null);
+    setMessage(null);
+    setIsResettingSession(true);
+
+    try {
+      const response = await fetch(
+        `/api/bridge/scan-sessions/${encodeURIComponent(
+          scanSessionId,
+        )}/recommendations/reset`,
+        {
+          body: JSON.stringify({ confirmation: resetConfirmation }),
+          headers: {
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+        },
+      );
+      const payload = (await response.json()) as
+        | {
+            ok: true;
+            resetCount: number;
+            suggestions: BridgeOrganizationSuggestionSummary[];
+          }
+        | { ok: false; error: string };
+
+      if (!payload.ok) {
+        setError(payload.error);
+        return;
+      }
+
+      setRows(payload.suggestions);
+      setResetConfirmation("");
+      setIsResetDialogOpen(false);
+      setMessage(
+        `${payload.resetCount} reviewed recommendation${
+          payload.resetCount === 1 ? "" : "s"
+        } reopened for this scan session. No files were changed.`,
+      );
+      router.refresh();
+    } catch {
+      setError("The recommendation decisions could not be reset right now.");
+    } finally {
+      setIsResettingSession(false);
+    }
+  }
+
   if (rows.length === 0) {
     return (
       <NsnEmptyState
@@ -773,6 +890,19 @@ export function OrganizationSuggestionsReviewPanel({
           <NsnButton onClick={collapseAllGroups} type="button" variant="secondary">
             Collapse all
           </NsnButton>
+          {scanSessionId && hasReviewedRecommendations ? (
+            <NsnButton
+              onClick={() => {
+                setError(null);
+                setMessage(null);
+                setIsResetDialogOpen(true);
+              }}
+              type="button"
+              variant="secondary"
+            >
+              Reset Review Decisions
+            </NsnButton>
+          ) : null}
         </div>
 
         <div aria-live="polite" className="grid gap-2">
@@ -1005,9 +1135,21 @@ export function OrganizationSuggestionsReviewPanel({
                                   ) : null}
                                 </div>
                                 {!canReview ? (
-                                  <p className="text-xs leading-5 text-[var(--nsn-slate)]">
-                                    This recommendation has been reviewed.
-                                  </p>
+                                  <div className="grid gap-2">
+                                    <NsnButton
+                                      disabled={isCardSaving}
+                                      onClick={() => changeDecision(suggestion)}
+                                      type="button"
+                                      variant="secondary"
+                                    >
+                                      {pendingAction === "RESET"
+                                        ? "Reopening..."
+                                        : "Change Decision"}
+                                    </NsnButton>
+                                    <p className="text-xs leading-5 text-[var(--nsn-slate)]">
+                                      This recommendation has been reviewed.
+                                    </p>
+                                  </div>
                                 ) : null}
                               </div>
                             </div>
@@ -1261,6 +1403,67 @@ export function OrganizationSuggestionsReviewPanel({
                 variant="primary"
               >
                 {editIsSaving ? "Saving edit..." : "Save Edited Recommendation"}
+              </NsnButton>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {isResetDialogOpen ? (
+        <div
+          aria-labelledby="reset-recommendations-title"
+          aria-modal="true"
+          className="fixed inset-0 z-50 grid min-w-0 place-items-center overflow-y-auto bg-[rgba(18,34,43,0.45)] p-4 sm:p-6"
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && !isResettingSession) {
+              setResetConfirmation("");
+              setIsResetDialogOpen(false);
+            }
+          }}
+          role="dialog"
+        >
+          <div className="grid max-h-[calc(100vh-2rem)] w-full max-w-xl min-w-0 gap-5 overflow-y-auto rounded-lg border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-4 shadow-xl sm:p-6">
+            <div className="min-w-0">
+              <h3
+                className="nsn-display break-words text-2xl leading-8 text-[var(--nsn-navy)] [overflow-wrap:anywhere]"
+                id="reset-recommendations-title"
+              >
+                Reset review decisions?
+              </h3>
+              <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                This reopens reviewed recommendations for this scan session only.
+                It does not rescan files, change files, or erase earlier notebook
+                context.
+              </p>
+            </div>
+            <label className="grid min-w-0 gap-2 text-sm font-semibold text-[var(--nsn-navy)]">
+              Type RESET to continue
+              <input
+                autoFocus
+                className="min-h-11 min-w-0 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] px-3 text-sm font-semibold text-[var(--nsn-navy)] outline-none focus:border-[var(--nsn-teal)]"
+                onChange={(event) => setResetConfirmation(event.target.value)}
+                value={resetConfirmation}
+              />
+            </label>
+            <div className="grid min-w-0 gap-3 sm:grid-cols-2">
+              <NsnButton
+                disabled={isResettingSession || resetConfirmation !== "RESET"}
+                onClick={resetSessionDecisions}
+                type="button"
+                variant="primary"
+              >
+                {isResettingSession ? "Resetting..." : "Reset Decisions"}
+              </NsnButton>
+              <NsnButton
+                disabled={isResettingSession}
+                onClick={() => {
+                  setResetConfirmation("");
+                  setIsResetDialogOpen(false);
+                }}
+                type="button"
+                variant="secondary"
+              >
+                Cancel
               </NsnButton>
             </div>
           </div>

@@ -102,6 +102,27 @@ function planActions(value: Prisma.JsonValue): BridgeOrganizationPlanAction[] {
     : [];
 }
 
+function actionIsSelectableForExecution(action: BridgeOrganizationPlanAction) {
+  return (
+    (action.actionType === "MOVE_FILE" ||
+      action.actionType === "RENAME_FILE" ||
+      action.actionType === "MOVE_AND_RENAME_FILE") &&
+    typeof action.sourceRelativePath === "string" &&
+    action.sourceRelativePath.trim().length > 0 &&
+    typeof action.plannedRelativePath === "string" &&
+    action.plannedRelativePath.trim().length > 0
+  );
+}
+
+function actionIsExecutableInSavedPlan(action: BridgeOrganizationPlanAction) {
+  return (
+    (actionIsSelectableForExecution(action) &&
+      action.selectedForExecution === true) ||
+    (action.actionType === "CREATE_FOLDER" &&
+      action.requiredForSelectedActions === true)
+  );
+}
+
 function safeRelativePath(value: string | null | undefined) {
   if (!value) {
     return null;
@@ -230,11 +251,13 @@ async function loadRemotePlan(planId: string): Promise<LoadedRemotePlan | null> 
     plan.scanSession.scannedFiles.map((file) => [file.relativePath, file]),
   );
   const actions = planActions(plan.actions);
+  const selectedActions = actions.filter(actionIsExecutableInSavedPlan);
   const blockingIssues: BridgeExecutionIssue[] = [];
   const warnings: BridgeExecutionIssue[] = [];
   const normalizedActions: RemotePlanAction[] = [];
   const previewActions: BridgeExecutionPreview["actions"] = [];
   const destinations = new Map<string, string[]>();
+  const sources = new Map<string, Array<{ id: string; destination: string }>>();
 
   if (plan.status !== "READY_FOR_EXECUTION") {
     blockingIssues.push(
@@ -269,7 +292,29 @@ async function loadRemotePlan(planId: string): Promise<LoadedRemotePlan | null> 
     );
   }
 
-  for (const [index, action] of actions.entries()) {
+  for (const action of actions) {
+    if (
+      action.selectedForExecution === true &&
+      !actionIsSelectableForExecution(action) &&
+      !(
+        action.actionType === "CREATE_FOLDER" &&
+        action.requiredForSelectedActions === true
+      )
+    ) {
+      blockingIssues.push(
+        issue({
+          actionIds: [action.id],
+          category: "UNSUPPORTED_ACTION",
+          description:
+            "Only move and rename file recommendations can be selected for filesystem organization.",
+          id: `unsupported-selection-${action.id}`,
+          title: "Unsupported selected action",
+        }),
+      );
+    }
+  }
+
+  for (const [index, action] of selectedActions.entries()) {
     if (
       action.actionType !== "CREATE_FOLDER" &&
       action.actionType !== "MOVE_FILE" &&
@@ -350,6 +395,16 @@ async function loadRemotePlan(planId: string): Promise<LoadedRemotePlan | null> 
       ...(destinations.get(destinationRelativePath) ?? []),
       action.id,
     ]);
+
+    if (sourceRelativePath) {
+      sources.set(sourceRelativePath, [
+        ...(sources.get(sourceRelativePath) ?? []),
+        {
+          destination: destinationRelativePath,
+          id: action.id,
+        },
+      ]);
+    }
   }
 
   for (const [destination, actionIds] of destinations.entries()) {
@@ -366,11 +421,30 @@ async function loadRemotePlan(planId: string): Promise<LoadedRemotePlan | null> 
     }
   }
 
+  for (const [source, entries] of sources.entries()) {
+    const sourceDestinations = [
+      ...new Set(entries.map((entry) => entry.destination)),
+    ];
+
+    if (sourceDestinations.length > 1) {
+      blockingIssues.push(
+        issue({
+          actionIds: entries.map((entry) => entry.id),
+          category: "DUPLICATE_SOURCE",
+          description: `${source} is selected for more than one destination. Choose one destination before execution.`,
+          id: `duplicate-source-${source}`,
+          title: "Duplicate source",
+        }),
+      );
+    }
+  }
+
   if (normalizedActions.length === 0) {
     blockingIssues.push(
       issue({
         category: "PLAN_EMPTY",
-        description: "No supported file or folder actions are ready to execute.",
+        description:
+          "Select and save at least one file action before executing an Organization Plan.",
         id: `plan-empty-${plan.id}`,
         title: "No executable actions",
       }),

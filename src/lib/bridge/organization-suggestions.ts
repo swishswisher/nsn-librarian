@@ -10,6 +10,7 @@ import {
   requireScannedFilePermission,
 } from "./connected-libraries";
 import { isAudioFileType, jsonAudioHumanLabels, jsonStringArray } from "./audio-metadata";
+import { recordChecksumDuplicateSuggestionsForSession } from "./checksum-duplicates";
 import { jsonImageHumanLabels } from "./image-metadata";
 import { readScannedFile } from "./reader";
 import { scannedFileSummary } from "./scan-sessions";
@@ -2258,4 +2259,132 @@ export async function reviewOrganizationSuggestion(
   }
 
   return summarizeOrganizationSuggestion(updated);
+}
+
+export async function resetOrganizationSuggestionDecision(
+  suggestionId: string,
+  scanSessionId: string,
+) {
+  const prisma = getPrismaClient();
+  const normalizedScanSessionId = scanSessionId.trim();
+
+  if (!normalizedScanSessionId) {
+    throw new OrganizationSuggestionError(
+      "The Librarian could not match this recommendation to a scan session.",
+      400,
+    );
+  }
+
+  const existing = await storedSuggestionById(suggestionId);
+
+  if (!existing) {
+    throw new OrganizationSuggestionError(
+      "The Librarian could not find that organization suggestion.",
+      404,
+    );
+  }
+
+  if (existing.scanSessionId !== normalizedScanSessionId) {
+    throw new OrganizationSuggestionError(
+      "The Librarian could not find that recommendation in this scan session.",
+      404,
+    );
+  }
+
+  if (normalizeSuggestionStatus(existing.status) !== "PENDING") {
+    await prisma.organizationSuggestion.update({
+      data: {
+        reviewedAt: null,
+        status: "PENDING",
+      },
+      where: {
+        id: suggestionId,
+      },
+    });
+  }
+
+  await recordChecksumDuplicateSuggestionsForSession(normalizedScanSessionId);
+
+  const updated = await storedSuggestionById(suggestionId);
+
+  if (!updated) {
+    throw new OrganizationSuggestionError(
+      "The Librarian could not reload that organization suggestion.",
+      404,
+    );
+  }
+
+  return summarizeOrganizationSuggestion(updated);
+}
+
+export async function resetOrganizationSuggestionDecisionsForScanSession(
+  scanSessionId: string,
+) {
+  const prisma = getPrismaClient();
+  const normalizedScanSessionId = scanSessionId.trim();
+
+  if (!normalizedScanSessionId) {
+    throw new OrganizationSuggestionError(
+      "The Librarian could not match these recommendations to a scan session.",
+      400,
+    );
+  }
+
+  const session = await prisma.scanSession.findUnique({
+    select: {
+      id: true,
+    },
+    where: {
+      id: normalizedScanSessionId,
+    },
+  });
+
+  if (!session) {
+    throw new OrganizationSuggestionError(
+      "The Librarian could not find that scan session.",
+      404,
+    );
+  }
+
+  const activePlan = await prisma.organizationPlan.findFirst({
+    select: {
+      id: true,
+      status: true,
+    },
+    where: {
+      scanSessionId: normalizedScanSessionId,
+      status: {
+        in: ["DRAFT", "READY_FOR_EXECUTION"],
+      },
+    },
+  });
+
+  if (activePlan) {
+    throw new OrganizationSuggestionError(
+      "Cancel the active Organization Plan for this scan session before resetting review decisions.",
+      409,
+    );
+  }
+
+  const result = await prisma.organizationSuggestion.updateMany({
+    data: {
+      reviewedAt: null,
+      status: "PENDING",
+    },
+    where: {
+      scanSessionId: normalizedScanSessionId,
+      status: {
+        not: "PENDING",
+      },
+    },
+  });
+
+  await recordChecksumDuplicateSuggestionsForSession(normalizedScanSessionId);
+
+  return {
+    resetCount: result.count,
+    suggestions:
+      (await getOrganizationSuggestionsForScanSession(normalizedScanSessionId))
+        ?.suggestions ?? [],
+  };
 }

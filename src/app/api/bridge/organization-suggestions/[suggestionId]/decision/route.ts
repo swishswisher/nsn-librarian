@@ -2,6 +2,7 @@ import { revalidatePath } from "next/cache";
 
 import {
   OrganizationSuggestionError,
+  resetOrganizationSuggestionDecision,
   reviewOrganizationSuggestion,
   type ReviewOrganizationSuggestionInput,
 } from "@/lib/bridge/organization-suggestions";
@@ -47,6 +48,10 @@ function actionFrom(value: unknown): ReviewOrganizationSuggestionInput["action"]
   return null;
 }
 
+function resetActionFrom(value: unknown) {
+  return value === "RESET" || value === "CHANGE_DECISION";
+}
+
 export async function POST(
   request: Request,
   context: { params: Promise<{ suggestionId: string }> },
@@ -67,9 +72,10 @@ export async function POST(
   }
 
   const action = actionFrom(body.action);
+  const isResetAction = resetActionFrom(body.action);
   const scanSessionId = requiredText(body.scanSessionId);
 
-  if (!action) {
+  if (!action && !isResetAction) {
     return Response.json(
       {
         ok: false,
@@ -90,18 +96,22 @@ export async function POST(
   }
 
   try {
-    const suggestion = await reviewOrganizationSuggestion(suggestionId, {
-      action,
-      context: optionalText(body.context),
-      destinationFolder: optionalText(body.destinationFolder),
-      fileName: optionalText(body.fileName),
-      scanSessionId,
-    });
+    const suggestion = isResetAction
+      ? await resetOrganizationSuggestionDecision(suggestionId, scanSessionId)
+      : await reviewOrganizationSuggestion(suggestionId, {
+          action: action as ReviewOrganizationSuggestionInput["action"],
+          context: optionalText(body.context),
+          destinationFolder: optionalText(body.destinationFolder),
+          fileName: optionalText(body.fileName),
+          scanSessionId,
+        });
 
-    try {
-      await recordRecommendationDecisionNotebookEntry(suggestion.id);
-    } catch {
-      // Notebook reflection failures should not block recommendation review.
+    if (!isResetAction) {
+      try {
+        await recordRecommendationDecisionNotebookEntry(suggestion.id);
+      } catch {
+        // Notebook reflection failures should not block recommendation review.
+      }
     }
 
     revalidatePath(getScanSessionRoute(suggestion.scanSessionId));

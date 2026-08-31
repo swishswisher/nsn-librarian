@@ -41,6 +41,7 @@ let ConnectedLibraryError: typeof import("../../src/lib/bridge/connected-librari
 let createBridgeScanSessionFromScan: typeof import("../../src/lib/bridge/scan-sessions").createBridgeScanSessionFromScan;
 let getOrganizationSuggestionsForConnectedLibraries: typeof import("../../src/lib/bridge/organization-suggestions").getOrganizationSuggestionsForConnectedLibraries;
 let generateOrganizationPlanForScanSession: typeof import("../../src/lib/bridge/planner").generateOrganizationPlanForScanSession;
+let saveOrganizationPlanSelection: typeof import("../../src/lib/bridge/planner").saveOrganizationPlanSelection;
 let batchConnectPost: typeof import("../../src/app/api/bridge/connected-libraries/batch/route").POST;
 
 const testSchemaName = `connected_library_batch_${process.pid}_${Date.now()}`;
@@ -311,6 +312,7 @@ before(async () => {
     organizationSuggestions.getOrganizationSuggestionsForConnectedLibraries;
   generateOrganizationPlanForScanSession =
     planner.generateOrganizationPlanForScanSession;
+  saveOrganizationPlanSelection = planner.saveOrganizationPlanSelection;
   batchConnectPost = batchRoute.POST;
 });
 
@@ -627,7 +629,18 @@ test("Organization Plans remain specific to one connected library", async () => 
     "plan-research",
   );
 
-  const plan = await generateOrganizationPlanForScanSession(workshops.session.id);
+  const draft = await generateOrganizationPlanForScanSession(workshops.session.id);
+  const selectableAction = draft.actions.find(
+    (action) =>
+      action.suggestionId === workshopSuggestion.id &&
+      action.selectableForExecution === true,
+  );
+
+  assert.ok(selectableAction);
+
+  const plan = await saveOrganizationPlanSelection(draft.id, [
+    selectableAction.id,
+  ]);
 
   assert.equal(plan.scanSessionId, workshops.session.id);
   assert.equal(plan.connectedLibraryId, workshops.connectedLibrary.id);

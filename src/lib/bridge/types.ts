@@ -223,6 +223,7 @@ export type OrganizationPlanActionType =
   (typeof organizationPlanActionTypes)[number];
 
 export const organizationPlanWarningTypes = [
+  "DUPLICATE_SOURCE",
   "DUPLICATE_DESTINATION",
   "FILENAME_CONFLICT",
   "FOLDER_CONFLICT",
@@ -1089,6 +1090,14 @@ export type BridgeOrganizationPlanAction = {
   id: string;
   order: number;
   actionType: OrganizationPlanActionType;
+  selectedForExecution?: boolean;
+  requiredForSelectedActions?: boolean;
+  selectableForExecution?: boolean;
+  executionRole?:
+    | "FILE_ACTION"
+    | "FOLDER_DEPENDENCY"
+    | "REVIEW_ONLY"
+    | "UNSELECTED_CANDIDATE";
   suggestionId: string;
   suggestionType: OrganizationSuggestionType;
   sourceRelativePath: string;
@@ -1148,6 +1157,11 @@ export type BridgeOrganizationPlanSummary = {
   newFolders: number;
   estimatedOperations: number;
   warnings: number;
+  blockingWarnings: number;
+  reviewOnlyNotes: number;
+  requiredFolderCreations: number;
+  selectableFileActions: number;
+  selectedFileActions: number;
 };
 
 export type BridgeOrganizationPlan = {

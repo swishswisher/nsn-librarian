@@ -5,6 +5,7 @@ import {
   ConnectedLibraryFileResolutionError,
   resolveConnectedLibraryFile,
 } from "./connected-library-file-resolver";
+import { findExactChecksumDuplicateForScannedFile } from "./checksum-duplicates";
 import {
   extractImageMetadata,
   imageDimensionsText,
@@ -304,24 +305,14 @@ async function detectImageDuplicate(
   metadata: BridgeImageMetadataDraft,
 ): Promise<ImageDuplicateResult> {
   const prisma = getPrismaClient();
+  const exact = await findExactChecksumDuplicateForScannedFile(scannedFile.id);
 
-  if (scannedFile.checksum) {
-    const exact = await prisma.scannedFile.findFirst({
-      select: { id: true },
-      where: {
-        checksum: scannedFile.checksum,
-        id: { not: scannedFile.id },
-        sessionId: scannedFile.sessionId,
-      },
-    });
-
-    if (exact) {
-      return {
-        duplicateConfidence: 0.98,
-        duplicateKind: "EXACT_DUPLICATE",
-        duplicateOfScannedFileId: exact.id,
-      };
-    }
+  if (exact) {
+    return {
+      duplicateConfidence: 0.98,
+      duplicateKind: "EXACT_DUPLICATE",
+      duplicateOfScannedFileId: exact.id,
+    };
   }
 
   if (metadata.imageFingerprint) {

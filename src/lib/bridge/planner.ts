@@ -150,6 +150,28 @@ const actionOrder: Record<OrganizationPlanActionType, number> = {
   WEBSITE_ACTION: 60,
   REVIEW_ONLY: 70,
 };
+const selectableFileActionTypes = new Set<OrganizationPlanActionType>([
+  "MOVE_FILE",
+  "RENAME_FILE",
+  "MOVE_AND_RENAME_FILE",
+]);
+const executableActionTypes = new Set<OrganizationPlanActionType>([
+  "CREATE_FOLDER",
+  ...selectableFileActionTypes,
+]);
+const reviewOnlyActionTypes = new Set<OrganizationPlanActionType>([
+  "REVIEW_ONLY",
+  "WEBSITE_ACTION",
+]);
+const blockingWarningTypes = new Set<OrganizationPlanWarningType>([
+  "DUPLICATE_SOURCE",
+  "DUPLICATE_DESTINATION",
+  "FILENAME_CONFLICT",
+  "FOLDER_CONFLICT",
+  "INVALID_PATH",
+  "MISSING_PARENT",
+  "OUTSIDE_ROOT_DESTINATION",
+]);
 
 function toJsonInput(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
@@ -176,6 +198,80 @@ function asPlanActions(value: Prisma.JsonValue): BridgeOrganizationPlanAction[] 
       typeof item.id === "string" &&
       typeof item.order === "number" &&
       typeof item.actionType === "string",
+  );
+}
+
+function actionIsSelectableForExecution(action: BridgeOrganizationPlanAction) {
+  return (
+    selectableFileActionTypes.has(action.actionType) &&
+    typeof action.sourceRelativePath === "string" &&
+    action.sourceRelativePath.trim().length > 0 &&
+    typeof action.plannedRelativePath === "string" &&
+    action.plannedRelativePath.trim().length > 0
+  );
+}
+
+function actionIsRequiredDependency(action: BridgeOrganizationPlanAction) {
+  return (
+    action.actionType === "CREATE_FOLDER" &&
+    action.requiredForSelectedActions === true
+  );
+}
+
+function actionIsSelectedFileAction(action: BridgeOrganizationPlanAction) {
+  return actionIsSelectableForExecution(action) && action.selectedForExecution === true;
+}
+
+function actionIsExecutableInSavedPlan(action: BridgeOrganizationPlanAction) {
+  return actionIsSelectedFileAction(action) || actionIsRequiredDependency(action);
+}
+
+function actionIsReviewOnly(action: BridgeOrganizationPlanAction) {
+  return (
+    reviewOnlyActionTypes.has(action.actionType) ||
+    (action.actionType === "CREATE_FOLDER" && !actionIsRequiredDependency(action)) ||
+    !executableActionTypes.has(action.actionType)
+  );
+}
+
+function normalizePlanAction(
+  action: BridgeOrganizationPlanAction,
+): BridgeOrganizationPlanAction {
+  const selectableForExecution = actionIsSelectableForExecution(action);
+  const requiredForSelectedActions =
+    action.actionType === "CREATE_FOLDER" &&
+    action.requiredForSelectedActions === true;
+  const selectedForExecution =
+    selectableForExecution && action.selectedForExecution === true;
+  const executionRole =
+    requiredForSelectedActions
+      ? "FOLDER_DEPENDENCY"
+      : selectedForExecution
+        ? "FILE_ACTION"
+        : selectableForExecution
+          ? "UNSELECTED_CANDIDATE"
+          : "REVIEW_ONLY";
+
+  return {
+    ...action,
+    executionRole,
+    requiredForSelectedActions,
+    selectableForExecution,
+    selectedForExecution,
+  };
+}
+
+function normalizePlanActions(actions: BridgeOrganizationPlanAction[]) {
+  return actions.map(normalizePlanAction);
+}
+
+function storedCandidateActions(actions: BridgeOrganizationPlanAction[]) {
+  return normalizePlanActions(actions).filter(
+    (action) =>
+      !(
+        action.actionType === "CREATE_FOLDER" &&
+        (action.requiredForSelectedActions || action.id.startsWith("action-folder-"))
+      ),
   );
 }
 
@@ -518,6 +614,11 @@ function actionFromSuggestion(
     actionType,
     confidence: suggestion.confidence,
     evidence: evidenceForSuggestion(suggestion),
+    executionRole: actionType === "WEBSITE_ACTION" || actionType === "REVIEW_ONLY"
+      ? "REVIEW_ONLY"
+      : actionType === "CREATE_FOLDER"
+        ? "REVIEW_ONLY"
+        : "UNSELECTED_CANDIDATE",
     humanEdits: suggestion.revisions.map((revision) => ({
       context: revision.context,
       createdAt: revision.createdAt.toISOString(),
@@ -542,6 +643,12 @@ function actionFromSuggestion(
       suggestion.revisions[0]?.context ??
       suggestion.explanation ??
       "Deanne reviewed this organization suggestion.",
+    requiredForSelectedActions: false,
+    selectableForExecution:
+      actionType === "MOVE_FILE" ||
+      actionType === "RENAME_FILE" ||
+      actionType === "MOVE_AND_RENAME_FILE",
+    selectedForExecution: false,
     sourceRelativePath: currentRelativePath,
     suggestionId: suggestion.id,
     suggestionType,
@@ -568,6 +675,7 @@ function generatedFolderActionFor(
     actionType: "CREATE_FOLDER",
     confidence: sourceAction.confidence,
     evidence: sourceAction.evidence,
+    executionRole: "FOLDER_DEPENDENCY",
     humanEdits: sourceAction.humanEdits,
     id: stableId("action-folder", [folderPath]),
     order: 0,
@@ -582,38 +690,32 @@ function generatedFolderActionFor(
     plannedRelativePath: null,
     reason:
       "This destination folder is needed for one or more approved organization recommendations.",
+    requiredForSelectedActions: true,
+    selectableForExecution: false,
+    selectedForExecution: true,
     sourceRelativePath: sourceAction.sourceRelativePath,
     suggestionId: sourceAction.suggestionId,
     suggestionType: "CREATE_FOLDER",
   };
 }
 
-function withGeneratedFolderActions(
+function withGeneratedFolderActionsForSelection(
   actions: BridgeOrganizationPlanAction[],
   scannedFiles: ExistingScanFile[],
 ) {
   const existingFolders = collectExistingFolders(scannedFiles);
-  const plannedFolderActions = new Map<string, BridgeOrganizationPlanAction>();
   const generatedFolderActions = new Map<string, BridgeOrganizationPlanAction>();
+  const candidates = storedCandidateActions(actions);
+  const selectedFileActions = candidates.filter(actionIsSelectedFileAction);
 
-  for (const action of actions) {
-    if (action.actionType === "CREATE_FOLDER" && action.plannedFolderPath) {
-      plannedFolderActions.set(
-        normalizeBridgeRelativePath(action.plannedFolderPath),
-        action,
-      );
-    }
-  }
-
-  for (const action of actions) {
-    if (action.actionType === "CREATE_FOLDER" || !action.plannedFolderPath) {
+  for (const action of selectedFileActions) {
+    if (!action.plannedFolderPath) {
       continue;
     }
 
     for (const folderPath of folderChain(action.plannedFolderPath)) {
       if (
         existingFolders.has(folderPath) ||
-        plannedFolderActions.has(folderPath) ||
         generatedFolderActions.has(folderPath)
       ) {
         continue;
@@ -626,7 +728,7 @@ function withGeneratedFolderActions(
     }
   }
 
-  return [...generatedFolderActions.values(), ...actions];
+  return [...generatedFolderActions.values(), ...candidates];
 }
 
 function skippedItemFor(
@@ -675,32 +777,50 @@ function uniqueFolders(actions: BridgeOrganizationPlanAction[]) {
   return folders;
 }
 
+function blockingWarningCount(warnings: BridgeOrganizationPlanWarning[]) {
+  return warnings.filter((warning) =>
+    blockingWarningTypes.has(warning.warningType),
+  ).length;
+}
+
 function planSummary(
   actions: BridgeOrganizationPlanAction[],
   warnings: BridgeOrganizationPlanWarning[],
 ): BridgeOrganizationPlanSummary {
+  const normalizedActions = normalizePlanActions(actions);
+  const selectedFileActions = normalizedActions.filter(actionIsSelectedFileAction);
+  const executableActions = normalizedActions.filter(actionIsExecutableInSavedPlan);
+  const reviewOnlyActions = normalizedActions.filter(actionIsReviewOnly);
+
   return {
-    estimatedOperations: actions.length,
+    blockingWarnings: blockingWarningCount(warnings),
+    estimatedOperations: executableActions.length,
     filesAffected: new Set(
-      actions
-        .filter((action) => action.actionType !== "CREATE_FOLDER")
+      selectedFileActions
         .map((action) => action.sourceRelativePath)
         .filter((value) => value.trim().length > 0),
     ).size,
-    foldersAffected: uniqueFolders(actions).size,
-    moves: actions.filter(
+    foldersAffected: uniqueFolders(executableActions).size,
+    moves: selectedFileActions.filter(
       (action) =>
         action.actionType === "MOVE_FILE" ||
         action.actionType === "MOVE_AND_RENAME_FILE",
     ).length,
-    newFolders: actions.filter(
+    newFolders: executableActions.filter(
       (action) => action.actionType === "CREATE_FOLDER",
     ).length,
-    renames: actions.filter(
+    renames: selectedFileActions.filter(
       (action) =>
         action.actionType === "RENAME_FILE" ||
         action.actionType === "MOVE_AND_RENAME_FILE",
     ).length,
+    requiredFolderCreations: executableActions.filter(
+      (action) => action.actionType === "CREATE_FOLDER",
+    ).length,
+    reviewOnlyNotes: reviewOnlyActions.length,
+    selectableFileActions: normalizedActions.filter(actionIsSelectableForExecution)
+      .length,
+    selectedFileActions: selectedFileActions.length,
     warnings: warnings.length,
   };
 }
@@ -739,6 +859,7 @@ function collectExistingFolders(scannedFiles: ExistingScanFile[]) {
 function validatePlanActions(
   actions: BridgeOrganizationPlanAction[],
   scannedFiles: ExistingScanFile[],
+  options: { selectedOnly?: boolean } = {},
 ) {
   const warnings: BridgeOrganizationPlanWarning[] = [];
   const existingFilePaths = new Map(
@@ -755,9 +876,17 @@ function validatePlanActions(
       .filter((value): value is string => Boolean(value)),
   );
   const destinations = new Map<string, string[]>();
-  const folderDestinations = new Map<string, string[]>();
+  const sources = new Map<string, Array<{ id: string; destination: string }>>();
+  const normalizedActions = normalizePlanActions(actions);
+  const validationActions = options.selectedOnly
+    ? normalizedActions.filter(actionIsExecutableInSavedPlan)
+    : normalizedActions.filter(
+        (action) =>
+          actionIsSelectableForExecution(action) ||
+          actionIsRequiredDependency(action),
+      );
 
-  for (const action of actions) {
+  for (const action of validationActions) {
     try {
       if (action.plannedRelativePath) {
         const normalized = normalizeBridgeRelativePath(action.plannedRelativePath);
@@ -765,6 +894,17 @@ function validatePlanActions(
           ...(destinations.get(normalized) ?? []),
           action.id,
         ]);
+
+        if (actionIsSelectableForExecution(action)) {
+          const source = normalizeBridgeRelativePath(action.sourceRelativePath);
+          sources.set(source, [
+            ...(sources.get(source) ?? []),
+            {
+              destination: normalized,
+              id: action.id,
+            },
+          ]);
+        }
 
         if (
           existingFilePaths.has(normalized) &&
@@ -784,12 +924,6 @@ function validatePlanActions(
         const normalizedFolder = normalizeBridgeRelativePath(
           action.plannedFolderPath,
         );
-        if (action.actionType === "CREATE_FOLDER") {
-          folderDestinations.set(normalizedFolder, [
-            ...(folderDestinations.get(normalizedFolder) ?? []),
-            action.id,
-          ]);
-        }
 
         if (existingFilePaths.has(normalizedFolder)) {
           addWarning(
@@ -833,19 +967,6 @@ function validatePlanActions(
         [action.id],
       );
     }
-
-    if (
-      action.actionType === "WEBSITE_ACTION" ||
-      action.actionType === "REVIEW_ONLY"
-    ) {
-      addWarning(
-        warnings,
-        "REVIEW_ONLY_ACTION",
-        "A future action is listed for review only",
-        "This action is part of the plan for visibility, but this milestone cannot publish website content or execute review-only changes.",
-        [action.id],
-      );
-    }
   }
 
   for (const [destination, actionIds] of destinations.entries()) {
@@ -860,14 +981,20 @@ function validatePlanActions(
     }
   }
 
-  for (const [destination, actionIds] of folderDestinations.entries()) {
-    if (actionIds.length > 1) {
+  for (const [source, entries] of sources.entries()) {
+    const distinctDestinations = [
+      ...new Set(entries.map((entry) => entry.destination)),
+    ];
+
+    if (distinctDestinations.length > 1) {
       addWarning(
         warnings,
-        "DUPLICATE_DESTINATION",
-        "Multiple actions point to the same folder",
-        `${destination} is proposed by more than one action.`,
-        actionIds,
+        "DUPLICATE_SOURCE",
+        "One file has more than one proposed destination",
+        `${source} is proposed for more than one destination: ${distinctDestinations.join(
+          ", ",
+        )}. Choose one before approving the plan.`,
+        entries.map((entry) => entry.id),
       );
     }
   }
@@ -935,9 +1062,7 @@ function buildPlanSnapshot(input: PlanBuildInput) {
       );
     }
   }
-  const actions = orderedActions(
-    withGeneratedFolderActions(suggestedActions, input.scannedFiles),
-  );
+  const actions = orderedActions(storedCandidateActions(suggestedActions));
   const warnings = validatePlanActions(actions, input.scannedFiles);
   const now = new Date().toISOString();
   const history: BridgeOrganizationPlanHistoryItem[] = [
@@ -975,7 +1100,7 @@ function buildPlanSnapshot(input: PlanBuildInput) {
 }
 
 function summarizePlan(plan: StoredPlan): BridgeOrganizationPlan {
-  const actions = asPlanActions(plan.actions);
+  const actions = normalizePlanActions(asPlanActions(plan.actions));
   const warnings = asPlanWarnings(plan.warnings);
 
   return {
@@ -1314,6 +1439,216 @@ function appendPlanHistory(
   ].slice(-20);
 }
 
+function validateSelectedActionIds(
+  candidateActions: BridgeOrganizationPlanAction[],
+  selectedActionIds: string[],
+) {
+  const candidatesById = new Map(candidateActions.map((action) => [action.id, action]));
+  const uniqueSelectedIds = [...new Set(selectedActionIds.map((id) => id.trim()))]
+    .filter(Boolean);
+  const unknownIds = uniqueSelectedIds.filter((id) => !candidatesById.has(id));
+
+  if (uniqueSelectedIds.length === 0) {
+    throw new OrganizationPlanError(
+      "Select at least one file action before saving the plan selection.",
+      422,
+    );
+  }
+
+  if (unknownIds.length > 0) {
+    throw new OrganizationPlanError(
+      "The plan selection included an action the Librarian could not verify.",
+      422,
+    );
+  }
+
+  const invalidAction = uniqueSelectedIds
+    .map((id) => candidatesById.get(id))
+    .find((action) => action && !actionIsSelectableForExecution(action));
+
+  if (invalidAction) {
+    throw new OrganizationPlanError(
+      "Only move and rename file recommendations can be selected for filesystem organization.",
+      422,
+    );
+  }
+
+  return uniqueSelectedIds;
+}
+
+function applyActionSelection(
+  actions: BridgeOrganizationPlanAction[],
+  selectedActionIds: string[],
+  scannedFiles: ExistingScanFile[],
+) {
+  const candidateActions = storedCandidateActions(actions);
+  const validatedSelectedIds = validateSelectedActionIds(
+    candidateActions,
+    selectedActionIds,
+  );
+  const selectedIdSet = new Set(validatedSelectedIds);
+  const updatedCandidates = candidateActions.map((action) =>
+    normalizePlanAction({
+      ...action,
+      requiredForSelectedActions: false,
+      selectedForExecution: selectedIdSet.has(action.id),
+    }),
+  );
+
+  return orderedActions(
+    withGeneratedFolderActionsForSelection(updatedCandidates, scannedFiles),
+  );
+}
+
+function clearActionSelection(actions: BridgeOrganizationPlanAction[]) {
+  return orderedActions(
+    storedCandidateActions(actions).map((action) =>
+      normalizePlanAction({
+        ...action,
+        requiredForSelectedActions: false,
+        selectedForExecution: false,
+      }),
+    ),
+  );
+}
+
+function assertNoBlockingWarnings(warnings: BridgeOrganizationPlanWarning[]) {
+  const blockingWarning = warnings.find((warning) =>
+    blockingWarningTypes.has(warning.warningType),
+  );
+
+  if (blockingWarning) {
+    throw new OrganizationPlanError(blockingWarning.description, 422);
+  }
+}
+
+async function planScannedFiles(plan: StoredPlan) {
+  const prisma = getPrismaClient();
+  const session = await prisma.scanSession.findUnique({
+    select: {
+      scannedFiles: {
+        select: {
+          id: true,
+          relativePath: true,
+        },
+      },
+    },
+    where: {
+      id: plan.scanSessionId,
+    },
+  });
+
+  if (!session) {
+    throw new OrganizationPlanError(
+      "The Librarian could not find that plan's scan session.",
+      404,
+    );
+  }
+
+  return session.scannedFiles;
+}
+
+export async function saveOrganizationPlanSelection(
+  planId: string,
+  selectedActionIds: string[],
+) {
+  const prisma = getPrismaClient();
+  const existing = await planById(planId);
+
+  if (!existing) {
+    throw new OrganizationPlanError(
+      "The Librarian could not find that organization plan.",
+      404,
+    );
+  }
+
+  if (normalizePlanStatus(existing.status) !== "DRAFT") {
+    throw new OrganizationPlanError(
+      "Only a draft Organization Plan can have its selected actions changed.",
+      409,
+    );
+  }
+
+  await requirePlanningPermission(existing.scanSessionId);
+
+  const scannedFiles = await planScannedFiles(existing);
+  const actions = applyActionSelection(
+    asPlanActions(existing.actions),
+    selectedActionIds,
+    scannedFiles,
+  );
+  const warnings = validatePlanActions(actions, scannedFiles, {
+    selectedOnly: true,
+  });
+  const summary = planSummary(actions, warnings);
+
+  assertNoBlockingWarnings(warnings);
+
+  const updated = await prisma.organizationPlan.update({
+    data: {
+      actions: toJsonInput(actions),
+      history: toJsonInput(
+        appendPlanHistory(
+          existing,
+          "Selected actions saved",
+          `${summary.selectedFileActions} file action${
+            summary.selectedFileActions === 1 ? "" : "s"
+          } selected for later approval. No filesystem action occurred.`,
+        ),
+      ),
+      warnings: toJsonInput(warnings),
+    },
+    where: {
+      id: existing.id,
+    },
+  });
+
+  return summarizePlan(updated);
+}
+
+export async function clearOrganizationPlanSelection(planId: string) {
+  const prisma = getPrismaClient();
+  const existing = await planById(planId);
+
+  if (!existing) {
+    throw new OrganizationPlanError(
+      "The Librarian could not find that organization plan.",
+      404,
+    );
+  }
+
+  if (normalizePlanStatus(existing.status) !== "DRAFT") {
+    throw new OrganizationPlanError(
+      "Only a draft Organization Plan can have its selected actions changed.",
+      409,
+    );
+  }
+
+  await requirePlanningPermission(existing.scanSessionId);
+
+  const scannedFiles = await planScannedFiles(existing);
+  const actions = clearActionSelection(asPlanActions(existing.actions));
+  const warnings = validatePlanActions(actions, scannedFiles);
+  const updated = await prisma.organizationPlan.update({
+    data: {
+      actions: toJsonInput(actions),
+      history: toJsonInput(
+        appendPlanHistory(
+          existing,
+          "Selection cleared",
+          "Deanne cleared the selected file actions. No filesystem action occurred.",
+        ),
+      ),
+      warnings: toJsonInput(warnings),
+    },
+    where: {
+      id: existing.id,
+    },
+  });
+
+  return summarizePlan(updated);
+}
+
 export async function approveOrganizationPlan(planId: string) {
   const prisma = getPrismaClient();
   const existing = await planById(planId);
@@ -1325,9 +1660,11 @@ export async function approveOrganizationPlan(planId: string) {
     );
   }
 
-  if (existing.totalActions === 0 || asPlanActions(existing.actions).length === 0) {
+  const actions = normalizePlanActions(asPlanActions(existing.actions));
+
+  if (actions.filter(actionIsSelectedFileAction).length === 0) {
     throw new OrganizationPlanError(
-      "No reviewed recommendations are ready for planning.",
+      "Select and save at least one file action before approving the Organization Plan.",
       422,
     );
   }

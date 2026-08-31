@@ -13,6 +13,7 @@ import {
 import { getPrismaClient } from "@/lib/db/prisma";
 import { sanitizeReadingWarning } from "@/lib/reading-room/utils";
 
+import { findExactChecksumDuplicateForScannedFile } from "./checksum-duplicates";
 import {
   ConnectedLibraryFileResolutionError,
   resolveConnectedLibraryFile,
@@ -639,24 +640,14 @@ async function detectVideoDuplicate(
   metadata: BridgeVideoMetadataDraft,
 ): Promise<VideoDuplicateResult> {
   const prisma = getPrismaClient();
+  const exact = await findExactChecksumDuplicateForScannedFile(scannedFile.id);
 
-  if (scannedFile.checksum) {
-    const exact = await prisma.scannedFile.findFirst({
-      select: { id: true },
-      where: {
-        checksum: scannedFile.checksum,
-        id: { not: scannedFile.id },
-        readStatus: "SUPPORTED",
-      },
-    });
-
-    if (exact) {
-      return {
-        duplicateConfidence: 0.98,
-        duplicateKind: "EXACT_DUPLICATE",
-        duplicateOfScannedFileId: exact.id,
-      };
-    }
+  if (exact) {
+    return {
+      duplicateConfidence: 0.98,
+      duplicateKind: "EXACT_DUPLICATE",
+      duplicateOfScannedFileId: exact.id,
+    };
   }
 
   if (metadata.videoFingerprint) {
