@@ -89,6 +89,8 @@ const packageResult = spawnSync(
     "--mac",
     "dmg",
     bridgeArchFlag,
+    "--publish",
+    "never",
   ],
   {
     env: {

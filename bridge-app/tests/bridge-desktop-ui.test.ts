@@ -1210,4 +1210,15 @@ describe("Bridge desktop app lifecycle", () => {
     assert.match(packageScript, /NSN_BRIDGE_RELEASE_VERSION/);
     assert.match(packageScript, /bridgePackage\.version = releaseVersion/);
   });
+
+  it("keeps architecture packaging offline and publishes only after both DMGs exist", async () => {
+    const workflow = await readFile(".github/workflows/release-bridge-macos.yml", "utf8");
+    const packageScript = await readFile("scripts/package-bridge-mac.mjs", "utf8");
+    const buildJob = workflow.split(/^  publish-macos:/mu)[0] ?? "";
+
+    assert.match(packageScript, /"--publish",\s+"never"/u);
+    assert.equal(buildJob.includes("GH_TOKEN:"), false);
+    assert.match(workflow, /^  publish-macos:/mu);
+    assert.match(workflow, /uses: softprops\/action-gh-release@v2/u);
+  });
 });
