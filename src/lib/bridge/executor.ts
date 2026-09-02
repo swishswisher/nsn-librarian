@@ -2133,16 +2133,19 @@ export async function executeOrganizationPlan(
                 id: true,
                 isEnabled: true,
                 localPath: true,
-                    moveFilePermission: true,
-                    readPermission: true,
-                    renameFilePermission: true,
-                    status: true,
-                    watchPermission: true,
+                moveFilePermission: true,
+                readPermission: true,
+                renameFilePermission: true,
+                status: true,
+                watchPermission: true,
               },
             },
             organizationSuggestions: {
               select: {
                 id: true,
+                invalidatedAt: true,
+                recommendationGenerationId: true,
+                recommendationGenerationVersion: true,
                 scannedFile: {
                   select: {
                     checksum: true,

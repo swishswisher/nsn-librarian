@@ -1911,6 +1911,7 @@ async function persistDrafts(context: SuggestionContext, drafts: SuggestionDraft
   const recommendationGenerationId = newRecommendationGenerationId(context);
   let createdCount = 0;
   let existingCount = 0;
+  let createdGenerationId: string | null = null;
 
   await prisma.$transaction(
     async (transaction) => {
@@ -1974,62 +1975,63 @@ async function persistDrafts(context: SuggestionContext, drafts: SuggestionDraft
         },
       });
 
-      for (const draft of cleanedDrafts) {
-        const suggestionKey = suggestionKeyFor(
-          context,
-          draft,
-          recommendationGenerationId,
-        );
-        const existing = await transaction.organizationSuggestion.findUnique({
-          include: {
-            revisions: {
-              orderBy: {
-                createdAt: "desc",
-              },
-            },
-          },
-          where: {
-            suggestionKey,
-          },
+      if (cleanedDrafts.length > 0) {
+        await transaction.organizationSuggestion.createMany({
+          data: cleanedDrafts.map((draft) => {
+            const suggestionKey = suggestionKeyFor(
+              context,
+              draft,
+              recommendationGenerationId,
+            );
+
+            return {
+              confidence: draft.confidence,
+              currentRelativePath: context.currentRelativePath,
+              explanation: draft.explanation,
+              proposedFileName: draft.proposedFileName,
+              proposedRelativePath: draft.proposedRelativePath,
+              recommendationGenerationId,
+              recommendationGenerationVersion: currentRecommendationGenerationVersion,
+              scanSessionId: context.scanSessionId,
+              scannedFileId: context.scannedFileId,
+              status: "PENDING",
+              suggestionKey,
+              suggestionType: draft.suggestionType,
+              supportingInformation: toJsonInput(draft.supportingInformation),
+              title: draft.title,
+              whySuggested: toJsonInput(draft.whySuggested),
+            };
+          }),
         });
 
-        if (existing) {
-          existingCount += 1;
-          suggestions.push(summarizeOrganizationSuggestion(existing));
-          continue;
-        }
-
-        const created = await transaction.organizationSuggestion.create({
-          data: {
-            confidence: draft.confidence,
-            currentRelativePath: context.currentRelativePath,
-            explanation: draft.explanation,
-            proposedFileName: draft.proposedFileName,
-            proposedRelativePath: draft.proposedRelativePath,
-            recommendationGenerationId,
-            recommendationGenerationVersion: currentRecommendationGenerationVersion,
-            scanSessionId: context.scanSessionId,
-            scannedFileId: context.scannedFileId,
-            status: "PENDING",
-            suggestionKey,
-            suggestionType: draft.suggestionType,
-            supportingInformation: toJsonInput(draft.supportingInformation),
-            title: draft.title,
-            whySuggested: toJsonInput(draft.whySuggested),
-          },
-          include: {
-            revisions: true,
-          },
-        });
-
-        createdCount += 1;
-        suggestions.push(summarizeOrganizationSuggestion(created));
+        createdCount = cleanedDrafts.length;
+        createdGenerationId = recommendationGenerationId;
       }
     },
     {
       timeout: 15_000,
     },
   );
+
+  if (createdGenerationId) {
+    const createdSuggestions = await prisma.organizationSuggestion.findMany({
+      include: {
+        revisions: {
+          orderBy: {
+            createdAt: "desc",
+          },
+        },
+      },
+      orderBy: {
+        title: "asc",
+      },
+      where: {
+        recommendationGenerationId: createdGenerationId,
+      },
+    });
+
+    suggestions.push(...createdSuggestions.map(summarizeOrganizationSuggestion));
+  }
 
   return {
     createdCount,
