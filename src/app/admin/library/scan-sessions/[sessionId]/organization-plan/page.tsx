@@ -144,12 +144,12 @@ export default async function OrganizationPlanPage({
     <LibraryShell active="review">
       <div className="grid min-w-0 gap-8">
         <NsnPageHeader
-          description="This plan gathers only reviewed recommendations into one inspection view. Organizing files requires plan approval, a safety preview, and Deanne's final confirmation."
+          description="Nothing will move yet. Select where each file should go, save your choices, and review the final changes before execution."
           eyebrow="Organization Plan"
           subtitle={`${data.session.folderDisplayName}. Started ${formatScanDate(
             data.session.startedAt,
           )}.`}
-          title="Review Organization Plan"
+          title="Choose which changes to include"
         >
           <div className="flex w-full flex-col gap-3 sm:w-auto sm:flex-row">
             {hasReviewedSuggestions ? (
@@ -177,19 +177,11 @@ export default async function OrganizationPlanPage({
           </div>
         </NsnPageHeader>
 
-        <NsnCard tone="aqua">
-          <p className="break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-            The Organization Plan is a readable checklist for Deanne. It keeps
-            every planned action, warning, skipped item, and decision history
-            visible before the Bridge is allowed to create folders, move files,
-            or rename files.
-          </p>
-        </NsnCard>
-
         {hasUsablePlan && data.plan ? (
           <OrganizationPlanReviewPanel
             latestExecution={data.latestExecution}
             plan={data.plan}
+            rootLabel={data.session.folderDisplayName}
           />
         ) : (
           <EmptyPlanningState

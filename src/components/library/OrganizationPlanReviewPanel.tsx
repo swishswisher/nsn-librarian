@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { useRouter } from "next/navigation";
 
@@ -16,7 +16,6 @@ import type {
   BridgeExecutionRunSummary,
   BridgeOrganizationPlan,
   BridgeOrganizationPlanAction,
-  BridgeOrganizationPlanDownload,
   BridgeOrganizationPlanMutationResponse,
   BridgeUndoPreview,
   BridgeUndoPreviewResponse,
@@ -26,21 +25,40 @@ import type {
   OrganizationPlanStatus,
   OrganizationPlanWarningType,
 } from "@/lib/bridge/types";
+import {
+  actionCanBeChosen,
+  chooseActionForSource,
+  organizationPlanDownload,
+  organizationPlanDecisionGroups,
+  organizationPlanLiveSummary,
+  selectedActionIdsFromActions,
+} from "@/lib/bridge/organization-plan-review";
 import { getConnectedLibrariesRoute } from "@/lib/library/routes";
 
 type OrganizationPlanReviewPanelProps = {
   latestExecution?: BridgeExecutionRunSummary | null;
   plan: BridgeOrganizationPlan;
+  rootLabel: string;
 };
 
 type PlanDecision = "APPROVE" | "CANCEL";
 
 function statusLabel(status: OrganizationPlanStatus) {
-  if (status === "READY_FOR_EXECUTION") {
-    return "Ready for organization";
+  if (status === "DRAFT") {
+    return "Choosing destinations";
   }
 
-  return status.replaceAll("_", " ").toLowerCase();
+  if (status === "READY_FOR_EXECUTION") {
+    return "Ready for final authorization";
+  }
+
+  if (status === "CANCELLED") {
+    return "Plan cancelled";
+  }
+
+  if (status === "EXECUTED") {
+    return "Changes completed";
+  }
 }
 
 function statusTone(status: OrganizationPlanStatus): NsnBadgeTone {
@@ -91,61 +109,8 @@ function fileNameFromRelativePath(relativePath: string) {
   return relativePath.split("/").filter(Boolean).pop() ?? relativePath;
 }
 
-function whatWillHappen(actionType: OrganizationPlanActionType) {
-  if (actionType === "CREATE_FOLDER") {
-    return "Create this folder inside the connected library.";
-  }
-
-  if (actionType === "MOVE_FILE") {
-    return "Move this file to the planned location.";
-  }
-
-  if (actionType === "RENAME_FILE") {
-    return "Rename this file in its current folder.";
-  }
-
-  if (actionType === "MOVE_AND_RENAME_FILE") {
-    return "Move and rename this file as one approved organization step.";
-  }
-
-  return "Keep this as a review-only note.";
-}
-
-function requiredPermissionsFor(actionType: OrganizationPlanActionType) {
-  if (actionType === "CREATE_FOLDER") {
-    return ["Read files", "Create folders after approval"];
-  }
-
-  if (actionType === "MOVE_FILE") {
-    return ["Read files", "Move files after approval"];
-  }
-
-  if (actionType === "RENAME_FILE") {
-    return ["Read files", "Rename files after approval"];
-  }
-
-  if (actionType === "MOVE_AND_RENAME_FILE") {
-    return [
-      "Read files",
-      "Move files after approval",
-      "Rename files after approval",
-    ];
-  }
-
-  return ["Review only"];
-}
-
-function actionIsSelectableForExecution(action: BridgeOrganizationPlanAction) {
-  return (
-    (action.actionType === "MOVE_FILE" ||
-      action.actionType === "RENAME_FILE" ||
-      action.actionType === "MOVE_AND_RENAME_FILE") &&
-    Boolean(action.plannedRelativePath)
-  );
-}
-
 function actionIsSelectedForExecution(action: BridgeOrganizationPlanAction) {
-  return actionIsSelectableForExecution(action) && action.selectedForExecution === true;
+  return actionCanBeChosen(action) && action.selectedForExecution === true;
 }
 
 function actionIsRequiredDependency(action: BridgeOrganizationPlanAction) {
@@ -163,10 +128,105 @@ function actionIsReviewOnly(action: BridgeOrganizationPlanAction) {
   );
 }
 
-function selectedActionIdsFromPlan(plan: BridgeOrganizationPlan) {
-  return plan.actions
-    .filter(actionIsSelectedForExecution)
-    .map((action) => action.id);
+function folderFromRelativePath(relativePath: string) {
+  const parts = relativePath.split("/").filter(Boolean);
+
+  return parts.slice(0, -1).join("/");
+}
+
+function readableLibraryPath(rootLabel: string, relativePath: string) {
+  const parts = relativePath.split("/").filter(Boolean);
+
+  return [rootLabel, ...parts].join(" › ");
+}
+
+function confidenceLabel(value: number) {
+  if (value >= 0.8) {
+    return "High";
+  }
+
+  if (value >= 0.5) {
+    return "Medium";
+  }
+
+  return "Low";
+}
+
+function counted(count: number, singular: string, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function destinationOptionLabel(action: BridgeOrganizationPlanAction) {
+  const destination = action.plannedRelativePath ?? "the proposed location";
+
+  if (action.actionType === "RENAME_FILE") {
+    return `Rename it to ${fileNameFromRelativePath(destination)}`;
+  }
+
+  if (action.actionType === "MOVE_AND_RENAME_FILE") {
+    return `Move and rename it to ${destination}`;
+  }
+
+  return `Move it to ${folderFromRelativePath(destination) || destination}`;
+}
+
+function plainLanguageReason(action: BridgeOrganizationPlanAction) {
+  const destination = action.plannedRelativePath ?? "";
+  const fileName = fileNameFromRelativePath(action.sourceRelativePath);
+
+  if (
+    /\.(m4a|mp3|wav|aac|flac|ogg)$/i.test(fileName) &&
+    /workshop/i.test(destination)
+  ) {
+    return "This is an audio recording about a workshop, so it may belong with other workshop recordings.";
+  }
+
+  const specificReason = [
+    action.reason,
+    ...action.evidence.originatingSuggestion.slice(2),
+  ].find(
+    (item) =>
+      item.trim().length > 0 &&
+      !/the librarian noticed|similar folder or name signals|practical folder pattern|audio-specific signals|video-specific signals|recommendation for review/i.test(
+        item,
+      ),
+  );
+
+  if (specificReason) {
+    return specificReason;
+  }
+
+  const destinationFolder = folderFromRelativePath(destination);
+
+  return `The reviewed file details relate to ${
+    destinationFolder || destination
+  }, so that location may make the file easier to find.`;
+}
+
+function inclusionLabel(
+  action: BridgeOrganizationPlanAction,
+  checked: boolean,
+) {
+  const change =
+    action.actionType === "RENAME_FILE"
+      ? "rename"
+      : action.actionType === "MOVE_AND_RENAME_FILE"
+        ? "move and rename"
+        : "move";
+
+  return checked
+    ? `Include this ${change} in the plan`
+    : `Choosing this option will include this ${change} in the plan`;
+}
+
+function sameStringSet(left: string[], right: string[]) {
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+
+  return (
+    sortedLeft.length === sortedRight.length &&
+    sortedLeft.every((value, index) => value === sortedRight[index])
+  );
 }
 
 function executionActionTypeLabel(actionType: string) {
@@ -381,29 +441,6 @@ function warningTypeLabel(warningType: OrganizationPlanWarningType) {
   return "Invalid path";
 }
 
-function formatConfidence(value: number) {
-  return `${Math.round(value * 100)}%`;
-}
-
-function SummaryTile({
-  label,
-  value,
-}: {
-  label: string;
-  value: number | string;
-}) {
-  return (
-    <NsnCard className="min-w-0">
-      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--nsn-warm-gray)]">
-        {label}
-      </p>
-      <p className="nsn-display mt-2 break-words text-3xl text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
-        {value}
-      </p>
-    </NsnCard>
-  );
-}
-
 function Section({
   children,
   id,
@@ -418,62 +455,6 @@ function Section({
       <h2 className="nsn-display text-2xl text-[var(--nsn-navy)]">{title}</h2>
       {children}
     </section>
-  );
-}
-
-function ActionDestination({ action }: { action: BridgeOrganizationPlanAction }) {
-  if (action.actionType === "CREATE_FOLDER") {
-    return (
-      <>
-        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--nsn-warm-gray)]">
-          Planned folder
-        </p>
-        <p className="break-words text-sm font-semibold leading-6 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
-          {action.plannedFolderPath ?? "No folder path recorded"}
-        </p>
-      </>
-    );
-  }
-
-  return (
-    <div className="grid gap-2">
-      <div className="min-w-0">
-        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--nsn-warm-gray)]">
-          Current location
-        </p>
-        <p className="break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-          {action.sourceRelativePath}
-        </p>
-      </div>
-      <div className="min-w-0">
-        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--nsn-warm-gray)]">
-          Planned location
-        </p>
-        <p className="break-words text-sm font-semibold leading-6 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
-          {action.plannedRelativePath ?? "No planned location recorded"}
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function EvidenceList({ items }: { items: string[] }) {
-  if (items.length === 0) {
-    return (
-      <p className="text-sm leading-6 text-[var(--nsn-slate)]">
-        No supporting detail was recorded for this category.
-      </p>
-    );
-  }
-
-  return (
-    <ul className="grid gap-1 pl-4 text-sm leading-6 text-[var(--nsn-slate)]">
-      {items.map((item) => (
-        <li className="list-disc break-words [overflow-wrap:anywhere]" key={item}>
-          {item}
-        </li>
-      ))}
-    </ul>
   );
 }
 
@@ -920,6 +901,7 @@ function ExecutionRunPanel({
 export function OrganizationPlanReviewPanel({
   latestExecution = null,
   plan,
+  rootLabel,
 }: OrganizationPlanReviewPanelProps) {
   const router = useRouter();
   const [currentPlan, setCurrentPlan] = useState(plan);
@@ -932,7 +914,7 @@ export function OrganizationPlanReviewPanel({
     latestExecution?.latestUndoRun ?? null,
   );
   const [selectedActionIds, setSelectedActionIds] = useState<string[]>(
-    selectedActionIdsFromPlan(plan),
+    () => selectedActionIdsFromActions(plan.actions),
   );
   const [error, setError] = useState<string | null>(null);
   const [executeConfirmation, setExecuteConfirmation] = useState("");
@@ -949,32 +931,36 @@ export function OrganizationPlanReviewPanel({
 
   function replaceCurrentPlan(nextPlan: BridgeOrganizationPlan) {
     setCurrentPlan(nextPlan);
-    setSelectedActionIds(selectedActionIdsFromPlan(nextPlan));
+    setSelectedActionIds(selectedActionIdsFromActions(nextPlan.actions));
   }
 
-  function toggleSelectedAction(action: BridgeOrganizationPlanAction) {
+  function chooseDestination(sourceRelativePath: string, actionId: string | null) {
     if (
       currentPlan.status !== "DRAFT" ||
-      !actionIsSelectableForExecution(action) ||
       isSavingSelection
     ) {
       return;
     }
 
-    setSelectedActionIds((current) => {
-      const alreadySelected = current.includes(action.id);
-      const withoutSameSource = current.filter((id) => {
-        const candidate = currentPlan.actions.find((item) => item.id === id);
-
-        return candidate?.sourceRelativePath !== action.sourceRelativePath;
-      });
-
-      return alreadySelected ? withoutSameSource : [...withoutSameSource, action.id];
-    });
+    setSelectedActionIds((current) =>
+      chooseActionForSource(
+        current,
+        currentPlan.actions,
+        sourceRelativePath,
+        actionId,
+      ),
+    );
+    setMessage(null);
+    setExecutionPreview(null);
   }
 
   async function saveSelection() {
     if (isSavingSelection || currentPlan.status !== "DRAFT") {
+      return;
+    }
+
+    if (selectedActionIds.length === 0) {
+      await clearSelection();
       return;
     }
 
@@ -1005,11 +991,7 @@ export function OrganizationPlanReviewPanel({
 
       replaceCurrentPlan(payload.plan);
       setExecutionPreview(null);
-      setMessage(
-        `${payload.plan.summary.selectedFileActions} file action${
-          payload.plan.summary.selectedFileActions === 1 ? "" : "s"
-        } saved for plan approval. Nothing has been changed.`,
-      );
+      setMessage("Your choices were saved. No files were moved.");
       router.refresh();
     } catch {
       setError("The selected file actions could not be saved right now.");
@@ -1056,7 +1038,7 @@ export function OrganizationPlanReviewPanel({
 
       replaceCurrentPlan(payload.plan);
       setExecutionPreview(null);
-      setMessage("Selected file actions were cleared. Nothing has been changed.");
+      setMessage("Your choices were saved. No files were moved.");
       router.refresh();
     } catch {
       setError("The selected file actions could not be cleared right now.");
@@ -1117,14 +1099,7 @@ export function OrganizationPlanReviewPanel({
       return;
     }
 
-    const payload: BridgeOrganizationPlanDownload = {
-      exportedAt: new Date().toISOString(),
-      plan: currentPlan,
-      safety: {
-        executionAllowed: false,
-        note: "This JSON is an organization plan only. It does not authorize moving, renaming, creating, deleting, copying, or publishing files.",
-      },
-    };
+    const payload = organizationPlanDownload(currentPlan);
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
       type: "application/json",
     });
@@ -1333,7 +1308,10 @@ export function OrganizationPlanReviewPanel({
   const hasPlanActions =
     currentPlan.totalActions > 0 && currentPlan.actions.length > 0;
   const hasSavedSelection = currentPlan.summary.selectedFileActions > 0;
-  const selectableActions = currentPlan.actions.filter(actionIsSelectableForExecution);
+  const decisionGroups = useMemo(
+    () => organizationPlanDecisionGroups(currentPlan.actions),
+    [currentPlan.actions],
+  );
   const reviewOnlyActions = currentPlan.actions.filter(actionIsReviewOnly);
   const filesystemActions = currentPlan.actions.filter(
     (action) => !actionIsReviewOnly(action),
@@ -1343,6 +1321,16 @@ export function OrganizationPlanReviewPanel({
       actionIsSelectedForExecution(action) || actionIsRequiredDependency(action),
   );
   const selectedActionCount = selectedActionIds.length;
+  const savedActionIds = useMemo(
+    () => selectedActionIdsFromActions(currentPlan.actions),
+    [currentPlan.actions],
+  );
+  const hasUnsavedChoices = !sameStringSet(selectedActionIds, savedActionIds);
+  const liveSummary = useMemo(
+    () =>
+      organizationPlanLiveSummary(currentPlan.actions, selectedActionIds),
+    [currentPlan.actions, selectedActionIds],
+  );
   const hasExecutionStarted =
     currentPlan.status === "EXECUTED" ||
     executionRun?.status === "COMPLETED" ||
@@ -1359,6 +1347,72 @@ export function OrganizationPlanReviewPanel({
   return (
     <div className="grid min-w-0 gap-8">
       <NsnCard tone="aqua">
+        <div className="grid min-w-0 gap-5">
+          <div className="min-w-0">
+            <h2 className="nsn-display text-3xl text-[var(--nsn-navy)]">
+              Choose which changes to include
+            </h2>
+            <p className="mt-3 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+              Nothing will move yet. Select where each file should go, save your
+              choices, and review the final changes before execution.
+            </p>
+          </div>
+          <ol className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-label="Organization process">
+            {[
+              "Choose file destinations",
+              "Save choices",
+              "Review final plan",
+              "Authorize execution",
+            ].map((step, index) => (
+              <li
+                className="flex min-w-0 items-center gap-3 rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-card)] p-3 text-sm font-semibold text-[var(--nsn-navy)]"
+                key={step}
+              >
+                <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-[var(--nsn-teal)] text-xs text-white">
+                  {index + 1}
+                </span>
+                <span className="break-words [overflow-wrap:anywhere]">{step}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
+      </NsnCard>
+
+      <section
+        aria-label="Live safety summary"
+        aria-live="polite"
+        className="sticky top-3 z-10"
+      >
+        <NsnCard className="min-w-0 shadow-sm">
+          <div className="grid min-w-0 gap-4">
+            <div>
+              <h2 className="text-sm font-semibold text-[var(--nsn-navy)]">
+                Safety summary
+              </h2>
+              <p className="mt-1 text-sm font-semibold text-[var(--nsn-teal-dark)]">
+                Nothing has happened yet
+              </p>
+            </div>
+            <ul className="grid min-w-0 gap-2 text-sm text-[var(--nsn-slate)] sm:grid-cols-2 xl:grid-cols-5">
+              <li>{counted(liveSummary.filesMoved, "file")} will move</li>
+              <li>
+                {counted(liveSummary.foldersCreated, "folder")} will be created
+              </li>
+              <li>
+                {counted(liveSummary.filesRenamed, "file")} will be renamed
+              </li>
+              <li>
+                {counted(liveSummary.filesDeleted, "file")} will be deleted
+              </li>
+              <li>
+                {counted(liveSummary.filesOverwritten, "file")} will be overwritten
+              </li>
+            </ul>
+          </div>
+        </NsnCard>
+      </section>
+
+      <NsnCard tone="aqua">
         <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
           <div className="min-w-0">
             <div className="flex flex-wrap gap-2">
@@ -1366,21 +1420,21 @@ export function OrganizationPlanReviewPanel({
                 {statusLabel(currentPlan.status)}
               </NsnBadge>
               <NsnBadge tone="source">
-                {currentPlan.totalActions} plan entries
+                {decisionGroups.length} files to decide
               </NsnBadge>
               <NsnBadge tone="approved">
-                {currentPlan.summary.selectedFileActions} selected
+                {currentPlan.summary.selectedFileActions} saved changes
               </NsnBadge>
               <NsnBadge tone="migration">
-                {currentPlan.summary.estimatedOperations} executable operations
+                {currentPlan.summary.estimatedOperations} steps after authorization
               </NsnBadge>
               <NsnBadge tone={currentPlan.warnings.length > 0 ? "review" : "approved"}>
                 {currentPlan.warnings.length} warnings
               </NsnBadge>
             </div>
             <p className="mt-4 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-              This plan can only organize files after approval, preview, and final
-              confirmation. The Bridge will not overwrite or delete files.
+              NSN can only organize files after you save, review, and authorize
+              the final plan. It will not overwrite or delete files.
             </p>
           </div>
           <div className="grid min-w-0 gap-3 sm:grid-cols-3 lg:min-w-80 lg:grid-cols-1">
@@ -1390,6 +1444,7 @@ export function OrganizationPlanReviewPanel({
                   disabled={
                     currentPlan.status !== "DRAFT" ||
                     !hasSavedSelection ||
+                    hasUnsavedChoices ||
                     currentPlan.summary.blockingWarnings > 0 ||
                     pendingAction === "APPROVE"
                   }
@@ -1397,15 +1452,17 @@ export function OrganizationPlanReviewPanel({
                   type="button"
                   variant="primary"
                 >
-                  {pendingAction === "APPROVE" ? "Approving..." : "Approve Plan"}
+                  {pendingAction === "APPROVE"
+                    ? "Preparing final plan..."
+                    : "Review final plan"}
                 </NsnButton>
                 <NsnButton
-                  disabled={!hasSavedSelection}
+                  disabled={!hasSavedSelection || hasUnsavedChoices}
                   onClick={downloadPlan}
                   type="button"
                   variant="accent"
                 >
-                  Download Plan
+                  Download saved plan JSON
                 </NsnButton>
                 {canPreviewExecution ? (
                   <NsnButton
@@ -1435,7 +1492,9 @@ export function OrganizationPlanReviewPanel({
               type="button"
               variant="secondary"
             >
-              {pendingAction === "CANCEL" ? "Cancelling..." : "Cancel Plan"}
+              {pendingAction === "CANCEL"
+                ? "Cancelling..."
+                : "Cancel this plan"}
             </NsnButton>
           </div>
         </div>
@@ -1473,37 +1532,47 @@ export function OrganizationPlanReviewPanel({
         />
       ) : null}
 
-      <Section title="Choose File Actions">
+      <Section title="Choose file destinations">
         <NsnCard className="min-w-0">
           <div className="grid min-w-0 gap-4">
             <div className="flex flex-wrap gap-2">
               <NsnBadge tone="source">
-                {selectableActions.length} selectable file actions
+                {counted(decisionGroups.length, "file")} {decisionGroups.length === 1 ? "needs" : "need"} a choice
               </NsnBadge>
               <NsnBadge tone={selectedActionCount > 0 ? "approved" : "pending"}>
-                {selectedActionCount} currently checked
+                {selectedActionCount} moves or renames included
               </NsnBadge>
-              <NsnBadge tone={hasSavedSelection ? "approved" : "pending"}>
-                {currentPlan.summary.selectedFileActions} saved
-              </NsnBadge>
+              {hasUnsavedChoices ? (
+                <NsnBadge tone="review">Choices not saved yet</NsnBadge>
+              ) : (
+                <NsnBadge tone={hasSavedSelection ? "approved" : "pending"}>
+                  Choices match the saved plan
+                </NsnBadge>
+              )}
             </div>
             <p className="break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-              Nothing executable is selected by default. Choose the file moves or
-              renames Deanne wants in this plan, then save the selection before
-              approving.
+              Each file has one choice. Keeping the current location is the
+              default. Choosing a destination includes that move in the plan; it
+              does not move the file now.
             </p>
-            <div className="grid min-w-0 gap-3 sm:grid-cols-3">
+            <div className="grid min-w-0 gap-3 sm:grid-cols-2">
               <NsnButton
                 disabled={
                   currentPlan.status !== "DRAFT" ||
-                  selectedActionCount === 0 ||
+                  !hasUnsavedChoices ||
                   isSavingSelection
                 }
                 onClick={saveSelection}
                 type="button"
                 variant="primary"
               >
-                {isSavingSelection ? "Saving..." : "Save Selected Actions"}
+                {isSavingSelection
+                  ? "Saving choices..."
+                  : selectedActionCount === 0
+                    ? "Save choice to keep every file where it is"
+                    : `Save ${selectedActionCount} choice${
+                        selectedActionCount === 1 ? "" : "s"
+                      }`}
               </NsnButton>
               <NsnButton
                 disabled={currentPlan.status !== "DRAFT" || isSavingSelection}
@@ -1511,125 +1580,170 @@ export function OrganizationPlanReviewPanel({
                 type="button"
                 variant="secondary"
               >
-                Clear Selection
-              </NsnButton>
-              <NsnButton
-                disabled={!canApproveOrCancel || hasExecutionStarted || pendingAction === "CANCEL"}
-                onClick={() => submitDecision("CANCEL")}
-                type="button"
-                variant="secondary"
-              >
-                {pendingAction === "CANCEL" ? "Cancelling..." : "Cancel Plan"}
+                Leave every file where it is
               </NsnButton>
             </div>
-            {!hasSavedSelection ? (
+            {hasUnsavedChoices ? (
               <p className="rounded-md border border-[var(--nsn-warm-beige)] bg-[var(--nsn-sand)] p-3 text-sm leading-6 text-[var(--nsn-slate)]">
-                Approve Plan is unavailable until at least one selected file
-                action has been saved.
+                Save these choices before reviewing or downloading the final
+                plan. Nothing has moved.
               </p>
             ) : null}
           </div>
         </NsnCard>
 
-        {selectableActions.length === 0 ? (
+        {decisionGroups.length === 0 ? (
           <NsnCard>
             <p className="text-sm leading-6 text-[var(--nsn-slate)]">
-              No reviewed move or rename recommendations are selectable for
-              filesystem organization.
+              There are no file destinations to choose in this plan.
             </p>
           </NsnCard>
         ) : (
-          <FolderGroupedList
-            getId={(action) => action.id}
-            getRelativePath={(action) => action.sourceRelativePath}
-            itemLabel="selectable file action"
-            items={selectableActions}
-            renderItem={(action) => {
-              const checked = selectedActionIds.includes(action.id);
+          <div className="grid min-w-0 gap-5">
+            {decisionGroups.map((group) => {
+              const selectedAction = group.actions.find((action) =>
+                selectedActionIds.includes(action.id),
+              );
               const disabled = currentPlan.status !== "DRAFT" || isSavingSelection;
+              const sourceFolder = folderFromRelativePath(
+                group.sourceRelativePath,
+              );
+              const fileName = fileNameFromRelativePath(group.sourceRelativePath);
 
               return (
-                <NsnCard className="min-w-0" key={action.id}>
-                  <label className="grid min-w-0 cursor-pointer gap-4 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-start">
-                    <input
-                      checked={checked}
-                      className="mt-1 h-5 w-5"
-                      disabled={disabled}
-                      onChange={() => toggleSelectedAction(action)}
-                      type="checkbox"
-                    />
-                    <span className="grid min-w-0 gap-3">
-                      <span className="flex flex-wrap gap-2">
-                        <NsnBadge tone={checked ? "approved" : "pending"}>
-                          {checked ? "Selected" : "Not selected"}
-                        </NsnBadge>
-                        <NsnBadge tone="migration">
-                          {actionTypeLabel(action.actionType)}
-                        </NsnBadge>
-                      </span>
-                      <span className="grid min-w-0 gap-2 text-sm leading-6">
-                        <span className="break-words text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                          Current: {action.sourceRelativePath}
+                <NsnCard className="min-w-0" key={group.sourceRelativePath}>
+                  <fieldset className="grid min-w-0 gap-4" disabled={disabled}>
+                    <legend className="nsn-display break-words text-2xl text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                      {group.actions.length > 1
+                        ? `Choose one location for ${fileName}`
+                        : group.actions[0]?.actionType === "RENAME_FILE"
+                          ? "Rename this file?"
+                          : "Move this file?"}
+                    </legend>
+                    <div className="grid min-w-0 gap-2 text-sm leading-6">
+                      <p className="break-words [overflow-wrap:anywhere]">
+                        <span className="font-semibold text-[var(--nsn-navy)]">
+                          File:
+                        </span>{" "}
+                        <span className="text-[var(--nsn-slate)]">{fileName}</span>
+                      </p>
+                      <p className="break-words [overflow-wrap:anywhere]">
+                        <span className="font-semibold text-[var(--nsn-navy)]">
+                          From:
+                        </span>{" "}
+                        <span className="text-[var(--nsn-slate)]">
+                          {readableLibraryPath(rootLabel, sourceFolder)}
                         </span>
+                      </p>
+                    </div>
+
+                    <label className="grid min-w-0 cursor-pointer gap-3 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-4 sm:grid-cols-[auto_minmax(0,1fr)]">
+                      <input
+                        checked={!selectedAction}
+                        className="mt-1 h-5 w-5"
+                        name={`destination-${group.sourceRelativePath}`}
+                        onChange={() =>
+                          chooseDestination(group.sourceRelativePath, null)
+                        }
+                        type="radio"
+                      />
+                      <span className="grid min-w-0 gap-1">
                         <span className="break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
-                          Planned: {action.plannedRelativePath}
+                          Keep it in {sourceFolder || rootLabel} — default
                         </span>
-                        <span className="break-words text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                          {action.reason}
+                        <span className="text-sm text-[var(--nsn-slate)]">
+                          Leave this file where it is
                         </span>
                       </span>
-                    </span>
-                  </label>
+                    </label>
+
+                    {group.actions.map((action) => {
+                      const checked = selectedAction?.id === action.id;
+                      const destination = action.plannedRelativePath ?? "";
+                      const destinationFolder = folderFromRelativePath(destination);
+
+                      return (
+                        <label
+                          className="grid min-w-0 cursor-pointer gap-3 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-4 sm:grid-cols-[auto_minmax(0,1fr)]"
+                          key={action.id}
+                        >
+                          <input
+                            checked={checked}
+                            className="mt-1 h-5 w-5"
+                            name={`destination-${group.sourceRelativePath}`}
+                            onChange={() =>
+                              chooseDestination(
+                                group.sourceRelativePath,
+                                action.id,
+                              )
+                            }
+                            type="radio"
+                          />
+                          <span className="grid min-w-0 gap-3">
+                            <span className="break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                              {destinationOptionLabel(action)}
+                            </span>
+                            <span className="grid min-w-0 gap-2 text-sm leading-6">
+                              <span className="break-words [overflow-wrap:anywhere]">
+                                <span className="font-semibold text-[var(--nsn-navy)]">
+                                  To:
+                                </span>{" "}
+                                <span className="text-[var(--nsn-slate)]">
+                                  {readableLibraryPath(
+                                    rootLabel,
+                                    action.actionType === "RENAME_FILE"
+                                      ? destination
+                                      : destinationFolder,
+                                  )}
+                                </span>
+                              </span>
+                              <span className="break-words text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                                <span className="font-semibold text-[var(--nsn-navy)]">
+                                  Why this may fit:
+                                </span>{" "}
+                                {plainLanguageReason(action)}
+                              </span>
+                              <span className="text-[var(--nsn-slate)]">
+                                <span className="font-semibold text-[var(--nsn-navy)]">
+                                  Confidence:
+                                </span>{" "}
+                                {confidenceLabel(action.confidence)}
+                              </span>
+                              <span className="font-semibold text-[var(--nsn-teal-dark)]">
+                                {inclusionLabel(action, checked)}
+                              </span>
+                            </span>
+                            {checked &&
+                            (action.requiredFolderPaths?.length ?? 0) > 0 ? (
+                              <span className="grid gap-2 rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3 text-sm leading-6 text-[var(--nsn-slate)]">
+                                {action.requiredFolderPaths?.map((folderPath) => (
+                                  <span
+                                    className="break-words [overflow-wrap:anywhere]"
+                                    key={folderPath}
+                                  >
+                                    NSN will also create the folder ‘{folderPath}’
+                                    because this destination does not exist.
+                                  </span>
+                                ))}
+                              </span>
+                            ) : null}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </fieldset>
                 </NsnCard>
               );
-            }}
-          />
+            })}
+          </div>
         )}
       </Section>
 
-      <Section title="Summary">
-        <div className="grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          <SummaryTile label="Files Affected" value={currentPlan.summary.filesAffected} />
-          <SummaryTile
-            label="Folders Affected"
-            value={currentPlan.summary.foldersAffected}
-          />
-          <SummaryTile
-            label="Selectable File Actions"
-            value={currentPlan.summary.selectableFileActions}
-          />
-          <SummaryTile
-            label="Selected File Actions"
-            value={currentPlan.summary.selectedFileActions}
-          />
-          <SummaryTile
-            label="Required Folders"
-            value={currentPlan.summary.requiredFolderCreations}
-          />
-          <SummaryTile label="Moves" value={currentPlan.summary.moves} />
-          <SummaryTile label="Renames" value={currentPlan.summary.renames} />
-          <SummaryTile label="New Folders" value={currentPlan.summary.newFolders} />
-          <SummaryTile
-            label="Estimated Operations"
-            value={currentPlan.summary.estimatedOperations}
-          />
-          <SummaryTile
-            label="Review-only Notes"
-            value={currentPlan.summary.reviewOnlyNotes}
-          />
-          <SummaryTile label="Warnings" value={currentPlan.summary.warnings} />
-          <SummaryTile
-            label="Blocking Warnings"
-            value={currentPlan.summary.blockingWarnings}
-          />
-        </div>
-      </Section>
-
-      <Section title="Selected Filesystem Actions">
+      <Section title="Saved final plan">
         {selectedFilesystemActions.length === 0 ? (
           <NsnCard>
             <p className="text-sm leading-6 text-[var(--nsn-slate)]">
-              No file actions have been saved for execution yet.
+              No file destinations have been saved yet. Nothing will move.
             </p>
           </NsnCard>
         ) : (
@@ -1641,7 +1755,7 @@ export function OrganizationPlanReviewPanel({
               action.plannedFolderPath ||
               ""
             }
-            itemLabel="selected filesystem action"
+            itemLabel="saved plan item"
             items={selectedFilesystemActions}
             renderItem={(action) => (
               <NsnCard className="min-w-0" key={action.id}>
@@ -1651,81 +1765,40 @@ export function OrganizationPlanReviewPanel({
                       {action.order}. {actionTypeLabel(action.actionType)}
                     </NsnBadge>
                     <NsnBadge tone="source">
-                      Confidence {formatConfidence(action.confidence)}
+                      Confidence {confidenceLabel(action.confidence)}
                     </NsnBadge>
                     {actionIsRequiredDependency(action) ? (
-                      <NsnBadge tone="approved">Required folder</NsnBadge>
+                      <NsnBadge tone="approved">Created automatically</NsnBadge>
                     ) : null}
                   </div>
 
-                  <div className="grid gap-4 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
-                    <div className="min-w-0 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-3">
-                      <p className="mb-3 break-words text-sm font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
-                        File:{" "}
-                        {fileNameFromRelativePath(
-                          action.plannedRelativePath ??
-                            action.plannedFolderPath ??
-                            action.sourceRelativePath,
+                  {actionIsRequiredDependency(action) ? (
+                    <p className="break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                      NSN will create the folder ‘{action.plannedFolderPath}’
+                      because a saved file destination needs it.
+                    </p>
+                  ) : (
+                    <div className="grid min-w-0 gap-3 text-sm leading-6">
+                      <p className="break-words [overflow-wrap:anywhere]">
+                        <span className="font-semibold text-[var(--nsn-navy)]">File:</span>{" "}
+                        {fileNameFromRelativePath(action.sourceRelativePath)}
+                      </p>
+                      <p className="break-words [overflow-wrap:anywhere]">
+                        <span className="font-semibold text-[var(--nsn-navy)]">From:</span>{" "}
+                        {readableLibraryPath(
+                          rootLabel,
+                          folderFromRelativePath(action.sourceRelativePath),
                         )}
                       </p>
-                      <ActionDestination action={action} />
-                    </div>
-                    <div className="min-w-0">
-                      <h3 className="text-sm font-semibold text-[var(--nsn-navy)]">
-                        What will happen
-                      </h3>
-                      <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                        {whatWillHappen(action.actionType)}
+                      <p className="break-words [overflow-wrap:anywhere]">
+                        <span className="font-semibold text-[var(--nsn-navy)]">To:</span>{" "}
+                        {readableLibraryPath(
+                          rootLabel,
+                          action.plannedRelativePath ?? "",
+                        )}
                       </p>
-                      <h3 className="mt-4 text-sm font-semibold text-[var(--nsn-navy)]">
-                        Why is this in the plan?
-                      </h3>
-                      <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                        {action.reason}
-                      </p>
-                      <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                        Originating suggestion:{" "}
-                        {action.originatingSuggestion.title}
-                      </p>
-                      <h3 className="mt-4 text-sm font-semibold text-[var(--nsn-navy)]">
-                        Required permissions
-                      </h3>
-                      <ul className="mt-2 grid gap-1 pl-4 text-sm leading-6 text-[var(--nsn-slate)]">
-                        {requiredPermissionsFor(action.actionType).map((item) => (
-                          <li className="list-disc" key={item}>
-                            {item}
-                          </li>
-                        ))}
-                      </ul>
                     </div>
-                  </div>
-
-                  <div className="grid gap-4 xl:grid-cols-2">
-                    <div className="min-w-0">
-                      <h4 className="text-sm font-semibold text-[var(--nsn-navy)]">
-                        Approved observation
-                      </h4>
-                      <EvidenceList items={action.evidence.approvedObservation} />
-                    </div>
-                    <div className="min-w-0">
-                      <h4 className="text-sm font-semibold text-[var(--nsn-navy)]">
-                        Approved Memory
-                      </h4>
-                      <EvidenceList items={action.evidence.approvedMemory} />
-                    </div>
-                    <div className="min-w-0">
-                      <h4 className="text-sm font-semibold text-[var(--nsn-navy)]">
-                        Human modification
-                      </h4>
-                      <EvidenceList items={action.evidence.humanModification} />
-                    </div>
-                    <div className="min-w-0">
-                      <h4 className="text-sm font-semibold text-[var(--nsn-navy)]">
-                        Originating suggestion
-                      </h4>
-                      <EvidenceList items={action.evidence.originatingSuggestion} />
-                    </div>
-                  </div>
+                  )}
                 </div>
               </NsnCard>
             )}
@@ -1733,62 +1806,66 @@ export function OrganizationPlanReviewPanel({
         )}
       </Section>
 
-      <Section title="Review-only Notes">
-        {reviewOnlyActions.length === 0 ? (
-          <NsnCard>
-            <p className="text-sm leading-6 text-[var(--nsn-slate)]">
-              No review-only notes are attached to this plan.
+      <Section title="Other review information">
+        <NsnCard className="min-w-0">
+          <details className="group min-w-0">
+            <summary className="cursor-pointer break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+              Items that need review but will not be moved (
+              {reviewOnlyActions.length + currentPlan.warnings.length})
+            </summary>
+            <p className="mt-3 text-sm leading-6 text-[var(--nsn-slate)]">
+              These notes cannot be selected and are not part of filesystem
+              execution.
             </p>
-          </NsnCard>
-        ) : (
-          <div className="grid min-w-0 gap-3">
-            {reviewOnlyActions.map((action) => (
-              <NsnCard className="min-w-0" key={action.id}>
-                <div className="flex flex-wrap gap-2">
-                  <NsnBadge tone="source">
-                    {actionTypeLabel(action.actionType)}
-                  </NsnBadge>
-                  <NsnBadge tone="pending">Not executable</NsnBadge>
-                </div>
-                <p className="mt-3 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                  {action.sourceRelativePath}
-                </p>
-                <p className="mt-2 break-words text-sm font-semibold leading-6 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
-                  {action.originatingSuggestion.title}
-                </p>
-                <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                  {action.reason}
-                </p>
-              </NsnCard>
-            ))}
-          </div>
-        )}
-      </Section>
-
-      <Section title="Warnings">
-        {currentPlan.warnings.length === 0 ? (
-          <NsnCard>
-            <p className="text-sm leading-6 text-[var(--nsn-slate)]">
-              No conflicts were detected in this planning snapshot.
-            </p>
-          </NsnCard>
-        ) : (
-          <div className="grid gap-3">
-            {currentPlan.warnings.map((warning) => (
-              <NsnCard className="min-w-0" key={warning.id}>
-                <NsnBadge tone="review">
-                  {warningTypeLabel(warning.warningType)}
-                </NsnBadge>
-                <h3 className="mt-3 break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
-                  {warning.title}
-                </h3>
-                <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                  {warning.description}
-                </p>
-              </NsnCard>
-            ))}
-          </div>
-        )}
+            {reviewOnlyActions.length === 0 &&
+            currentPlan.warnings.length === 0 ? (
+              <p className="mt-4 text-sm leading-6 text-[var(--nsn-slate)]">
+                There are no review-only notes or warnings in this plan.
+              </p>
+            ) : (
+              <div className="mt-4 grid min-w-0 gap-3">
+                {reviewOnlyActions.map((action) => (
+                  <div
+                    className="min-w-0 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-4"
+                    key={action.id}
+                  >
+                    <div className="flex flex-wrap gap-2">
+                      <NsnBadge tone="source">
+                        {actionTypeLabel(action.actionType)}
+                      </NsnBadge>
+                      <NsnBadge tone="pending">Will not move</NsnBadge>
+                    </div>
+                    <p className="mt-3 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                      {action.sourceRelativePath}
+                    </p>
+                    <p className="mt-2 break-words text-sm font-semibold leading-6 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                      {action.originatingSuggestion.title}
+                    </p>
+                    <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                      {action.reason}
+                    </p>
+                  </div>
+                ))}
+                {currentPlan.warnings.map((warning) => (
+                  <div
+                    className="min-w-0 rounded-md border border-[var(--nsn-warm-beige)] bg-[var(--nsn-sand)] p-4"
+                    key={warning.id}
+                  >
+                    <NsnBadge tone="review">
+                      {warningTypeLabel(warning.warningType)}
+                    </NsnBadge>
+                    <h3 className="mt-3 break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                      {warning.title}
+                    </h3>
+                    <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                      {warning.description}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </details>
+        </NsnCard>
       </Section>
 
       <Section title="Skipped Items">

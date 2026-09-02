@@ -12,6 +12,7 @@ import { requireScanSessionPermission } from "./connected-libraries";
 import { readScannedFile, BridgeReaderError } from "./reader";
 import { createObservationSessionForScannedFileReadResult } from "./scanned-file-observations";
 import { isImageFileType } from "./media-kind";
+import { currentRecommendationGenerationVersion } from "./recommendation-generation";
 import {
   createBridgeScanSessionFromEnvironment,
   createBridgeScanSessionForConnectedLibrary,
@@ -258,6 +259,10 @@ async function nextSupportedFileForProcessing(
           id: true,
           suggestionType: true,
         },
+        where: {
+          invalidatedAt: null,
+          recommendationGenerationVersion: currentRecommendationGenerationVersion,
+        },
       },
       processedAt: true,
       processingStage: true,
@@ -348,6 +353,8 @@ async function fileAlreadyHasSuggestions(scannedFileId: string) {
   const prisma = getPrismaClient();
   const count = await prisma.organizationSuggestion.count({
     where: {
+      invalidatedAt: null,
+      recommendationGenerationVersion: currentRecommendationGenerationVersion,
       scannedFileId,
       suggestionType: {
         not: "POSSIBLE_DUPLICATE",
@@ -454,7 +461,10 @@ async function reconcileCompletedFiles(sessionId: string) {
   const prisma = getPrismaClient();
   const baseWhere: Prisma.ScannedFileWhereInput = {
     organizationSuggestions: {
-      some: {},
+      some: {
+        invalidatedAt: null,
+        recommendationGenerationVersion: currentRecommendationGenerationVersion,
+      },
     },
     extractionStatus: "COMPLETED",
     processingStage: {

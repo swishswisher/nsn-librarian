@@ -792,6 +792,7 @@ export function OrganizationSuggestionsReviewPanel({
       );
       const payload = (await response.json()) as
         | {
+            cancelledPlanCount: number;
             ok: true;
             resetCount: number;
             suggestions: BridgeOrganizationSuggestionSummary[];
@@ -809,7 +810,7 @@ export function OrganizationSuggestionsReviewPanel({
       setMessage(
         `${payload.resetCount} reviewed recommendation${
           payload.resetCount === 1 ? "" : "s"
-        } reopened for this scan session. No files were changed.`,
+        } reopened for this scan session. Previous plan choices were cleared. No files were changed.`,
       );
       router.refresh();
     } catch {
@@ -1431,9 +1432,9 @@ export function OrganizationSuggestionsReviewPanel({
                 Reset review decisions?
               </h3>
               <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                This reopens reviewed recommendations for this scan session only.
-                It does not rescan files, change files, or erase earlier notebook
-                context.
+                This reopens reviewed recommendations for this scan session only
+                and clears choices in its unfinished Organization Plan. It does
+                not rescan or change any files.
               </p>
             </div>
             <label className="grid min-w-0 gap-2 text-sm font-semibold text-[var(--nsn-navy)]">

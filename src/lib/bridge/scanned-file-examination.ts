@@ -16,6 +16,7 @@ import {
   type BridgeScannedFileExaminationData,
 } from "./types";
 import { summarizeOrganizationSuggestion } from "./organization-suggestions";
+import { currentRecommendationGenerationVersion } from "./recommendation-generation";
 
 type ScannedFileForExamination = StoredScannedFile & {
   localPath: string;
@@ -95,6 +96,10 @@ export async function getScannedFileExamination(
           },
         },
         orderBy: [{ status: "asc" }, { createdAt: "desc" }],
+        where: {
+          invalidatedAt: null,
+          recommendationGenerationVersion: currentRecommendationGenerationVersion,
+        },
       },
       scanSession: {
         include: {
@@ -168,6 +173,8 @@ export async function getRecommendationExamination(
   const suggestion = await prisma.organizationSuggestion.findUnique({
     select: {
       id: true,
+      invalidatedAt: true,
+      recommendationGenerationVersion: true,
       scannedFileId: true,
       scanSessionId: true,
     },
@@ -176,7 +183,13 @@ export async function getRecommendationExamination(
     },
   });
 
-  if (!suggestion || suggestion.scanSessionId !== scanSessionId) {
+  if (
+    !suggestion ||
+    suggestion.scanSessionId !== scanSessionId ||
+    suggestion.invalidatedAt ||
+    suggestion.recommendationGenerationVersion !==
+      currentRecommendationGenerationVersion
+  ) {
     return null;
   }
 

@@ -1,6 +1,7 @@
 import { getPrismaClient } from "@/lib/db/prisma";
 
 import { organizationSuggestionCounts } from "./scan-sessions";
+import { currentRecommendationGenerationVersion } from "./recommendation-generation";
 import type {
   BridgeScanSessionStatus,
   ConnectedLibraryPlatform,
@@ -183,6 +184,10 @@ export async function getOrganizationPlanScanSessionSelectorData(): Promise<Orga
           organizationSuggestions: {
             select: {
               status: true,
+            },
+            where: {
+              invalidatedAt: null,
+              recommendationGenerationVersion: currentRecommendationGenerationVersion,
             },
           },
           startedAt: true,

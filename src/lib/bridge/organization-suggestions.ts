@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
 import type { Prisma } from "@prisma/client";
@@ -13,6 +13,10 @@ import { isAudioFileType, jsonAudioHumanLabels, jsonStringArray } from "./audio-
 import { recordChecksumDuplicateSuggestionsForSession } from "./checksum-duplicates";
 import { jsonImageHumanLabels } from "./image-metadata";
 import { readScannedFile } from "./reader";
+import {
+  currentRecommendationGenerationVersion,
+  isCurrentRecommendationGeneration,
+} from "./recommendation-generation";
 import { scannedFileSummary } from "./scan-sessions";
 import { isImageFileType } from "./media-kind";
 import { isVideoFileType, jsonVideoHumanLabels } from "./video-metadata";
@@ -48,6 +52,10 @@ type StoredSuggestion = {
   status: string;
   whySuggested: Prisma.JsonValue;
   supportingInformation: Prisma.JsonValue;
+  recommendationGenerationId: string;
+  recommendationGenerationVersion: string;
+  invalidatedAt: Date | null;
+  invalidatedReason: string | null;
   createdAt: Date;
   reviewedAt: Date | null;
   revisions: {
@@ -94,6 +102,7 @@ type SuggestionContext = {
     audioFingerprint?: string | null;
     imageFingerprint?: string | null;
     videoFingerprint?: string | null;
+    sizeBytes?: bigint | null;
   }>;
   reviewedObservationText: string[];
   memoryMatches: MemoryMatch[];
@@ -170,25 +179,33 @@ const stopWords = new Set([
   "because",
   "before",
   "bridge",
+  "copy",
   "could",
   "deanne",
   "document",
   "documents",
   "file",
   "files",
+  "final",
   "from",
   "have",
   "item",
   "items",
   "knowledge",
+  "large",
   "library",
   "librarian",
+  "long",
+  "loose",
   "manual",
   "memory",
+  "mixed",
   "might",
+  "notes",
   "only",
   "organization",
   "path",
+  "random",
   "read",
   "review",
   "reviewed",
@@ -205,9 +222,13 @@ const stopWords = new Set([
   "these",
   "this",
   "those",
+  "thought",
+  "thoughts",
   "through",
+  "test",
   "with",
   "without",
+  "workshop",
   "would",
 ]);
 
@@ -814,7 +835,11 @@ function possibleDuplicateDraft(context: SuggestionContext) {
 
   const duplicates = context.siblingFiles
     .filter(
-      (file) => file.id !== context.scannedFileId && file.checksum === context.checksum,
+      (file) =>
+        file.id !== context.scannedFileId &&
+        file.checksum === context.checksum &&
+        file.sizeBytes !== BigInt(0) &&
+        normalizeBridgeRelativePath(file.relativePath) !== context.currentRelativePath,
     )
     .slice(0, 4);
 
@@ -990,7 +1015,8 @@ function audioMoveDraft(context: SuggestionContext) {
       ? {
           folder: "Audio/Workshops",
           title: "Consider moving this into the workshop recordings",
-          reason: "The recording appears connected to workshop material.",
+          reason:
+            "This is an audio recording about a workshop, so it may belong with other workshop recordings.",
         }
       : text.includes("meeting")
         ? {
@@ -1024,8 +1050,7 @@ function audioMoveDraft(context: SuggestionContext) {
 
   return makeDraft(context, {
     confidence: 0.61,
-    explanation:
-      "The Librarian noticed audio-specific signals that may fit an existing recording archive. This remains a recommendation for review.",
+    explanation: target.reason,
     proposedRelativePath: joinRelativePath(target.folder, context.fileName),
     suggestionType: "MOVE_FILE",
     title: target.title,
@@ -1117,8 +1142,7 @@ function videoMoveDraft(context: SuggestionContext) {
 
   return makeDraft(context, {
     confidence: 0.61,
-    explanation:
-      "The Librarian noticed video-specific signals that may fit a recording archive. This remains a recommendation for review.",
+    explanation: target.reason,
     proposedRelativePath: joinRelativePath(target.folder, context.fileName),
     suggestionType: "MOVE_FILE",
     title: target.title,
@@ -1228,11 +1252,13 @@ function moveAndFolderDrafts(context: SuggestionContext) {
   }
 
   if (normalizeText(currentFolder) !== normalizeText(destinationFolder)) {
+    const matchedConcepts =
+      best.directMatches.join(", ") || best.rule.folder.toLowerCase();
+
     drafts.push(
       makeDraft(context, {
         confidence: 0.58 + best.score * 0.05,
-        explanation:
-          "The Librarian noticed a practical folder pattern that may fit this item. The suggestion is a reviewable destination only.",
+        explanation: `${best.rule.explanation} The file contains the matching terms ${matchedConcepts}, so ${destinationFolder} may be a useful location.`,
         proposedRelativePath,
         suggestionType: "MOVE_FILE",
         title: `Consider placing this with ${best.rule.folder}`,
@@ -1334,20 +1360,24 @@ function groupWithFilesDraft(context: SuggestionContext, topTerms: string[]) {
   }
 
   const groupName = titleCaseTerm(similarFiles[0]?.overlap[0] ?? topTerms[0] ?? "Related");
+  const sharedTerms = [
+    ...new Set(similarFiles.flatMap((entry) => entry.overlap)),
+  ].slice(0, 5);
+  const relatedPaths = similarFiles
+    .map((entry) => entry.file.relativePath)
+    .slice(0, 2);
 
   return makeDraft(context, {
     confidence: 0.55 + Math.min(similarFiles.length, 3) * 0.05,
-    explanation:
-      "The Librarian noticed this file may belong near other scanned files with similar folder or name signals.",
+    explanation: `This file shares the wording ${sharedTerms.join(", ")} with ${relatedPaths.join(
+      " and ",
+    )}, so it may be easier to find beside those related files.`,
     proposedRelativePath: joinRelativePath(groupName, context.fileName),
     suggestionType: "GROUP_WITH_FILES",
     title: `Review this with related ${groupName} files`,
     whySuggested: [
       "Other files in this scan session share visible wording or folder patterns.",
-      `Shared signals: ${similarFiles
-        .flatMap((entry) => entry.overlap)
-        .slice(0, 5)
-        .join(", ")}`,
+      `Shared wording: ${sharedTerms.join(", ")}`,
     ],
     supportingInformation: similarFiles.map(
       (entry) => `Similar file or folder pattern: ${entry.file.relativePath}`,
@@ -1465,8 +1495,13 @@ function cleanDraftPaths(draft: SuggestionDraft) {
   };
 }
 
-function suggestionKeyFor(context: SuggestionContext, draft: SuggestionDraft) {
+function suggestionKeyFor(
+  context: SuggestionContext,
+  draft: SuggestionDraft,
+  recommendationGenerationId: string,
+) {
   return hashSuggestionKey([
+    recommendationGenerationId,
     context.scannedFileId,
     draft.suggestionType,
     context.currentRelativePath,
@@ -1474,6 +1509,49 @@ function suggestionKeyFor(context: SuggestionContext, draft: SuggestionDraft) {
     draft.proposedFileName ?? "",
     draft.title,
   ]);
+}
+
+function suggestionContentSignatureFor(input: {
+  currentRelativePath: string;
+  proposedFileName: string | null;
+  proposedRelativePath: string | null;
+  scannedFileId: string;
+  suggestionType: string;
+  title: string;
+}) {
+  return hashSuggestionKey([
+    input.scannedFileId,
+    input.suggestionType,
+    input.currentRelativePath,
+    input.proposedRelativePath ?? "",
+    input.proposedFileName ?? "",
+    input.title,
+  ]);
+}
+
+function draftContentSignatureFor(
+  context: SuggestionContext,
+  draft: SuggestionDraft,
+) {
+  return suggestionContentSignatureFor({
+    currentRelativePath: context.currentRelativePath,
+    proposedFileName: draft.proposedFileName ?? null,
+    proposedRelativePath: draft.proposedRelativePath ?? null,
+    scannedFileId: context.scannedFileId,
+    suggestionType: draft.suggestionType,
+    title: draft.title,
+  });
+}
+
+function storedSuggestionContentSignature(suggestion: StoredSuggestion) {
+  return suggestionContentSignatureFor({
+    currentRelativePath: suggestion.currentRelativePath,
+    proposedFileName: suggestion.proposedFileName,
+    proposedRelativePath: suggestion.proposedRelativePath,
+    scannedFileId: suggestion.scannedFileId,
+    suggestionType: suggestion.suggestionType,
+    title: suggestion.title,
+  });
 }
 
 function normalizeSuggestionType(value: string): OrganizationSuggestionType {
@@ -1497,8 +1575,12 @@ export function summarizeOrganizationSuggestion(
     currentRelativePath: suggestion.currentRelativePath,
     explanation: suggestion.explanation,
     id: suggestion.id,
+    invalidatedAt: suggestion.invalidatedAt?.toISOString() ?? null,
+    invalidatedReason: suggestion.invalidatedReason,
     proposedFileName: suggestion.proposedFileName,
     proposedRelativePath: suggestion.proposedRelativePath,
+    recommendationGenerationId: suggestion.recommendationGenerationId,
+    recommendationGenerationVersion: suggestion.recommendationGenerationVersion,
     reviewedAt: suggestion.reviewedAt?.toISOString() ?? null,
     revisions: suggestion.revisions.map((revision) => ({
       context: revision.context,
@@ -1539,6 +1621,10 @@ async function refreshedScannedFileSummary(
         select: {
           status: true,
           suggestionType: true,
+        },
+        where: {
+          invalidatedAt: null,
+          recommendationGenerationVersion: currentRecommendationGenerationVersion,
         },
       },
     },
@@ -1640,6 +1726,7 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
               fileType: true,
               id: true,
               relativePath: true,
+              sizeBytes: true,
             },
           },
         },
@@ -1717,6 +1804,7 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
       imageFingerprint: file.imageMetadata?.imageFingerprint ?? null,
       id: file.id,
       relativePath: file.relativePath,
+      sizeBytes: file.sizeBytes,
       videoFingerprint: file.videoMetadata?.videoFingerprint ?? null,
     })),
     audioMetadata: scannedFile.audioMetadata
@@ -1798,58 +1886,150 @@ async function storedSuggestionById(id: string) {
   });
 }
 
+function newRecommendationGenerationId(context: SuggestionContext) {
+  return `org-rec-${context.scanSessionId}-${context.scannedFileId}-${randomUUID()}`;
+}
+
 async function persistDrafts(context: SuggestionContext, drafts: SuggestionDraft[]) {
   const prisma = getPrismaClient();
   const suggestions: BridgeOrganizationSuggestionSummary[] = [];
-  let createdCount = 0;
-  let existingCount = 0;
+  const cleanedDrafts: SuggestionDraft[] = [];
+  const seenDraftSignatures = new Set<string>();
 
   for (const rawDraft of drafts) {
     const draft = cleanDraftPaths(rawDraft);
-    const suggestionKey = suggestionKeyFor(context, draft);
-    const existing = await prisma.organizationSuggestion.findUnique({
-      include: {
-        revisions: {
-          orderBy: {
-            createdAt: "desc",
-          },
-        },
-      },
-      where: {
-        suggestionKey,
-      },
-    });
+    const signature = draftContentSignatureFor(context, draft);
 
-    if (existing) {
-      existingCount += 1;
-      suggestions.push(summarizeOrganizationSuggestion(existing));
+    if (seenDraftSignatures.has(signature)) {
       continue;
     }
 
-    const created = await prisma.organizationSuggestion.create({
-      data: {
-        confidence: draft.confidence,
-        currentRelativePath: context.currentRelativePath,
-        explanation: draft.explanation,
-        proposedFileName: draft.proposedFileName,
-        proposedRelativePath: draft.proposedRelativePath,
-        scanSessionId: context.scanSessionId,
-        scannedFileId: context.scannedFileId,
-        status: "PENDING",
-        suggestionKey,
-        suggestionType: draft.suggestionType,
-        supportingInformation: toJsonInput(draft.supportingInformation),
-        title: draft.title,
-        whySuggested: toJsonInput(draft.whySuggested),
-      },
-      include: {
-        revisions: true,
-      },
-    });
-
-    createdCount += 1;
-    suggestions.push(summarizeOrganizationSuggestion(created));
+    seenDraftSignatures.add(signature);
+    cleanedDrafts.push(draft);
   }
+
+  const recommendationGenerationId = newRecommendationGenerationId(context);
+  let createdCount = 0;
+  let existingCount = 0;
+
+  await prisma.$transaction(
+    async (transaction) => {
+      const activeSuggestions = await transaction.organizationSuggestion.findMany({
+        include: {
+          revisions: {
+            orderBy: {
+              createdAt: "desc",
+            },
+          },
+        },
+        where: {
+          invalidatedAt: null,
+          scannedFileId: context.scannedFileId,
+        },
+      });
+      const activeCurrentSuggestions = activeSuggestions.filter(
+        (suggestion) =>
+          isCurrentRecommendationGeneration(
+            suggestion.recommendationGenerationVersion,
+          ),
+      );
+      const currentPendingSignatures = new Set(
+        activeCurrentSuggestions.map(storedSuggestionContentSignature),
+      );
+      const draftSignatures = new Set(
+        cleanedDrafts.map((draft) => draftContentSignatureFor(context, draft)),
+      );
+      const hasOnlyCurrentPendingSuggestions =
+        activeSuggestions.length === activeCurrentSuggestions.length &&
+        activeCurrentSuggestions.length >= cleanedDrafts.length &&
+        activeCurrentSuggestions.every(
+          (suggestion) =>
+            normalizeSuggestionStatus(suggestion.status) === "PENDING",
+        );
+      const draftSetIsAlreadyPresent = [...draftSignatures].every((signature) =>
+        currentPendingSignatures.has(signature),
+      );
+
+      if (hasOnlyCurrentPendingSuggestions && draftSetIsAlreadyPresent) {
+        existingCount = activeCurrentSuggestions.length;
+        suggestions.push(
+          ...activeCurrentSuggestions
+            .sort((left, right) => left.title.localeCompare(right.title))
+            .map(summarizeOrganizationSuggestion),
+        );
+        return;
+      }
+
+      await transaction.organizationSuggestion.updateMany({
+        data: {
+          invalidatedAt: new Date(),
+          invalidatedReason:
+            "This recommendation was replaced by a newer recommendation generation for the same scanned file.",
+          reviewedAt: null,
+          status: "PENDING",
+        },
+        where: {
+          invalidatedAt: null,
+          scannedFileId: context.scannedFileId,
+        },
+      });
+
+      for (const draft of cleanedDrafts) {
+        const suggestionKey = suggestionKeyFor(
+          context,
+          draft,
+          recommendationGenerationId,
+        );
+        const existing = await transaction.organizationSuggestion.findUnique({
+          include: {
+            revisions: {
+              orderBy: {
+                createdAt: "desc",
+              },
+            },
+          },
+          where: {
+            suggestionKey,
+          },
+        });
+
+        if (existing) {
+          existingCount += 1;
+          suggestions.push(summarizeOrganizationSuggestion(existing));
+          continue;
+        }
+
+        const created = await transaction.organizationSuggestion.create({
+          data: {
+            confidence: draft.confidence,
+            currentRelativePath: context.currentRelativePath,
+            explanation: draft.explanation,
+            proposedFileName: draft.proposedFileName,
+            proposedRelativePath: draft.proposedRelativePath,
+            recommendationGenerationId,
+            recommendationGenerationVersion: currentRecommendationGenerationVersion,
+            scanSessionId: context.scanSessionId,
+            scannedFileId: context.scannedFileId,
+            status: "PENDING",
+            suggestionKey,
+            suggestionType: draft.suggestionType,
+            supportingInformation: toJsonInput(draft.supportingInformation),
+            title: draft.title,
+            whySuggested: toJsonInput(draft.whySuggested),
+          },
+          include: {
+            revisions: true,
+          },
+        });
+
+        createdCount += 1;
+        suggestions.push(summarizeOrganizationSuggestion(created));
+      }
+    },
+    {
+      timeout: 15_000,
+    },
+  );
 
   return {
     createdCount,
@@ -1959,6 +2139,10 @@ export async function getOrganizationSuggestionsForScanSession(
           },
         },
         orderBy: [{ status: "asc" }, { createdAt: "desc" }],
+        where: {
+          invalidatedAt: null,
+          recommendationGenerationVersion: currentRecommendationGenerationVersion,
+        },
       },
     },
     where: {
@@ -2021,6 +2205,10 @@ export async function getOrganizationSuggestionsForConnectedLibraries(take = 160
     },
     orderBy: [{ status: "asc" }, { createdAt: "desc" }],
     take,
+    where: {
+      invalidatedAt: null,
+      recommendationGenerationVersion: currentRecommendationGenerationVersion,
+    },
   });
   const librariesById = new Map<string, string>();
   const libraryIdBySuggestionId: Record<string, string> = {};
@@ -2176,6 +2364,22 @@ export async function reviewOrganizationSuggestion(
     );
   }
 
+  if (existing.invalidatedAt) {
+    throw new OrganizationSuggestionError(
+      "This recommendation has been replaced by newer review information. Regenerate recommendations before reviewing it.",
+      409,
+    );
+  }
+
+  if (
+    !isCurrentRecommendationGeneration(existing.recommendationGenerationVersion)
+  ) {
+    throw new OrganizationSuggestionError(
+      "This recommendation came from an older recommendation pass. Regenerate recommendations before reviewing it.",
+      409,
+    );
+  }
+
   const nextStatus = statusForAction(input.action);
   const currentStatus = normalizeSuggestionStatus(existing.status);
   const context = input.context?.trim() || null;
@@ -2292,15 +2496,28 @@ export async function resetOrganizationSuggestionDecision(
   }
 
   if (normalizeSuggestionStatus(existing.status) !== "PENDING") {
-    await prisma.organizationSuggestion.update({
-      data: {
-        reviewedAt: null,
-        status: "PENDING",
-      },
-      where: {
-        id: suggestionId,
-      },
-    });
+    await prisma.$transaction([
+      prisma.organizationSuggestion.update({
+        data: {
+          reviewedAt: null,
+          status: "PENDING",
+        },
+        where: {
+          id: suggestionId,
+        },
+      }),
+      prisma.organizationPlan.updateMany({
+        data: {
+          status: "CANCELLED",
+        },
+        where: {
+          scanSessionId: normalizedScanSessionId,
+          status: {
+            in: ["DRAFT", "READY_FOR_EXECUTION"],
+          },
+        },
+      }),
+    ]);
   }
 
   await recordChecksumDuplicateSuggestionsForSession(normalizedScanSessionId);
@@ -2346,42 +2563,36 @@ export async function resetOrganizationSuggestionDecisionsForScanSession(
     );
   }
 
-  const activePlan = await prisma.organizationPlan.findFirst({
-    select: {
-      id: true,
-      status: true,
-    },
-    where: {
-      scanSessionId: normalizedScanSessionId,
-      status: {
-        in: ["DRAFT", "READY_FOR_EXECUTION"],
+  const [cancelledPlans, result] = await prisma.$transaction([
+    prisma.organizationPlan.updateMany({
+      data: {
+        status: "CANCELLED",
       },
-    },
-  });
-
-  if (activePlan) {
-    throw new OrganizationSuggestionError(
-      "Cancel the active Organization Plan for this scan session before resetting review decisions.",
-      409,
-    );
-  }
-
-  const result = await prisma.organizationSuggestion.updateMany({
-    data: {
-      reviewedAt: null,
-      status: "PENDING",
-    },
-    where: {
-      scanSessionId: normalizedScanSessionId,
-      status: {
-        not: "PENDING",
+      where: {
+        scanSessionId: normalizedScanSessionId,
+        status: {
+          in: ["DRAFT", "READY_FOR_EXECUTION"],
+        },
       },
-    },
-  });
+    }),
+    prisma.organizationSuggestion.updateMany({
+      data: {
+        reviewedAt: null,
+        status: "PENDING",
+      },
+      where: {
+        scanSessionId: normalizedScanSessionId,
+        status: {
+          not: "PENDING",
+        },
+      },
+    }),
+  ]);
 
   await recordChecksumDuplicateSuggestionsForSession(normalizedScanSessionId);
 
   return {
+    cancelledPlanCount: cancelledPlans.count,
     resetCount: result.count,
     suggestions:
       (await getOrganizationSuggestionsForScanSession(normalizedScanSessionId))

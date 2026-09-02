@@ -1,6 +1,7 @@
 import type { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
+import { currentRecommendationGenerationVersion } from "@/lib/bridge/recommendation-generation";
 import { getRelatedKnowledgeForNotebookEntry } from "@/lib/knowledge/queries";
 import {
   getOrganizationPlanRoute,
@@ -429,6 +430,10 @@ export async function recordScanSessionNotebookEntry(scanSessionId: string) {
         select: {
           id: true,
           status: true,
+        },
+        where: {
+          invalidatedAt: null,
+          recommendationGenerationVersion: currentRecommendationGenerationVersion,
         },
       },
       scannedFiles: {

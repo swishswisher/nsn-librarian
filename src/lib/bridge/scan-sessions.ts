@@ -34,6 +34,7 @@ import type {
   ScannedFileReadStatus,
 } from "./types";
 import { recordChecksumDuplicateSuggestionsForSession } from "./checksum-duplicates";
+import { currentRecommendationGenerationVersion } from "./recommendation-generation";
 
 type StoredScanSession = {
   connectedFolderId: string;
@@ -1102,6 +1103,10 @@ export async function getBridgeScanSessionProgress(sessionId: string) {
               status: true,
               suggestionType: true,
             },
+            where: {
+              invalidatedAt: null,
+              recommendationGenerationVersion: currentRecommendationGenerationVersion,
+            },
           },
         },
       },
@@ -1182,6 +1187,10 @@ export async function getBridgeScanSessionDetail(
             select: {
               status: true,
               suggestionType: true,
+            },
+            where: {
+              invalidatedAt: null,
+              recommendationGenerationVersion: currentRecommendationGenerationVersion,
             },
           },
         },

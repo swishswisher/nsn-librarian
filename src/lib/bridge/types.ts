@@ -998,6 +998,10 @@ export type BridgeOrganizationSuggestionSummary = {
   status: OrganizationSuggestionStatus;
   createdAt: string;
   reviewedAt: string | null;
+  recommendationGenerationId: string;
+  recommendationGenerationVersion: string;
+  invalidatedAt: string | null;
+  invalidatedReason: string | null;
   whySuggested: string[];
   supportingInformation: string[];
   revisions: BridgeOrganizationSuggestionRevision[];
@@ -1104,6 +1108,16 @@ export type BridgeOrganizationPlanAction = {
   plannedRelativePath: string | null;
   plannedFolderPath: string | null;
   plannedFileName: string | null;
+  requiredFolderPaths?: string[];
+  recommendationGenerationId?: string;
+  recommendationGenerationVersion?: string;
+  sourceSnapshot?: {
+    scannedFileId: string;
+    relativePath: string;
+    checksum: string | null;
+    sizeBytes: string | null;
+    lastModified: string | null;
+  };
   reason: string;
   confidence: number;
   originatingSuggestion: {
@@ -1162,6 +1176,7 @@ export type BridgeOrganizationPlanSummary = {
   requiredFolderCreations: number;
   selectableFileActions: number;
   selectedFileActions: number;
+  unselectedAlternatives: number;
 };
 
 export type BridgeOrganizationPlan = {
@@ -1216,6 +1231,23 @@ export type BridgeOrganizationPlanMutationResponse =
 
 export type BridgeOrganizationPlanDownload = {
   exportedAt: string;
+  connectedLibraryId: string;
+  scanSessionId: string;
+  recommendationGenerations: Array<{
+    id: string;
+    version: string;
+  }>;
+  totals: BridgeOrganizationPlanSummary;
+  executable: {
+    selectedFileActions: BridgeOrganizationPlanAction[];
+    requiredFolderCreations: BridgeOrganizationPlanAction[];
+  };
+  nonExecutable: {
+    alternatives: BridgeOrganizationPlanAction[];
+    reviewOnlyNotes: BridgeOrganizationPlanAction[];
+    skippedItems: BridgeOrganizationPlanSkippedItem[];
+  };
+  warnings: BridgeOrganizationPlanWarning[];
   safety: {
     executionAllowed: false;
     note: string;

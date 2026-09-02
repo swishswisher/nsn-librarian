@@ -14,6 +14,7 @@ import {
   takeLocalBridgeWatcherEvents,
   type LocalBridgeExecutionActionInput,
 } from "./local-bridge-client";
+import { isCurrentRecommendationGeneration } from "./recommendation-generation";
 import type {
   BridgeExecutionIssue,
   BridgeExecutionIssueCategory,
@@ -154,6 +155,9 @@ type StoredPlanForExecution = {
     };
     organizationSuggestions: {
       id: string;
+      invalidatedAt: Date | null;
+      recommendationGenerationId: string;
+      recommendationGenerationVersion: string;
       scannedFile: StoredScannedFileForExecution;
     }[];
     scannedFiles: StoredScannedFileForExecution[];
@@ -320,7 +324,10 @@ function actionIsSelectableForExecution(action: BridgeOrganizationPlanAction) {
     typeof action.sourceRelativePath === "string" &&
     action.sourceRelativePath.trim().length > 0 &&
     typeof action.plannedRelativePath === "string" &&
-    action.plannedRelativePath.trim().length > 0
+    action.plannedRelativePath.trim().length > 0 &&
+    isCurrentRecommendationGeneration(
+      action.recommendationGenerationVersion ?? "",
+    )
   );
 }
 
@@ -331,7 +338,10 @@ function actionIsSelectedFileAction(action: BridgeOrganizationPlanAction) {
 function actionIsRequiredDependency(action: BridgeOrganizationPlanAction) {
   return (
     action.actionType === "CREATE_FOLDER" &&
-    action.requiredForSelectedActions === true
+    action.requiredForSelectedActions === true &&
+    isCurrentRecommendationGeneration(
+      action.recommendationGenerationVersion ?? "",
+    )
   );
 }
 
@@ -355,6 +365,7 @@ function planSummary(
   const selectedFileActions = actions.filter(actionIsSelectedFileAction);
   const executableActions = actions.filter(actionIsExecutableInSavedPlan);
   const reviewOnlyActions = actions.filter(actionIsReviewOnly);
+  const selectableActions = actions.filter(actionIsSelectableForExecution);
 
   return {
     blockingWarnings: warnings.length,
@@ -386,8 +397,10 @@ function planSummary(
       (action) => action.actionType === "CREATE_FOLDER",
     ).length,
     reviewOnlyNotes: reviewOnlyActions.length,
-    selectableFileActions: actions.filter(actionIsSelectableForExecution).length,
+    selectableFileActions: selectableActions.length,
     selectedFileActions: selectedFileActions.length,
+    unselectedAlternatives:
+      selectableActions.length - selectedFileActions.length,
     warnings: warnings.length,
   };
 }
@@ -543,7 +556,7 @@ function executableActionsFor(
   const suggestionsById = new Map(
     plan.scanSession.organizationSuggestions.map((suggestion) => [
       suggestion.id,
-      suggestion.scannedFile,
+      suggestion,
     ]),
   );
   const actions = asPlanActions(plan.actions);
@@ -631,11 +644,107 @@ function executableActionsFor(
         return null;
       }
 
+      const suggestion = suggestionsById.get(action.suggestionId) ?? null;
+
+      if (!suggestion) {
+        issues.push(
+          issue(
+            "VALIDATION_FAILED",
+            "The source recommendation could not be verified",
+            "The Bridge could not match this planned action to its reviewed recommendation.",
+            [action.id],
+          ),
+        );
+        return null;
+      }
+
+      if (
+        suggestion.invalidatedAt ||
+        !isCurrentRecommendationGeneration(
+          suggestion.recommendationGenerationVersion,
+        )
+      ) {
+        issues.push(
+          issue(
+            "VALIDATION_FAILED",
+            "The source recommendation is no longer current",
+            "Regenerate recommendations and rebuild the Organization Plan before executing this action.",
+            [action.id],
+          ),
+        );
+        return null;
+      }
+
+      if (
+        action.recommendationGenerationId !==
+          suggestion.recommendationGenerationId ||
+        action.recommendationGenerationVersion !==
+          suggestion.recommendationGenerationVersion
+      ) {
+        issues.push(
+          issue(
+            "VALIDATION_FAILED",
+            "The plan does not match the current recommendation pass",
+            "The Bridge refused a planned action whose recommendation generation no longer matches the reviewed recommendation.",
+            [action.id],
+          ),
+        );
+        return null;
+      }
+
+      const snapshot = action.sourceSnapshot;
+      const scannedFile = suggestion.scannedFile;
+
+      if (action.sourceRelativePath !== scannedFile.relativePath) {
+        issues.push(
+          issue(
+            "VALIDATION_FAILED",
+            "The planned source does not match the scanned file record",
+            "The Bridge refused a planned action whose source path no longer matches the reviewed recommendation.",
+            [action.id],
+          ),
+        );
+        return null;
+      }
+
+      if (
+        !snapshot ||
+        snapshot.scannedFileId !== scannedFile.id ||
+        snapshot.relativePath !== scannedFile.relativePath
+      ) {
+        issues.push(
+          issue(
+            "VALIDATION_FAILED",
+            "The plan source does not match the scanned file record",
+            "The Bridge refused a planned action whose source identity changed after the plan was built.",
+            [action.id],
+          ),
+        );
+        return null;
+      }
+
+      if (
+        snapshot.checksum !== scannedFile.checksum ||
+        snapshot.sizeBytes !== (scannedFile.sizeBytes?.toString() ?? null) ||
+        snapshot.lastModified !==
+          (scannedFile.lastModified?.toISOString() ?? null)
+      ) {
+        issues.push(
+          issue(
+            "CHANGED_SOURCE",
+            "A source file changed after the plan was built",
+            `${action.sourceRelativePath} no longer matches the source snapshot used to build this plan.`,
+            [action.id],
+          ),
+        );
+        return null;
+      }
+
       return {
         action,
         actionType: action.actionType,
         destinationRelativePath: action.plannedRelativePath,
-        scannedFile: suggestionsById.get(action.suggestionId) ?? null,
+        scannedFile,
         sequence: 0,
         sourceRelativePath: action.sourceRelativePath,
       };
@@ -1131,6 +1240,9 @@ async function loadPlanForExecution(planId: string) {
           organizationSuggestions: {
             select: {
               id: true,
+              invalidatedAt: true,
+              recommendationGenerationId: true,
+              recommendationGenerationVersion: true,
               scannedFile: {
                 select: {
                   checksum: true,

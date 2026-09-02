@@ -12,6 +12,7 @@ import { PrismaClient } from "@prisma/client";
 import { createBridgeServer } from "../../bridge-app/src/api/server";
 import { createFolderSelection } from "../../bridge-app/src/main/registry";
 import { defaultBridgePermissions } from "../../bridge-app/src/permissions/defaults";
+import { currentRecommendationGenerationVersion } from "../../src/lib/bridge/recommendation-generation";
 import {
   duplicateSelectionRootIds,
   folderSelectionOverlaps,
@@ -227,6 +228,8 @@ async function createSuggestion(
       explanation:
         "The Librarian noticed a reviewed folder pattern for this file.",
       proposedRelativePath: `Organized/${path.posix.basename(currentRelativePath)}`,
+      recommendationGenerationId: `batch-generation:${sessionId}`,
+      recommendationGenerationVersion: currentRecommendationGenerationVersion,
       scanSessionId: sessionId,
       scannedFileId,
       status,

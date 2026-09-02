@@ -19,6 +19,7 @@ import {
   summarizeExecutionRun,
 } from "./executor";
 import { getOrganizationPlanPageData } from "./planner";
+import { isCurrentRecommendationGeneration } from "./recommendation-generation";
 import type {
   BridgeExecutionIssue,
   BridgeExecutionPreview,
@@ -64,8 +65,22 @@ type LoadedRemotePlan = {
       } | null;
     };
     scanSession: {
+      organizationSuggestions: {
+        id: string;
+        invalidatedAt: Date | null;
+        recommendationGenerationId: string;
+        recommendationGenerationVersion: string;
+        scannedFile: {
+          checksum: string | null;
+          id: string;
+          lastModified: Date | null;
+          relativePath: string;
+          sizeBytes: bigint | null;
+        };
+      }[];
       scannedFiles: {
         checksum: string | null;
+        id: string;
         lastModified: Date | null;
         relativePath: string;
         sizeBytes: bigint | null;
@@ -110,7 +125,10 @@ function actionIsSelectableForExecution(action: BridgeOrganizationPlanAction) {
     typeof action.sourceRelativePath === "string" &&
     action.sourceRelativePath.trim().length > 0 &&
     typeof action.plannedRelativePath === "string" &&
-    action.plannedRelativePath.trim().length > 0
+    action.plannedRelativePath.trim().length > 0 &&
+    isCurrentRecommendationGeneration(
+      action.recommendationGenerationVersion ?? "",
+    )
   );
 }
 
@@ -119,7 +137,10 @@ function actionIsExecutableInSavedPlan(action: BridgeOrganizationPlanAction) {
     (actionIsSelectableForExecution(action) &&
       action.selectedForExecution === true) ||
     (action.actionType === "CREATE_FOLDER" &&
-      action.requiredForSelectedActions === true)
+      action.requiredForSelectedActions === true &&
+      isCurrentRecommendationGeneration(
+        action.recommendationGenerationVersion ?? "",
+      ))
   );
 }
 
@@ -146,6 +167,28 @@ function safeRelativePath(value: string | null | undefined) {
   }
 
   return normalized;
+}
+
+function sourceSnapshotMatches(
+  action: BridgeOrganizationPlanAction,
+  scannedFile: {
+    checksum: string | null;
+    id: string;
+    lastModified: Date | null;
+    relativePath: string;
+    sizeBytes: bigint | null;
+  },
+) {
+  const snapshot = action.sourceSnapshot;
+
+  return (
+    Boolean(snapshot) &&
+    snapshot?.scannedFileId === scannedFile.id &&
+    snapshot.relativePath === scannedFile.relativePath &&
+    snapshot.checksum === scannedFile.checksum &&
+    snapshot.sizeBytes === (scannedFile.sizeBytes?.toString() ?? null) &&
+    snapshot.lastModified === (scannedFile.lastModified?.toISOString() ?? null)
+  );
 }
 
 function issue(input: {
@@ -222,9 +265,27 @@ async function loadRemotePlan(planId: string): Promise<LoadedRemotePlan | null> 
       },
       scanSession: {
         select: {
+          organizationSuggestions: {
+            select: {
+              id: true,
+              invalidatedAt: true,
+              recommendationGenerationId: true,
+              recommendationGenerationVersion: true,
+              scannedFile: {
+                select: {
+                  checksum: true,
+                  id: true,
+                  lastModified: true,
+                  relativePath: true,
+                  sizeBytes: true,
+                },
+              },
+            },
+          },
           scannedFiles: {
             select: {
               checksum: true,
+              id: true,
               lastModified: true,
               relativePath: true,
               sizeBytes: true,
@@ -247,8 +308,11 @@ async function loadRemotePlan(planId: string): Promise<LoadedRemotePlan | null> 
     return null;
   }
 
-  const storedFiles = new Map(
-    plan.scanSession.scannedFiles.map((file) => [file.relativePath, file]),
+  const suggestionsById = new Map(
+    plan.scanSession.organizationSuggestions.map((suggestion) => [
+      suggestion.id,
+      suggestion,
+    ]),
   );
   const actions = planActions(plan.actions);
   const selectedActions = actions.filter(actionIsExecutableInSavedPlan);
@@ -370,7 +434,93 @@ async function loadRemotePlan(planId: string): Promise<LoadedRemotePlan | null> 
       );
     }
 
-    const file = sourceRelativePath ? storedFiles.get(sourceRelativePath) : null;
+    if (action.actionType !== "CREATE_FOLDER") {
+      const suggestion = suggestionsById.get(action.suggestionId) ?? null;
+
+      if (!suggestion) {
+        blockingIssues.push(
+          issue({
+            actionIds: [action.id],
+            category: "VALIDATION_FAILED",
+            description:
+              "The Bridge could not match this planned action to its reviewed recommendation.",
+            id: `recommendation-missing-${action.id}`,
+            title: "The source recommendation could not be verified",
+          }),
+        );
+        continue;
+      }
+
+      if (
+        suggestion.invalidatedAt ||
+        !isCurrentRecommendationGeneration(
+          suggestion.recommendationGenerationVersion,
+        )
+      ) {
+        blockingIssues.push(
+          issue({
+            actionIds: [action.id],
+            category: "VALIDATION_FAILED",
+            description:
+              "Regenerate recommendations and rebuild the Organization Plan before executing this action.",
+            id: `recommendation-stale-${action.id}`,
+            title: "The source recommendation is no longer current",
+          }),
+        );
+        continue;
+      }
+
+      if (
+        action.recommendationGenerationId !==
+          suggestion.recommendationGenerationId ||
+        action.recommendationGenerationVersion !==
+          suggestion.recommendationGenerationVersion
+      ) {
+        blockingIssues.push(
+          issue({
+            actionIds: [action.id],
+            category: "VALIDATION_FAILED",
+            description:
+              "The Bridge refused a planned action whose recommendation generation no longer matches the reviewed recommendation.",
+            id: `recommendation-generation-mismatch-${action.id}`,
+            title: "The plan does not match the current recommendation pass",
+          }),
+        );
+        continue;
+      }
+
+      if (sourceRelativePath !== suggestion.scannedFile.relativePath) {
+        blockingIssues.push(
+          issue({
+            actionIds: [action.id],
+            category: "VALIDATION_FAILED",
+            description:
+              "The Bridge refused a planned action whose source path no longer matches the reviewed recommendation.",
+            id: `source-record-mismatch-${action.id}`,
+            title: "The planned source does not match the scanned file record",
+          }),
+        );
+        continue;
+      }
+
+      if (!sourceSnapshotMatches(action, suggestion.scannedFile)) {
+        blockingIssues.push(
+          issue({
+            actionIds: [action.id],
+            category: "CHANGED_SOURCE",
+            description: `${action.sourceRelativePath} no longer matches the source snapshot used to build this plan.`,
+            id: `source-snapshot-changed-${action.id}`,
+            title: "A source file changed after the plan was built",
+          }),
+        );
+        continue;
+      }
+    }
+
+    const file =
+      action.actionType === "CREATE_FOLDER"
+        ? null
+        : suggestionsById.get(action.suggestionId)?.scannedFile ?? null;
     const normalized: RemotePlanAction = {
       actionType: action.actionType,
       destinationRelativePath,

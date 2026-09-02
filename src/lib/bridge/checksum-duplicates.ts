@@ -4,6 +4,7 @@ import type { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 
+import { currentRecommendationGenerationVersion } from "./recommendation-generation";
 import { isImageFileType } from "./media-kind";
 import { isAudioFileType } from "./audio-metadata";
 import { isVideoFileType } from "./video-metadata";
@@ -475,14 +476,19 @@ async function upsertDuplicateSuggestion(
 ) {
   const prisma = getPrismaClient();
   const copy = duplicateSuggestionCopy(file, target);
+  const recommendationGenerationId = `checksum-duplicates-${file.sessionId}`;
 
   await prisma.organizationSuggestion.upsert({
     create: {
       confidence: exactDuplicateConfidence,
       currentRelativePath: file.relativePath,
       explanation: copy.explanation,
+      invalidatedAt: null,
+      invalidatedReason: null,
       proposedFileName: null,
       proposedRelativePath: null,
+      recommendationGenerationId,
+      recommendationGenerationVersion: currentRecommendationGenerationVersion,
       scanSessionId: file.sessionId,
       scannedFileId: file.id,
       status: "PENDING",
@@ -495,6 +501,12 @@ async function upsertDuplicateSuggestion(
     update: {
       confidence: exactDuplicateConfidence,
       explanation: copy.explanation,
+      invalidatedAt: null,
+      invalidatedReason: null,
+      recommendationGenerationId,
+      recommendationGenerationVersion: currentRecommendationGenerationVersion,
+      reviewedAt: null,
+      status: "PENDING",
       supportingInformation: jsonInput(copy.supportingInformation),
       title: copy.title,
       whySuggested: jsonInput(copy.whySuggested),
@@ -587,6 +599,7 @@ async function reconcileStaleExactDuplicates(
   const staleSuggestionWhere: Prisma.OrganizationSuggestionWhereInput = {
     scanSessionId,
     suggestionType: "POSSIBLE_DUPLICATE",
+    invalidatedAt: null,
     confidence: {
       gte: exactDuplicateConfidence,
     },
@@ -603,6 +616,9 @@ async function reconcileStaleExactDuplicates(
       confidence: 0.35,
       explanation:
         "The Librarian rechecked this item against the current scan snapshot and no longer found a useful exact duplicate. Same physical files seen in older scans are not treated as duplicates.",
+      invalidatedAt: new Date(),
+      invalidatedReason:
+        "The current scan snapshot no longer supports this exact duplicate recommendation.",
       reviewedAt: null,
       status: "PENDING",
       suggestionType: "KEEP_UNCHANGED",
