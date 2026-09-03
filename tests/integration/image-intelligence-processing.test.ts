@@ -3,7 +3,15 @@ import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, beforeEach, test } from "node:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -37,7 +45,9 @@ let createBridgeScanSessionFromScan: typeof import("../../src/lib/bridge/scan-se
 let fileMatchesScannedFileFilter: typeof import("../../src/lib/bridge/scanned-file-filters").fileMatchesScannedFileFilter;
 let generateOrganizationSuggestionsForScannedFileWithText: typeof import("../../src/lib/bridge/organization-suggestions").generateOrganizationSuggestionsForScannedFileWithText;
 let getScannedImagePreviewSource: typeof import("../../src/lib/bridge/image-reader").getScannedImagePreviewSource;
+let getBridgeScanSessionProgress: typeof import("../../src/lib/bridge/scan-sessions").getBridgeScanSessionProgress;
 let processBridgeScanSession: typeof import("../../src/lib/bridge/processing-pipeline").processBridgeScanSession;
+let processNextBridgeScanSessionFile: typeof import("../../src/lib/bridge/processing-pipeline").processNextBridgeScanSessionFile;
 let readScannedFile: typeof import("../../src/lib/bridge/reader").readScannedFile;
 let retryBridgeScanSessionProcessing: typeof import("../../src/lib/bridge/processing-pipeline").retryBridgeScanSessionProcessing;
 let scannedFileSummary: typeof import("../../src/lib/bridge/scan-sessions").scannedFileSummary;
@@ -192,6 +202,57 @@ async function createBridgeBackedImageLibrary() {
   };
 }
 
+async function createBridgeBackedTextLibrary(files: Map<string, string>) {
+  const libraryRoot = path.join(tempRoot, `text-library-${Date.now()}`);
+
+  for (const [relativePath, content] of files) {
+    const fullPath = path.join(libraryRoot, ...relativePath.split("/"));
+
+    await mkdir(path.dirname(fullPath), { recursive: true });
+    await writeFile(fullPath, content);
+  }
+
+  const selection = await createFolderSelection(libraryRoot);
+  const root = await registerRootFromSelection({
+    permissions: defaultBridgePermissions,
+    selectionToken: selection.selectionToken,
+  });
+  const connected = await connectBridgeLibrary({
+    root: root as LocalBridgeRootSummary,
+  });
+  const scan = await scanBridgeRoot(root.id);
+  const session = await createBridgeScanSessionFromScan(scan, {
+    allowReusableSession: false,
+    connectedLibraryId: connected.library.id,
+  });
+
+  return {
+    libraryRoot,
+    rootId: root.id,
+    sessionId: session.id,
+  };
+}
+
+async function listRelativeFiles(root: string, current = ""): Promise<string[]> {
+  const directory = path.join(root, current);
+  const entries = await readdir(directory);
+  const files: string[] = [];
+
+  for (const entry of entries) {
+    const relativePath = current ? path.posix.join(current, entry) : entry;
+    const fullPath = path.join(directory, entry);
+    const info = await stat(fullPath);
+
+    if (info.isDirectory()) {
+      files.push(...(await listRelativeFiles(root, relativePath)));
+    } else {
+      files.push(relativePath);
+    }
+  }
+
+  return files.sort((left, right) => left.localeCompare(right));
+}
+
 async function storedFile(sessionId: string, relativePath: string) {
   return prisma.scannedFile.findFirstOrThrow({
     include: {
@@ -254,6 +315,7 @@ before(async () => {
   prisma = prismaModule.getPrismaClient();
   connectBridgeLibrary = connectedLibraries.connectBridgeLibrary;
   createBridgeScanSessionFromScan = scanSessions.createBridgeScanSessionFromScan;
+  getBridgeScanSessionProgress = scanSessions.getBridgeScanSessionProgress;
   scannedFileSummary = scanSessions.scannedFileSummary;
   fileMatchesScannedFileFilter = filters.fileMatchesScannedFileFilter;
   getScannedImagePreviewSource = imageReader.getScannedImagePreviewSource;
@@ -261,6 +323,8 @@ before(async () => {
   generateOrganizationSuggestionsForScannedFileWithText =
     organizationSuggestions.generateOrganizationSuggestionsForScannedFileWithText;
   processBridgeScanSession = processingPipeline.processBridgeScanSession;
+  processNextBridgeScanSessionFile =
+    processingPipeline.processNextBridgeScanSessionFile;
   retryBridgeScanSessionProcessing =
     processingPipeline.retryBridgeScanSessionProcessing;
   readScannedFile = reader.readScannedFile;
@@ -462,4 +526,98 @@ test("processes scanned images through image intelligence without treating damag
   });
 
   assert.equal(retrySuggestionCount, suggestionCountBefore);
+});
+
+test("explicit regeneration revisits terminal files that no longer have current recommendations", async () => {
+  const relativePath = "Archive/LetterFromMara.txt";
+  const originalText =
+    "Mara sent a short note about garden schedules and household receipts.";
+  const { libraryRoot, sessionId } = await createBridgeBackedTextLibrary(
+    new Map([[relativePath, originalText]]),
+  );
+  const originalFiles = await listRelativeFiles(libraryRoot);
+
+  await processBridgeScanSession(sessionId, { recordNotebook: false });
+
+  const processedFile = await storedFile(sessionId, relativePath);
+  const firstActiveSuggestions = processedFile.organizationSuggestions.filter(
+    (suggestion) => suggestion.invalidatedAt === null,
+  );
+  const firstObservationCount =
+    processedFile.libraryDocument?.observationSessions.length ?? 0;
+
+  assert.equal(processedFile.processingStage, "SUGGESTIONS_GENERATED");
+  assert.equal(firstObservationCount, 1);
+  assert.equal(firstActiveSuggestions.length, 1);
+  assert.equal(firstActiveSuggestions[0]?.suggestionType, "KEEP_UNCHANGED");
+
+  await prisma.organizationSuggestion.updateMany({
+    data: {
+      invalidatedAt: new Date(),
+      invalidatedReason: "Regression test reset.",
+      reviewedAt: null,
+      status: "PENDING",
+    },
+    where: {
+      invalidatedAt: null,
+      scannedFileId: processedFile.id,
+    },
+  });
+
+  const progressAfterInvalidation =
+    await getBridgeScanSessionProgress(sessionId);
+
+  assert.ok(progressAfterInvalidation);
+  assert.equal(progressAfterInvalidation.progress.filesWithSuggestions, 0);
+  assert.equal(progressAfterInvalidation.progress.remainingFiles, 1);
+
+  const regenerated = await processNextBridgeScanSessionFile(sessionId, {
+    recordNotebook: false,
+  });
+
+  assert.equal(regenerated.progress.filesWithSuggestions, 1);
+  assert.equal(regenerated.progress.remainingFiles, 0);
+
+  const afterRegeneration = await storedFile(sessionId, relativePath);
+  const allSuggestions = await prisma.organizationSuggestion.findMany({
+    orderBy: {
+      createdAt: "asc",
+    },
+    where: {
+      scannedFileId: processedFile.id,
+    },
+  });
+  const activeSuggestions = allSuggestions.filter(
+    (suggestion) => suggestion.invalidatedAt === null,
+  );
+  const invalidatedSuggestions = allSuggestions.filter(
+    (suggestion) => suggestion.invalidatedAt !== null,
+  );
+
+  assert.equal(afterRegeneration.processingStage, "SUGGESTIONS_GENERATED");
+  assert.equal(
+    afterRegeneration.libraryDocument?.observationSessions.length,
+    firstObservationCount,
+  );
+  assert.equal(allSuggestions.length, 2);
+  assert.equal(invalidatedSuggestions.length, 1);
+  assert.equal(activeSuggestions.length, 1);
+  assert.equal(activeSuggestions[0]?.suggestionType, "KEEP_UNCHANGED");
+
+  await processNextBridgeScanSessionFile(sessionId, {
+    recordNotebook: false,
+  });
+
+  const afterSecondRegeneration = await prisma.organizationSuggestion.findMany({
+    where: {
+      scannedFileId: processedFile.id,
+    },
+  });
+
+  assert.equal(afterSecondRegeneration.length, allSuggestions.length);
+  assert.deepEqual(await listRelativeFiles(libraryRoot), originalFiles);
+  assert.equal(
+    await readFile(path.join(libraryRoot, ...relativePath.split("/")), "utf8"),
+    originalText,
+  );
 });

@@ -1543,17 +1543,6 @@ function draftContentSignatureFor(
   });
 }
 
-function storedSuggestionContentSignature(suggestion: StoredSuggestion) {
-  return suggestionContentSignatureFor({
-    currentRelativePath: suggestion.currentRelativePath,
-    proposedFileName: suggestion.proposedFileName,
-    proposedRelativePath: suggestion.proposedRelativePath,
-    scannedFileId: suggestion.scannedFileId,
-    suggestionType: suggestion.suggestionType,
-    title: suggestion.title,
-  });
-}
-
 function normalizeSuggestionType(value: string): OrganizationSuggestionType {
   return organizationSuggestionTypes.has(value as OrganizationSuggestionType)
     ? (value as OrganizationSuggestionType)
@@ -1934,24 +1923,17 @@ async function persistDrafts(context: SuggestionContext, drafts: SuggestionDraft
             suggestion.recommendationGenerationVersion,
           ),
       );
-      const currentPendingSignatures = new Set(
-        activeCurrentSuggestions.map(storedSuggestionContentSignature),
-      );
-      const draftSignatures = new Set(
-        cleanedDrafts.map((draft) => draftContentSignatureFor(context, draft)),
-      );
+      const hasOnlyCurrentSuggestions =
+        activeSuggestions.length === activeCurrentSuggestions.length;
       const hasOnlyCurrentPendingSuggestions =
-        activeSuggestions.length === activeCurrentSuggestions.length &&
-        activeCurrentSuggestions.length >= cleanedDrafts.length &&
+        hasOnlyCurrentSuggestions &&
+        activeCurrentSuggestions.length > 0 &&
         activeCurrentSuggestions.every(
           (suggestion) =>
             normalizeSuggestionStatus(suggestion.status) === "PENDING",
         );
-      const draftSetIsAlreadyPresent = [...draftSignatures].every((signature) =>
-        currentPendingSignatures.has(signature),
-      );
 
-      if (hasOnlyCurrentPendingSuggestions && draftSetIsAlreadyPresent) {
+      if (hasOnlyCurrentPendingSuggestions) {
         existingCount = activeCurrentSuggestions.length;
         suggestions.push(
           ...activeCurrentSuggestions

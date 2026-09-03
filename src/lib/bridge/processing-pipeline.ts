@@ -203,6 +203,10 @@ function fileNeedsProcessing(
   },
   options: ProcessingOptions,
 ) {
+  const hasObservation =
+    (file.libraryDocument?.observationSessions.length ?? 0) > 0;
+  const hasCurrentRecommendations = file.organizationSuggestions.length > 0;
+
   if (file.processingStage === "FAILED") {
     if (!options.includeFailed) {
       return false;
@@ -215,21 +219,19 @@ function fileNeedsProcessing(
     return !file.processedAt || file.processedAt < options.retryStartedAt;
   }
 
-  if (isRecommendationTerminalStage(file.processingStage)) {
-    return false;
-  }
-
   if (file.readingStatus !== "READ" || file.extractionStatus !== "COMPLETED") {
     return true;
   }
 
-  if ((file.libraryDocument?.observationSessions.length ?? 0) === 0) {
+  if (!hasObservation) {
     return true;
   }
 
-  return file.organizationSuggestions.every(
-    (suggestion) => suggestion.suggestionType === "POSSIBLE_DUPLICATE",
-  );
+  if (!hasCurrentRecommendations) {
+    return true;
+  }
+
+  return !isRecommendationTerminalStage(file.processingStage);
 }
 
 async function nextSupportedFileForProcessing(
@@ -356,9 +358,6 @@ async function fileAlreadyHasSuggestions(scannedFileId: string) {
       invalidatedAt: null,
       recommendationGenerationVersion: currentRecommendationGenerationVersion,
       scannedFileId,
-      suggestionType: {
-        not: "POSSIBLE_DUPLICATE",
-      },
     },
   });
 

@@ -1013,13 +1013,20 @@ function scanProgressForSession(
   const filesWithSuggestions = fileSummaries.filter(
     (file) => file.organizationSuggestionCounts.total > 0,
   ).length;
+  const fileHasCurrentRecommendations = (file: BridgeScannedFileSummary) =>
+    file.organizationSuggestionCounts.total > 0;
+  const fileNeedsAttention = (file: BridgeScannedFileSummary) =>
+    file.processingStage === "FAILED" ||
+    file.readStatus === "FAILED" ||
+    file.readingStatus === "FAILED" ||
+    file.extractionStatus === "FAILED";
   const filesProcessed = fileSummaries.filter(
     (file) =>
-      isRecommendationTerminalStage(file.processingStage) ||
-      file.processingStage === "FAILED" ||
+      fileNeedsAttention(file) ||
       file.processingStage === "UNSUPPORTED" ||
       file.readStatus === "UNSUPPORTED" ||
-      file.readStatus === "FAILED",
+      (isRecommendationTerminalStage(file.processingStage) &&
+        fileHasCurrentRecommendations(file)),
   ).length;
   const suggestionsGenerated = fileSummaries.reduce(
     (total, file) => total + file.organizationSuggestionCounts.total,
@@ -1030,11 +1037,7 @@ function scanProgressForSession(
     0,
   );
   const failedFiles = fileSummaries.filter(
-    (file) =>
-      file.processingStage === "FAILED" ||
-      file.readStatus === "FAILED" ||
-      file.readingStatus === "FAILED" ||
-      file.extractionStatus === "FAILED",
+    (file) => fileNeedsAttention(file),
   ).length;
   const summary = scanSessionSummary({
     ...session,
