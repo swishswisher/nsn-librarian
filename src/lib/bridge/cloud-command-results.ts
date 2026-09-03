@@ -735,10 +735,34 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
       warnings: result.warnings,
     },
   };
-  await createObservationSessionForScannedFileReadResult(
-    scannedFileId,
-    readResult,
-  );
+  const observationReused = file.hasObservation;
+
+  if (observationReused) {
+    await prisma.scannedFile.update({
+      data: {
+        processedAt: new Date(),
+        processingErrorCategory: null,
+        processingStage: "EXAMINED",
+      },
+      where: {
+        id: scannedFileId,
+      },
+    });
+  } else {
+    await createObservationSessionForScannedFileReadResult(
+      scannedFileId,
+      readResult,
+    );
+  }
+
+  await prisma.scanSession.update({
+    data: {
+      status: "GENERATING_SUGGESTIONS",
+    },
+    where: {
+      id: scanSessionId,
+    },
+  });
   const suggestions = await generateOrganizationSuggestionsForScannedFileWithText(
     scannedFileId,
     result.extractedText,
@@ -748,6 +772,7 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
   return {
     characterCount: result.characterCount,
     observationPrepared: true,
+    observationReused,
     scannedFileId,
     suggestionsCreated: suggestions.createdCount,
     suggestionsReused: suggestions.existingCount,

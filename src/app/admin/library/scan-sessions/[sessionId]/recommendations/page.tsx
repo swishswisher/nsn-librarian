@@ -188,6 +188,7 @@ export default async function RecommendationsPage({
                 <RetryAutomaticProcessingButton
                   busyLabel="Preparing Recommendations..."
                   label="Generate Recommendations for This Scan"
+                  retryFailed={false}
                   scanSessionId={data.session.id}
                   variant="primary"
                 />

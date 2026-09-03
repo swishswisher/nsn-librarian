@@ -67,6 +67,7 @@ function EmptyPlanningState({
             <RetryAutomaticProcessingButton
               busyLabel="Preparing Recommendations..."
               label="Generate Recommendations for This Scan"
+              retryFailed={false}
               scanSessionId={session.id}
               variant="primary"
             />

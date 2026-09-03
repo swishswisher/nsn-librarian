@@ -7,6 +7,7 @@ import { NsnButton } from "@/components/library/NsnButton";
 import type {
   BridgeScanApiResponse,
   BridgeScanProcessingProgress,
+  BridgeScanProgressApiResponse,
 } from "@/lib/bridge/types";
 
 type RetryAutomaticProcessingButtonProps = {
@@ -18,8 +19,37 @@ type RetryAutomaticProcessingButtonProps = {
   variant?: "primary" | "secondary" | "accent";
 };
 
+const remoteProgressPollDelayMs = 2_000;
+const remoteProgressPollAttempts = 450;
+
 function summaryText(progress: BridgeScanProcessingProgress) {
   return `${progress.filesProcessed} examined, ${progress.filesWithSuggestions} files with recommendations, ${progress.failedFiles} needing attention, ${progress.remainingFiles} remaining.`;
+}
+
+function waitForRemoteProgress() {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, remoteProgressPollDelayMs);
+  });
+}
+
+async function readProgress(scanSessionId: string) {
+  const response = await fetch(
+    `/api/bridge/scan-sessions/${encodeURIComponent(scanSessionId)}/progress`,
+    {
+      method: "GET",
+    },
+  );
+  const payload = (await response.json()) as BridgeScanProgressApiResponse;
+
+  if (!response.ok || !payload.ok) {
+    throw new Error(
+      payload.ok
+        ? "The Librarian could not refresh recommendation progress."
+        : payload.error,
+    );
+  }
+
+  return payload.progress;
 }
 
 export function RetryAutomaticProcessingButton({
@@ -33,6 +63,7 @@ export function RetryAutomaticProcessingButton({
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
   const [progress, setProgress] =
     useState<BridgeScanProcessingProgress | null>(null);
 
@@ -42,6 +73,7 @@ export function RetryAutomaticProcessingButton({
     }
 
     setError(null);
+    setMessage(null);
     setProgress(null);
     setIsProcessing(true);
 
@@ -79,6 +111,40 @@ export function RetryAutomaticProcessingButton({
         latestProgress = payload.progress;
         setProgress(payload.progress);
 
+        if (payload.message) {
+          setMessage(payload.message);
+        }
+
+        if (payload.queued) {
+          for (
+            let pollAttempt = 0;
+            pollAttempt < remoteProgressPollAttempts;
+            pollAttempt += 1
+          ) {
+            if (!latestProgress.isActive || latestProgress.isStale) {
+              break;
+            }
+
+            await waitForRemoteProgress();
+            latestProgress = await readProgress(scanSessionId);
+            setProgress(latestProgress);
+          }
+
+          if (!latestProgress.isActive) {
+            setMessage(
+              latestProgress.failedFiles > 0
+                ? "Recommendation generation finished. One or more files still need attention."
+                : "Recommendation generation finished.",
+            );
+          } else if (latestProgress.isStale) {
+            setError(
+              "Recommendation generation appears to have stopped. Try again after checking that NSN Bridge is online.",
+            );
+          }
+
+          break;
+        }
+
         if (!payload.progress.isActive || payload.progress.isStale) {
           break;
         }
@@ -110,6 +176,11 @@ export function RetryAutomaticProcessingButton({
       </NsnButton>
 
       <div aria-live="polite" className="grid gap-2">
+        {message ? (
+          <p className="rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3 text-sm leading-6 text-[var(--nsn-teal-dark)]">
+            {message}
+          </p>
+        ) : null}
         {progress ? (
           <p className="rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3 text-sm leading-6 text-[var(--nsn-teal-dark)]">
             {summaryText(progress)}

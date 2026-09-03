@@ -879,6 +879,9 @@ export type BridgeScanSessionDetail = BridgeScanSessionSummary & {
 export type BridgeScanApiSuccess = {
   ok: true;
   alreadyActive?: boolean;
+  message?: string;
+  queued?: boolean;
+  queuedFiles?: number;
   session: BridgeScanSessionSummary;
   progress: BridgeScanProcessingProgress;
 };

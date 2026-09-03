@@ -1,7 +1,8 @@
 import { processNextBridgeScanSessionFile } from "@/lib/bridge/processing-pipeline";
+import { BridgeCloudError } from "@/lib/bridge/cloud-coordinator";
 import { ConnectedLibraryError } from "@/lib/bridge/connected-libraries";
+import { queueRemoteRecommendationRegenerationForSession } from "@/lib/bridge/remote-read-commands";
 import { remoteSessionIsCloudManaged } from "@/lib/bridge/remote-scan-queue";
-import { getBridgeScanSessionProgress } from "@/lib/bridge/scan-sessions";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,29 +12,29 @@ export async function POST(
   context: { params: Promise<{ sessionId: string }> },
 ) {
   const { sessionId } = await context.params;
+  const body = (await request.json().catch(() => null)) as {
+    retryFailed?: unknown;
+    retryStartedAt?: unknown;
+  } | null;
 
   try {
     if (await remoteSessionIsCloudManaged(sessionId)) {
-      const current = await getBridgeScanSessionProgress(sessionId);
+      const result =
+        await queueRemoteRecommendationRegenerationForSession(sessionId);
 
-      if (!current) {
-        throw new ConnectedLibraryError(
-          "The Librarian could not find this cloud-managed scan session.",
-          404,
-        );
-      }
-
-      return Response.json({
-        ok: true,
-        progress: current.progress,
-        session: current.session,
-      });
+      return Response.json(
+        {
+          message: result.message,
+          ok: true,
+          progress: result.progress,
+          queued: result.queued,
+          queuedFiles: result.queuedFiles,
+          session: result.session,
+        },
+        { status: result.queued ? 202 : 200 },
+      );
     }
 
-    const body = (await request.json().catch(() => null)) as {
-      retryFailed?: unknown;
-      retryStartedAt?: unknown;
-    } | null;
     const retryStartedAt =
       typeof body?.retryStartedAt === "string"
         ? new Date(body.retryStartedAt)
@@ -52,9 +53,13 @@ export async function POST(
       session: result.session,
     });
   } catch (error) {
-    if (error instanceof ConnectedLibraryError) {
+    if (
+      error instanceof BridgeCloudError ||
+      error instanceof ConnectedLibraryError
+    ) {
       return Response.json(
         {
+          ...(error instanceof BridgeCloudError ? { code: error.code } : {}),
           ok: false,
           error: error.message,
         },

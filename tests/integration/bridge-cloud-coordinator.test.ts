@@ -11,6 +11,7 @@ import {
   createBridgeKeyPair,
 } from "../../packages/bridge-protocol/src";
 import { cloudBridgeHealth } from "../../src/lib/bridge/effective-health";
+import { currentRecommendationGenerationVersion } from "../../src/lib/bridge/recommendation-generation";
 import type { LocalBridgeRootSummary } from "../../src/lib/bridge/local-bridge-client";
 
 let createBridgePairingCode: typeof import("../../src/lib/bridge/cloud-coordinator").createBridgePairingCode;
@@ -31,11 +32,13 @@ let getMonitoringDashboardData: typeof import("../../src/lib/bridge/monitor").ge
 let expireRemoteReadCommandsForSession: typeof import("../../src/lib/bridge/remote-read-commands").expireRemoteReadCommandsForSession;
 let markRemoteReadFailure: typeof import("../../src/lib/bridge/remote-read-commands").markRemoteReadFailure;
 let queueRemoteReadRetryForScannedFile: typeof import("../../src/lib/bridge/remote-read-commands").queueRemoteReadRetryForScannedFile;
+let processScanSessionPost: typeof import("../../src/app/api/bridge/scan-sessions/[sessionId]/process/route").POST;
 let prisma: PrismaClient;
 let previousDatabaseUrl: string | undefined;
 let previousDirectUrl: string | undefined;
 let previousLocalBridgeUrl: string | undefined;
 let previousCommandSigningSecret: string | undefined;
+let previousOpenAIKey: string | undefined;
 let previousPairingSecret: string | undefined;
 let testDatabaseUrl: string;
 let testDirectDatabaseUrl: string;
@@ -77,6 +80,7 @@ before(async () => {
   previousDirectUrl = process.env.DIRECT_URL;
   previousLocalBridgeUrl = process.env.NSN_LOCAL_BRIDGE_URL;
   previousCommandSigningSecret = process.env.NSN_BRIDGE_COMMAND_SIGNING_SECRET;
+  previousOpenAIKey = process.env.OPENAI_API_KEY;
   previousPairingSecret = process.env.NSN_BRIDGE_PAIRING_SECRET;
   testDatabaseUrl = databaseUrlForSchema(testSchemaName);
   testDirectDatabaseUrl = databaseUrlForSchema(
@@ -88,6 +92,7 @@ before(async () => {
   process.env.NSN_BRIDGE_COMMAND_SIGNING_SECRET =
     "bridge-cloud-coordinator-command-test-secret";
   process.env.NSN_BRIDGE_PAIRING_SECRET = "bridge-cloud-coordinator-test-secret";
+  process.env.OPENAI_API_KEY = "";
   runPrismaDbPush();
 
   const prismaModule = await import("../../src/lib/db/prisma");
@@ -95,6 +100,9 @@ before(async () => {
   const commandResults = await import("../../src/lib/bridge/cloud-command-results");
   const deviceRootSync = await import("../../src/lib/bridge/device-root-sync");
   const remoteReadCommands = await import("../../src/lib/bridge/remote-read-commands");
+  const processRoute = await import(
+    "../../src/app/api/bridge/scan-sessions/[sessionId]/process/route"
+  );
 
   prisma = prismaModule.getPrismaClient();
   createBridgePairingCode = coordinator.createBridgePairingCode;
@@ -123,6 +131,7 @@ before(async () => {
   markRemoteReadFailure = remoteReadCommands.markRemoteReadFailure;
   queueRemoteReadRetryForScannedFile =
     remoteReadCommands.queueRemoteReadRetryForScannedFile;
+  processScanSessionPost = processRoute.POST;
 });
 
 beforeEach(async () => {
@@ -174,6 +183,12 @@ after(async () => {
     delete process.env.NSN_BRIDGE_PAIRING_SECRET;
   } else {
     process.env.NSN_BRIDGE_PAIRING_SECRET = previousPairingSecret;
+  }
+
+  if (previousOpenAIKey === undefined) {
+    delete process.env.OPENAI_API_KEY;
+  } else {
+    process.env.OPENAI_API_KEY = previousOpenAIKey;
   }
 });
 
@@ -306,6 +321,32 @@ async function latestReadCommand(scannedFileId: string) {
   });
 }
 
+async function completeTemporaryRead(input: {
+  bridgeDeviceId: string;
+  commandId: string;
+  relativePath: string;
+  text: string;
+}) {
+  await acknowledgeBridgeCloudCommand(input.bridgeDeviceId, input.commandId);
+  const prepared = await prepareBridgeCommandReportForPersistence(
+    input.bridgeDeviceId,
+    {
+      commandId: input.commandId,
+      result: {
+        extractedText: input.text,
+        fileName: input.relativePath.split("/").at(-1) ?? "note.txt",
+        fileType: "DOCUMENT",
+        relativePath: input.relativePath,
+        warnings: [],
+      },
+      safeErrorCategory: null,
+      status: "COMPLETED",
+    },
+  );
+
+  await completeBridgeCloudCommand(input.bridgeDeviceId, prepared);
+}
+
 test("pairing creates a paired device but heartbeat is required for online health", async () => {
   const keys = createBridgeKeyPair();
   const bridgeDeviceId = createBridgeDeviceId();
@@ -404,6 +445,369 @@ test("Retry Reading on a cloud-owned scanned file queues a Bridge command instea
     }),
     1,
   );
+});
+
+test("cloud-managed recommendation regeneration queues temporary reads and completes idempotently", async () => {
+  const firstRelativePath = "Notes/remote-regeneration-one.txt";
+  const secondRelativePath = "Notes/remote-regeneration-two.txt";
+  const cloud = await createCloudScannedFile({
+    relativePath: firstRelativePath,
+  });
+  const secondFile = await prisma.scannedFile.create({
+    data: {
+      checksum: `checksum-${randomUUID()}`,
+      extractionErrorCategory: "READ_FAILED",
+      extractionStatus: "FAILED",
+      fileType: "txt",
+      localPath: `bridge://${cloud.bridgeRootId}/${secondRelativePath}`,
+      processingErrorCategory: "READ_FAILED",
+      processingStage: "FAILED",
+      readStatus: "SUPPORTED",
+      readingStatus: "FAILED",
+      relativePath: secondRelativePath,
+      scanError: "Previous read attempt needs attention.",
+      sessionId: cloud.session.id,
+      sizeBytes: BigInt(192),
+    },
+  });
+  await prisma.scannedFile.createMany({
+    data: [
+      {
+        checksum: `checksum-${randomUUID()}`,
+        extractionErrorCategory: "FILE_CORRUPT",
+        extractionStatus: "FAILED",
+        fileType: "pdf",
+        localPath: `bridge://${cloud.bridgeRootId}/Damaged/broken.pdf`,
+        processingErrorCategory: "FILE_CORRUPT",
+        processingStage: "FAILED",
+        readStatus: "SUPPORTED",
+        readingStatus: "FAILED",
+        relativePath: "Damaged/broken.pdf",
+        scanError: "This file appears damaged.",
+        sessionId: cloud.session.id,
+        sizeBytes: BigInt(32),
+      },
+      {
+        extractionErrorCategory: "UNSUPPORTED_FILE_TYPE",
+        extractionStatus: "UNSUPPORTED",
+        fileType: "UNSUPPORTED",
+        localPath: `bridge://${cloud.bridgeRootId}/Archives/package.zip`,
+        processingErrorCategory: "UNSUPPORTED_FILE_TYPE",
+        processingStage: "UNSUPPORTED",
+        readStatus: "UNSUPPORTED",
+        readingStatus: "UNSUPPORTED",
+        relativePath: "Archives/package.zip",
+        scanError: "Unsupported for reading.",
+        sessionId: cloud.session.id,
+        sizeBytes: BigInt(64),
+      },
+    ],
+  });
+  await prisma.scanSession.update({
+    data: {
+      failedFiles: 3,
+      filesScanned: 4,
+      supportedFiles: 3,
+      unsupportedFiles: 1,
+    },
+    where: {
+      id: cloud.session.id,
+    },
+  });
+
+  for (const file of [cloud.scannedFile, secondFile]) {
+    await queueRemoteReadRetryForScannedFile(file.id);
+  }
+
+  for (const [file, text] of [
+    [cloud.scannedFile, "A calm note about home records and weekly planning."],
+    [secondFile, "A separate note about gardening dates and family receipts."],
+  ] as const) {
+    const command = await latestReadCommand(file.id);
+
+    assert.ok(command);
+    await completeTemporaryRead({
+      bridgeDeviceId: cloud.device.bridgeDeviceId,
+      commandId: command.commandId,
+      relativePath: file.relativePath,
+      text,
+    });
+  }
+
+  const observationsBefore = await prisma.observationSession.count({
+    where: {
+      libraryDocument: {
+        scannedFiles: {
+          some: {
+            sessionId: cloud.session.id,
+          },
+        },
+      },
+    },
+  });
+  const oldRecommendations = await prisma.organizationSuggestion.findMany({
+    where: {
+      invalidatedAt: null,
+      recommendationGenerationVersion:
+        currentRecommendationGenerationVersion,
+      scanSessionId: cloud.session.id,
+    },
+  });
+
+  assert.equal(observationsBefore, 2);
+  assert.ok(oldRecommendations.length >= 2);
+
+  await prisma.organizationSuggestion.updateMany({
+    data: {
+      invalidatedAt: new Date(),
+      invalidatedReason: "Cloud regeneration regression test.",
+      reviewedAt: null,
+      status: "PENDING",
+    },
+    where: {
+      id: {
+        in: oldRecommendations.map((suggestion) => suggestion.id),
+      },
+    },
+  });
+
+  const response = await processScanSessionPost(
+    new Request(
+      `http://localhost/api/bridge/scan-sessions/${cloud.session.id}/process`,
+      {
+        body: JSON.stringify({ retryFailed: false }),
+        headers: {
+          "Content-Type": "application/json",
+        },
+        method: "POST",
+      },
+    ),
+    {
+      params: Promise.resolve({ sessionId: cloud.session.id }),
+    },
+  );
+  const payload = (await response.json()) as {
+    message: string;
+    ok: boolean;
+    progress: { remainingFiles: number };
+    queued: boolean;
+    queuedFiles: number;
+  };
+
+  assert.equal(response.status, 202);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.queued, true);
+  assert.equal(payload.queuedFiles, 2);
+  assert.match(payload.message, /queued for 2 files/i);
+  assert.equal(payload.progress.remainingFiles, 2);
+
+  const regenerationCommands = await prisma.bridgeCommand.findMany({
+    orderBy: {
+      issuedAt: "asc",
+    },
+    where: {
+      commandType: "READ_FILE_TEMPORARILY",
+      idempotencyKey: {
+        startsWith: `recommendation-regeneration:${currentRecommendationGenerationVersion}:${cloud.session.id}:`,
+      },
+    },
+  });
+
+  assert.equal(regenerationCommands.length, 2);
+
+  for (const command of regenerationCommands) {
+    const commandPayload = command.payload as Record<string, unknown>;
+
+    assert.equal(
+      commandPayload.processingPurpose,
+      "RECOMMENDATION_REGENERATION",
+    );
+    assert.equal(
+      commandPayload.recommendationGenerationVersion,
+      currentRecommendationGenerationVersion,
+    );
+    assert.equal(commandPayload.localPath, undefined);
+    assert.equal(commandPayload.actualPath, undefined);
+  }
+
+  const repeatedResponse = await processScanSessionPost(
+    new Request(
+      `http://localhost/api/bridge/scan-sessions/${cloud.session.id}/process`,
+      {
+        body: JSON.stringify({ retryFailed: false }),
+        headers: {
+          "Content-Type": "application/json",
+        },
+        method: "POST",
+      },
+    ),
+    {
+      params: Promise.resolve({ sessionId: cloud.session.id }),
+    },
+  );
+  const repeatedPayload = (await repeatedResponse.json()) as {
+    queued: boolean;
+    queuedFiles: number;
+  };
+
+  assert.equal(repeatedResponse.status, 202);
+  assert.equal(repeatedPayload.queued, true);
+  assert.equal(repeatedPayload.queuedFiles, 0);
+  assert.equal(
+    await prisma.bridgeCommand.count({
+      where: {
+        idempotencyKey: {
+          startsWith: `recommendation-regeneration:${currentRecommendationGenerationVersion}:${cloud.session.id}:`,
+        },
+      },
+    }),
+    2,
+  );
+
+  for (const command of regenerationCommands) {
+    const commandPayload = command.payload as Record<string, unknown>;
+    const scannedFileId = String(commandPayload.scannedFileId);
+    const relativePath = String(commandPayload.relativePath);
+
+    await completeTemporaryRead({
+      bridgeDeviceId: cloud.device.bridgeDeviceId,
+      commandId: command.commandId,
+      relativePath,
+      text:
+        scannedFileId === cloud.scannedFile.id
+          ? "A calm note about home records and weekly planning."
+          : "A separate note about gardening dates and family receipts.",
+    });
+  }
+
+  const completedResponse = await processScanSessionPost(
+    new Request(
+      `http://localhost/api/bridge/scan-sessions/${cloud.session.id}/process`,
+      {
+        body: JSON.stringify({ retryFailed: false }),
+        headers: {
+          "Content-Type": "application/json",
+        },
+        method: "POST",
+      },
+    ),
+    {
+      params: Promise.resolve({ sessionId: cloud.session.id }),
+    },
+  );
+  const completedPayload = (await completedResponse.json()) as {
+    progress: {
+      filesWithSuggestions: number;
+      remainingFiles: number;
+    };
+    queued: boolean;
+  };
+  const currentRecommendations = await prisma.organizationSuggestion.findMany({
+    where: {
+      invalidatedAt: null,
+      recommendationGenerationVersion:
+        currentRecommendationGenerationVersion,
+      scanSessionId: cloud.session.id,
+    },
+  });
+  const observationsAfter = await prisma.observationSession.count({
+    where: {
+      libraryDocument: {
+        scannedFiles: {
+          some: {
+            sessionId: cloud.session.id,
+          },
+        },
+      },
+    },
+  });
+  const storedOldRecommendations = await prisma.organizationSuggestion.findMany({
+    where: {
+      id: {
+        in: oldRecommendations.map((suggestion) => suggestion.id),
+      },
+    },
+  });
+  const allCommands = await prisma.bridgeCommand.findMany({
+    where: {
+      connectedLibraryId: cloud.library.id,
+    },
+  });
+
+  assert.equal(completedResponse.status, 200);
+  assert.equal(completedPayload.queued, false);
+  assert.equal(completedPayload.progress.filesWithSuggestions, 2);
+  assert.equal(completedPayload.progress.remainingFiles, 0);
+  assert.ok(currentRecommendations.length >= 2);
+  assert.ok(
+    storedOldRecommendations.every(
+      (suggestion) => suggestion.invalidatedAt !== null,
+    ),
+  );
+  assert.equal(observationsAfter, observationsBefore);
+  assert.equal(
+    await prisma.bridgeCommand.count({
+      where: {
+        idempotencyKey: {
+          startsWith: `recommendation-regeneration:${currentRecommendationGenerationVersion}:${cloud.session.id}:`,
+        },
+      },
+    }),
+    2,
+  );
+  assert.ok(
+    allCommands.every(
+      (command) => command.commandType === "READ_FILE_TEMPORARILY",
+    ),
+  );
+});
+
+test("cloud-managed recommendation regeneration reports an offline Bridge", async () => {
+  const cloud = await createCloudScannedFile({
+    deviceStatus: "OFFLINE",
+    relativePath: "Notes/offline-regeneration.txt",
+  });
+
+  await prisma.scannedFile.update({
+    data: {
+      extractionErrorCategory: null,
+      extractionStatus: "COMPLETED",
+      processingErrorCategory: null,
+      processingStage: "SUGGESTIONS_GENERATED",
+      readingStatus: "READ",
+      scanError: null,
+    },
+    where: {
+      id: cloud.scannedFile.id,
+    },
+  });
+
+  const response = await processScanSessionPost(
+    new Request(
+      `http://localhost/api/bridge/scan-sessions/${cloud.session.id}/process`,
+      {
+        body: JSON.stringify({ retryFailed: false }),
+        headers: {
+          "Content-Type": "application/json",
+        },
+        method: "POST",
+      },
+    ),
+    {
+      params: Promise.resolve({ sessionId: cloud.session.id }),
+    },
+  );
+  const payload = (await response.json()) as {
+    code: string;
+    error: string;
+    ok: boolean;
+  };
+
+  assert.equal(response.status, 409);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.code, "BRIDGE_OFFLINE");
+  assert.match(payload.error, /open nsn bridge/i);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
 });
 
 test("remote read failures keep file-specific categories instead of Bridge offline", async () => {

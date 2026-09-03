@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 import { getPrismaClient } from "@/lib/db/prisma";
@@ -5,7 +6,9 @@ import {
   BridgeCloudError,
   createBridgeCloudCommand,
 } from "@/lib/bridge/cloud-coordinator";
+import { requireScanSessionPermission } from "@/lib/bridge/connected-libraries";
 
+import { currentRecommendationGenerationVersion } from "./recommendation-generation";
 import {
   getBridgeScanSessionDetail,
   getBridgeScanSessionProgress,
@@ -17,6 +20,7 @@ import type {
 
 const onlineWindowMs = 90_000;
 const readCommandLifetimeMs = 10 * 60 * 1000;
+const regenerationReadCommandLifetimeMs = 24 * 60 * 60 * 1000;
 const activeReadCommandStatuses = [
   "PENDING",
   "ACKNOWLEDGED",
@@ -36,7 +40,10 @@ type RemoteReadCommandInput = {
   bridgeDeviceId: string;
   bridgeRootId: string;
   connectedLibraryId: string;
+  expiresAt?: Date;
   idempotencyKey: string;
+  processingPurpose?: "RECOMMENDATION_REGENERATION";
+  recommendationGenerationVersion?: string;
   relativePath: string;
   scanSessionId: string;
   scannedFileId: string;
@@ -282,9 +289,19 @@ export async function queueRemoteReadCommand(input: RemoteReadCommandInput) {
     bridgeRootId: input.bridgeRootId,
     commandType: "READ_FILE_TEMPORARILY",
     connectedLibraryId: input.connectedLibraryId,
-    expiresAt: new Date(Date.now() + readCommandLifetimeMs),
+    expiresAt:
+      input.expiresAt ?? new Date(Date.now() + readCommandLifetimeMs),
     idempotencyKey: input.idempotencyKey,
     payload: {
+      ...(input.processingPurpose
+        ? { processingPurpose: input.processingPurpose }
+        : {}),
+      ...(input.recommendationGenerationVersion
+        ? {
+            recommendationGenerationVersion:
+              input.recommendationGenerationVersion,
+          }
+        : {}),
       relativePath: input.relativePath,
       scanSessionId: input.scanSessionId,
       scannedFileId: input.scannedFileId,
@@ -398,6 +415,271 @@ async function markRetryQueued(scannedFileId: string, scanSessionId: string) {
       },
     }),
   ]);
+}
+
+function commandScannedFileId(command: { payload: unknown }, sessionId: string) {
+  const payload = objectValue(command.payload);
+
+  return payload?.scanSessionId === sessionId &&
+    typeof payload.scannedFileId === "string"
+    ? payload.scannedFileId
+    : null;
+}
+
+export async function queueRemoteRecommendationRegenerationForSession(
+  sessionId: string,
+) {
+  await requireScanSessionPermission(
+    sessionId,
+    "readPermission",
+    "read files for recommendation generation",
+  );
+  await requireScanSessionPermission(
+    sessionId,
+    "recommendationPermission",
+    "prepare organization recommendations",
+  );
+
+  const prisma = getPrismaClient();
+  const session = await prisma.scanSession.findUnique({
+    include: {
+      connectedFolder: {
+        include: {
+          bridgeDevice: true,
+        },
+      },
+      scannedFiles: {
+        orderBy: {
+          relativePath: "asc",
+        },
+        select: {
+          id: true,
+          organizationSuggestions: {
+            orderBy: {
+              invalidatedAt: "desc",
+            },
+            select: {
+              id: true,
+            },
+            take: 1,
+            where: {
+              invalidatedAt: {
+                not: null,
+              },
+              recommendationGenerationVersion:
+                currentRecommendationGenerationVersion,
+            },
+          },
+          relativePath: true,
+        },
+        where: {
+          extractionStatus: {
+            not: "FAILED",
+          },
+          organizationSuggestions: {
+            none: {
+              invalidatedAt: null,
+              recommendationGenerationVersion:
+                currentRecommendationGenerationVersion,
+            },
+          },
+          processingStage: {
+            notIn: ["FAILED", "UNSUPPORTED"],
+          },
+          readingStatus: {
+            not: "FAILED",
+          },
+          readStatus: "SUPPORTED",
+        },
+      },
+    },
+    where: {
+      id: sessionId,
+    },
+  });
+
+  if (!session) {
+    throw new BridgeCloudError(
+      "The Librarian could not find that scan session.",
+      404,
+      "SCAN_SESSION_NOT_FOUND",
+    );
+  }
+
+  const library = session.connectedFolder;
+
+  if (session.scannedFiles.length === 0) {
+    await finalizeRemoteReadSessionIfComplete(sessionId);
+    const progress = await getBridgeScanSessionProgress(sessionId);
+
+    if (!progress) {
+      throw new BridgeCloudError(
+        "The Librarian could not refresh this scan session.",
+        404,
+        "SCAN_SESSION_NOT_FOUND",
+      );
+    }
+
+    return {
+      alreadyQueuedFiles: 0,
+      message:
+        "Every supported file in this scan already has a current recommendation.",
+      progress: progress.progress,
+      queued: false,
+      queuedFiles: 0,
+      session: progress.session,
+    };
+  }
+
+  if (!library.bridgeDeviceId || !library.bridgeRootId || !library.bridgeDevice) {
+    throw new BridgeCloudError(
+      "Pair and reconnect this Mac before generating recommendations.",
+      409,
+      "ROOT_NOT_CONNECTED",
+    );
+  }
+
+  const lastSeenAt = library.bridgeDevice.lastSeenAt?.getTime() ?? Number.NaN;
+  const bridgeIsOnline =
+    library.bridgeDevice.status === "ONLINE" &&
+    Number.isFinite(lastSeenAt) &&
+    Date.now() - lastSeenAt <= onlineWindowMs;
+
+  if (!bridgeIsOnline) {
+    throw new BridgeCloudError(
+      "Open NSN Bridge on this Mac before generating recommendations.",
+      409,
+      "BRIDGE_OFFLINE",
+    );
+  }
+
+  await expireRemoteReadCommandsForSession(sessionId);
+
+  const readCommands = await prisma.bridgeCommand.findMany({
+    orderBy: {
+      issuedAt: "desc",
+    },
+    where: {
+      bridgeDeviceId: library.bridgeDeviceId,
+      bridgeRootId: library.bridgeRootId,
+      commandType: "READ_FILE_TEMPORARILY",
+      connectedLibraryId: library.id,
+    },
+  });
+  const latestCommandByFileId = new Map<string, (typeof readCommands)[number]>();
+  const activeCommandFileIds = new Set<string>();
+  const now = new Date();
+
+  for (const command of readCommands) {
+    const scannedFileId = commandScannedFileId(command, sessionId);
+
+    if (!scannedFileId) {
+      continue;
+    }
+
+    if (!latestCommandByFileId.has(scannedFileId)) {
+      latestCommandByFileId.set(scannedFileId, command);
+    }
+
+    if (
+      activeReadCommandStatuses.includes(
+        command.status as (typeof activeReadCommandStatuses)[number],
+      ) &&
+      command.expiresAt > now
+    ) {
+      activeCommandFileIds.add(scannedFileId);
+    }
+  }
+
+  await prisma.$transaction([
+    prisma.scannedFile.updateMany({
+      data: {
+        extractedAt: null,
+        extractionErrorCategory: null,
+        extractionStatus: "EXTRACTING",
+        processedAt: now,
+        processingErrorCategory: null,
+        processingStage: "READING",
+        readingStatus: "NOT_READ",
+        scanError: null,
+        sourceUnavailableAt: null,
+        sourceUnavailableReason: null,
+      },
+      where: {
+        id: {
+          in: session.scannedFiles.map((file) => file.id),
+        },
+        sessionId,
+      },
+    }),
+    prisma.scanSession.update({
+      data: {
+        completedAt: null,
+        status: "READING",
+      },
+      where: {
+        id: sessionId,
+      },
+    }),
+  ]);
+
+  let queuedFiles = 0;
+  let alreadyQueuedFiles = 0;
+
+  for (const file of session.scannedFiles) {
+    if (activeCommandFileIds.has(file.id)) {
+      alreadyQueuedFiles += 1;
+      continue;
+    }
+
+    const previousCommand = latestCommandByFileId.get(file.id);
+    const generationBasis =
+      previousCommand?.commandId ??
+      file.organizationSuggestions[0]?.id ??
+      randomUUID();
+
+    await queueRemoteReadCommand({
+      bridgeDeviceId: library.bridgeDeviceId,
+      bridgeRootId: library.bridgeRootId,
+      connectedLibraryId: library.id,
+      expiresAt: new Date(now.getTime() + regenerationReadCommandLifetimeMs),
+      idempotencyKey: `recommendation-regeneration:${currentRecommendationGenerationVersion}:${sessionId}:${file.id}:${generationBasis}`,
+      processingPurpose: "RECOMMENDATION_REGENERATION",
+      recommendationGenerationVersion:
+        currentRecommendationGenerationVersion,
+      relativePath: file.relativePath,
+      scanSessionId: sessionId,
+      scannedFileId: file.id,
+    });
+    queuedFiles += 1;
+  }
+
+  const progress = await getBridgeScanSessionProgress(sessionId);
+
+  if (!progress) {
+    throw new BridgeCloudError(
+      "The Librarian could not refresh this scan session.",
+      404,
+      "SCAN_SESSION_NOT_FOUND",
+    );
+  }
+
+  const queued = queuedFiles > 0 || alreadyQueuedFiles > 0;
+  const message =
+    queuedFiles > 0
+      ? `Recommendation generation was queued for ${queuedFiles} ${queuedFiles === 1 ? "file" : "files"}. This page will update as the Mac reports back.`
+      : alreadyQueuedFiles > 0
+        ? "Recommendation generation is already queued. This page will update as the Mac reports back."
+        : "Every supported file in this scan already has a current recommendation.";
+
+  return {
+    alreadyQueuedFiles,
+    message,
+    progress: progress.progress,
+    queued,
+    queuedFiles,
+    session: progress.session,
+  };
 }
 
 async function finalizeRemoteReadSessionIfComplete(sessionId: string) {
