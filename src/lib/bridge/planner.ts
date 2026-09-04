@@ -22,6 +22,7 @@ import {
   currentRecommendationGenerationVersion,
   isCurrentRecommendationGeneration,
 } from "./recommendation-generation";
+import { recommendationSupportFromJson } from "./recommendation-reconciliation";
 import {
   summarizeExecutionRun,
   validateOrganizationPlanForApproval,
@@ -573,7 +574,9 @@ function fileActionTypeForPaths(
 }
 
 function evidenceForSuggestion(suggestion: StoredSuggestion) {
-  const supportingInformation = asStringArray(suggestion.supportingInformation);
+  const supportingInformation = recommendationSupportFromJson(
+    suggestion.supportingInformation,
+  ).details;
   const whySuggested = asStringArray(suggestion.whySuggested);
 
   return {

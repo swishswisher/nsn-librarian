@@ -5,6 +5,7 @@ import type { Prisma } from "@prisma/client";
 import { getPrismaClient } from "@/lib/db/prisma";
 
 import { currentRecommendationGenerationVersion } from "./recommendation-generation";
+import { recommendationSupportForStorage } from "./recommendation-reconciliation";
 import { isImageFileType } from "./media-kind";
 import { isAudioFileType } from "./audio-metadata";
 import { isVideoFileType } from "./video-metadata";
@@ -452,6 +453,18 @@ function duplicateSuggestionCopy(
     file.scanSession.connectedFolder.id === target.scanSession.connectedFolder.id;
 
   return {
+    duplicateEvidence: [
+      {
+        connectedLibraryName: target.scanSession.connectedFolder.displayName,
+        relativePath: target.relativePath,
+        signals: [
+          "Exact content match: the non-empty files have the same checksum.",
+          ...(file.sizeBytes !== null && file.sizeBytes === target.sizeBytes
+            ? [`Matching file size: ${file.sizeBytes.toString()} bytes.`]
+            : []),
+        ],
+      },
+    ],
     explanation:
       "The Librarian found another scanned file with matching contents. This is a review prompt only; nothing should be deleted automatically.",
     supportingInformation: [
@@ -494,7 +507,14 @@ async function upsertDuplicateSuggestion(
       status: "PENDING",
       suggestionKey: suggestionKeyFor(file),
       suggestionType: "POSSIBLE_DUPLICATE",
-      supportingInformation: jsonInput(copy.supportingInformation),
+      supportingInformation: jsonInput(
+        recommendationSupportForStorage({
+          alternatives: [],
+          duplicateEvidence: copy.duplicateEvidence,
+          requiredFolderPaths: [],
+          supportingInformation: copy.supportingInformation,
+        }),
+      ),
       title: copy.title,
       whySuggested: jsonInput(copy.whySuggested),
     },
@@ -507,7 +527,14 @@ async function upsertDuplicateSuggestion(
       recommendationGenerationVersion: currentRecommendationGenerationVersion,
       reviewedAt: null,
       status: "PENDING",
-      supportingInformation: jsonInput(copy.supportingInformation),
+      supportingInformation: jsonInput(
+        recommendationSupportForStorage({
+          alternatives: [],
+          duplicateEvidence: copy.duplicateEvidence,
+          requiredFolderPaths: [],
+          supportingInformation: copy.supportingInformation,
+        }),
+      ),
       title: copy.title,
       whySuggested: jsonInput(copy.whySuggested),
     },
@@ -622,10 +649,17 @@ async function reconcileStaleExactDuplicates(
       reviewedAt: null,
       status: "PENDING",
       suggestionType: "KEEP_UNCHANGED",
-      supportingInformation: jsonInput([
-        "Exact duplicate metadata was rechecked using connected-library identity and relative path.",
-        "No physical files were changed.",
-      ]),
+      supportingInformation: jsonInput(
+        recommendationSupportForStorage({
+          alternatives: [],
+          duplicateEvidence: [],
+          requiredFolderPaths: [],
+          supportingInformation: [
+            "Exact duplicate metadata was rechecked using connected-library identity and relative path.",
+            "No physical files were changed.",
+          ],
+        }),
+      ),
       title: "No exact duplicate after recheck",
       whySuggested: jsonInput([
         "The earlier checksum match appears to have represented the same physical file from an older scan, or a zero-byte file without useful duplicate value.",

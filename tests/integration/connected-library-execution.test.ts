@@ -12,6 +12,7 @@ import { PrismaClient } from "@prisma/client";
 import { createBridgeServer } from "../../bridge-app/src/api/server";
 import { createFolderSelection } from "../../bridge-app/src/main/registry";
 import { currentRecommendationGenerationVersion } from "../../src/lib/bridge/recommendation-generation";
+import { recommendationSupportFromJson } from "../../src/lib/bridge/recommendation-reconciliation";
 import type { ConnectedLibraryPermissions } from "../../src/lib/bridge/types";
 
 let prisma: PrismaClient;
@@ -567,6 +568,19 @@ test("non-empty checksum duplicates remain detectable within and across roots", 
   });
 
   assert.equal(sameRootDuplicates.length, 2);
+  assert.ok(
+    sameRootDuplicates.every((suggestion) => {
+      const evidence = recommendationSupportFromJson(
+        suggestion.supportingInformation,
+      ).duplicateEvidence;
+
+      return (
+        evidence.length === 1 &&
+        evidence[0]!.relativePath.length > 0 &&
+        evidence[0]!.signals.some((signal) => /same checksum/i.test(signal))
+      );
+    }),
+  );
 
   const rootB = await createConnectedFixture("duplicate-root-b", {
     "Archive/cross-root-copy.txt": "duplicate body\n",
@@ -742,6 +756,42 @@ test("generic shared words do not create executable Copy Long or Test destinatio
       [],
     );
   }
+});
+
+test("recommendation generation reconciles decisions without changing source files", async () => {
+  const source = "Clients/Loose/Alice_Client_Intake.txt";
+  const originalContent =
+    "Attachment regulation clinical tools Alice client intake notes.\n";
+  const fixture = await createConnectedFixture("recommendation-quality", {
+    "Alice/reference-intake.txt":
+      "Alice client intake reference and attachment notes.\n",
+    [source]: originalContent,
+  });
+  const file = scannedFileByRelativePath(fixture.scannedFiles, source);
+  const absoluteSourcePath = path.join(
+    fixture.folderPath,
+    ...source.split("/"),
+  );
+  const before = await readFile(absoluteSourcePath, "utf8");
+  const contentText = await readAndApproveScannedFile(file.id);
+  const result = await generateOrganizationSuggestionsForScannedFileWithText(
+    file.id,
+    contentText,
+  );
+  const after = await readFile(absoluteSourcePath, "utf8");
+  const locationSuggestions = result.suggestions.filter((suggestion) =>
+    ["MOVE_FILE", "GROUP_WITH_FILES"].includes(suggestion.suggestionType),
+  );
+
+  assert.equal(before, originalContent);
+  assert.equal(after, originalContent);
+  assert.ok(locationSuggestions.length <= 1);
+  assert.equal(
+    result.suggestions.some(
+      (suggestion) => suggestion.suggestionType === "CREATE_FOLDER",
+    ),
+    false,
+  );
 });
 
 test("legacy and invalidated recommendations cannot enter selected or approved plans", async () => {

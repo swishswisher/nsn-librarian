@@ -189,6 +189,20 @@ function recommendedPath(suggestion: BridgeOrganizationSuggestionSummary) {
   return suggestion.proposedRelativePath ?? "Review before changing anything.";
 }
 
+function alternativePath(
+  alternative: BridgeOrganizationSuggestionSummary["alternatives"][number],
+) {
+  if (alternative.proposedRelativePath) {
+    return alternative.proposedRelativePath;
+  }
+
+  if (alternative.proposedFileName) {
+    return alternative.proposedFileName;
+  }
+
+  return alternative.title;
+}
+
 function recommendationSummary(suggestion: BridgeOrganizationSuggestionSummary) {
   const text = suggestion.explanation.trim().replace(/\s+/g, " ");
 
@@ -338,6 +352,9 @@ function basedOnSummary(suggestion: BridgeOrganizationSuggestionSummary) {
     suggestion.explanation,
     suggestion.whySuggested.join(" "),
     suggestion.supportingInformation.join(" "),
+    suggestion.duplicateEvidence
+      .flatMap((match) => [match.relativePath, ...match.signals])
+      .join(" "),
   ]
     .join(" ")
     .toLowerCase();
@@ -492,6 +509,22 @@ export function OrganizationSuggestionsReviewPanel({
           suggestion.explanation,
           suggestion.whySuggested.join(" "),
           suggestion.supportingInformation.join(" "),
+          suggestion.alternatives
+            .flatMap((alternative) => [
+              alternative.title,
+              alternative.proposedRelativePath,
+              alternative.proposedFileName,
+              alternative.explanation,
+            ])
+            .filter(Boolean)
+            .join(" "),
+          suggestion.duplicateEvidence
+            .flatMap((match) => [
+              match.connectedLibraryName,
+              match.relativePath,
+              ...match.signals,
+            ])
+            .join(" "),
           libraryNameBySuggestionId[suggestion.id],
         ]
           .filter(Boolean)
@@ -1044,6 +1077,94 @@ export function OrganizationSuggestionsReviewPanel({
                                   <p className="font-semibold text-[var(--nsn-teal-dark)]">
                                     Confidence: {formatConfidence(suggestion.confidence)}
                                   </p>
+
+                                  {suggestion.requiredFolderPaths.length > 0 ? (
+                                    <div className="grid min-w-0 gap-2 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-3">
+                                      <p className="text-sm font-semibold text-[var(--nsn-navy)]">
+                                        One organization decision
+                                      </p>
+                                      <p className="text-sm leading-6 text-[var(--nsn-slate)]">
+                                        If this file change is later selected in a
+                                        plan, these required folders will be included
+                                        with it. They are not separate approvals.
+                                      </p>
+                                      <ul className="grid gap-1 pl-4 text-sm leading-6 text-[var(--nsn-slate)]">
+                                        {suggestion.requiredFolderPaths.map(
+                                          (folder) => (
+                                            <li
+                                              className="list-disc break-words [overflow-wrap:anywhere]"
+                                              key={folder}
+                                            >
+                                              Create {folder}, if it does not exist
+                                            </li>
+                                          ),
+                                        )}
+                                      </ul>
+                                    </div>
+                                  ) : null}
+
+                                  {suggestion.alternatives.length > 0 ? (
+                                    <div className="grid min-w-0 gap-2 rounded-md border border-[var(--nsn-warm-beige)] bg-[var(--nsn-sand)] p-3">
+                                      <p className="text-sm font-semibold text-[var(--nsn-navy)]">
+                                        Other destinations considered
+                                      </p>
+                                      <p className="text-sm leading-6 text-[var(--nsn-slate)]">
+                                        These are alternatives to the recommendation
+                                        above, not separate actions. Use Edit
+                                        Suggestion if another destination fits better.
+                                      </p>
+                                      <ul className="grid gap-2 text-sm leading-6 text-[var(--nsn-slate)]">
+                                        {suggestion.alternatives.map(
+                                          (alternative) => (
+                                            <li
+                                              className="min-w-0 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-2"
+                                              key={`${alternative.suggestionType}-${alternativePath(alternative)}`}
+                                            >
+                                              <p className="break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                                                {alternativePath(alternative)}
+                                              </p>
+                                              <p className="break-words [overflow-wrap:anywhere]">
+                                                {alternative.explanation}
+                                              </p>
+                                            </li>
+                                          ),
+                                        )}
+                                      </ul>
+                                    </div>
+                                  ) : null}
+
+                                  {suggestion.duplicateEvidence.length > 0 ? (
+                                    <div className="grid min-w-0 gap-2 rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3">
+                                      <p className="text-sm font-semibold text-[var(--nsn-navy)]">
+                                        File to compare
+                                      </p>
+                                      <p className="text-sm leading-6 text-[var(--nsn-slate)]">
+                                        A duplicate recommendation is a request to
+                                        compare files. It never deletes either file.
+                                      </p>
+                                      {suggestion.duplicateEvidence.map((match) => (
+                                        <div
+                                          className="grid min-w-0 gap-1 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-2"
+                                          key={`${match.connectedLibraryName}-${match.relativePath}`}
+                                        >
+                                          <p className="break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                                            {match.connectedLibraryName} {" -> "}
+                                            {match.relativePath}
+                                          </p>
+                                          <ul className="grid gap-1 pl-4 text-sm leading-6 text-[var(--nsn-slate)]">
+                                            {match.signals.map((signal) => (
+                                              <li
+                                                className="list-disc break-words [overflow-wrap:anywhere]"
+                                                key={signal}
+                                              >
+                                                {signal}
+                                              </li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : null}
 
                                   {relatedTopics.length > 0 ? (
                                     <div className="grid min-w-0 gap-2 rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3">

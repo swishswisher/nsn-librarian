@@ -10,9 +10,19 @@ import {
   requireScannedFilePermission,
 } from "./connected-libraries";
 import { isAudioFileType, jsonAudioHumanLabels, jsonStringArray } from "./audio-metadata";
-import { recordChecksumDuplicateSuggestionsForSession } from "./checksum-duplicates";
+import {
+  findExactChecksumDuplicateForScannedFile,
+  recordChecksumDuplicateSuggestionsForSession,
+} from "./checksum-duplicates";
 import { jsonImageHumanLabels } from "./image-metadata";
 import { readScannedFile } from "./reader";
+import {
+  recommendationSupportForStorage,
+  recommendationSupportFromJson,
+  reconcileRecommendationDrafts,
+  type RecommendationDraft,
+  type RecommendationDuplicateMatch,
+} from "./recommendation-reconciliation";
 import {
   currentRecommendationGenerationVersion,
   isCurrentRecommendationGeneration,
@@ -67,16 +77,7 @@ type StoredSuggestion = {
   }[];
 };
 
-type SuggestionDraft = {
-  suggestionType: OrganizationSuggestionType;
-  proposedRelativePath?: string | null;
-  proposedFileName?: string | null;
-  title: string;
-  explanation: string;
-  confidence: number;
-  whySuggested: string[];
-  supportingInformation: string[];
-};
+type SuggestionDraft = RecommendationDraft;
 
 type TopicRule = {
   id: string;
@@ -94,6 +95,12 @@ type SuggestionContext = {
   scanSessionId: string;
   checksum: string | null;
   folderStructure: string[];
+  connectedLibraryName: string;
+  duplicateMatches: Array<
+    RecommendationDuplicateMatch & {
+      scannedFileId: string;
+    }
+  >;
   siblingFiles: Array<{
     id: string;
     relativePath: string;
@@ -125,23 +132,27 @@ type SuggestionContext = {
     duplicateOfScannedFileId: string | null;
     humanLabels: string[];
     imageFingerprint: string | null;
+    height: number | null;
     machineLabels: string[];
     privacyState: string;
     provisionalTopics: string[];
     relatedSignals: string[];
     summary: string | null;
+    width: number | null;
   } | null;
   videoMetadata: {
     duplicateConfidence: number | null;
     duplicateKind: string | null;
     duplicateOfScannedFileId: string | null;
     durationSeconds: number | null;
+    height: number | null;
     humanLabels: string[];
     machineLabels: string[];
     privacyState: string;
     provisionalTopics: string[];
     summary: string | null;
     videoFingerprint: string | null;
+    width: number | null;
   } | null;
 };
 
@@ -149,6 +160,23 @@ type MemoryMatch = {
   title: string;
   memoryType: string;
   overlap: string[];
+};
+
+type DuplicateEvidenceFile = {
+  audioFingerprint: string | null;
+  audioDurationSeconds: number | null;
+  checksum: string | null;
+  connectedLibraryId: string;
+  connectedLibraryName: string;
+  fileName: string;
+  height: number | null;
+  imageFingerprint: string | null;
+  relativePath: string;
+  scannedFileId: string;
+  sizeBytes: bigint | null;
+  videoDurationSeconds: number | null;
+  videoFingerprint: string | null;
+  width: number | null;
 };
 
 const trustedObservationStatuses = new Set(["APPROVED", "MODIFIED"]);
@@ -326,7 +354,7 @@ function rankedTerms(value: string, take = 10) {
 }
 
 function confidence(value: number) {
-  return Math.round(Math.min(Math.max(value, 0.25), 0.95) * 100) / 100;
+  return Math.round(Math.min(Math.max(value, 0.25), 0.98) * 100) / 100;
 }
 
 function titleCaseTerm(value: string) {
@@ -761,13 +789,25 @@ function pathSupport(context: SuggestionContext) {
 
 function makeDraft(
   context: SuggestionContext,
-  draft: Omit<SuggestionDraft, "supportingInformation"> & {
+  draft: Omit<
+    SuggestionDraft,
+    | "alternatives"
+    | "duplicateEvidence"
+    | "requiredFolderPaths"
+    | "supportingInformation"
+  > & {
+    alternatives?: SuggestionDraft["alternatives"];
+    duplicateEvidence?: SuggestionDraft["duplicateEvidence"];
+    requiredFolderPaths?: string[];
     supportingInformation?: string[];
   },
 ): SuggestionDraft {
   return {
     ...draft,
+    alternatives: draft.alternatives ?? [],
     confidence: confidence(draft.confidence),
+    duplicateEvidence: draft.duplicateEvidence ?? [],
+    requiredFolderPaths: draft.requiredFolderPaths ?? [],
     supportingInformation: [
       ...pathSupport(context),
       ...memorySupport(context),
@@ -778,88 +818,73 @@ function makeDraft(
 }
 
 function possibleDuplicateDraft(context: SuggestionContext) {
-  if (context.audioMetadata?.duplicateKind) {
-    return makeDraft(context, {
-      confidence: context.audioMetadata.duplicateConfidence ?? 0.68,
-      explanation:
-        "The Librarian noticed this recording may match another audio file. This is only a review prompt; nothing should be deleted automatically.",
-      suggestionType: "POSSIBLE_DUPLICATE",
-      title: "Review as a possible duplicate recording",
-      whySuggested: [
-        `Audio duplicate signal: ${context.audioMetadata.duplicateKind.replaceAll("_", " ").toLowerCase()}.`,
-        "The Bridge never deletes recordings from a duplicate suggestion.",
-      ],
-      supportingInformation: context.audioMetadata.duplicateOfScannedFileId
-        ? ["A related recording had similar audio metadata or checksum."]
-        : [],
-    });
-  }
+  const metadata = context.audioMetadata?.duplicateKind
+    ? {
+        confidence: context.audioMetadata.duplicateConfidence ?? 0.62,
+        duplicateKind: context.audioMetadata.duplicateKind,
+        duplicateOfScannedFileId:
+          context.audioMetadata.duplicateOfScannedFileId,
+        noun: "recording",
+      }
+    : context.videoMetadata?.duplicateKind
+      ? {
+          confidence: context.videoMetadata.duplicateConfidence ?? 0.62,
+          duplicateKind: context.videoMetadata.duplicateKind,
+          duplicateOfScannedFileId:
+            context.videoMetadata.duplicateOfScannedFileId,
+          noun: "video",
+        }
+      : context.imageMetadata?.duplicateKind
+        ? {
+            confidence: context.imageMetadata.duplicateConfidence ?? 0.62,
+            duplicateKind: context.imageMetadata.duplicateKind,
+            duplicateOfScannedFileId:
+              context.imageMetadata.duplicateOfScannedFileId,
+            noun: "image",
+          }
+        : null;
+  const metadataMatch = metadata?.duplicateOfScannedFileId
+    ? context.duplicateMatches.find(
+        (match) => match.scannedFileId === metadata.duplicateOfScannedFileId,
+      )
+    : null;
+  const exactMatch = context.duplicateMatches.find((match) =>
+    match.signals.some((signal) =>
+      /exact (?:content|checksum|hash)|same checksum/i.test(signal),
+    ),
+  );
+  const match = exactMatch ?? metadataMatch;
 
-  if (context.videoMetadata?.duplicateKind) {
-    return makeDraft(context, {
-      confidence: context.videoMetadata.duplicateConfidence ?? 0.68,
-      explanation:
-        "The Librarian noticed this video may match another recording. This is only a review prompt; nothing should be deleted automatically.",
-      suggestionType: "POSSIBLE_DUPLICATE",
-      title: "Review as a possible duplicate video",
-      whySuggested: [
-        `Video duplicate signal: ${context.videoMetadata.duplicateKind.replaceAll("_", " ").toLowerCase()}.`,
-        "The Bridge never deletes recordings from a duplicate suggestion.",
-      ],
-      supportingInformation: context.videoMetadata.duplicateOfScannedFileId
-        ? ["A related video had similar metadata, duration, checksum, or frame signals."]
-        : [],
-    });
-  }
-
-  if (context.imageMetadata?.duplicateKind) {
-    return makeDraft(context, {
-      confidence: context.imageMetadata.duplicateConfidence ?? 0.68,
-      explanation:
-        "The Librarian noticed this image may match another image file. This is only a review prompt; nothing should be deleted automatically.",
-      suggestionType: "POSSIBLE_DUPLICATE",
-      title: "Review as a possible duplicate image",
-      whySuggested: [
-        `Image duplicate signal: ${context.imageMetadata.duplicateKind.replaceAll("_", " ").toLowerCase()}.`,
-        "The Bridge never deletes images from a duplicate suggestion.",
-      ],
-      supportingInformation: context.imageMetadata.duplicateOfScannedFileId
-        ? ["A related image had similar metadata, checksum, or visual size signals."]
-        : [],
-    });
-  }
-
-  if (!context.checksum) {
+  if (!match) {
     return null;
   }
 
-  const duplicates = context.siblingFiles
-    .filter(
-      (file) =>
-        file.id !== context.scannedFileId &&
-        file.checksum === context.checksum &&
-        file.sizeBytes !== BigInt(0) &&
-        normalizeBridgeRelativePath(file.relativePath) !== context.currentRelativePath,
-    )
-    .slice(0, 4);
-
-  if (duplicates.length === 0) {
-    return null;
-  }
+  const noun = metadata?.noun ?? "file";
+  const duplicateKind = metadata?.duplicateKind
+    ? metadata.duplicateKind.replaceAll("_", " ").toLowerCase()
+    : "exact checksum match";
 
   return makeDraft(context, {
-    confidence: 0.92,
-    explanation:
-      "The Librarian found another scanned file with the same checksum. That makes this a possible duplicate to review, not a deletion instruction.",
+    confidence: exactMatch ? 0.98 : (metadata?.confidence ?? 0.52),
+    duplicateEvidence: [match],
+    explanation: `The Librarian found a specific ${noun} that may contain the same material. Compare both files before deciding what, if anything, to do. Nothing will be deleted automatically.`,
     suggestionType: "POSSIBLE_DUPLICATE",
-    title: "Review as a possible duplicate",
+    title:
+      noun === "recording"
+        ? "Review as a possible duplicate recording"
+        : noun === "video"
+          ? "Review as a possible duplicate video"
+          : noun === "image"
+            ? "Review as a possible duplicate image"
+            : "Review as a possible duplicate",
     whySuggested: [
-      "A matching checksum appeared in the same scan session.",
-      "The Bridge remains read-only; this does not delete either file.",
+      `Duplicate signal: ${duplicateKind}.`,
+      "The machine suggests a comparison. Deanne decides, and neither file is deleted automatically.",
     ],
-    supportingInformation: duplicates.map(
-      (file) => `Similar file: ${file.relativePath}`,
-    ),
+    supportingInformation: [
+      `Specific file to compare: ${match.connectedLibraryName} -> ${match.relativePath}`,
+      ...match.signals,
+    ],
   });
 }
 
@@ -912,8 +937,7 @@ function imageDuplicateDraft(context: SuggestionContext) {
       (candidate) =>
         candidate.matchingFingerprint ||
         candidate.sameStem ||
-        candidate.overlap.length >= 2 ||
-        /\b(duplicate|duplicates|copy|resized|small|thumbnail)\b/.test(pathText),
+        candidate.overlap.length >= 2,
     )
     .slice(0, 4);
 
@@ -929,6 +953,25 @@ function imageDuplicateDraft(context: SuggestionContext) {
         : 0.58,
     explanation:
       "The Librarian noticed image file names or folders that may point to duplicate or resized copies. This is only a review prompt; nothing should be deleted automatically.",
+    duplicateEvidence: candidates.map((candidate) => ({
+      connectedLibraryName: context.connectedLibraryName,
+      relativePath: candidate.file.relativePath,
+      signals: [
+        candidate.matchingFingerprint ? "Matching image fingerprint." : null,
+        candidate.sameStem ? "Matching normalized filename." : null,
+        candidate.overlap.length >= 2
+          ? `Filename terms in common: ${candidate.overlap.join(", ")}.`
+          : null,
+        candidate.file.sizeBytes !== null &&
+        context.siblingFiles.find((file) => file.id === context.scannedFileId)
+          ?.sizeBytes === candidate.file.sizeBytes
+          ? "Matching file size."
+          : null,
+        /\b(resized|small|thumbnail)\b/.test(pathText)
+          ? "The current filename indicates a possible resized copy."
+          : null,
+      ].filter((signal): signal is string => Boolean(signal)),
+    })),
     suggestionType: "POSSIBLE_DUPLICATE",
     title: "Review as a possible duplicate image",
     whySuggested: [
@@ -1472,15 +1515,13 @@ function buildDrafts(context: SuggestionContext) {
     usefulDrafts.push(keepUnchangedDraft(context));
   }
 
-  return usefulDrafts
-    .sort((left, right) => {
-      if (right.confidence !== left.confidence) {
-        return right.confidence - left.confidence;
-      }
+  return usefulDrafts.sort((left, right) => {
+    if (right.confidence !== left.confidence) {
+      return right.confidence - left.confidence;
+    }
 
-      return left.title.localeCompare(right.title);
-    })
-    .slice(0, 6);
+    return left.title.localeCompare(right.title);
+  });
 }
 
 function cleanDraftPaths(draft: SuggestionDraft) {
@@ -1558,10 +1599,16 @@ function normalizeSuggestionStatus(value: string): OrganizationSuggestionStatus 
 export function summarizeOrganizationSuggestion(
   suggestion: StoredSuggestion,
 ): BridgeOrganizationSuggestionSummary {
+  const support = recommendationSupportFromJson(
+    suggestion.supportingInformation,
+  );
+
   return {
+    alternatives: support.alternatives,
     confidence: suggestion.confidence,
     createdAt: suggestion.createdAt.toISOString(),
     currentRelativePath: suggestion.currentRelativePath,
+    duplicateEvidence: support.duplicateEvidence,
     explanation: suggestion.explanation,
     id: suggestion.id,
     invalidatedAt: suggestion.invalidatedAt?.toISOString() ?? null,
@@ -1570,6 +1617,7 @@ export function summarizeOrganizationSuggestion(
     proposedRelativePath: suggestion.proposedRelativePath,
     recommendationGenerationId: suggestion.recommendationGenerationId,
     recommendationGenerationVersion: suggestion.recommendationGenerationVersion,
+    requiredFolderPaths: support.requiredFolderPaths,
     reviewedAt: suggestion.reviewedAt?.toISOString() ?? null,
     revisions: suggestion.revisions.map((revision) => ({
       context: revision.context,
@@ -1582,7 +1630,7 @@ export function summarizeOrganizationSuggestion(
     scannedFileId: suggestion.scannedFileId,
     status: normalizeSuggestionStatus(suggestion.status),
     suggestionType: normalizeSuggestionType(suggestion.suggestionType),
-    supportingInformation: asStringArray(suggestion.supportingInformation),
+    supportingInformation: support.details,
     title: suggestion.title,
     whySuggested: asStringArray(suggestion.whySuggested),
   };
@@ -1632,6 +1680,106 @@ async function refreshedScannedFileSummary(
   return scannedFileSummary(file);
 }
 
+function duplicateNameSignals(leftFileName: string, rightFileName: string) {
+  const leftStem = normalizeText(
+    path.posix.basename(leftFileName, path.posix.extname(leftFileName)),
+  );
+  const rightStem = normalizeText(
+    path.posix.basename(rightFileName, path.posix.extname(rightFileName)),
+  );
+  const overlap = [...new Set(tokenize(leftStem))].filter((term) =>
+    new Set(tokenize(rightStem)).has(term),
+  );
+
+  if (leftStem && leftStem === rightStem) {
+    return ["Matching normalized filename."];
+  }
+
+  return overlap.length >= 2
+    ? [`Filename terms in common: ${overlap.join(", ")}.`]
+    : [];
+}
+
+function duplicateSignals(
+  source: DuplicateEvidenceFile,
+  target: DuplicateEvidenceFile,
+) {
+  const signals: string[] = [];
+
+  if (
+    source.checksum?.trim() &&
+    source.checksum === target.checksum &&
+    source.sizeBytes !== BigInt(0) &&
+    target.sizeBytes !== BigInt(0)
+  ) {
+    signals.push("Exact content match: the non-empty files have the same checksum.");
+  }
+
+  if (
+    source.audioFingerprint &&
+    source.audioFingerprint === target.audioFingerprint
+  ) {
+    signals.push("Matching audio fingerprint.");
+  }
+
+  if (
+    source.videoFingerprint &&
+    source.videoFingerprint === target.videoFingerprint
+  ) {
+    signals.push("Matching video fingerprint.");
+  }
+
+  if (
+    source.imageFingerprint &&
+    source.imageFingerprint === target.imageFingerprint
+  ) {
+    signals.push("Matching image fingerprint.");
+  }
+
+  if (
+    source.sizeBytes !== null &&
+    source.sizeBytes !== BigInt(0) &&
+    source.sizeBytes === target.sizeBytes
+  ) {
+    signals.push(`Matching file size: ${source.sizeBytes.toString()} bytes.`);
+  }
+
+  if (
+    source.audioDurationSeconds !== null &&
+    target.audioDurationSeconds !== null &&
+    Math.abs(source.audioDurationSeconds - target.audioDurationSeconds) <= 3
+  ) {
+    signals.push(
+      `Similar audio duration: ${source.audioDurationSeconds.toFixed(1)} and ${target.audioDurationSeconds.toFixed(1)} seconds.`,
+    );
+  }
+
+  if (
+    source.videoDurationSeconds !== null &&
+    target.videoDurationSeconds !== null &&
+    Math.abs(source.videoDurationSeconds - target.videoDurationSeconds) <= 5
+  ) {
+    signals.push(
+      `Similar video duration: ${source.videoDurationSeconds.toFixed(1)} and ${target.videoDurationSeconds.toFixed(1)} seconds.`,
+    );
+  }
+
+  if (
+    source.width !== null &&
+    source.height !== null &&
+    target.width !== null &&
+    target.height !== null &&
+    source.width === target.width &&
+    source.height === target.height
+  ) {
+    signals.push(`Matching dimensions: ${source.width} x ${source.height}.`);
+  }
+
+  signals.push(...duplicateNameSignals(source.fileName, target.fileName));
+
+  return [...new Set(signals)];
+}
+
 async function scannedFileContext(scannedFileId: string, contentText: string) {
   const prisma = getPrismaClient();
   const scannedFile = await prisma.scannedFile.findUnique({
@@ -1656,12 +1804,14 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
           duplicateKind: true,
           duplicateOfScannedFileId: true,
           humanLabels: true,
+          height: true,
           imageFingerprint: true,
           machineLabels: true,
           privacyState: true,
           provisionalTopics: true,
           relatedSignals: true,
           summary: true,
+          width: true,
         },
       },
       videoMetadata: {
@@ -1670,12 +1820,14 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
           duplicateKind: true,
           duplicateOfScannedFileId: true,
           durationSeconds: true,
+          height: true,
           humanLabels: true,
           machineLabels: true,
           privacyState: true,
           provisionalTopics: true,
           summary: true,
           videoFingerprint: true,
+          width: true,
         },
       },
       libraryDocument: {
@@ -1694,21 +1846,33 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
       },
       scanSession: {
         include: {
+          connectedFolder: {
+            select: {
+              displayName: true,
+              id: true,
+            },
+          },
           scannedFiles: {
             select: {
               audioMetadata: {
                 select: {
                   audioFingerprint: true,
+                  durationSeconds: true,
                 },
               },
               imageMetadata: {
                 select: {
+                  height: true,
                   imageFingerprint: true,
+                  width: true,
                 },
               },
               videoMetadata: {
                 select: {
+                  durationSeconds: true,
+                  height: true,
                   videoFingerprint: true,
+                  width: true,
                 },
               },
               checksum: true,
@@ -1771,11 +1935,131 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
   });
   const memoryMatches = activeMemoryMatches(memoryEntries, analysisTerms);
   const preferredTerms = preferredTermsFromMemory(memoryEntries, analysisText);
+  const exactDuplicate = await findExactChecksumDuplicateForScannedFile(
+    scannedFile.id,
+  );
+  const duplicateTargetIds = [
+    exactDuplicate?.id,
+    scannedFile.audioMetadata?.duplicateOfScannedFileId,
+    scannedFile.imageMetadata?.duplicateOfScannedFileId,
+    scannedFile.videoMetadata?.duplicateOfScannedFileId,
+  ].filter((id): id is string => Boolean(id));
+  const duplicateTargets =
+    duplicateTargetIds.length > 0
+      ? await prisma.scannedFile.findMany({
+          select: {
+            audioMetadata: {
+              select: {
+                audioFingerprint: true,
+                durationSeconds: true,
+              },
+            },
+            checksum: true,
+            id: true,
+            imageMetadata: {
+              select: {
+                height: true,
+                imageFingerprint: true,
+                width: true,
+              },
+            },
+            relativePath: true,
+            scanSession: {
+              select: {
+                connectedFolder: {
+                  select: {
+                    displayName: true,
+                    id: true,
+                  },
+                },
+              },
+            },
+            sizeBytes: true,
+            videoMetadata: {
+              select: {
+                durationSeconds: true,
+                height: true,
+                videoFingerprint: true,
+                width: true,
+              },
+            },
+          },
+          where: {
+            id: {
+              in: duplicateTargetIds,
+            },
+          },
+        })
+      : [];
+  const sourceEvidence: DuplicateEvidenceFile = {
+    audioDurationSeconds:
+      scannedFile.audioMetadata?.durationSeconds ?? null,
+    audioFingerprint: scannedFile.audioMetadata?.audioFingerprint ?? null,
+    checksum: scannedFile.checksum,
+    connectedLibraryId: scannedFile.scanSession.connectedFolder.id,
+    connectedLibraryName: scannedFile.scanSession.connectedFolder.displayName,
+    fileName: fileNameFromRelativePath(scannedFile.relativePath),
+    height:
+      scannedFile.imageMetadata?.height ??
+      scannedFile.videoMetadata?.height ??
+      null,
+    imageFingerprint: scannedFile.imageMetadata?.imageFingerprint ?? null,
+    relativePath: scannedFile.relativePath,
+    scannedFileId: scannedFile.id,
+    sizeBytes: scannedFile.sizeBytes,
+    videoDurationSeconds:
+      scannedFile.videoMetadata?.durationSeconds ?? null,
+    videoFingerprint: scannedFile.videoMetadata?.videoFingerprint ?? null,
+    width:
+      scannedFile.imageMetadata?.width ??
+      scannedFile.videoMetadata?.width ??
+      null,
+  };
+  const duplicateMatches = duplicateTargets.flatMap((target) => {
+    if (
+      target.scanSession.connectedFolder.id === sourceEvidence.connectedLibraryId &&
+      normalizeBridgeRelativePath(target.relativePath).toLowerCase() ===
+        normalizeBridgeRelativePath(sourceEvidence.relativePath).toLowerCase()
+    ) {
+      return [];
+    }
+
+    const targetEvidence: DuplicateEvidenceFile = {
+      audioDurationSeconds: target.audioMetadata?.durationSeconds ?? null,
+      audioFingerprint: target.audioMetadata?.audioFingerprint ?? null,
+      checksum: target.checksum,
+      connectedLibraryId: target.scanSession.connectedFolder.id,
+      connectedLibraryName: target.scanSession.connectedFolder.displayName,
+      fileName: fileNameFromRelativePath(target.relativePath),
+      height: target.imageMetadata?.height ?? target.videoMetadata?.height ?? null,
+      imageFingerprint: target.imageMetadata?.imageFingerprint ?? null,
+      relativePath: target.relativePath,
+      scannedFileId: target.id,
+      sizeBytes: target.sizeBytes,
+      videoDurationSeconds: target.videoMetadata?.durationSeconds ?? null,
+      videoFingerprint: target.videoMetadata?.videoFingerprint ?? null,
+      width: target.imageMetadata?.width ?? target.videoMetadata?.width ?? null,
+    };
+    const signals = duplicateSignals(sourceEvidence, targetEvidence);
+
+    return signals.length > 0
+      ? [
+          {
+            connectedLibraryName: targetEvidence.connectedLibraryName,
+            relativePath: targetEvidence.relativePath,
+            scannedFileId: targetEvidence.scannedFileId,
+            signals,
+          },
+        ]
+      : [];
+  });
 
   return {
     checksum: scannedFile.checksum,
     contentText,
     currentRelativePath: normalizeBridgeRelativePath(scannedFile.relativePath),
+    connectedLibraryName: scannedFile.scanSession.connectedFolder.displayName,
+    duplicateMatches,
     fileName: fileNameFromRelativePath(scannedFile.relativePath),
     fileType: scannedFile.fileType,
     folderStructure: collectFolderStructure(
@@ -1824,6 +2108,7 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
           humanLabels: jsonImageHumanLabels(
             scannedFile.imageMetadata.humanLabels,
           ),
+          height: scannedFile.imageMetadata.height,
           imageFingerprint: scannedFile.imageMetadata.imageFingerprint,
           machineLabels: jsonStringArray(scannedFile.imageMetadata.machineLabels),
           privacyState: scannedFile.imageMetadata.privacyState,
@@ -1834,6 +2119,7 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
             scannedFile.imageMetadata.relatedSignals,
           ),
           summary: scannedFile.imageMetadata.summary,
+          width: scannedFile.imageMetadata.width,
         }
       : null,
     videoMetadata: scannedFile.videoMetadata
@@ -1843,6 +2129,7 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
           duplicateOfScannedFileId:
             scannedFile.videoMetadata.duplicateOfScannedFileId,
           durationSeconds: scannedFile.videoMetadata.durationSeconds,
+          height: scannedFile.videoMetadata.height,
           humanLabels: jsonVideoHumanLabels(
             scannedFile.videoMetadata.humanLabels,
           ),
@@ -1853,6 +2140,7 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
           ),
           summary: scannedFile.videoMetadata.summary,
           videoFingerprint: scannedFile.videoMetadata.videoFingerprint,
+          width: scannedFile.videoMetadata.width,
         }
       : null,
   } satisfies SuggestionContext;
@@ -1884,9 +2172,16 @@ async function persistDrafts(context: SuggestionContext, drafts: SuggestionDraft
   const suggestions: BridgeOrganizationSuggestionSummary[] = [];
   const cleanedDrafts: SuggestionDraft[] = [];
   const seenDraftSignatures = new Set<string>();
+  const reconciledDrafts = reconcileRecommendationDrafts(
+    context.currentRelativePath,
+    drafts.map(cleanDraftPaths),
+  );
+  const draftsToPersist =
+    reconciledDrafts.length > 0
+      ? reconciledDrafts
+      : [cleanDraftPaths(keepUnchangedDraft(context))];
 
-  for (const rawDraft of drafts) {
-    const draft = cleanDraftPaths(rawDraft);
+  for (const draft of draftsToPersist) {
     const signature = draftContentSignatureFor(context, draft);
 
     if (seenDraftSignatures.has(signature)) {
@@ -1979,7 +2274,9 @@ async function persistDrafts(context: SuggestionContext, drafts: SuggestionDraft
               status: "PENDING",
               suggestionKey,
               suggestionType: draft.suggestionType,
-              supportingInformation: toJsonInput(draft.supportingInformation),
+              supportingInformation: toJsonInput(
+                recommendationSupportForStorage(draft),
+              ),
               title: draft.title,
               whySuggested: toJsonInput(draft.whySuggested),
             };

@@ -987,7 +987,24 @@ export type BridgeOrganizationSuggestionRevision = {
   createdAt: string;
 };
 
+export type BridgeOrganizationSuggestionAlternative = {
+  confidence: number;
+  explanation: string;
+  proposedFileName: string | null;
+  proposedRelativePath: string | null;
+  requiredFolderPaths: string[];
+  suggestionType: OrganizationSuggestionType;
+  title: string;
+};
+
+export type BridgeOrganizationSuggestionDuplicateEvidence = {
+  connectedLibraryName: string;
+  relativePath: string;
+  signals: string[];
+};
+
 export type BridgeOrganizationSuggestionSummary = {
+  alternatives: BridgeOrganizationSuggestionAlternative[];
   id: string;
   scannedFileId: string;
   scanSessionId: string;
@@ -1005,6 +1022,8 @@ export type BridgeOrganizationSuggestionSummary = {
   recommendationGenerationVersion: string;
   invalidatedAt: string | null;
   invalidatedReason: string | null;
+  duplicateEvidence: BridgeOrganizationSuggestionDuplicateEvidence[];
+  requiredFolderPaths: string[];
   whySuggested: string[];
   supportingInformation: string[];
   revisions: BridgeOrganizationSuggestionRevision[];

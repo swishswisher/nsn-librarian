@@ -1,7 +1,7 @@
 export const legacyRecommendationGenerationId = "legacy";
 export const legacyRecommendationGenerationVersion = "legacy";
 export const currentRecommendationGenerationVersion =
-  "organization-recommendations-v2";
+  "organization-recommendations-v3";
 
 export function isCurrentRecommendationGeneration(version: string) {
   return version === currentRecommendationGenerationVersion;
