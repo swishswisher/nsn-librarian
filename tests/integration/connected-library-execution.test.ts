@@ -42,6 +42,7 @@ let clearOrganizationPlanSelection: typeof import("../../src/lib/bridge/planner"
 let executeOrganizationPlan: typeof import("../../src/lib/bridge/executor").executeOrganizationPlan;
 let previewExecutionUndo: typeof import("../../src/lib/bridge/undo").previewExecutionUndo;
 let executeExecutionUndo: typeof import("../../src/lib/bridge/undo").executeExecutionUndo;
+let findExactChecksumDuplicateForScannedFile: typeof import("../../src/lib/bridge/checksum-duplicates").findExactChecksumDuplicateForScannedFile;
 let recordChecksumDuplicateSuggestionsForSession: typeof import("../../src/lib/bridge/checksum-duplicates").recordChecksumDuplicateSuggestionsForSession;
 let resetOrganizationSuggestionDecision: typeof import("../../src/lib/bridge/organization-suggestions").resetOrganizationSuggestionDecision;
 let resetOrganizationSuggestionDecisionsForScanSession: typeof import("../../src/lib/bridge/organization-suggestions").resetOrganizationSuggestionDecisionsForScanSession;
@@ -362,6 +363,8 @@ before(async () => {
   executeExecutionUndo = undo.executeExecutionUndo;
   recordChecksumDuplicateSuggestionsForSession =
     duplicates.recordChecksumDuplicateSuggestionsForSession;
+  findExactChecksumDuplicateForScannedFile =
+    duplicates.findExactChecksumDuplicateForScannedFile;
   resetOrganizationSuggestionDecision =
     organizationSuggestions.resetOrganizationSuggestionDecision;
   resetOrganizationSuggestionDecisionsForScanSession =
@@ -547,13 +550,171 @@ test("historical scans do not mark the same physical path as its own duplicate",
 
   assert.equal(result.duplicateFiles, 0);
   assert.equal(duplicateSuggestions.length, 0);
+  assert.equal(
+    await findExactChecksumDuplicateForScannedFile(
+      scannedFileByRelativePath(
+        await prisma.scannedFile.findMany({
+          where: { sessionId: secondSession.id },
+        }),
+        "Documents/Same-File.txt",
+      ).id,
+    ),
+    null,
+  );
+});
+
+test("Bridge root aliases and hidden superseded roots cannot duplicate the same physical path", async () => {
+  const bridgeRootId = "root_historical_alias_identity";
+  const supersededRootId = "root_superseded_history_identity";
+  const relativePath = "Clients/Loose/Alice_Client_Intake.docx";
+  const checksum = "same-physical-file-checksum";
+  const canonicalLibrary = await prisma.connectedLibrary.create({
+    data: {
+      bridgeRootId,
+      displayName: "SCAN_ROOT_A_GENERAL_INBOX",
+      localPath: `bridge://${bridgeRootId}`,
+      platform: "MACOS",
+      status: "CONNECTED",
+    },
+  });
+  const historicalAlias = await prisma.connectedLibrary.create({
+    data: {
+      displayName: "SCAN_ROOT_A_GENERAL_INBOX",
+      folderFingerprint: bridgeRootId,
+      localPath: `bridge://${bridgeRootId}/historical-record`,
+      platform: "MACOS",
+      status: "CONNECTED",
+    },
+  });
+  const supersededLibrary = await prisma.connectedLibrary.create({
+    data: {
+      bridgeRootId: supersededRootId,
+      displayName: "SCAN_ROOT_A_GENERAL_INBOX",
+      folderFingerprint: supersededRootId,
+      hiddenFromActiveListAt: new Date("2026-08-15T00:00:00.000Z"),
+      isEnabled: false,
+      localPath: `bridge://${supersededRootId}`,
+      platform: "MACOS",
+      status: "HIDDEN_FROM_ACTIVE_LIST",
+    },
+  });
+  const historicalSession = await prisma.scanSession.create({
+    data: {
+      completedAt: new Date("2026-08-01T00:10:00.000Z"),
+      connectedFolderId: historicalAlias.id,
+      filesScanned: 1,
+      startedAt: new Date("2026-08-01T00:00:00.000Z"),
+      status: "COMPLETED",
+    },
+  });
+  const currentSession = await prisma.scanSession.create({
+    data: {
+      completedAt: new Date("2026-09-01T00:10:00.000Z"),
+      connectedFolderId: canonicalLibrary.id,
+      filesScanned: 1,
+      startedAt: new Date("2026-09-01T00:00:00.000Z"),
+      status: "COMPLETED",
+    },
+  });
+  const supersededSession = await prisma.scanSession.create({
+    data: {
+      completedAt: new Date("2026-08-15T00:10:00.000Z"),
+      connectedFolderId: supersededLibrary.id,
+      filesScanned: 1,
+      startedAt: new Date("2026-08-15T00:00:00.000Z"),
+      status: "COMPLETED_WITH_ERRORS",
+    },
+  });
+
+  await prisma.scannedFile.create({
+    data: {
+      checksum,
+      fileType: "DOCX",
+      localPath: `bridge://${bridgeRootId}/clients\\loose\\ALICE_CLIENT_INTAKE.docx`,
+      relativePath: "clients\\loose\\ALICE_CLIENT_INTAKE.docx",
+      sessionId: historicalSession.id,
+      sizeBytes: BigInt(512),
+    },
+  });
+  await prisma.scannedFile.create({
+    data: {
+      checksum,
+      fileType: "DOCX",
+      localPath: `bridge://${supersededRootId}/${relativePath}`,
+      relativePath,
+      sessionId: supersededSession.id,
+      sizeBytes: BigInt(512),
+    },
+  });
+  const currentFile = await prisma.scannedFile.create({
+    data: {
+      checksum,
+      fileType: "DOCX",
+      localPath: `bridge://${bridgeRootId}/${relativePath}`,
+      relativePath,
+      sessionId: currentSession.id,
+      sizeBytes: BigInt(512),
+    },
+  });
+  const staleSuggestion = await prisma.organizationSuggestion.create({
+    data: {
+      confidence: 0.98,
+      currentRelativePath: relativePath,
+      explanation: "Historical false self-duplicate fixture.",
+      recommendationGenerationId: `checksum-duplicates-${currentSession.id}`,
+      recommendationGenerationVersion: currentRecommendationGenerationVersion,
+      scannedFileId: currentFile.id,
+      scanSessionId: currentSession.id,
+      suggestionKey: "historical-alias-false-self-duplicate",
+      suggestionType: "POSSIBLE_DUPLICATE",
+      supportingInformation: [],
+      title: "Review as a possible duplicate",
+      whySuggested: [],
+    },
+  });
+
+  const result = await recordChecksumDuplicateSuggestionsForSession(
+    currentSession.id,
+  );
+  const reconciledSuggestion =
+    await prisma.organizationSuggestion.findUniqueOrThrow({
+      where: { id: staleSuggestion.id },
+    });
+
+  assert.equal(result.duplicateFiles, 0);
+  assert.equal(result.duplicateGroups, 0);
+  assert.equal(
+    await findExactChecksumDuplicateForScannedFile(currentFile.id),
+    null,
+  );
+  assert.ok(reconciledSuggestion.invalidatedAt);
+  assert.equal(reconciledSuggestion.suggestionType, "KEEP_UNCHANGED");
+  assert.equal(
+    await prisma.organizationSuggestion.count({
+      where: {
+        confidence: { gte: 0.98 },
+        invalidatedAt: null,
+        scannedFileId: currentFile.id,
+        suggestionType: "POSSIBLE_DUPLICATE",
+      },
+    }),
+    0,
+  );
 });
 
 test("non-empty checksum duplicates remain detectable within and across roots", async () => {
   const rootA = await createConnectedFixture("duplicate-root-a", {
-    "A/original.txt": "duplicate body\n",
-    "B/copy.txt": "duplicate body\n",
+    "Mixed_Loose/same-content-copy-1.txt": "duplicate body\n",
+    "Mixed_Loose/same-content-copy-2.txt": "duplicate body\n",
   });
+  const firstPath = "Mixed_Loose/same-content-copy-1.txt";
+  const secondPath = "Mixed_Loose/same-content-copy-2.txt";
+  const firstAbsolutePath = path.join(rootA.folderPath, ...firstPath.split("/"));
+  const secondAbsolutePath = path.join(rootA.folderPath, ...secondPath.split("/"));
+  const before = await Promise.all([
+    readFile(firstAbsolutePath, "utf8"),
+    readFile(secondAbsolutePath, "utf8"),
+  ]);
 
   await recordChecksumDuplicateSuggestionsForSession(rootA.session.id);
 
@@ -568,6 +729,17 @@ test("non-empty checksum duplicates remain detectable within and across roots", 
   });
 
   assert.equal(sameRootDuplicates.length, 2);
+  assert.ok(
+    sameRootDuplicates.every(
+      (suggestion) => suggestion.confidence === 0.98,
+    ),
+  );
+  assert.deepEqual(
+    sameRootDuplicates
+      .map((suggestion) => suggestion.currentRelativePath)
+      .sort(),
+    [firstPath, secondPath],
+  );
   assert.ok(
     sameRootDuplicates.every((suggestion) => {
       const evidence = recommendationSupportFromJson(
@@ -610,6 +782,13 @@ test("non-empty checksum duplicates remain detectable within and across roots", 
 
   assert.equal(sameRootDuplicates.length, 2);
   assert.equal(crossRootDuplicates.length, 1);
+  assert.deepEqual(
+    await Promise.all([
+      readFile(firstAbsolutePath, "utf8"),
+      readFile(secondAbsolutePath, "utf8"),
+    ]),
+    before,
+  );
 });
 
 test("zero-byte files do not create exact duplicates but media checksum duplicates do", async () => {

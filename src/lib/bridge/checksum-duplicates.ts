@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 
 import type { Prisma } from "@prisma/client";
 
@@ -22,11 +23,18 @@ type DuplicateCandidate = {
   scanSession: {
     connectedFolder: {
       bridgeRootId: string | null;
+      canonicalConnectedLibraryId: string | null;
       displayName: string;
+      folderFingerprint: string | null;
       id: string;
+      localPath: string;
+      platform: string;
     };
   };
 };
+
+type ConnectedRootIdentity =
+  DuplicateCandidate["scanSession"]["connectedFolder"];
 
 const exactDuplicateConfidence = 0.98;
 const reusableSnapshotStatuses = [
@@ -41,24 +49,89 @@ function jsonInput(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 }
 
-function normalizeRelativePathKey(value: string) {
-  const normalized = value.trim().replace(/\\/g, "/");
+function caseInsensitivePlatform(platform: string) {
+  return platform === "MACOS" || platform === "WINDOWS";
+}
 
-  if (!normalized) {
+function normalizeRelativePathKey(value: string, caseInsensitive: boolean) {
+  const withForwardSlashes = value.trim().replace(/\\/g, "/");
+
+  if (!withForwardSlashes) {
     return "";
   }
 
-  return normalized
-    .split("/")
-    .filter(Boolean)
-    .join("/")
-    .toLowerCase();
+  const normalized = path.posix
+    .normalize(`/${withForwardSlashes}`)
+    .replace(/^\/+/, "");
+
+  return caseInsensitive ? normalized.toLowerCase() : normalized;
 }
 
-function physicalFileIdentity(file: DuplicateCandidate) {
-  return `${file.scanSession.connectedFolder.id}\u001f${normalizeRelativePathKey(
-    file.relativePath,
-  )}`;
+function bridgeRootIdFromUri(value: string) {
+  return /^bridge:\/\/([^/]+)(?:\/.*)?$/i.exec(value.trim())?.[1] ?? null;
+}
+
+function normalizeRootPathKey(value: string, platform: string) {
+  const normalized = value
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+
+  return caseInsensitivePlatform(platform)
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+function connectedRootAliases(root: ConnectedRootIdentity) {
+  const bridgeUriRootId = bridgeRootIdFromUri(root.localPath);
+  const aliases = [
+    `library:${root.id}`,
+    root.canonicalConnectedLibraryId
+      ? `library:${root.canonicalConnectedLibraryId}`
+      : null,
+    root.bridgeRootId ? `root:${root.bridgeRootId.toLowerCase()}` : null,
+    root.folderFingerprint
+      ? `root:${root.folderFingerprint.toLowerCase()}`
+      : null,
+    bridgeUriRootId ? `root:${bridgeUriRootId.toLowerCase()}` : null,
+    bridgeUriRootId
+      ? null
+      : `path:${root.platform}:${normalizeRootPathKey(root.localPath, root.platform)}`,
+  ].filter((alias): alias is string => Boolean(alias));
+
+  return new Set(aliases);
+}
+
+function sameConnectedRoot(
+  left: ConnectedRootIdentity,
+  right: ConnectedRootIdentity,
+) {
+  const leftAliases = connectedRootAliases(left);
+
+  return [...connectedRootAliases(right)].some((alias) =>
+    leftAliases.has(alias),
+  );
+}
+
+function samePhysicalFile(
+  left: DuplicateCandidate,
+  right: DuplicateCandidate,
+) {
+  if (!sameConnectedRoot(
+    left.scanSession.connectedFolder,
+    right.scanSession.connectedFolder,
+  )) {
+    return false;
+  }
+
+  const caseInsensitive =
+    caseInsensitivePlatform(left.scanSession.connectedFolder.platform) ||
+    caseInsensitivePlatform(right.scanSession.connectedFolder.platform);
+
+  return (
+    normalizeRelativePathKey(left.relativePath, caseInsensitive) ===
+    normalizeRelativePathKey(right.relativePath, caseInsensitive)
+  );
 }
 
 function hasUsefulChecksum(file: Pick<DuplicateCandidate, "checksum" | "sizeBytes">) {
@@ -105,7 +178,7 @@ function duplicateTargetFor(file: DuplicateCandidate, group: DuplicateCandidate[
     .filter(
       (candidate) =>
         candidate.id !== file.id &&
-        physicalFileIdentity(candidate) !== physicalFileIdentity(file),
+        !samePhysicalFile(candidate, file),
     )
     .sort(
       (left, right) =>
@@ -121,7 +194,17 @@ async function comparableSessionIdsFor(scanSessionId: string) {
   const prisma = getPrismaClient();
   const session = await prisma.scanSession.findUnique({
     select: {
-      connectedFolderId: true,
+      connectedFolder: {
+        select: {
+          bridgeRootId: true,
+          canonicalConnectedLibraryId: true,
+          displayName: true,
+          folderFingerprint: true,
+          id: true,
+          localPath: true,
+          platform: true,
+        },
+      },
       id: true,
     },
     where: {
@@ -131,40 +214,71 @@ async function comparableSessionIdsFor(scanSessionId: string) {
 
   if (!session) {
     return {
-      currentConnectedFolderId: null,
       sessionIds: [] as string[],
     };
   }
 
   const otherSessions = await prisma.scanSession.findMany({
-    orderBy: [{ connectedFolderId: "asc" }, { completedAt: "desc" }, { startedAt: "desc" }],
+    orderBy: [
+      { completedAt: "desc" },
+      { startedAt: "desc" },
+      { id: "asc" },
+    ],
     select: {
-      connectedFolderId: true,
+      connectedFolder: {
+        select: {
+          bridgeRootId: true,
+          canonicalConnectedLibraryId: true,
+          displayName: true,
+          folderFingerprint: true,
+          id: true,
+          localPath: true,
+          platform: true,
+        },
+      },
       id: true,
     },
     where: {
-      connectedFolderId: {
-        not: session.connectedFolderId,
+      connectedFolder: {
+        canonicalConnectedLibraryId: null,
+        hiddenFromActiveListAt: null,
+        isEnabled: true,
+        mergedAt: null,
+        status: {
+          in: ["CONNECTED", "PAUSED", "NEEDS_ATTENTION"],
+        },
+      },
+      id: {
+        not: session.id,
       },
       status: {
         in: [...reusableSnapshotStatuses],
       },
     },
   });
-  const latestByConnectedFolder = new Map<string, string>();
+  const latestOtherRoots: typeof otherSessions = [];
 
   for (const otherSession of otherSessions) {
-    if (!latestByConnectedFolder.has(otherSession.connectedFolderId)) {
-      latestByConnectedFolder.set(
-        otherSession.connectedFolderId,
-        otherSession.id,
-      );
+    if (
+      sameConnectedRoot(
+        session.connectedFolder,
+        otherSession.connectedFolder,
+      ) ||
+      latestOtherRoots.some((latest) =>
+        sameConnectedRoot(
+          latest.connectedFolder,
+          otherSession.connectedFolder,
+        ),
+      )
+    ) {
+      continue;
     }
+
+    latestOtherRoots.push(otherSession);
   }
 
   return {
-    currentConnectedFolderId: session.connectedFolderId,
-    sessionIds: [session.id, ...latestByConnectedFolder.values()],
+    sessionIds: [session.id, ...latestOtherRoots.map((item) => item.id)],
   };
 }
 
@@ -172,18 +286,21 @@ function collapseHistoricalPhysicalFiles(
   candidates: DuplicateCandidate[],
   currentScanSessionId: string,
 ) {
-  const collapsed = new Map<string, DuplicateCandidate>();
+  const collapsed: DuplicateCandidate[] = [];
 
   for (const candidate of candidates) {
-    const identity = physicalFileIdentity(candidate);
-    const existing = collapsed.get(identity);
+    const existingIndex = collapsed.findIndex((existing) =>
+      samePhysicalFile(existing, candidate),
+    );
 
-    if (!existing || candidate.sessionId === currentScanSessionId) {
-      collapsed.set(identity, candidate);
+    if (existingIndex === -1) {
+      collapsed.push(candidate);
+    } else if (candidate.sessionId === currentScanSessionId) {
+      collapsed[existingIndex] = candidate;
     }
   }
 
-  return [...collapsed.values()];
+  return collapsed;
 }
 
 async function duplicateCandidatesForChecksums(
@@ -214,8 +331,12 @@ async function duplicateCandidatesForChecksums(
           connectedFolder: {
             select: {
               bridgeRootId: true,
+              canonicalConnectedLibraryId: true,
               displayName: true,
+              folderFingerprint: true,
               id: true,
+              localPath: true,
+              platform: true,
             },
           },
         },
@@ -259,8 +380,12 @@ export async function findExactChecksumDuplicateForScannedFile(
           connectedFolder: {
             select: {
               bridgeRootId: true,
+              canonicalConnectedLibraryId: true,
               displayName: true,
+              folderFingerprint: true,
               id: true,
+              localPath: true,
+              platform: true,
             },
           },
         },
@@ -285,7 +410,7 @@ export async function findExactChecksumDuplicateForScannedFile(
     (candidate) => candidate.checksum === file.checksum,
   );
 
-  return duplicateTargetFor(file, group);
+  return duplicateTargetFor(file, group) ?? null;
 }
 
 async function markAudioDuplicate(
