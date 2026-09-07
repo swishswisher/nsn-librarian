@@ -1076,6 +1076,7 @@ export function OrganizationSuggestionsReviewPanel({
 
                                   <p className="font-semibold text-[var(--nsn-teal-dark)]">
                                     Confidence: {formatConfidence(suggestion.confidence)}
+                                    {" | "}Evidence: {suggestion.evidenceStrength.toLowerCase()}
                                   </p>
 
                                   {suggestion.requiredFolderPaths.length > 0 ? (

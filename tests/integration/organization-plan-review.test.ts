@@ -71,6 +71,7 @@ const source = "Workshops_Unsorted/Workshop_Voice_Memo.m4a";
 function recommendationDraft(input: {
   confidence?: number;
   duplicateEvidence?: RecommendationDraft["duplicateEvidence"];
+  evidenceStrength?: RecommendationDraft["evidenceStrength"];
   proposedFileName?: string | null;
   proposedRelativePath?: string | null;
   suggestionType: OrganizationSuggestionType;
@@ -80,6 +81,7 @@ function recommendationDraft(input: {
     alternatives: [],
     confidence: input.confidence ?? 0.7,
     duplicateEvidence: input.duplicateEvidence ?? [],
+    evidenceStrength: input.evidenceStrength ?? "SUPPORTED",
     explanation: `Review ${input.title ?? input.suggestionType.toLowerCase()}.`,
     proposedFileName: input.proposedFileName ?? null,
     proposedRelativePath: input.proposedRelativePath ?? null,
@@ -367,6 +369,7 @@ test("duplicate recommendations retain a named counterpart and concrete evidence
   );
 
   assert.equal(duplicate?.confidence, 0.98);
+  assert.equal(duplicate?.evidenceStrength, "STRONG");
   assert.deepEqual(duplicate?.duplicateEvidence, duplicateEvidence);
   assert.equal(
     duplicate?.duplicateEvidence[0]?.relativePath,
@@ -423,6 +426,7 @@ test("structured recommendation evidence remains backward compatible", () => {
     alternatives: [],
     details: ["Legacy evidence."],
     duplicateEvidence: [],
+    evidenceStrength: "LIMITED",
     requiredFolderPaths: [],
   });
 
@@ -430,6 +434,7 @@ test("structured recommendation evidence remains backward compatible", () => {
     alternatives: [
       {
         confidence: 0.62,
+        evidenceStrength: "SUPPORTED",
         explanation: "Another plausible destination.",
         proposedFileName: null,
         proposedRelativePath: "Alice/intake.docx",
@@ -440,13 +445,66 @@ test("structured recommendation evidence remains backward compatible", () => {
     ],
     details: ["Reviewed evidence."],
     duplicateEvidence: [],
+    evidenceStrength: "STRONG",
     requiredFolderPaths: ["Clinical Tools"],
     version: 1,
   });
 
   assert.equal(structured.alternatives.length, 1);
+  assert.equal(structured.alternatives[0]?.evidenceStrength, "SUPPORTED");
   assert.deepEqual(structured.details, ["Reviewed evidence."]);
+  assert.equal(structured.evidenceStrength, "STRONG");
   assert.deepEqual(structured.requiredFolderPaths, ["Clinical Tools"]);
+});
+
+test("exact duplicates suppress limited organization guesses but retain independently strong destinations", () => {
+  const currentPath = "Loose/same-content-copy-2.txt";
+  const duplicateEvidence = [
+    {
+      connectedLibraryName: "Root A",
+      relativePath: "Archive/original.txt",
+      signals: [
+        "Exact content match: the non-empty files have the same checksum.",
+      ],
+    },
+  ];
+  const limited = reconcileRecommendationDrafts(currentPath, [
+    recommendationDraft({
+      confidence: 0.98,
+      duplicateEvidence,
+      suggestionType: "POSSIBLE_DUPLICATE",
+    }),
+    recommendationDraft({
+      confidence: 0.7,
+      evidenceStrength: "LIMITED",
+      proposedRelativePath: "Content/same-content-copy-2.txt",
+      suggestionType: "GROUP_WITH_FILES",
+    }),
+  ]);
+
+  assert.deepEqual(
+    limited.map((draft) => draft.suggestionType),
+    ["POSSIBLE_DUPLICATE"],
+  );
+
+  const strong = reconcileRecommendationDrafts(currentPath, [
+    recommendationDraft({
+      confidence: 0.98,
+      duplicateEvidence,
+      suggestionType: "POSSIBLE_DUPLICATE",
+    }),
+    recommendationDraft({
+      confidence: 0.76,
+      evidenceStrength: "STRONG",
+      proposedRelativePath: "Research/same-content-copy-2.txt",
+      suggestionType: "GROUP_WITH_FILES",
+    }),
+  ]);
+
+  assert.deepEqual(
+    strong.map((draft) => draft.suggestionType).sort(),
+    ["GROUP_WITH_FILES", "POSSIBLE_DUPLICATE"],
+  );
 });
 
 test("the recommendation review shows alternatives, dependencies, and duplicate evidence", async () => {

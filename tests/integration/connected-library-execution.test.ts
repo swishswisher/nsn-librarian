@@ -714,21 +714,34 @@ test("regenerating recommendations invalidates stale approvals instead of reusin
   );
 });
 
-test("generic shared words do not create executable Copy Long or Test destinations", async () => {
+test("weak lexical, filename, and extension evidence falls back to a cautious keep recommendation", async () => {
+  const longFileName = `${"carefully-described-".repeat(7)}archive-item.txt`;
   const relativePaths = [
-    "Loose/Random Thoughts.txt",
-    "Loose/large-notes-200kb.txt",
-    "Loose/invoice.final.v3.txt",
-    "Loose/Alice_Session_Notes_Test.txt",
+    "Loose/same-content-copy-2.txt",
+    "Loose/Quarterly Roadmap.txt",
+    "Loose/UPPERCASE.markdown",
+    "Loose/Résumé - Café Notes.txt",
+    `Loose/${longFileName}`,
   ];
   const fixture = await createConnectedFixture("generic-recommendations", {
-    "Copy/reference-copy.txt": "copy test long notes\n",
-    "Long/reference-long.txt": "long mixed loose notes\n",
-    "Test/reference-test.txt": "test final notes\n",
-    [relativePaths[0] as string]: "random thoughts copy long test notes\n",
-    [relativePaths[1] as string]: "large notes mixed file document test\n",
-    [relativePaths[2] as string]: "invoice final test copy document\n",
-    [relativePaths[3] as string]: "alice session notes test loose\n",
+    "Archive/Quarterly Roadmap Reference.txt":
+      "A separate account of harbor maintenance schedules.\n",
+    "Content/reference-content.txt":
+      "A glossary entry that happens to mention content.\n",
+    "Extension/markdown-extension-reference.markdown":
+      "A short note that happens to mention extension.\n",
+    "Filename/reference-filename.txt":
+      "A short note that happens to mention filename.\n",
+    [relativePaths[0] as string]:
+      "Orchard inventory distinguishes cedar baskets from woven trays.\n",
+    [relativePaths[1] as string]:
+      "Tidal measurements were recorded beside the western pier.\n",
+    [relativePaths[2] as string]:
+      "Volcanic minerals cooled beneath an ancient island ridge.\n",
+    [relativePaths[3] as string]:
+      "Hospitality profiles describe regional menus and dining customs.\n",
+    [relativePaths[4] as string]:
+      "Ceramic restoration records kiln temperature and glaze condition.\n",
   });
 
   for (const relativePath of relativePaths) {
@@ -738,33 +751,28 @@ test("generic shared words do not create executable Copy Long or Test destinatio
       file.id,
       contentText,
     );
-    const executableDestinations = result.suggestions
-      .filter(
-        (suggestion) =>
-          suggestion.suggestionType === "MOVE_FILE" ||
-          suggestion.suggestionType === "CREATE_FOLDER",
-      )
-      .map(
-        (suggestion) =>
-          suggestion.proposedRelativePath ?? suggestion.proposedFileName ?? "",
-      );
-
     assert.deepEqual(
-      executableDestinations.filter((destination) =>
-        /^(Copy|Long|Test)(\/|$)/.test(destination),
-      ),
-      [],
+      result.suggestions.map((suggestion) => suggestion.suggestionType),
+      ["KEEP_UNCHANGED"],
+    );
+    assert.equal(result.suggestions[0]?.evidenceStrength, "LIMITED");
+    assert.ok((result.suggestions[0]?.confidence ?? 1) < 0.5);
+    assert.match(
+      result.suggestions[0]?.explanation ?? "",
+      /not find enough reviewed evidence/i,
     );
   }
 });
 
-test("recommendation generation reconciles decisions without changing source files", async () => {
+test("strong content and an established Clients folder pattern can produce one grouping without changing source files", async () => {
   const source = "Clients/Loose/Alice_Client_Intake.txt";
   const originalContent =
-    "Attachment regulation clinical tools Alice client intake notes.\n";
+    "Alice client intake appointment history and contact preferences.\n";
   const fixture = await createConnectedFixture("recommendation-quality", {
-    "Alice/reference-intake.txt":
-      "Alice client intake reference and attachment notes.\n",
+    "Alice/Alice_Appointment_History.txt":
+      "Historical appointment information for Alice.\n",
+    "Alice/Alice_Client_Intake_Reference.txt":
+      "Reference details for Alice client intake.\n",
     [source]: originalContent,
   });
   const file = scannedFileByRelativePath(fixture.scannedFiles, source);
@@ -785,7 +793,17 @@ test("recommendation generation reconciles decisions without changing source fil
 
   assert.equal(before, originalContent);
   assert.equal(after, originalContent);
-  assert.ok(locationSuggestions.length <= 1);
+  assert.equal(locationSuggestions.length, 1);
+  assert.equal(locationSuggestions[0]?.suggestionType, "GROUP_WITH_FILES");
+  assert.equal(
+    locationSuggestions[0]?.proposedRelativePath,
+    "Alice/Alice_Client_Intake.txt",
+  );
+  assert.equal(locationSuggestions[0]?.evidenceStrength, "STRONG");
+  assert.match(
+    locationSuggestions[0]?.explanation ?? "",
+    /existing files under Alice/i,
+  );
   assert.equal(
     result.suggestions.some(
       (suggestion) => suggestion.suggestionType === "CREATE_FOLDER",

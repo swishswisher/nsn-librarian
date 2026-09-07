@@ -209,12 +209,17 @@ const stopWords = new Set([
   "bridge",
   "copy",
   "could",
+  "content",
   "deanne",
   "document",
   "documents",
+  "docx",
+  "extension",
   "file",
   "files",
+  "filename",
   "final",
+  "format",
   "from",
   "have",
   "item",
@@ -227,6 +232,7 @@ const stopWords = new Set([
   "loose",
   "manual",
   "memory",
+  "name",
   "mixed",
   "might",
   "notes",
@@ -239,6 +245,7 @@ const stopWords = new Set([
   "reviewed",
   "scan",
   "scanned",
+  "same",
   "session",
   "should",
   "suggest",
@@ -254,10 +261,20 @@ const stopWords = new Set([
   "thoughts",
   "through",
   "test",
+  "text",
   "with",
   "without",
   "workshop",
   "would",
+  "html",
+  "markdown",
+  "jpeg",
+  "webp",
+  "tiff",
+  "heic",
+  "heif",
+  "uppercase",
+  "lowercase",
 ]);
 
 const topicRules: TopicRule[] = [
@@ -325,6 +342,8 @@ function asStringArray(value: Prisma.JsonValue | unknown) {
 
 function normalizeText(value: string) {
   return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/['']/g, "")
     .replace(/[^a-z0-9]+/g, " ")
@@ -353,16 +372,24 @@ function rankedTerms(value: string, take = 10) {
     .map(([term]) => term);
 }
 
-function confidence(value: number) {
-  return Math.round(Math.min(Math.max(value, 0.25), 0.98) * 100) / 100;
+function semanticAnalysisText(input: {
+  contentText: string;
+  currentRelativePath: string;
+  reviewedObservationText: string[];
+}) {
+  const contentTerms = new Set(tokenize(input.contentText));
+  const pathTerms = new Set(tokenize(input.currentRelativePath));
+  const reviewedTerms = input.reviewedObservationText.flatMap((text) =>
+    tokenize(text).filter(
+      (term) => !pathTerms.has(term) || contentTerms.has(term),
+    ),
+  );
+
+  return [input.contentText, reviewedTerms.join(" ")].join(" ");
 }
 
-function titleCaseTerm(value: string) {
-  return value
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
-    .join(" ");
+function confidence(value: number) {
+  return Math.round(Math.min(Math.max(value, 0.25), 0.98) * 100) / 100;
 }
 
 function hashSuggestionKey(parts: string[]) {
@@ -510,14 +537,58 @@ function collectFolderStructure(relativePaths: string[]) {
   return [...folders].sort((left, right) => left.localeCompare(right));
 }
 
-function bestExistingFolder(rule: TopicRule, folders: string[]) {
-  const ruleTokens = new Set(tokenize(rule.folder));
+function filesUnderFolder(context: SuggestionContext, folder: string) {
+  const normalizedFolder = normalizeBridgeRelativePath(folder).toLowerCase();
+  const prefix = `${normalizedFolder}/`;
 
-  return folders.find((folder) => {
-    const folderTokens = new Set(tokenize(folder));
+  return context.siblingFiles.filter((file) => {
+    if (file.id === context.scannedFileId) {
+      return false;
+    }
 
-    return [...ruleTokens].some((token) => folderTokens.has(token));
+    const relativePath = normalizeBridgeRelativePath(
+      file.relativePath,
+    ).toLowerCase();
+
+    return relativePath.startsWith(prefix);
   });
+}
+
+function establishedFolderForRule(
+  rule: TopicRule,
+  context: SuggestionContext,
+) {
+  const normalizedRuleFolder = normalizeText(rule.folder);
+  const ruleTerms = new Set(tokenize(rule.folder));
+
+  return context.folderStructure
+    .map((folder) => {
+      const folderName = path.posix.basename(folder);
+      const folderTerms = new Set(tokenize(folderName));
+      const exactName = normalizeText(folderName) === normalizedRuleFolder;
+      const sharedTerms = [...ruleTerms].filter((term) =>
+        folderTerms.has(term),
+      );
+      const files = filesUnderFolder(context, folder);
+
+      return {
+        exactName,
+        fileCount: files.length,
+        folder,
+        sharedTerms,
+      };
+    })
+    .filter(
+      (candidate) =>
+        candidate.fileCount >= 2 &&
+        (candidate.exactName || candidate.sharedTerms.length >= 2),
+    )
+    .sort(
+      (left, right) =>
+        Number(right.exactName) - Number(left.exactName) ||
+        right.fileCount - left.fileCount ||
+        left.folder.localeCompare(right.folder),
+    )[0];
 }
 
 function textFromJson(value: Prisma.JsonValue) {
@@ -650,8 +721,12 @@ function preferredTermsFromMemory(
   return [...new Set(terms)];
 }
 
-function scoreRule(rule: TopicRule, terms: Set<string>, memoryMatches: MemoryMatch[]) {
-  const directMatches = rule.terms.filter((term) => terms.has(term));
+function scoreRule(
+  rule: TopicRule,
+  semanticTerms: Set<string>,
+  memoryMatches: MemoryMatch[],
+) {
+  const directMatches = rule.terms.filter((term) => semanticTerms.has(term));
   const memoryScore = memoryMatches.filter((memory) =>
     memory.overlap.some((term) => rule.terms.includes(term)),
   ).length;
@@ -659,26 +734,23 @@ function scoreRule(rule: TopicRule, terms: Set<string>, memoryMatches: MemoryMat
   return {
     directMatches,
     memoryScore,
-    score: directMatches.length + memoryScore,
+    score: directMatches.length * 2 + memoryScore,
   };
 }
 
 function bestRuleFor(context: SuggestionContext) {
-  const analysisTerms = new Set(
-    tokenize(
-      [
-        context.contentText.slice(0, maxAnalysisCharacters),
-        context.currentRelativePath,
-        context.reviewedObservationText.join(" "),
-        context.preferredTerms.join(" "),
-      ].join(" "),
-    ),
+  const semanticTerms = new Set(
+    tokenize(semanticAnalysisText(context)),
   );
+
+  for (const preferredTerm of context.preferredTerms) {
+    semanticTerms.add(preferredTerm);
+  }
 
   return topicRules
     .map((rule) => ({
       rule,
-      ...scoreRule(rule, analysisTerms, context.memoryMatches),
+      ...scoreRule(rule, semanticTerms, context.memoryMatches),
     }))
     .sort((left, right) => {
       if (right.score !== left.score) {
@@ -793,11 +865,13 @@ function makeDraft(
     SuggestionDraft,
     | "alternatives"
     | "duplicateEvidence"
+    | "evidenceStrength"
     | "requiredFolderPaths"
     | "supportingInformation"
   > & {
     alternatives?: SuggestionDraft["alternatives"];
     duplicateEvidence?: SuggestionDraft["duplicateEvidence"];
+    evidenceStrength?: SuggestionDraft["evidenceStrength"];
     requiredFolderPaths?: string[];
     supportingInformation?: string[];
   },
@@ -807,6 +881,7 @@ function makeDraft(
     alternatives: draft.alternatives ?? [],
     confidence: confidence(draft.confidence),
     duplicateEvidence: draft.duplicateEvidence ?? [],
+    evidenceStrength: draft.evidenceStrength ?? "LIMITED",
     requiredFolderPaths: draft.requiredFolderPaths ?? [],
     supportingInformation: [
       ...pathSupport(context),
@@ -1047,41 +1122,95 @@ function videoLabelText(context: SuggestionContext) {
     .toLowerCase();
 }
 
+function textContainsAnyTerm(value: string, terms: string[]) {
+  const availableTerms = new Set(tokenize(value));
+
+  return terms.some((term) => availableTerms.has(term));
+}
+
+function mediaMoveEvidence(
+  context: SuggestionContext,
+  terms: string[],
+  metadataText: string,
+) {
+  const contentText = [
+    context.contentText.slice(0, maxAnalysisCharacters),
+    context.reviewedObservationText.join(" "),
+  ].join(" ");
+  const contentMatch = textContainsAnyTerm(contentText, terms);
+  const metadataMatch = textContainsAnyTerm(metadataText, terms);
+  const pathMatch = textContainsAnyTerm(context.currentRelativePath, terms);
+  const sources = [contentMatch, metadataMatch, pathMatch].filter(Boolean).length;
+
+  if (sources < 2 || (!contentMatch && !metadataMatch)) {
+    return null;
+  }
+
+  return {
+    evidenceStrength:
+      contentMatch && metadataMatch ? ("STRONG" as const) : ("SUPPORTED" as const),
+    supportingInformation: [
+      contentMatch ? "The readable or reviewed content supports this category." : null,
+      metadataMatch ? "Media labels or summary support this category." : null,
+      pathMatch ? "The current filename or folder agrees with this category." : null,
+    ].filter((item): item is string => Boolean(item)),
+  };
+}
+
 function audioMoveDraft(context: SuggestionContext) {
   if (!context.audioMetadata || !isAudioFileType(context.fileType)) {
     return null;
   }
 
-  const text = audioLabelText(context);
-  const target =
-    text.includes("workshop")
-      ? {
-          folder: "Audio/Workshops",
-          title: "Consider moving this into the workshop recordings",
-          reason:
-            "This is an audio recording about a workshop, so it may belong with other workshop recordings.",
-        }
-      : text.includes("meeting")
-        ? {
-            folder: "Audio/Meetings",
-            title: "Consider moving this into meeting recordings",
-            reason: "The recording appears connected to a meeting or agenda.",
-          }
-        : text.includes("podcast")
-          ? {
-              folder: "Audio/Podcasts",
-              title: "Consider moving this into podcast recordings",
-              reason: "The recording appears connected to podcast material.",
-            }
-          : text.includes("research")
-            ? {
-                folder: "Audio/Research",
-                title: "Consider moving this into audio research",
-                reason: "The recording appears connected to research material.",
-              }
-            : null;
+  const metadataText = [
+    ...context.audioMetadata.humanLabels,
+    ...context.audioMetadata.machineLabels,
+    ...context.audioMetadata.provisionalTopics,
+    context.audioMetadata.summary,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const target = [
+    {
+      folder: "Audio/Workshops",
+      reason:
+        "The recording content and its media context both point to workshop material.",
+      terms: ["workshop"],
+      title: "Consider moving this into the workshop recordings",
+    },
+    {
+      folder: "Audio/Meetings",
+      reason:
+        "The recording content and its media context both point to a meeting or agenda.",
+      terms: ["meeting", "agenda"],
+      title: "Consider moving this into meeting recordings",
+    },
+    {
+      folder: "Audio/Podcasts",
+      reason:
+        "The recording content and its media context both point to podcast material.",
+      terms: ["podcast"],
+      title: "Consider moving this into podcast recordings",
+    },
+    {
+      folder: "Audio/Research",
+      reason:
+        "The recording content and its media context both point to research material.",
+      terms: ["research"],
+      title: "Consider moving this into audio research",
+    },
+  ]
+    .map((candidate) => ({
+      ...candidate,
+      evidence: mediaMoveEvidence(
+        context,
+        candidate.terms,
+        metadataText,
+      ),
+    }))
+    .find((candidate) => candidate.evidence !== null);
 
-  if (!target) {
+  if (!target?.evidence) {
     return null;
   }
 
@@ -1092,7 +1221,8 @@ function audioMoveDraft(context: SuggestionContext) {
   }
 
   return makeDraft(context, {
-    confidence: 0.61,
+    confidence: target.evidence.evidenceStrength === "STRONG" ? 0.74 : 0.64,
+    evidenceStrength: target.evidence.evidenceStrength,
     explanation: target.reason,
     proposedRelativePath: joinRelativePath(target.folder, context.fileName),
     suggestionType: "MOVE_FILE",
@@ -1101,6 +1231,7 @@ function audioMoveDraft(context: SuggestionContext) {
       target.reason,
       "Audio labels and transcript snippets are provisional until Deanne reviews them.",
     ],
+    supportingInformation: target.evidence.supportingInformation,
   });
 }
 
@@ -1145,35 +1276,55 @@ function videoMoveDraft(context: SuggestionContext) {
     return null;
   }
 
-  const text = videoLabelText(context);
-  const target =
-    text.includes("workshop")
-      ? {
-          folder: "Video/Workshops",
-          reason: "The video appears connected to workshop material.",
-          title: "Consider moving this into workshop recordings",
-        }
-      : text.includes("presentation") || text.includes("slide")
-        ? {
-            folder: "Video/Presentations",
-            reason: "The video appears connected to presentation or slide material.",
-            title: "Consider moving this into presentation recordings",
-          }
-        : text.includes("webinar")
-          ? {
-              folder: "Video/Webinars",
-              reason: "The video appears connected to webinar material.",
-              title: "Consider moving this into webinar recordings",
-            }
-          : text.includes("interview")
-            ? {
-                folder: "Video/Interviews",
-                reason: "The video appears connected to interview material.",
-                title: "Consider moving this into interview recordings",
-              }
-            : null;
+  const metadataText = [
+    ...context.videoMetadata.humanLabels,
+    ...context.videoMetadata.machineLabels,
+    ...context.videoMetadata.provisionalTopics,
+    context.videoMetadata.summary,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const target = [
+    {
+      folder: "Video/Workshops",
+      reason:
+        "The video content and its media context both point to workshop material.",
+      terms: ["workshop"],
+      title: "Consider moving this into workshop recordings",
+    },
+    {
+      folder: "Video/Presentations",
+      reason:
+        "The video content and its media context both point to presentation material.",
+      terms: ["presentation", "slide"],
+      title: "Consider moving this into presentation recordings",
+    },
+    {
+      folder: "Video/Webinars",
+      reason:
+        "The video content and its media context both point to webinar material.",
+      terms: ["webinar"],
+      title: "Consider moving this into webinar recordings",
+    },
+    {
+      folder: "Video/Interviews",
+      reason:
+        "The video content and its media context both point to interview material.",
+      terms: ["interview"],
+      title: "Consider moving this into interview recordings",
+    },
+  ]
+    .map((candidate) => ({
+      ...candidate,
+      evidence: mediaMoveEvidence(
+        context,
+        candidate.terms,
+        metadataText,
+      ),
+    }))
+    .find((candidate) => candidate.evidence !== null);
 
-  if (!target) {
+  if (!target?.evidence) {
     return null;
   }
 
@@ -1184,7 +1335,8 @@ function videoMoveDraft(context: SuggestionContext) {
   }
 
   return makeDraft(context, {
-    confidence: 0.61,
+    confidence: target.evidence.evidenceStrength === "STRONG" ? 0.74 : 0.64,
+    evidenceStrength: target.evidence.evidenceStrength,
     explanation: target.reason,
     proposedRelativePath: joinRelativePath(target.folder, context.fileName),
     suggestionType: "MOVE_FILE",
@@ -1193,6 +1345,7 @@ function videoMoveDraft(context: SuggestionContext) {
       target.reason,
       "Video labels, transcript snippets, and frame notes are provisional until Deanne reviews them.",
     ],
+    supportingInformation: target.evidence.supportingInformation,
   });
 }
 
@@ -1260,58 +1413,77 @@ function imageWebsiteCandidateDraft(context: SuggestionContext) {
 function moveAndFolderDrafts(context: SuggestionContext) {
   const best = bestRuleFor(context);
 
-  if (!best || best.score < 2) {
+  if (!best) {
     return [];
   }
 
-  const existingFolder = bestExistingFolder(best.rule, context.folderStructure);
-  const destinationFolder = existingFolder ?? best.rule.folder;
+  const establishedFolder = establishedFolderForRule(best.rule, context);
+  const hasSupportedMeaning =
+    best.directMatches.length >= 2 ||
+    (best.directMatches.length >= 1 && best.memoryScore >= 1);
+  const hasStrongMeaning =
+    best.directMatches.length >= 3 ||
+    (best.directMatches.length >= 2 && best.memoryScore >= 1);
+
+  if (
+    (!establishedFolder && !hasStrongMeaning) ||
+    (establishedFolder && !hasSupportedMeaning)
+  ) {
+    return [];
+  }
+
+  const destinationFolder = establishedFolder?.folder ?? best.rule.folder;
   const currentFolder = folderFromRelativePath(context.currentRelativePath);
   const proposedRelativePath = joinRelativePath(destinationFolder, context.fileName);
   const drafts: SuggestionDraft[] = [];
+  const matchedConcepts = best.directMatches.join(", ");
+  const folderEvidence = establishedFolder
+    ? `${establishedFolder.fileCount} existing files are already stored under ${establishedFolder.folder}.`
+    : `${matchedConcepts} appear together in the readable or reviewed content.`;
 
-  if (!existingFolder) {
+  if (!establishedFolder) {
     drafts.push(
       makeDraft(context, {
-        confidence: 0.56 + best.score * 0.04,
-        explanation:
-          "The Librarian noticed a recurring topic that does not yet have a matching folder in this scan session. This is only a plan for review.",
+        confidence: 0.68 + Math.min(best.directMatches.length, 4) * 0.02,
+        evidenceStrength: "STRONG",
+        explanation: `The readable or reviewed content repeatedly supports ${matchedConcepts}. There is no established matching folder in this scan, so creating ${best.rule.folder} is presented only as a dependency of the proposed move.`,
         proposedRelativePath: normalizeBridgeRelativePath(destinationFolder),
         suggestionType: "CREATE_FOLDER",
         title: `Consider a ${best.rule.folder} folder`,
         whySuggested: [
           best.rule.explanation,
-          `Repeated concepts: ${best.directMatches.join(", ") || best.rule.folder}`,
+          `Content concepts: ${matchedConcepts}`,
         ],
         supportingInformation: [
-          `Existing folders checked: ${
-            context.folderStructure.length > 0
-              ? context.folderStructure.slice(0, 6).join(", ")
-              : "none in this scan session"
-          }`,
+          folderEvidence,
+          "A category folder is proposed only because several related content signals agree.",
         ],
       }),
     );
   }
 
   if (normalizeText(currentFolder) !== normalizeText(destinationFolder)) {
-    const matchedConcepts =
-      best.directMatches.join(", ") || best.rule.folder.toLowerCase();
-
     drafts.push(
       makeDraft(context, {
-        confidence: 0.58 + best.score * 0.05,
-        explanation: `${best.rule.explanation} The file contains the matching terms ${matchedConcepts}, so ${destinationFolder} may be a useful location.`,
+        confidence:
+          0.68 +
+          Math.min(best.directMatches.length, 4) * 0.02 +
+          (establishedFolder ? 0.04 : 0),
+        evidenceStrength: "STRONG",
+        explanation: `The readable or reviewed content includes the related concepts ${matchedConcepts}. ${folderEvidence} Together, that evidence supports reviewing ${destinationFolder} as a destination.`,
         proposedRelativePath,
         suggestionType: "MOVE_FILE",
         title: `Consider placing this with ${best.rule.folder}`,
         whySuggested: [
           best.rule.explanation,
-          `Repeated concepts: ${best.directMatches.join(", ") || best.rule.folder}`,
+          `Content concepts: ${matchedConcepts}`,
         ],
-        supportingInformation: existingFolder
-          ? [`Matching folder already exists in this scan: ${existingFolder}`]
-          : [`Suggested folder: ${best.rule.folder}`],
+        supportingInformation: [
+          folderEvidence,
+          ...(best.memoryScore > 0
+            ? ["Approved Memory corroborates this topic classification."]
+            : []),
+        ],
       }),
     );
   }
@@ -1324,8 +1496,19 @@ function renameDraft(context: SuggestionContext, topTerms: string[]) {
     return null;
   }
 
+  const meaningfulTerms = [
+    ...new Set([...context.preferredTerms, ...topTerms]),
+  ].slice(0, 4);
+  const hasStrongEvidence =
+    topTerms.length >= 3 ||
+    (topTerms.length >= 2 && context.preferredTerms.length > 0);
+
+  if (topTerms.length < 2) {
+    return null;
+  }
+
   const proposedFileName = proposedFileNameFromTerms(
-    [...context.preferredTerms, ...topTerms],
+    meaningfulTerms,
     context.fileName,
   );
 
@@ -1334,15 +1517,15 @@ function renameDraft(context: SuggestionContext, topTerms: string[]) {
   }
 
   return makeDraft(context, {
-    confidence: 0.62,
-    explanation:
-      "The current file name looks generic. The Librarian can suggest a clearer name, but Deanne decides whether it is right.",
+    confidence: hasStrongEvidence ? 0.69 : 0.58,
+    evidenceStrength: hasStrongEvidence ? "STRONG" : "SUPPORTED",
+    explanation: `The current filename is generic, while the readable or reviewed content repeatedly emphasizes ${meaningfulTerms.join(", ")}. Those content-derived terms support reviewing a clearer name.`,
     proposedFileName,
     suggestionType: "RENAME_FILE",
     title: `Consider renaming this file to ${proposedFileName}`,
     whySuggested: [
       "The current file name does not describe the contents clearly.",
-      `Readable terms noticed: ${topTerms.slice(0, 4).join(", ")}`,
+      `Content-derived terms: ${meaningfulTerms.join(", ")}`,
     ],
   });
 }
@@ -1357,12 +1540,7 @@ function websiteCandidateDraft(context: SuggestionContext) {
   }
 
   const analysisTerms = new Set(
-    tokenize(
-      [
-        context.contentText.slice(0, maxAnalysisCharacters),
-        context.reviewedObservationText.join(" "),
-      ].join(" "),
-    ),
+    tokenize(semanticAnalysisText(context)),
   );
   const websiteRule = topicRules.find((rule) => rule.id === "website");
   const matches = websiteRule
@@ -1388,43 +1566,109 @@ function websiteCandidateDraft(context: SuggestionContext) {
 }
 
 function groupWithFilesDraft(context: SuggestionContext, topTerms: string[]) {
-  const termSet = new Set(topTerms.slice(0, 6));
-  const similarFiles = context.siblingFiles
-    .filter((file) => file.id !== context.scannedFileId)
-    .map((file) => ({
-      file,
-      overlap: tokenize(file.relativePath).filter((term) => termSet.has(term)),
-    }))
-    .filter((entry) => entry.overlap.length > 0)
-    .slice(0, 4);
+  const semanticTerms = new Set(topTerms.slice(0, 10));
+  const sourceFileNameTerms = new Set(tokenize(context.fileName));
+  const currentFolder = normalizeText(
+    folderFromRelativePath(context.currentRelativePath),
+  );
+  const candidatesByFolder = new Map<
+    string,
+    Array<{
+      file: SuggestionContext["siblingFiles"][number];
+      overlap: string[];
+    }>
+  >();
 
-  if (similarFiles.length === 0) {
+  for (const file of context.siblingFiles) {
+    if (file.id === context.scannedFileId) {
+      continue;
+    }
+
+    const folder = folderFromRelativePath(file.relativePath);
+    const overlap = [
+      ...new Set(
+        tokenize(file.relativePath).filter((term) => semanticTerms.has(term)),
+      ),
+    ];
+
+    if (!folder || overlap.length === 0 || normalizeText(folder) === currentFolder) {
+      continue;
+    }
+
+    const entries = candidatesByFolder.get(folder) ?? [];
+
+    entries.push({ file, overlap });
+    candidatesByFolder.set(folder, entries);
+  }
+
+  const candidate = [...candidatesByFolder.entries()]
+    .map(([folder, entries]) => {
+      const sharedTerms = [
+        ...new Set(entries.flatMap((entry) => entry.overlap)),
+      ];
+      const folderTerms = new Set(tokenize(folder));
+      const filenameAgreement = sharedTerms.filter((term) =>
+        sourceFileNameTerms.has(term),
+      );
+      const folderAgreement = sharedTerms.filter((term) =>
+        folderTerms.has(term),
+      );
+      const establishedPattern =
+        entries.length >= 2 && sharedTerms.length >= 2;
+      const strongThreeWayAgreement =
+        entries.some((entry) => entry.overlap.length >= 2) &&
+        filenameAgreement.length >= 2 &&
+        folderAgreement.length >= 1;
+
+      return {
+        entries,
+        establishedPattern,
+        filenameAgreement,
+        folder,
+        folderAgreement,
+        qualifies: establishedPattern || strongThreeWayAgreement,
+        score:
+          entries.length * 4 +
+          sharedTerms.length * 2 +
+          filenameAgreement.length +
+          folderAgreement.length,
+        sharedTerms,
+        strongThreeWayAgreement,
+      };
+    })
+    .filter((entry) => entry.qualifies)
+    .sort(
+      (left, right) =>
+        right.score - left.score || left.folder.localeCompare(right.folder),
+    )[0];
+
+  if (!candidate) {
     return null;
   }
 
-  const groupName = titleCaseTerm(similarFiles[0]?.overlap[0] ?? topTerms[0] ?? "Related");
-  const sharedTerms = [
-    ...new Set(similarFiles.flatMap((entry) => entry.overlap)),
-  ].slice(0, 5);
-  const relatedPaths = similarFiles
+  const sharedTerms = candidate.sharedTerms.slice(0, 5);
+  const relatedPaths = candidate.entries
     .map((entry) => entry.file.relativePath)
-    .slice(0, 2);
+    .slice(0, 3);
+  const patternDescription = candidate.establishedPattern
+    ? `${candidate.entries.length} existing files under ${candidate.folder} use the same specific content concepts.`
+    : `The content, filename, and existing folder ${candidate.folder} agree on the specific concepts ${sharedTerms.join(", ")}.`;
 
   return makeDraft(context, {
-    confidence: 0.55 + Math.min(similarFiles.length, 3) * 0.05,
-    explanation: `This file shares the wording ${sharedTerms.join(", ")} with ${relatedPaths.join(
-      " and ",
-    )}, so it may be easier to find beside those related files.`,
-    proposedRelativePath: joinRelativePath(groupName, context.fileName),
+    confidence: candidate.establishedPattern ? 0.75 : 0.72,
+    evidenceStrength: "STRONG",
+    explanation: `The readable or reviewed content is about ${sharedTerms.join(", ")}. ${patternDescription} This supports reviewing that established folder as a destination.`,
+    proposedRelativePath: joinRelativePath(candidate.folder, context.fileName),
     suggestionType: "GROUP_WITH_FILES",
-    title: `Review this with related ${groupName} files`,
+    title: `Review this with related files in ${candidate.folder}`,
     whySuggested: [
-      "Other files in this scan session share visible wording or folder patterns.",
-      `Shared wording: ${sharedTerms.join(", ")}`,
+      "The proposed folder is supported by content meaning and an existing file pattern.",
+      `Specific shared concepts: ${sharedTerms.join(", ")}`,
     ],
-    supportingInformation: similarFiles.map(
-      (entry) => `Similar file or folder pattern: ${entry.file.relativePath}`,
-    ),
+    supportingInformation: [
+      patternDescription,
+      ...relatedPaths.map((relativePath) => `Relevant existing file: ${relativePath}`),
+    ],
   });
 }
 
@@ -1472,7 +1716,7 @@ function keepUnchangedDraft(context: SuggestionContext) {
   }
 
   return makeDraft(context, {
-    confidence: 0.5,
+    confidence: 0.42,
     explanation:
       "The Librarian did not find enough reviewed evidence to justify changing this file's location or name right now.",
     suggestionType: "KEEP_UNCHANGED",
@@ -1485,15 +1729,7 @@ function keepUnchangedDraft(context: SuggestionContext) {
 }
 
 function buildDrafts(context: SuggestionContext) {
-  const topTerms = rankedTerms(
-    [
-      context.contentText.slice(0, maxAnalysisCharacters),
-      context.reviewedObservationText.join(" "),
-      context.currentRelativePath,
-      context.preferredTerms.join(" "),
-    ].join(" "),
-    12,
-  );
+  const topTerms = rankedTerms(semanticAnalysisText(context), 12);
   const drafts: Array<SuggestionDraft | null> = [
     possibleDuplicateDraft(context),
     imageDuplicateDraft(context),
@@ -1609,6 +1845,7 @@ export function summarizeOrganizationSuggestion(
     createdAt: suggestion.createdAt.toISOString(),
     currentRelativePath: suggestion.currentRelativePath,
     duplicateEvidence: support.duplicateEvidence,
+    evidenceStrength: support.evidenceStrength,
     explanation: suggestion.explanation,
     id: suggestion.id,
     invalidatedAt: suggestion.invalidatedAt?.toISOString() ?? null,
@@ -1920,11 +2157,11 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
   const reviewedText = reviewedObservationText(
     scannedFile.libraryDocument.observationSessions,
   );
-  const analysisText = [
-    contentText.slice(0, maxAnalysisCharacters),
-    scannedFile.relativePath,
-    reviewedText.join(" "),
-  ].join(" ");
+  const analysisText = semanticAnalysisText({
+    contentText: contentText.slice(0, maxAnalysisCharacters),
+    currentRelativePath: scannedFile.relativePath,
+    reviewedObservationText: reviewedText,
+  });
   const analysisTerms = new Set(tokenize(analysisText));
   const memoryEntries = await prisma.memoryEntry.findMany({
     orderBy: [{ occurrenceCount: "desc" }, { lastSeen: "desc" }],

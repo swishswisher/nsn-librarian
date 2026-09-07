@@ -987,8 +987,18 @@ export type BridgeOrganizationSuggestionRevision = {
   createdAt: string;
 };
 
+export const recommendationEvidenceStrengths = [
+  "STRONG",
+  "SUPPORTED",
+  "LIMITED",
+] as const;
+
+export type RecommendationEvidenceStrength =
+  (typeof recommendationEvidenceStrengths)[number];
+
 export type BridgeOrganizationSuggestionAlternative = {
   confidence: number;
+  evidenceStrength: RecommendationEvidenceStrength;
   explanation: string;
   proposedFileName: string | null;
   proposedRelativePath: string | null;
@@ -1023,6 +1033,7 @@ export type BridgeOrganizationSuggestionSummary = {
   invalidatedAt: string | null;
   invalidatedReason: string | null;
   duplicateEvidence: BridgeOrganizationSuggestionDuplicateEvidence[];
+  evidenceStrength: RecommendationEvidenceStrength;
   requiredFolderPaths: string[];
   whySuggested: string[];
   supportingInformation: string[];

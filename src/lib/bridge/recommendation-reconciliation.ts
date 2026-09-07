@@ -1,9 +1,13 @@
 import path from "node:path";
 
-import type { OrganizationSuggestionType } from "./types";
+import type {
+  OrganizationSuggestionType,
+  RecommendationEvidenceStrength,
+} from "./types";
 
 export type RecommendationAlternative = {
   confidence: number;
+  evidenceStrength: RecommendationEvidenceStrength;
   explanation: string;
   proposedFileName: string | null;
   proposedRelativePath: string | null;
@@ -22,6 +26,7 @@ export type RecommendationDraft = {
   alternatives: RecommendationAlternative[];
   confidence: number;
   duplicateEvidence: RecommendationDuplicateMatch[];
+  evidenceStrength: RecommendationEvidenceStrength;
   explanation: string;
   proposedFileName?: string | null;
   proposedRelativePath?: string | null;
@@ -36,6 +41,7 @@ export type RecommendationSupport = {
   alternatives: RecommendationAlternative[];
   details: string[];
   duplicateEvidence: RecommendationDuplicateMatch[];
+  evidenceStrength: RecommendationEvidenceStrength;
   requiredFolderPaths: string[];
 };
 
@@ -56,6 +62,19 @@ const organizationSuggestionTypes = new Set<OrganizationSuggestionType>([
 
 function uniqueStrings(values: string[]) {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+}
+
+function evidenceStrengthRank(value: RecommendationEvidenceStrength) {
+  return value === "STRONG" ? 3 : value === "SUPPORTED" ? 2 : 1;
+}
+
+function strongestEvidenceStrength(
+  left: RecommendationEvidenceStrength,
+  right: RecommendationEvidenceStrength,
+) {
+  return evidenceStrengthRank(left) >= evidenceStrengthRank(right)
+    ? left
+    : right;
 }
 
 function normalizedPathKey(value: string | null | undefined) {
@@ -129,6 +148,7 @@ function alternativeFromDraft(
 ): RecommendationAlternative {
   return {
     confidence: draft.confidence,
+    evidenceStrength: draft.evidenceStrength,
     explanation: draft.explanation,
     proposedFileName: draft.proposedFileName ?? null,
     proposedRelativePath: draft.proposedRelativePath ?? null,
@@ -181,6 +201,10 @@ function combineMoveAndRename(
   return {
     ...location,
     confidence: Math.max(location.confidence, rename.confidence),
+    evidenceStrength: strongestEvidenceStrength(
+      location.evidenceStrength,
+      rename.evidenceStrength,
+    ),
     explanation: `${location.explanation} The current filename also appears generic, so the same reviewed change can use the clearer name ${proposedFileName}.`,
     proposedFileName,
     proposedRelativePath,
@@ -221,6 +245,18 @@ function duplicateEvidenceStrength(matches: RecommendationDuplicateMatch[]) {
   return "WEAK" as const;
 }
 
+function duplicateRecommendationEvidenceStrength(
+  matches: RecommendationDuplicateMatch[],
+): RecommendationEvidenceStrength {
+  const strength = duplicateEvidenceStrength(matches);
+
+  if (strength === "EXACT" || strength === "STRONG") {
+    return "STRONG";
+  }
+
+  return strength === "MEDIUM" ? "SUPPORTED" : "LIMITED";
+}
+
 export function calibratedDuplicateConfidence(
   proposedConfidence: number,
   matches: RecommendationDuplicateMatch[],
@@ -256,6 +292,9 @@ function reconcileDuplicates(drafts: RecommendationDraft[]) {
       ...draft,
       confidence: calibratedDuplicateConfidence(
         draft.confidence,
+        draft.duplicateEvidence,
+      ),
+      evidenceStrength: duplicateRecommendationEvidenceStrength(
         draft.duplicateEvidence,
       ),
     }));
@@ -299,6 +338,9 @@ function reconcileDuplicates(drafts: RecommendationDraft[]) {
       duplicateEvidence,
     ),
     duplicateEvidence,
+    evidenceStrength: duplicateRecommendationEvidenceStrength(
+      duplicateEvidence,
+    ),
     supportingInformation: uniqueStrings(
       concrete.flatMap((draft) => draft.supportingInformation),
     ),
@@ -336,10 +378,18 @@ export function reconcileRecommendationDrafts(
     (draft) => draft.suggestionType === "CREATE_FOLDER",
   );
   const locationDrafts = sortDrafts(
-    viable.filter((draft) => locationSuggestionTypes.has(draft.suggestionType)),
+    viable.filter(
+      (draft) =>
+        locationSuggestionTypes.has(draft.suggestionType) &&
+        draft.evidenceStrength !== "LIMITED",
+    ),
   );
   const renameDrafts = sortDrafts(
-    viable.filter((draft) => draft.suggestionType === "RENAME_FILE"),
+    viable.filter(
+      (draft) =>
+        draft.suggestionType === "RENAME_FILE" &&
+        draft.evidenceStrength !== "LIMITED",
+    ),
   );
   const duplicate = reconcileDuplicates(
     viable.filter((draft) => draft.suggestionType === "POSSIBLE_DUPLICATE"),
@@ -352,7 +402,8 @@ export function reconcileRecommendationDrafts(
   )[0];
   const primaryLocation = locationDrafts[0];
   const primaryRename = renameDrafts[0];
-  let primary = primaryLocation ?? primaryRename ?? null;
+  let primary: RecommendationDraft | null =
+    primaryLocation ?? primaryRename ?? null;
 
   if (primaryLocation && primaryRename) {
     primary = combineMoveAndRename(
@@ -360,6 +411,23 @@ export function reconcileRecommendationDrafts(
       primaryLocation,
       primaryRename,
     );
+  }
+
+  const exactDuplicateHasPrecedence = Boolean(
+    duplicate &&
+      duplicate.confidence >= 0.98 &&
+      duplicate.duplicateEvidence.some((match) =>
+        match.signals.some((signal) =>
+          /exact (?:content|checksum|hash)|same checksum/i.test(signal),
+        ),
+      ),
+  );
+
+  if (
+    exactDuplicateHasPrecedence &&
+    primary?.evidenceStrength !== "STRONG"
+  ) {
+    primary = null;
   }
 
   if (primary) {
@@ -423,6 +491,14 @@ function stringArray(value: unknown) {
     : [];
 }
 
+function evidenceStrengthValue(
+  value: unknown,
+): RecommendationEvidenceStrength {
+  return value === "STRONG" || value === "SUPPORTED" || value === "LIMITED"
+    ? value
+    : "LIMITED";
+}
+
 function alternativeArray(value: unknown): RecommendationAlternative[] {
   if (!Array.isArray(value)) {
     return [];
@@ -450,6 +526,7 @@ function alternativeArray(value: unknown): RecommendationAlternative[] {
     return [
       {
         confidence: candidate.confidence,
+        evidenceStrength: evidenceStrengthValue(candidate.evidenceStrength),
         explanation: candidate.explanation,
         proposedFileName:
           typeof candidate.proposedFileName === "string"
@@ -504,6 +581,7 @@ export function recommendationSupportFromJson(
       alternatives: [],
       details: stringArray(value),
       duplicateEvidence: [],
+      evidenceStrength: "LIMITED",
       requiredFolderPaths: [],
     };
   }
@@ -513,6 +591,7 @@ export function recommendationSupportFromJson(
       alternatives: [],
       details: [],
       duplicateEvidence: [],
+      evidenceStrength: "LIMITED",
       requiredFolderPaths: [],
     };
   }
@@ -523,6 +602,7 @@ export function recommendationSupportFromJson(
     alternatives: alternativeArray(support.alternatives),
     details: stringArray(support.details),
     duplicateEvidence: duplicateMatchArray(support.duplicateEvidence),
+    evidenceStrength: evidenceStrengthValue(support.evidenceStrength),
     requiredFolderPaths: stringArray(support.requiredFolderPaths),
   };
 }
@@ -534,13 +614,17 @@ export function recommendationSupportForStorage(
     | "duplicateEvidence"
     | "requiredFolderPaths"
     | "supportingInformation"
-  >,
+  > &
+    Partial<Pick<RecommendationDraft, "evidenceStrength">>,
 ) {
   return {
     alternatives: draft.alternatives,
     details: draft.supportingInformation,
     duplicateEvidence: draft.duplicateEvidence,
+    evidenceStrength:
+      draft.evidenceStrength ??
+      duplicateRecommendationEvidenceStrength(draft.duplicateEvidence),
     requiredFolderPaths: draft.requiredFolderPaths,
-    version: 1,
+    version: 2,
   };
 }
