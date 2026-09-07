@@ -1,6 +1,10 @@
 import { processNextBridgeScanSessionFile } from "@/lib/bridge/processing-pipeline";
 import { BridgeCloudError } from "@/lib/bridge/cloud-coordinator";
 import { ConnectedLibraryError } from "@/lib/bridge/connected-libraries";
+import {
+  OrganizationSuggestionError,
+  prepareOrganizationRecommendationRegeneration,
+} from "@/lib/bridge/organization-suggestions";
 import { queueRemoteRecommendationRegenerationForSession } from "@/lib/bridge/remote-read-commands";
 import { remoteSessionIsCloudManaged } from "@/lib/bridge/remote-scan-queue";
 
@@ -13,14 +17,21 @@ export async function POST(
 ) {
   const { sessionId } = await context.params;
   const body = (await request.json().catch(() => null)) as {
+    confirmation?: unknown;
+    regenerate?: unknown;
     retryFailed?: unknown;
     retryStartedAt?: unknown;
   } | null;
+  const regenerate = body?.regenerate === true;
+  const confirmedReviewedDecisions = body?.confirmation === "REGENERATE";
 
   try {
     if (await remoteSessionIsCloudManaged(sessionId)) {
       const result =
-        await queueRemoteRecommendationRegenerationForSession(sessionId);
+        await queueRemoteRecommendationRegenerationForSession(sessionId, {
+          confirmedReviewedDecisions,
+          regenerate,
+        });
 
       return Response.json(
         {
@@ -39,6 +50,13 @@ export async function POST(
       typeof body?.retryStartedAt === "string"
         ? new Date(body.retryStartedAt)
         : null;
+
+    if (regenerate) {
+      await prepareOrganizationRecommendationRegeneration(sessionId, {
+        confirmedReviewedDecisions,
+      });
+    }
+
     const result = await processNextBridgeScanSessionFile(sessionId, {
       includeFailed: body?.retryFailed === true,
       retryStartedAt:
@@ -55,7 +73,8 @@ export async function POST(
   } catch (error) {
     if (
       error instanceof BridgeCloudError ||
-      error instanceof ConnectedLibraryError
+      error instanceof ConnectedLibraryError ||
+      error instanceof OrganizationSuggestionError
     ) {
       return Response.json(
         {

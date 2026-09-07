@@ -883,8 +883,8 @@ test("regenerating recommendations invalidates stale approvals instead of reusin
     staleRows.every(
       (suggestion) =>
         suggestion.invalidatedAt &&
-        suggestion.reviewedAt === null &&
-        suggestion.status === "PENDING",
+        suggestion.reviewedAt !== null &&
+        suggestion.status === "APPROVED",
     ),
   );
   await assert.rejects(

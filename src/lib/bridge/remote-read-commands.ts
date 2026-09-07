@@ -9,6 +9,7 @@ import {
 import { requireScanSessionPermission } from "@/lib/bridge/connected-libraries";
 
 import { currentRecommendationGenerationVersion } from "./recommendation-generation";
+import { prepareOrganizationRecommendationRegeneration } from "./organization-suggestions";
 import {
   getBridgeScanSessionDetail,
   getBridgeScanSessionProgress,
@@ -428,6 +429,10 @@ function commandScannedFileId(command: { payload: unknown }, sessionId: string) 
 
 export async function queueRemoteRecommendationRegenerationForSession(
   sessionId: string,
+  options: {
+    confirmedReviewedDecisions?: boolean;
+    regenerate?: boolean;
+  } = {},
 ) {
   await requireScanSessionPermission(
     sessionId,
@@ -448,50 +453,6 @@ export async function queueRemoteRecommendationRegenerationForSession(
           bridgeDevice: true,
         },
       },
-      scannedFiles: {
-        orderBy: {
-          relativePath: "asc",
-        },
-        select: {
-          id: true,
-          organizationSuggestions: {
-            orderBy: {
-              invalidatedAt: "desc",
-            },
-            select: {
-              id: true,
-            },
-            take: 1,
-            where: {
-              invalidatedAt: {
-                not: null,
-              },
-              recommendationGenerationVersion:
-                currentRecommendationGenerationVersion,
-            },
-          },
-          relativePath: true,
-        },
-        where: {
-          extractionStatus: {
-            not: "FAILED",
-          },
-          organizationSuggestions: {
-            none: {
-              invalidatedAt: null,
-              recommendationGenerationVersion:
-                currentRecommendationGenerationVersion,
-            },
-          },
-          processingStage: {
-            notIn: ["FAILED", "UNSUPPORTED"],
-          },
-          readingStatus: {
-            not: "FAILED",
-          },
-          readStatus: "SUPPORTED",
-        },
-      },
     },
     where: {
       id: sessionId,
@@ -508,7 +469,34 @@ export async function queueRemoteRecommendationRegenerationForSession(
 
   const library = session.connectedFolder;
 
-  if (session.scannedFiles.length === 0) {
+  const candidateFileCount = await prisma.scannedFile.count({
+    where: {
+      extractionStatus: {
+        not: "FAILED",
+      },
+      ...(options.regenerate
+        ? {}
+        : {
+            organizationSuggestions: {
+              none: {
+                invalidatedAt: null,
+                recommendationGenerationVersion:
+                  currentRecommendationGenerationVersion,
+              },
+            },
+          }),
+      processingStage: {
+        notIn: ["FAILED", "UNSUPPORTED"],
+      },
+      readingStatus: {
+        not: "FAILED",
+      },
+      readStatus: "SUPPORTED",
+      sessionId,
+    },
+  });
+
+  if (candidateFileCount === 0) {
     await finalizeRemoteReadSessionIfComplete(sessionId);
     const progress = await getBridgeScanSessionProgress(sessionId);
 
@@ -554,6 +542,58 @@ export async function queueRemoteRecommendationRegenerationForSession(
   }
 
   await expireRemoteReadCommandsForSession(sessionId);
+
+  if (options.regenerate) {
+    await prepareOrganizationRecommendationRegeneration(sessionId, {
+      confirmedReviewedDecisions: options.confirmedReviewedDecisions,
+    });
+  }
+
+  const scannedFiles = await prisma.scannedFile.findMany({
+    orderBy: {
+      relativePath: "asc",
+    },
+    select: {
+      id: true,
+      organizationSuggestions: {
+        orderBy: {
+          invalidatedAt: "desc",
+        },
+        select: {
+          id: true,
+        },
+        take: 1,
+        where: {
+          invalidatedAt: {
+            not: null,
+          },
+          recommendationGenerationVersion:
+            currentRecommendationGenerationVersion,
+        },
+      },
+      relativePath: true,
+    },
+    where: {
+      extractionStatus: {
+        not: "FAILED",
+      },
+      organizationSuggestions: {
+        none: {
+          invalidatedAt: null,
+          recommendationGenerationVersion:
+            currentRecommendationGenerationVersion,
+        },
+      },
+      processingStage: {
+        notIn: ["FAILED", "UNSUPPORTED"],
+      },
+      readingStatus: {
+        not: "FAILED",
+      },
+      readStatus: "SUPPORTED",
+      sessionId,
+    },
+  });
 
   const readCommands = await prisma.bridgeCommand.findMany({
     orderBy: {
@@ -607,7 +647,7 @@ export async function queueRemoteRecommendationRegenerationForSession(
       },
       where: {
         id: {
-          in: session.scannedFiles.map((file) => file.id),
+          in: scannedFiles.map((file) => file.id),
         },
         sessionId,
       },
@@ -626,7 +666,7 @@ export async function queueRemoteRecommendationRegenerationForSession(
   let queuedFiles = 0;
   let alreadyQueuedFiles = 0;
 
-  for (const file of session.scannedFiles) {
+  for (const file of scannedFiles) {
     if (activeCommandFileIds.has(file.id)) {
       alreadyQueuedFiles += 1;
       continue;

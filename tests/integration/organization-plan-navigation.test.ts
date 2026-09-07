@@ -200,6 +200,33 @@ describe("Organization Plan navigation workflow", () => {
     );
   });
 
+  it("offers safe recommendation regeneration for an existing scan", () => {
+    const recommendationsPageSource = readFileSync(
+      "src/app/admin/library/scan-sessions/[sessionId]/recommendations/page.tsx",
+      "utf8",
+    );
+    const processingButtonSource = readFileSync(
+      "src/components/library/RetryAutomaticProcessingButton.tsx",
+      "utf8",
+    );
+    const processRouteSource = readFileSync(
+      "src/app/api/bridge/scan-sessions/[sessionId]/process/route.ts",
+      "utf8",
+    );
+
+    assert.match(recommendationsPageSource, /Regenerate Recommendations/);
+    assert.match(recommendationsPageSource, /does not\s+scan the Mac folder again/);
+    assert.match(recommendationsPageSource, /Earlier recommendation history/);
+    assert.match(processingButtonSource, /current recommendation logic/);
+    assert.match(processingButtonSource, /reviewed decisions/);
+    assert.match(processingButtonSource, /Nothing moves without\s+approval/);
+    assert.match(processRouteSource, /regenerate/);
+    assert.match(
+      processRouteSource,
+      /queueRemoteRecommendationRegenerationForSession/,
+    );
+  });
+
   it("keeps selector and recommendation browsing read-only and path-safe", () => {
     const source = [
       readFileSync("src/lib/bridge/organization-plan-selector.ts", "utf8"),

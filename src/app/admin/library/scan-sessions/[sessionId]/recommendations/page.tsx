@@ -36,6 +36,12 @@ function formatScanDate(value: string | null) {
   }).format(new Date(value));
 }
 
+function recommendationLogicLabel(version: string) {
+  const match = version.match(/-v(\d+)$/i);
+
+  return match ? `Current recommendation logic: version ${match[1]}` : "Current recommendation logic";
+}
+
 export default async function RecommendationsPage({
   params,
 }: RecommendationsPageProps) {
@@ -52,6 +58,8 @@ export default async function RecommendationsPage({
   );
   const recommendationCounts = organizationSuggestionCounts(data.suggestions);
   const hasRecommendations = recommendationCounts.total > 0;
+  const hasActiveRecommendations =
+    data.regeneration.activeRecommendationCount > 0;
   const canBuildPlan = recommendationCounts.eligibleForPlanning > 0;
 
   return (
@@ -134,6 +142,82 @@ export default async function RecommendationsPage({
           </div>
         </NsnCard>
 
+        {hasRecommendations ? (
+          <NsnCard className="min-w-0">
+            <div className="grid min-w-0 gap-5 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+              <div className="min-w-0">
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--nsn-warm-gray)]">
+                  {recommendationLogicLabel(
+                    data.regeneration.currentGenerationVersion,
+                  )}
+                </p>
+                <h2 className="nsn-display mt-2 break-words text-2xl text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                  Re-analyze this existing scan
+                </h2>
+                <p className="mt-2 max-w-3xl break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                  Regeneration applies the Librarian&apos;s current
+                  recommendation logic to this saved scan snapshot. It does not
+                  scan the Mac folder again and cannot move, change, or delete
+                  files.
+                </p>
+                {data.regeneration.earlierGenerationCount > 0 ? (
+                  <p className="mt-3 break-words text-sm font-semibold leading-6 text-[var(--nsn-warning)] [overflow-wrap:anywhere]">
+                    {data.regeneration.earlierGenerationCount} active
+                    recommendations were prepared with earlier logic and should
+                    be regenerated before review.
+                  </p>
+                ) : null}
+              </div>
+              <RetryAutomaticProcessingButton
+                busyLabel="Regenerating Recommendations..."
+                label="Regenerate Recommendations"
+                regenerate
+                retryFailed={false}
+                reviewedRecommendationCount={
+                  data.regeneration.reviewedRecommendationCount
+                }
+                scanSessionId={data.session.id}
+                variant="primary"
+              />
+            </div>
+          </NsnCard>
+        ) : null}
+
+        {data.regeneration.historicalRecommendationCount > 0 ? (
+          <NsnCard className="min-w-0" tone="sand">
+            <details className="group min-w-0">
+              <summary className="cursor-pointer break-words text-sm font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                Earlier recommendation history: {data.regeneration.historicalRecommendationCount}{" "}
+                retained
+              </summary>
+              <p className="mt-3 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                Earlier recommendations remain available for audit context,
+                including {data.regeneration.historicalReviewedCount}{" "}
+                reviewed decisions. They are not active and cannot enter a new
+                Organization Plan.
+              </p>
+              <div className="mt-4 grid min-w-0 gap-3">
+                {data.regeneration.history.map((generation) => (
+                  <div
+                    className="grid min-w-0 gap-1 border-t border-[var(--nsn-border)] pt-3 text-sm text-[var(--nsn-slate)] sm:grid-cols-[minmax(0,1fr)_auto]"
+                    key={generation.generationId}
+                  >
+                    <p className="break-words [overflow-wrap:anywhere]">
+                      Earlier pass from {formatScanDate(generation.createdAt)}:
+                      {" "}{generation.total} recommendations
+                    </p>
+                    <p className="break-words [overflow-wrap:anywhere]">
+                      {generation.approved} approved, {generation.modified}{" "}
+                      edited, {generation.rejected} rejected,{" "}
+                      {generation.leftUnchanged} left unchanged
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </details>
+          </NsnCard>
+        ) : null}
+
         <NsnCard tone="aqua">
           <div className="grid min-w-0 gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
             <p className="break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
@@ -187,8 +271,16 @@ export default async function RecommendationsPage({
               <div className="mx-auto grid w-full max-w-md gap-3 sm:max-w-none sm:grid-cols-[auto_auto] sm:justify-center">
                 <RetryAutomaticProcessingButton
                   busyLabel="Preparing Recommendations..."
-                  label="Generate Recommendations for This Scan"
+                  label={
+                    hasActiveRecommendations
+                      ? "Regenerate Recommendations"
+                      : "Generate Recommendations for This Scan"
+                  }
+                  regenerate={hasActiveRecommendations}
                   retryFailed={false}
+                  reviewedRecommendationCount={
+                    data.regeneration.reviewedRecommendationCount
+                  }
                   scanSessionId={data.session.id}
                   variant="primary"
                 />

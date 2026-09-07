@@ -1067,6 +1067,27 @@ export type BridgeOrganizationSuggestionMutationResponse =
   | BridgeOrganizationSuggestionFailure;
 
 export type BridgeOrganizationSuggestionReviewPageData = {
+  regeneration: {
+    activeRecommendationCount: number;
+    currentGenerationCount: number;
+    currentGenerationVersion: string;
+    earlierGenerationCount: number;
+    historicalRecommendationCount: number;
+    historicalReviewedCount: number;
+    history: Array<{
+      approved: number;
+      createdAt: string;
+      generationId: string;
+      generationVersion: string;
+      invalidatedAt: string;
+      leftUnchanged: number;
+      modified: number;
+      pending: number;
+      rejected: number;
+      total: number;
+    }>;
+    reviewedRecommendationCount: number;
+  };
   session: BridgeScanSessionSummary;
   suggestions: BridgeOrganizationSuggestionSummary[];
 };

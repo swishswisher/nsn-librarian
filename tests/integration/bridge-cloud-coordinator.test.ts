@@ -32,6 +32,7 @@ let getMonitoringDashboardData: typeof import("../../src/lib/bridge/monitor").ge
 let expireRemoteReadCommandsForSession: typeof import("../../src/lib/bridge/remote-read-commands").expireRemoteReadCommandsForSession;
 let markRemoteReadFailure: typeof import("../../src/lib/bridge/remote-read-commands").markRemoteReadFailure;
 let queueRemoteReadRetryForScannedFile: typeof import("../../src/lib/bridge/remote-read-commands").queueRemoteReadRetryForScannedFile;
+let getOrganizationSuggestionsForScanSession: typeof import("../../src/lib/bridge/organization-suggestions").getOrganizationSuggestionsForScanSession;
 let processScanSessionPost: typeof import("../../src/app/api/bridge/scan-sessions/[sessionId]/process/route").POST;
 let prisma: PrismaClient;
 let previousDatabaseUrl: string | undefined;
@@ -100,6 +101,9 @@ before(async () => {
   const commandResults = await import("../../src/lib/bridge/cloud-command-results");
   const deviceRootSync = await import("../../src/lib/bridge/device-root-sync");
   const remoteReadCommands = await import("../../src/lib/bridge/remote-read-commands");
+  const organizationSuggestions = await import(
+    "../../src/lib/bridge/organization-suggestions"
+  );
   const processRoute = await import(
     "../../src/app/api/bridge/scan-sessions/[sessionId]/process/route"
   );
@@ -131,6 +135,8 @@ before(async () => {
   markRemoteReadFailure = remoteReadCommands.markRemoteReadFailure;
   queueRemoteReadRetryForScannedFile =
     remoteReadCommands.queueRemoteReadRetryForScannedFile;
+  getOrganizationSuggestionsForScanSession =
+    organizationSuggestions.getOrganizationSuggestionsForScanSession;
   processScanSessionPost = processRoute.POST;
 });
 
@@ -447,7 +453,7 @@ test("Retry Reading on a cloud-owned scanned file queues a Bridge command instea
   );
 });
 
-test("cloud-managed recommendation regeneration queues temporary reads and completes idempotently", async () => {
+test("an existing cloud scan regenerates recommendations while preserving reviewed history", async () => {
   const firstRelativePath = "Notes/remote-regeneration-one.txt";
   const secondRelativePath = "Notes/remote-regeneration-two.txt";
   const cloud = await createCloudScannedFile({
@@ -557,17 +563,63 @@ test("cloud-managed recommendation regeneration queues temporary reads and compl
   assert.equal(observationsBefore, 2);
   assert.ok(oldRecommendations.length >= 2);
 
-  await prisma.organizationSuggestion.updateMany({
+  const reviewedAt = new Date("2026-08-30T12:00:00.000Z");
+  const reviewedRecommendation = oldRecommendations[0];
+
+  assert.ok(reviewedRecommendation);
+  await prisma.organizationSuggestion.update({
     data: {
-      invalidatedAt: new Date(),
-      invalidatedReason: "Cloud regeneration regression test.",
-      reviewedAt: null,
-      status: "PENDING",
+      reviewedAt,
+      status: "APPROVED",
     },
     where: {
-      id: {
-        in: oldRecommendations.map((suggestion) => suggestion.id),
+      id: reviewedRecommendation.id,
+    },
+  });
+
+  const unconfirmedResponse = await processScanSessionPost(
+    new Request(
+      `http://localhost/api/bridge/scan-sessions/${cloud.session.id}/process`,
+      {
+        body: JSON.stringify({ regenerate: true, retryFailed: false }),
+        headers: {
+          "Content-Type": "application/json",
+        },
+        method: "POST",
       },
+    ),
+    {
+      params: Promise.resolve({ sessionId: cloud.session.id }),
+    },
+  );
+  const unconfirmedPayload = (await unconfirmedResponse.json()) as {
+    error: string;
+    ok: boolean;
+  };
+
+  assert.equal(unconfirmedResponse.status, 409);
+  assert.equal(unconfirmedPayload.ok, false);
+  assert.match(unconfirmedPayload.error, /reviewed recommendations/i);
+  assert.equal(
+    await prisma.organizationSuggestion.count({
+      where: {
+        id: reviewedRecommendation.id,
+        invalidatedAt: null,
+        reviewedAt,
+        status: "APPROVED",
+      },
+    }),
+    1,
+  );
+  assert.equal(await prisma.bridgeCommand.count(), 2);
+
+  await prisma.bridgeDevice.update({
+    data: {
+      lastSeenAt: new Date(),
+      status: "ONLINE",
+    },
+    where: {
+      bridgeDeviceId: cloud.device.bridgeDeviceId,
     },
   });
 
@@ -575,7 +627,11 @@ test("cloud-managed recommendation regeneration queues temporary reads and compl
     new Request(
       `http://localhost/api/bridge/scan-sessions/${cloud.session.id}/process`,
       {
-        body: JSON.stringify({ retryFailed: false }),
+        body: JSON.stringify({
+          confirmation: "REGENERATE",
+          regenerate: true,
+          retryFailed: false,
+        }),
         headers: {
           "Content-Type": "application/json",
         },
@@ -630,11 +686,25 @@ test("cloud-managed recommendation regeneration queues temporary reads and compl
     assert.equal(commandPayload.actualPath, undefined);
   }
 
+  await prisma.bridgeDevice.update({
+    data: {
+      lastSeenAt: new Date(),
+      status: "ONLINE",
+    },
+    where: {
+      bridgeDeviceId: cloud.device.bridgeDeviceId,
+    },
+  });
+
   const repeatedResponse = await processScanSessionPost(
     new Request(
       `http://localhost/api/bridge/scan-sessions/${cloud.session.id}/process`,
       {
-        body: JSON.stringify({ retryFailed: false }),
+        body: JSON.stringify({
+          confirmation: "REGENERATE",
+          regenerate: true,
+          retryFailed: false,
+        }),
         headers: {
           "Content-Type": "application/json",
         },
@@ -679,6 +749,16 @@ test("cloud-managed recommendation regeneration queues temporary reads and compl
           : "A separate note about gardening dates and family receipts.",
     });
   }
+
+  await prisma.bridgeDevice.update({
+    data: {
+      lastSeenAt: new Date(),
+      status: "ONLINE",
+    },
+    where: {
+      bridgeDeviceId: cloud.device.bridgeDeviceId,
+    },
+  });
 
   const completedResponse = await processScanSessionPost(
     new Request(
@@ -740,11 +820,42 @@ test("cloud-managed recommendation regeneration queues temporary reads and compl
   assert.equal(completedPayload.progress.remainingFiles, 0);
   assert.ok(currentRecommendations.length >= 2);
   assert.ok(
+    currentRecommendations.every(
+      (suggestion) =>
+        !oldRecommendations.some(
+          (oldSuggestion) => oldSuggestion.id === suggestion.id,
+        ),
+    ),
+  );
+  assert.ok(
     storedOldRecommendations.every(
       (suggestion) => suggestion.invalidatedAt !== null,
     ),
   );
+  const storedReviewedRecommendation = storedOldRecommendations.find(
+    (suggestion) => suggestion.id === reviewedRecommendation.id,
+  );
+  const recommendationPageData =
+    await getOrganizationSuggestionsForScanSession(cloud.session.id);
+
+  assert.ok(storedReviewedRecommendation);
+  assert.equal(storedReviewedRecommendation.status, "APPROVED");
+  assert.equal(
+    storedReviewedRecommendation.reviewedAt?.toISOString(),
+    reviewedAt.toISOString(),
+  );
+  assert.ok(recommendationPageData);
+  assert.ok(
+    recommendationPageData.regeneration.historicalRecommendationCount >=
+      oldRecommendations.length,
+  );
+  assert.ok(
+    recommendationPageData.regeneration.historicalReviewedCount >= 1,
+  );
   assert.equal(observationsAfter, observationsBefore);
+  assert.equal(await prisma.scanSession.count(), 1);
+  assert.equal(await prisma.organizationPlan.count(), 0);
+  assert.equal(await prisma.executionRun.count(), 0);
   assert.equal(
     await prisma.bridgeCommand.count({
       where: {

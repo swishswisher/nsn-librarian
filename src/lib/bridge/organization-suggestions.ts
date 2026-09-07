@@ -2480,8 +2480,6 @@ async function persistDrafts(context: SuggestionContext, drafts: SuggestionDraft
           invalidatedAt: new Date(),
           invalidatedReason:
             "This recommendation was replaced by a newer recommendation generation for the same scanned file.",
-          reviewedAt: null,
-          status: "PENDING",
         },
         where: {
           invalidatedAt: null,
@@ -2657,10 +2655,6 @@ export async function getOrganizationSuggestionsForScanSession(
           },
         },
         orderBy: [{ status: "asc" }, { createdAt: "desc" }],
-        where: {
-          invalidatedAt: null,
-          recommendationGenerationVersion: currentRecommendationGenerationVersion,
-        },
       },
     },
     where: {
@@ -2672,7 +2666,101 @@ export async function getOrganizationSuggestionsForScanSession(
     return null;
   }
 
+  const activeSuggestions = session.organizationSuggestions.filter(
+    (suggestion) => suggestion.invalidatedAt === null,
+  );
+  const currentSuggestions = activeSuggestions.filter(
+    (suggestion) =>
+      isCurrentRecommendationGeneration(
+        suggestion.recommendationGenerationVersion,
+      ),
+  );
+  const historicalSuggestions = session.organizationSuggestions.filter(
+    (suggestion) => suggestion.invalidatedAt !== null,
+  );
+  const historyByGeneration = new Map<
+    string,
+    {
+      approved: number;
+      createdAt: Date;
+      generationId: string;
+      generationVersion: string;
+      invalidatedAt: Date;
+      leftUnchanged: number;
+      modified: number;
+      pending: number;
+      rejected: number;
+      total: number;
+    }
+  >();
+
+  for (const suggestion of historicalSuggestions) {
+    const existing = historyByGeneration.get(
+      suggestion.recommendationGenerationId,
+    ) ?? {
+      approved: 0,
+      createdAt: suggestion.createdAt,
+      generationId: suggestion.recommendationGenerationId,
+      generationVersion: suggestion.recommendationGenerationVersion,
+      invalidatedAt: suggestion.invalidatedAt as Date,
+      leftUnchanged: 0,
+      modified: 0,
+      pending: 0,
+      rejected: 0,
+      total: 0,
+    };
+    const status = normalizeSuggestionStatus(suggestion.status);
+
+    existing.createdAt =
+      suggestion.createdAt < existing.createdAt
+        ? suggestion.createdAt
+        : existing.createdAt;
+    existing.invalidatedAt =
+      suggestion.invalidatedAt && suggestion.invalidatedAt > existing.invalidatedAt
+        ? suggestion.invalidatedAt
+        : existing.invalidatedAt;
+    existing.total += 1;
+
+    if (status === "APPROVED") {
+      existing.approved += 1;
+    } else if (status === "MODIFIED") {
+      existing.modified += 1;
+    } else if (status === "REJECTED") {
+      existing.rejected += 1;
+    } else if (status === "LEFT_UNCHANGED") {
+      existing.leftUnchanged += 1;
+    } else {
+      existing.pending += 1;
+    }
+
+    historyByGeneration.set(suggestion.recommendationGenerationId, existing);
+  }
+
   return {
+    regeneration: {
+      activeRecommendationCount: activeSuggestions.length,
+      currentGenerationCount: currentSuggestions.length,
+      currentGenerationVersion: currentRecommendationGenerationVersion,
+      earlierGenerationCount:
+        activeSuggestions.length - currentSuggestions.length,
+      historicalRecommendationCount: historicalSuggestions.length,
+      historicalReviewedCount: historicalSuggestions.filter(
+        (suggestion) => normalizeSuggestionStatus(suggestion.status) !== "PENDING",
+      ).length,
+      history: [...historyByGeneration.values()]
+        .sort(
+          (left, right) =>
+            right.invalidatedAt.getTime() - left.invalidatedAt.getTime(),
+        )
+        .map((generation) => ({
+          ...generation,
+          createdAt: generation.createdAt.toISOString(),
+          invalidatedAt: generation.invalidatedAt.toISOString(),
+        })),
+      reviewedRecommendationCount: activeSuggestions.filter(
+        (suggestion) => normalizeSuggestionStatus(suggestion.status) !== "PENDING",
+      ).length,
+    },
     session: {
       completedAt: session.completedAt?.toISOString() ?? null,
       connectedLibraryId: session.connectedFolderId,
@@ -2695,9 +2783,81 @@ export async function getOrganizationSuggestionsForScanSession(
       totalFiles: session.filesScanned,
       unsupportedFiles: session.unsupportedFiles,
     },
-    suggestions: session.organizationSuggestions.map(
-      summarizeOrganizationSuggestion,
-    ),
+    suggestions: currentSuggestions.map(summarizeOrganizationSuggestion),
+  };
+}
+
+export async function prepareOrganizationRecommendationRegeneration(
+  scanSessionId: string,
+  options: { confirmedReviewedDecisions?: boolean } = {},
+) {
+  const prisma = getPrismaClient();
+  const normalizedScanSessionId = scanSessionId.trim();
+
+  if (!normalizedScanSessionId) {
+    throw new OrganizationSuggestionError(
+      "The Librarian could not match these recommendations to a scan session.",
+      400,
+    );
+  }
+
+  const session = await prisma.scanSession.findUnique({
+    select: {
+      id: true,
+      organizationSuggestions: {
+        select: {
+          id: true,
+          status: true,
+        },
+        where: {
+          invalidatedAt: null,
+        },
+      },
+    },
+    where: {
+      id: normalizedScanSessionId,
+    },
+  });
+
+  if (!session) {
+    throw new OrganizationSuggestionError(
+      "The Librarian could not find that scan session.",
+      404,
+    );
+  }
+
+  const reviewedRecommendationCount = session.organizationSuggestions.filter(
+    (suggestion) => normalizeSuggestionStatus(suggestion.status) !== "PENDING",
+  ).length;
+
+  if (reviewedRecommendationCount > 0 && !options.confirmedReviewedDecisions) {
+    throw new OrganizationSuggestionError(
+      "This scan has reviewed recommendations. Confirm regeneration to keep those decisions in history and prepare a new set for review.",
+      409,
+    );
+  }
+
+  const invalidatedAt = new Date();
+  const superseded = await prisma.organizationSuggestion.updateMany({
+    data: {
+      invalidatedAt,
+      invalidatedReason:
+        reviewedRecommendationCount > 0
+          ? "This recommendation was retained in history after Deanne confirmed a new recommendation pass."
+          : "This pending recommendation was superseded by a new recommendation pass.",
+    },
+    where: {
+      id: {
+        in: session.organizationSuggestions.map((suggestion) => suggestion.id),
+      },
+      invalidatedAt: null,
+      scanSessionId: normalizedScanSessionId,
+    },
+  });
+
+  return {
+    reviewedRecommendationCount,
+    supersededRecommendationCount: superseded.count,
   };
 }
 
