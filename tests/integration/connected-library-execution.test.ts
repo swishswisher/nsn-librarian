@@ -35,6 +35,7 @@ let createBridgeScanSessionFromScan: typeof import("../../src/lib/bridge/scan-se
 let readScannedFile: typeof import("../../src/lib/bridge/reader").readScannedFile;
 let createObservationSessionForScannedFileReadResult: typeof import("../../src/lib/bridge/scanned-file-observations").createObservationSessionForScannedFileReadResult;
 let generateOrganizationSuggestionsForScannedFileWithText: typeof import("../../src/lib/bridge/organization-suggestions").generateOrganizationSuggestionsForScannedFileWithText;
+let generateScanRecommendationBatch: typeof import("../../src/lib/bridge/scan-recommendation-batch").generateScanRecommendationBatch;
 let reviewOrganizationSuggestion: typeof import("../../src/lib/bridge/organization-suggestions").reviewOrganizationSuggestion;
 let generateOrganizationPlanForScanSession: typeof import("../../src/lib/bridge/planner").generateOrganizationPlanForScanSession;
 let approveOrganizationPlan: typeof import("../../src/lib/bridge/planner").approveOrganizationPlan;
@@ -341,6 +342,9 @@ before(async () => {
   const organizationSuggestions = await import(
     "../../src/lib/bridge/organization-suggestions"
   );
+  const recommendationBatch = await import(
+    "../../src/lib/bridge/scan-recommendation-batch"
+  );
 
   prisma = prismaModule.getPrismaClient();
   connectBridgeLibrary = connectedLibraries.connectBridgeLibrary;
@@ -354,6 +358,8 @@ before(async () => {
     scannedFileObservations.createObservationSessionForScannedFileReadResult;
   generateOrganizationSuggestionsForScannedFileWithText =
     organizationSuggestions.generateOrganizationSuggestionsForScannedFileWithText;
+  generateScanRecommendationBatch =
+    recommendationBatch.generateScanRecommendationBatch;
   reviewOrganizationSuggestion =
     organizationSuggestions.reviewOrganizationSuggestion;
   generateOrganizationPlanForScanSession =
@@ -944,6 +950,129 @@ test("weak lexical, filename, and extension evidence stays explicitly uncertain"
       /does not have enough evidence to recommend a change yet/i,
     );
   }
+});
+
+test("a stable batch uses provisional scan-wide understanding without trusting it as Memory", async () => {
+  const sourceFiles = {
+    "Operations_Mess/a.txt": "Invoice reference for the office.",
+    "Operations_Mess/b.txt": "Payment note for supplies.",
+    "Operations_Mess/c.txt": "Monthly expense record.",
+    "Operations_Mess/damaged.txt": "Unreadable fixture.",
+  };
+  const fixture = await createConnectedFixture(
+    "provisional-working-intelligence",
+    sourceFiles,
+  );
+  const before = await Promise.all(
+    Object.keys(sourceFiles).map((relativePath) =>
+      readFile(path.join(fixture.folderPath, ...relativePath.split("/")), "utf8"),
+    ),
+  );
+
+  for (const relativePath of Object.keys(sourceFiles).filter(
+    (item) => !item.endsWith("damaged.txt"),
+  )) {
+    const scannedFile = scannedFileByRelativePath(
+      fixture.scannedFiles,
+      relativePath,
+    );
+    const readResult = await readScannedFile(scannedFile.id);
+    const observation = await createObservationSessionForScannedFileReadResult(
+      scannedFile.id,
+      readResult,
+    );
+
+    await prisma.observationSession.update({
+      data: {
+        explanation: {
+          summary:
+            "This appears to concern financial operations, payments, invoices, and expenses.",
+        },
+        interpretations: [
+          {
+            description:
+              "Financial operations and office accounting may be the shared subject.",
+          },
+        ],
+        observations: [
+          {
+            description:
+              "The material discusses finance, payment, invoice, and expense records.",
+            evidence: ["financial operations"],
+          },
+        ],
+        status: "AWAITING_REVIEW",
+      },
+      where: { id: observation.sessionId },
+    });
+  }
+
+  const damaged = scannedFileByRelativePath(
+    fixture.scannedFiles,
+    "Operations_Mess/damaged.txt",
+  );
+  await prisma.scannedFile.update({
+    data: {
+      extractionStatus: "FAILED",
+      processingStage: "FAILED",
+      readingStatus: "FAILED",
+    },
+    where: { id: damaged.id },
+  });
+
+  const result = await generateScanRecommendationBatch(fixture.session.id, {
+    recordNotebook: false,
+  });
+  const suggestions = await prisma.organizationSuggestion.findMany({
+    orderBy: { currentRelativePath: "asc" },
+    where: {
+      invalidatedAt: null,
+      recommendationGenerationVersion: currentRecommendationGenerationVersion,
+      scanSessionId: fixture.session.id,
+    },
+  });
+  const storedDocuments = await prisma.libraryDocument.findMany({
+    where: { scannedFiles: { some: { sessionId: fixture.session.id } } },
+  });
+  const after = await Promise.all(
+    Object.keys(sourceFiles).map((relativePath) =>
+      readFile(path.join(fixture.folderPath, ...relativePath.split("/")), "utf8"),
+    ),
+  );
+
+  assert.equal(result.processedFileCount, 3);
+  assert.equal(result.failedCount, 0);
+  assert.equal(result.workingKnowledge.clusters.length, 1);
+  assert.equal(await prisma.memoryEntry.count(), 0);
+  assert.ok(
+    suggestions.every(
+      (suggestion) =>
+        suggestion.suggestionType === "MOVE_FILE" ||
+        suggestion.suggestionType === "GROUP_WITH_FILES",
+    ),
+  );
+  assert.ok(
+    suggestions.every((suggestion) =>
+      JSON.stringify(suggestion.supportingInformation).includes(
+        "Working understanding",
+      ),
+    ),
+  );
+  assert.ok(
+    suggestions.every(
+      (suggestion) =>
+        suggestion.recommendationGenerationVersion ===
+        "organization-recommendations-v5",
+    ),
+  );
+  assert.ok(storedDocuments.every((document) => document.rawText === null));
+  assert.deepEqual(after, before);
+  assert.equal(
+    await prisma.organizationSuggestion.count({
+      where: { scannedFileId: damaged.id },
+    }),
+    0,
+  );
 });
 
 test("strong content and an established Clients folder pattern can produce one grouping without changing source files", async () => {

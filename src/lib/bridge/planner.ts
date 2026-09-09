@@ -362,7 +362,7 @@ function normalizeSuggestionType(value: string): OrganizationSuggestionType {
     return value;
   }
 
-  return "KEEP_UNCHANGED";
+  return "INSUFFICIENT_EVIDENCE";
 }
 
 function organizationSuggestionCounts(

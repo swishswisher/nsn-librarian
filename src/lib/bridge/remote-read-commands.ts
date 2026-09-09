@@ -10,6 +10,7 @@ import { requireScanSessionPermission } from "@/lib/bridge/connected-libraries";
 
 import { currentRecommendationGenerationVersion } from "./recommendation-generation";
 import { prepareOrganizationRecommendationRegeneration } from "./organization-suggestions";
+import { generateScanRecommendationBatchIfReady } from "./scan-recommendation-batch";
 import {
   getBridgeScanSessionDetail,
   getBridgeScanSessionProgress,
@@ -723,48 +724,7 @@ export async function queueRemoteRecommendationRegenerationForSession(
 }
 
 async function finalizeRemoteReadSessionIfComplete(sessionId: string) {
-  const prisma = getPrismaClient();
-  const remaining = await prisma.scannedFile.count({
-    where: {
-      readStatus: "SUPPORTED",
-      sessionId,
-      processingStage: {
-        notIn: [
-          "SUGGESTIONS_GENERATED",
-          "RECOMMENDATIONS_READY",
-          "FAILED",
-          "UNSUPPORTED",
-        ],
-      },
-    },
-  });
-
-  if (remaining > 0) {
-    return;
-  }
-
-  const failedFiles = await prisma.scannedFile.count({
-    where: {
-      OR: [
-        { processingStage: "FAILED" },
-        { readStatus: "FAILED" },
-        { readingStatus: "FAILED" },
-        { extractionStatus: "FAILED" },
-      ],
-      sessionId,
-    },
-  });
-
-  await prisma.scanSession.update({
-    data: {
-      completedAt: new Date(),
-      failedFiles,
-      status: failedFiles > 0 ? "COMPLETED_WITH_ERRORS" : "COMPLETED",
-    },
-    where: {
-      id: sessionId,
-    },
-  });
+  await generateScanRecommendationBatchIfReady(sessionId);
 }
 
 export async function expireRemoteReadCommandsForSession(

@@ -18,7 +18,7 @@ import {
 } from "@/lib/bridge/cloud-coordinator";
 import { logBridgePermissionDiagnostic } from "@/lib/bridge/permission-diagnostics";
 
-import { generateOrganizationSuggestionsForScannedFileWithText } from "./organization-suggestions";
+import { generateScanRecommendationBatchIfReady } from "./scan-recommendation-batch";
 import {
   createBridgeScanSessionFromScan,
   getBridgeScanSessionDetail,
@@ -529,48 +529,6 @@ function remoteReadResult(value: unknown) {
   };
 }
 
-async function finalizeScanSessionIfComplete(sessionId: string) {
-  const prisma = getPrismaClient();
-  const remaining = await prisma.scannedFile.count({
-    where: {
-      readStatus: "SUPPORTED",
-      sessionId,
-      processingStage: {
-        notIn: [
-          "SUGGESTIONS_GENERATED",
-          "RECOMMENDATIONS_READY",
-          "FAILED",
-          "UNSUPPORTED",
-        ],
-      },
-    },
-  });
-
-  if (remaining > 0) {
-    return;
-  }
-
-  const failedFiles = await prisma.scannedFile.count({
-    where: {
-      OR: [
-        { processingStage: "FAILED" },
-        { readStatus: "FAILED" },
-        { readingStatus: "FAILED" },
-      ],
-      sessionId,
-    },
-  });
-
-  await prisma.scanSession.update({
-    data: {
-      completedAt: new Date(),
-      failedFiles,
-      status: failedFiles > 0 ? "COMPLETED_WITH_ERRORS" : "COMPLETED",
-    },
-    where: { id: sessionId },
-  });
-}
-
 async function storeRemoteReadAudioMetadata(
   scannedFileId: string,
   metadata: RemoteAudioReadMetadata,
@@ -755,27 +713,15 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
     );
   }
 
-  await prisma.scanSession.update({
-    data: {
-      status: "GENERATING_SUGGESTIONS",
-    },
-    where: {
-      id: scanSessionId,
-    },
-  });
-  const suggestions = await generateOrganizationSuggestionsForScannedFileWithText(
-    scannedFileId,
-    result.extractedText,
-  );
-  await finalizeScanSessionIfComplete(scanSessionId);
+  const batch = await generateScanRecommendationBatchIfReady(scanSessionId);
 
   return {
     characterCount: result.characterCount,
     observationPrepared: true,
     observationReused,
     scannedFileId,
-    suggestionsCreated: suggestions.createdCount,
-    suggestionsReused: suggestions.existingCount,
+    suggestionsCreated: batch?.createdCount ?? 0,
+    suggestionsReused: batch?.existingCount ?? 0,
   } satisfies BridgeJson;
 }
 
@@ -793,7 +739,7 @@ async function applyFailedRead(commandPayload: unknown, safeErrorCategory: strin
     scanSessionId,
     scannedFileId,
   });
-  await finalizeScanSessionIfComplete(scanSessionId);
+  await generateScanRecommendationBatchIfReady(scanSessionId);
 }
 
 function jsonInput(value: unknown): Prisma.InputJsonValue {

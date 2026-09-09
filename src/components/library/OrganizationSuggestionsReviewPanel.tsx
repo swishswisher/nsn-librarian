@@ -374,6 +374,10 @@ function basedOnSummary(suggestion: BridgeOrganizationSuggestionSummary) {
     .toLowerCase();
   const items: string[] = [];
 
+  if (sourceText.includes("working understanding")) {
+    items.push("provisional working understanding");
+  }
+
   if (
     suggestion.suggestionType === "GROUP_WITH_FILES" ||
     suggestion.suggestionType === "POSSIBLE_DUPLICATE" ||
@@ -383,7 +387,7 @@ function basedOnSummary(suggestion: BridgeOrganizationSuggestionSummary) {
   }
 
   if (
-    sourceText.includes("approved memory") ||
+    sourceText.includes("approved memory used") ||
     sourceText.includes("preference") ||
     sourceText.includes("preferred")
   ) {

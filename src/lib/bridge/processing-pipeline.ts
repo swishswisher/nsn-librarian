@@ -1,18 +1,11 @@
-import type { Prisma } from "@prisma/client";
-
 import { getPrismaClient } from "@/lib/db/prisma";
-import { recordScanSessionNotebookEntry } from "@/lib/library/notebook";
 import { ObservationSessionError } from "@/lib/library/observation-sessions";
 
-import {
-  generateOrganizationSuggestionsForScannedFileWithText,
-  OrganizationSuggestionError,
-} from "./organization-suggestions";
 import { requireScanSessionPermission } from "./connected-libraries";
 import { readScannedFile, BridgeReaderError } from "./reader";
 import { createObservationSessionForScannedFileReadResult } from "./scanned-file-observations";
-import { isImageFileType } from "./media-kind";
 import { currentRecommendationGenerationVersion } from "./recommendation-generation";
+import { generateScanRecommendationBatchIfReady } from "./scan-recommendation-batch";
 import {
   createBridgeScanSessionFromEnvironment,
   createBridgeScanSessionForConnectedLibrary,
@@ -46,7 +39,6 @@ const safeFileProcessingFailureMessage =
   "The Librarian could not finish processing this file safely.";
 const readingTimeoutMs = 120_000;
 const observationTimeoutMs = 35_000;
-const suggestionTimeoutMs = 25_000;
 
 function isRecommendationTerminalStage(stage: string) {
   return stage === "SUGGESTIONS_GENERATED" || stage === "RECOMMENDATIONS_READY";
@@ -108,13 +100,6 @@ function fileProcessingFailure(
   if (error instanceof ObservationSessionError) {
     return {
       category: "OBSERVATION_FAILED",
-      message: error.message,
-    };
-  }
-
-  if (error instanceof OrganizationSuggestionError) {
-    return {
-      category: "SUGGESTIONS_FAILED",
       message: error.message,
     };
   }
@@ -227,6 +212,10 @@ function fileNeedsProcessing(
     return true;
   }
 
+  if (file.processingStage === "EXAMINED") {
+    return false;
+  }
+
   if (!hasCurrentRecommendations) {
     return true;
   }
@@ -301,33 +290,6 @@ async function markFileExamined(scannedFileId: string) {
   });
 }
 
-async function markFileSuggestionsGenerated(scannedFileId: string) {
-  const prisma = getPrismaClient();
-  const scannedFile = await prisma.scannedFile.findUnique({
-    select: {
-      fileType: true,
-    },
-    where: {
-      id: scannedFileId,
-    },
-  });
-
-  await prisma.scannedFile.update({
-    data: {
-      processedAt: new Date(),
-      processingErrorCategory: null,
-      processingStage:
-        scannedFile && isImageFileType(scannedFile.fileType)
-          ? "RECOMMENDATIONS_READY"
-          : "SUGGESTIONS_GENERATED",
-      scanError: null,
-    },
-    where: {
-      id: scannedFileId,
-    },
-  });
-}
-
 async function fileAlreadyExamined(scannedFileId: string) {
   const prisma = getPrismaClient();
   const file = await prisma.scannedFile.findUnique({
@@ -349,19 +311,6 @@ async function fileAlreadyExamined(scannedFileId: string) {
   });
 
   return (file?.libraryDocument?.observationSessions.length ?? 0) > 0;
-}
-
-async function fileAlreadyHasSuggestions(scannedFileId: string) {
-  const prisma = getPrismaClient();
-  const count = await prisma.organizationSuggestion.count({
-    where: {
-      invalidatedAt: null,
-      recommendationGenerationVersion: currentRecommendationGenerationVersion,
-      scannedFileId,
-    },
-  });
-
-  return count > 0;
 }
 
 async function processOneScannedFile(sessionId: string, scannedFileId: string) {
@@ -405,136 +354,7 @@ async function processOneScannedFile(sessionId: string, scannedFileId: string) {
     return;
   }
 
-  try {
-    await updateSessionStatus(sessionId, "GENERATING_SUGGESTIONS");
-
-    if (await fileAlreadyHasSuggestions(scannedFileId)) {
-      await markFileSuggestionsGenerated(scannedFileId);
-    } else {
-      await withTimeout(
-        generateOrganizationSuggestionsForScannedFileWithText(
-          scannedFileId,
-          readResult.preview.extractedText,
-        ),
-        suggestionTimeoutMs,
-        "SUGGESTIONS_TIMEOUT",
-      );
-    }
-  } catch (error) {
-    await markFileFailure(
-      scannedFileId,
-      fileProcessingFailure(error, "SUGGESTIONS_FAILED"),
-    );
-  }
-}
-
-async function finalStatusForSession(sessionId: string) {
-  const prisma = getPrismaClient();
-  const failedFiles = await prisma.scannedFile.count({
-    where: {
-      OR: [
-        {
-          processingStage: "FAILED",
-        },
-        {
-          readStatus: "FAILED",
-        },
-        {
-          readingStatus: "FAILED",
-        },
-        {
-          extractionStatus: "FAILED",
-        },
-      ],
-      sessionId,
-    },
-  });
-
-  return {
-    failedFiles,
-    status: failedFiles > 0 ? "COMPLETED_WITH_ERRORS" : "COMPLETED",
-  } as const;
-}
-
-async function reconcileCompletedFiles(sessionId: string) {
-  const prisma = getPrismaClient();
-  const baseWhere: Prisma.ScannedFileWhereInput = {
-    organizationSuggestions: {
-      some: {
-        invalidatedAt: null,
-        recommendationGenerationVersion: currentRecommendationGenerationVersion,
-      },
-    },
-    extractionStatus: "COMPLETED",
-    processingStage: {
-      notIn: ["SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"],
-    },
-    readingStatus: "READ",
-    readStatus: "SUPPORTED",
-    sessionId,
-  };
-
-  await prisma.scannedFile.updateMany({
-    data: {
-      processedAt: new Date(),
-      processingErrorCategory: null,
-      processingStage: "RECOMMENDATIONS_READY",
-      scanError: null,
-    },
-    where: {
-      ...baseWhere,
-      fileType: {
-        startsWith: "IMAGE_",
-      },
-    },
-  });
-
-  await prisma.scannedFile.updateMany({
-    data: {
-      processedAt: new Date(),
-      processingErrorCategory: null,
-      processingStage: "SUGGESTIONS_GENERATED",
-      scanError: null,
-    },
-    where: {
-      ...baseWhere,
-      NOT: {
-        fileType: {
-          startsWith: "IMAGE_",
-        },
-      },
-    },
-  });
-}
-
-async function finalizeBridgeScanSession(
-  sessionId: string,
-  options: Pick<ProcessingOptions, "recordNotebook"> = {},
-) {
-  const prisma = getPrismaClient();
-
-  await reconcileCompletedFiles(sessionId);
-
-  const finalStatus = await finalStatusForSession(sessionId);
-
-  await prisma.scanSession.update({
-    data: {
-      completedAt: new Date(),
-      failedFiles: finalStatus.failedFiles,
-      status: finalStatus.status,
-    },
-    where: {
-      id: sessionId,
-    },
-  });
-
-  if (options.recordNotebook ?? true) {
-    try {
-      await recordScanSessionNotebookEntry(sessionId);
-    } catch {
-      // Notebook reflections should never block scan completion.
-    }
-  }
+  await markFileExamined(scannedFileId);
 }
 
 async function progressResult(
@@ -563,7 +383,9 @@ export async function processNextBridgeScanSessionFile(
   const nextFile = await nextSupportedFileForProcessing(sessionId, options);
 
   if (!nextFile) {
-    await finalizeBridgeScanSession(sessionId, options);
+    await generateScanRecommendationBatchIfReady(sessionId, {
+      recordNotebook: options.recordNotebook ?? true,
+    });
     return progressResult(sessionId);
   }
 
@@ -574,7 +396,9 @@ export async function processNextBridgeScanSessionFile(
   });
 
   if (!remainingFile) {
-    await finalizeBridgeScanSession(sessionId, options);
+    await generateScanRecommendationBatchIfReady(sessionId, {
+      recordNotebook: options.recordNotebook ?? true,
+    });
   }
 
   return progressResult(sessionId);
@@ -602,7 +426,9 @@ export async function processBridgeScanSession(
     await processOneScannedFile(sessionId, nextFile.id);
   }
 
-  await finalizeBridgeScanSession(sessionId, options);
+  await generateScanRecommendationBatchIfReady(sessionId, {
+    recordNotebook: options.recordNotebook ?? true,
+  });
 }
 
 export async function startBridgeScanSessionFromEnvironment(): Promise<ProcessingStartResult> {

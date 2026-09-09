@@ -734,7 +734,7 @@ test("an existing cloud scan regenerates recommendations while preserving review
     2,
   );
 
-  for (const command of regenerationCommands) {
+  for (const [commandIndex, command] of regenerationCommands.entries()) {
     const commandPayload = command.payload as Record<string, unknown>;
     const scannedFileId = String(commandPayload.scannedFileId);
     const relativePath = String(commandPayload.relativePath);
@@ -748,6 +748,28 @@ test("an existing cloud scan regenerates recommendations while preserving review
           ? "A calm note about home records and weekly planning."
           : "A separate note about gardening dates and family receipts.",
     });
+
+    if (commandIndex === 0) {
+      assert.equal(
+        await prisma.organizationSuggestion.count({
+          where: {
+            invalidatedAt: null,
+            recommendationGenerationVersion:
+              currentRecommendationGenerationVersion,
+            scanSessionId: cloud.session.id,
+          },
+        }),
+        0,
+      );
+      assert.equal(
+        (
+          await prisma.scanSession.findUniqueOrThrow({
+            where: { id: cloud.session.id },
+          })
+        ).status,
+        "READING",
+      );
+    }
   }
 
   await prisma.bridgeDevice.update({

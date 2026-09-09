@@ -1,0 +1,579 @@
+import path from "node:path";
+
+import type { Prisma } from "@prisma/client";
+
+import { getPrismaClient } from "@/lib/db/prisma";
+
+export type WorkingEvidenceKind =
+  | "PROVISIONAL_OBSERVATION"
+  | "TRUSTED_OBSERVATION"
+  | "APPROVED_MEMORY";
+
+export type ScanWorkingKnowledgeInputFile = {
+  connectedLibraryId: string;
+  fileType: string;
+  id: string;
+  observationSessions: Array<{
+    explanation: unknown;
+    interpretations: unknown;
+    observations: unknown;
+    observerType: string;
+    status: string;
+  }>;
+  previewText: string | null;
+  relativePath: string;
+};
+
+export type ScanWorkingKnowledgeMemory = {
+  description: string;
+  evidence: unknown;
+  id: string;
+  memoryType: string;
+  title: string;
+};
+
+export type ScanWorkingKnowledgeRelationship = {
+  confidence: number;
+  evidenceKinds: WorkingEvidenceKind[];
+  leftFileId: string;
+  rightFileId: string;
+  sharedTerms: string[];
+};
+
+export type ScanWorkingKnowledgeCluster = {
+  confidence: number;
+  id: string;
+  label: string;
+  memberFileIds: string[];
+  memberRelativePaths: string[];
+  sharedTerms: string[];
+};
+
+export type ScanWorkingKnowledgeFile = {
+  approvedMemoryEvidence: string[];
+  connectedLibraryId: string;
+  fileName: string;
+  fileType: string;
+  id: string;
+  normalizedIdentity: string;
+  provisionalWorkingEvidence: string[];
+  relativePath: string;
+  semanticPreview: string;
+  semanticTerms: string[];
+  trustedObservationEvidence: string[];
+};
+
+export type ScanWorkingKnowledgeIndex = {
+  clusters: ScanWorkingKnowledgeCluster[];
+  files: ScanWorkingKnowledgeFile[];
+  relationships: ScanWorkingKnowledgeRelationship[];
+  scanSessionId: string;
+};
+
+type WeightedTerms = Map<
+  string,
+  {
+    sources: Set<WorkingEvidenceKind | "CONTENT">;
+    weight: number;
+  }
+>;
+
+const ignoredSemanticTerms = new Set([
+  "about",
+  "after",
+  "again",
+  "also",
+  "approved",
+  "assistance",
+  "automatic",
+  "because",
+  "before",
+  "being",
+  "cautious",
+  "content",
+  "could",
+  "deanne",
+  "decision",
+  "document",
+  "documentation",
+  "evidence",
+  "file",
+  "generated",
+  "help",
+  "human",
+  "information",
+  "item",
+  "librarian",
+  "material",
+  "memory",
+  "might",
+  "needs",
+  "observation",
+  "openai",
+  "possible",
+  "present",
+  "provisional",
+  "readable",
+  "remain",
+  "related",
+  "relationship",
+  "review",
+  "signal",
+  "suggestion",
+  "summary",
+  "their",
+  "theme",
+  "there",
+  "these",
+  "thing",
+  "this",
+  "those",
+  "understanding",
+  "uncertainty",
+  "used",
+  "using",
+  "which",
+  "while",
+  "with",
+  "would",
+]);
+
+const ignoredJsonKeys = new Set([
+  "actionType",
+  "basedOnObservationIds",
+  "confidence",
+  "id",
+  "label",
+  "requiresHumanApproval",
+  "uncertainty",
+]);
+
+function normalizedText(value: string) {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function normalizedTerm(value: string) {
+  if (value.length > 4 && value.endsWith("s") && !value.endsWith("ss")) {
+    return value.slice(0, -1);
+  }
+
+  return value;
+}
+
+export function workingKnowledgeTerms(value: string) {
+  return [
+    ...new Set(
+      (normalizedText(value).match(/[a-z0-9]+/g) ?? [])
+        .map(normalizedTerm)
+        .filter(
+          (term) =>
+            term.length >= 4 &&
+            !ignoredSemanticTerms.has(term) &&
+            !/^\d+$/.test(term),
+        ),
+    ),
+  ];
+}
+
+function jsonText(value: unknown, parentKey = ""): string[] {
+  if (typeof value === "string") {
+    return ignoredJsonKeys.has(parentKey) || !value.trim() ? [] : [value.trim()];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => jsonText(item, parentKey));
+  }
+
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+
+  return Object.entries(value as Record<string, unknown>).flatMap(([key, item]) =>
+    ignoredJsonKeys.has(key) ? [] : jsonText(item, key),
+  );
+}
+
+function uniqueText(values: string[], take = 20) {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].slice(
+    0,
+    take,
+  );
+}
+
+function observationEvidence(file: ScanWorkingKnowledgeInputFile) {
+  const provisionalWorkingEvidence: string[] = [];
+  const trustedObservationEvidence: string[] = [];
+
+  for (const session of file.observationSessions) {
+    if (session.status === "REJECTED") {
+      continue;
+    }
+
+    const text = uniqueText([
+      ...jsonText(session.observations),
+      ...jsonText(session.interpretations),
+      ...jsonText(session.explanation),
+    ]);
+
+    if (session.status === "APPROVED" || session.status === "MODIFIED") {
+      trustedObservationEvidence.push(...text);
+    } else if (session.status === "AWAITING_REVIEW") {
+      provisionalWorkingEvidence.push(...text);
+    }
+  }
+
+  return {
+    provisionalWorkingEvidence: uniqueText(provisionalWorkingEvidence),
+    trustedObservationEvidence: uniqueText(trustedObservationEvidence),
+  };
+}
+
+function addWeightedTerms(
+  target: WeightedTerms,
+  values: string[],
+  source: WorkingEvidenceKind | "CONTENT",
+  weight: number,
+) {
+  for (const term of values.flatMap(workingKnowledgeTerms)) {
+    const existing = target.get(term) ?? { sources: new Set(), weight: 0 };
+    existing.sources.add(source);
+    existing.weight += weight;
+    target.set(term, existing);
+  }
+}
+
+function memoryText(memory: ScanWorkingKnowledgeMemory) {
+  return [memory.title, memory.description, ...jsonText(memory.evidence)].join(" ");
+}
+
+function matchingMemory(
+  memory: ScanWorkingKnowledgeMemory[],
+  semanticText: string,
+) {
+  const terms = new Set(workingKnowledgeTerms(semanticText));
+
+  return memory
+    .filter((entry) => workingKnowledgeTerms(memoryText(entry)).some((term) => terms.has(term)))
+    .map((entry) => `${entry.title}: ${entry.description}`)
+    .slice(0, 8);
+}
+
+function identityFor(connectedLibraryId: string, relativePath: string) {
+  const normalizedPath = path.posix
+    .normalize(relativePath.trim().replace(/\\/g, "/"))
+    .replace(/^\.\//, "")
+    .toLowerCase();
+
+  return `${connectedLibraryId}:${normalizedPath}`;
+}
+
+function evidenceKindsForSharedTerm(
+  left: WeightedTerms,
+  right: WeightedTerms,
+  term: string,
+) {
+  const kinds: WorkingEvidenceKind[] = [];
+  const leftSources = left.get(term)?.sources ?? new Set();
+  const rightSources = right.get(term)?.sources ?? new Set();
+
+  if (
+    leftSources.has("TRUSTED_OBSERVATION") &&
+    rightSources.has("TRUSTED_OBSERVATION")
+  ) {
+    kinds.push("TRUSTED_OBSERVATION");
+  } else if (
+    (leftSources.has("TRUSTED_OBSERVATION") ||
+      leftSources.has("PROVISIONAL_OBSERVATION")) &&
+    (rightSources.has("TRUSTED_OBSERVATION") ||
+      rightSources.has("PROVISIONAL_OBSERVATION"))
+  ) {
+    kinds.push("PROVISIONAL_OBSERVATION");
+  }
+
+  if (
+    leftSources.has("APPROVED_MEMORY") &&
+    rightSources.has("APPROVED_MEMORY")
+  ) {
+    kinds.push("APPROVED_MEMORY");
+  }
+
+  return kinds;
+}
+
+function relationshipConfidence(
+  left: WeightedTerms,
+  right: WeightedTerms,
+  sharedTerms: string[],
+) {
+  let score = 0;
+
+  for (const term of sharedTerms) {
+    const evidenceKinds = evidenceKindsForSharedTerm(left, right, term);
+
+    if (evidenceKinds.includes("TRUSTED_OBSERVATION")) {
+      score += 0.38;
+    } else if (evidenceKinds.includes("APPROVED_MEMORY")) {
+      score += 0.36;
+    } else if (evidenceKinds.includes("PROVISIONAL_OBSERVATION")) {
+      score += 0.28;
+    } else {
+      score += 0.14;
+    }
+  }
+
+  return Math.min(0.92, Math.round(score * 100) / 100);
+}
+
+function titleCaseTerms(terms: string[]) {
+  return terms
+    .slice(0, 3)
+    .map((term) => term.charAt(0).toUpperCase() + term.slice(1))
+    .join(" / ");
+}
+
+export function buildScanWorkingKnowledge(input: {
+  files: ScanWorkingKnowledgeInputFile[];
+  memory?: ScanWorkingKnowledgeMemory[];
+  scanSessionId: string;
+}): ScanWorkingKnowledgeIndex {
+  const memory = input.memory ?? [];
+  const weightedByFileId = new Map<string, WeightedTerms>();
+  const files = [...input.files]
+    .sort((left, right) => left.relativePath.localeCompare(right.relativePath))
+    .map((file): ScanWorkingKnowledgeFile => {
+      const evidence = observationEvidence(file);
+      const semanticText = [
+        file.previewText ?? "",
+        ...evidence.provisionalWorkingEvidence,
+        ...evidence.trustedObservationEvidence,
+      ].join(" ");
+      const approvedMemoryEvidence = matchingMemory(memory, semanticText);
+      const weightedTerms: WeightedTerms = new Map();
+
+      addWeightedTerms(weightedTerms, [file.previewText ?? ""], "CONTENT", 1);
+      addWeightedTerms(
+        weightedTerms,
+        evidence.provisionalWorkingEvidence,
+        "PROVISIONAL_OBSERVATION",
+        2,
+      );
+      addWeightedTerms(
+        weightedTerms,
+        evidence.trustedObservationEvidence,
+        "TRUSTED_OBSERVATION",
+        3,
+      );
+      addWeightedTerms(
+        weightedTerms,
+        approvedMemoryEvidence,
+        "APPROVED_MEMORY",
+        3,
+      );
+      weightedByFileId.set(file.id, weightedTerms);
+
+      return {
+        approvedMemoryEvidence,
+        connectedLibraryId: file.connectedLibraryId,
+        fileName: path.posix.basename(file.relativePath),
+        fileType: file.fileType,
+        id: file.id,
+        normalizedIdentity: identityFor(file.connectedLibraryId, file.relativePath),
+        provisionalWorkingEvidence: evidence.provisionalWorkingEvidence,
+        relativePath: file.relativePath,
+        semanticPreview: file.previewText ?? "",
+        semanticTerms: [...weightedTerms.entries()]
+          .sort(
+            (left, right) =>
+              right[1].weight - left[1].weight || left[0].localeCompare(right[0]),
+          )
+          .map(([term]) => term),
+        trustedObservationEvidence: evidence.trustedObservationEvidence,
+      };
+    });
+  const relationships: ScanWorkingKnowledgeRelationship[] = [];
+
+  for (let leftIndex = 0; leftIndex < files.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < files.length; rightIndex += 1) {
+      const left = files[leftIndex];
+      const right = files[rightIndex];
+      const leftTerms = weightedByFileId.get(left.id) ?? new Map();
+      const rightTerms = weightedByFileId.get(right.id) ?? new Map();
+      const sharedTerms = [...leftTerms.keys()]
+        .filter((term) => rightTerms.has(term))
+        .sort((a, b) => {
+          const aWeight =
+            (leftTerms.get(a)?.weight ?? 0) + (rightTerms.get(a)?.weight ?? 0);
+          const bWeight =
+            (leftTerms.get(b)?.weight ?? 0) + (rightTerms.get(b)?.weight ?? 0);
+          return bWeight - aWeight || a.localeCompare(b);
+        })
+        .slice(0, 8);
+      const evidenceKinds = [
+        ...new Set(
+          sharedTerms.flatMap((term) =>
+            evidenceKindsForSharedTerm(leftTerms, rightTerms, term),
+          ),
+        ),
+      ];
+      const confidence = relationshipConfidence(leftTerms, rightTerms, sharedTerms);
+      const hasStructuredAgreement = evidenceKinds.length > 0;
+      const qualifies =
+        (hasStructuredAgreement && confidence >= 0.45) ||
+        (sharedTerms.length >= 3 && confidence >= 0.42);
+
+      if (qualifies) {
+        relationships.push({
+          confidence,
+          evidenceKinds,
+          leftFileId: left.id,
+          rightFileId: right.id,
+          sharedTerms,
+        });
+      }
+    }
+  }
+
+  const adjacency = new Map<string, Set<string>>();
+  for (const relation of relationships) {
+    const left = adjacency.get(relation.leftFileId) ?? new Set<string>();
+    const right = adjacency.get(relation.rightFileId) ?? new Set<string>();
+    left.add(relation.rightFileId);
+    right.add(relation.leftFileId);
+    adjacency.set(relation.leftFileId, left);
+    adjacency.set(relation.rightFileId, right);
+  }
+
+  const fileById = new Map(files.map((file) => [file.id, file]));
+  const visited = new Set<string>();
+  const clusters: ScanWorkingKnowledgeCluster[] = [];
+
+  for (const file of files) {
+    if (visited.has(file.id) || !adjacency.has(file.id)) {
+      continue;
+    }
+
+    const pending = [file.id];
+    const memberIds: string[] = [];
+    visited.add(file.id);
+
+    while (pending.length > 0) {
+      const current = pending.shift() as string;
+      memberIds.push(current);
+      for (const related of [...(adjacency.get(current) ?? [])].sort()) {
+        if (!visited.has(related)) {
+          visited.add(related);
+          pending.push(related);
+        }
+      }
+    }
+
+    const memberSet = new Set(memberIds);
+    const memberRelationships = relationships.filter(
+      (relation) =>
+        memberSet.has(relation.leftFileId) && memberSet.has(relation.rightFileId),
+    );
+    const termCounts = new Map<string, number>();
+    for (const relation of memberRelationships) {
+      for (const term of relation.sharedTerms) {
+        termCounts.set(term, (termCounts.get(term) ?? 0) + 1);
+      }
+    }
+    const sharedTerms = [...termCounts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .slice(0, 8)
+      .map(([term]) => term);
+    const sortedMembers = memberIds
+      .map((id) => fileById.get(id))
+      .filter((item): item is ScanWorkingKnowledgeFile => Boolean(item))
+      .sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+    const confidence =
+      memberRelationships.reduce((sum, relation) => sum + relation.confidence, 0) /
+      memberRelationships.length;
+
+    clusters.push({
+      confidence: Math.round(confidence * 100) / 100,
+      id: `working-cluster-${clusters.length + 1}`,
+      label: titleCaseTerms(sharedTerms) || "Related material",
+      memberFileIds: sortedMembers.map((member) => member.id),
+      memberRelativePaths: sortedMembers.map((member) => member.relativePath),
+      sharedTerms,
+    });
+  }
+
+  return {
+    clusters,
+    files,
+    relationships: relationships.sort(
+      (left, right) =>
+        left.leftFileId.localeCompare(right.leftFileId) ||
+        left.rightFileId.localeCompare(right.rightFileId),
+    ),
+    scanSessionId: input.scanSessionId,
+  };
+}
+
+export async function loadScanWorkingKnowledge(
+  scanSessionId: string,
+): Promise<ScanWorkingKnowledgeIndex> {
+  const prisma = getPrismaClient();
+  const [files, memory] = await Promise.all([
+    prisma.scannedFile.findMany({
+      orderBy: { relativePath: "asc" },
+      select: {
+        fileType: true,
+        id: true,
+        libraryDocument: {
+          select: {
+            observationSessions: {
+              orderBy: { createdAt: "desc" },
+              select: {
+                explanation: true,
+                interpretations: true,
+                observations: true,
+                observerType: true,
+                status: true,
+              },
+            },
+          },
+        },
+        previewText: true,
+        relativePath: true,
+        scanSession: { select: { connectedFolderId: true } },
+      },
+      where: {
+        extractionStatus: "COMPLETED",
+        readStatus: "SUPPORTED",
+        readingStatus: "READ",
+        sessionId: scanSessionId,
+      },
+    }),
+    prisma.memoryEntry.findMany({
+      orderBy: [{ occurrenceCount: "desc" }, { lastSeen: "desc" }],
+      select: {
+        description: true,
+        evidence: true,
+        id: true,
+        memoryType: true,
+        title: true,
+      },
+      take: 80,
+      where: { status: "ACTIVE" },
+    }),
+  ]);
+
+  return buildScanWorkingKnowledge({
+    files: files.map((file) => ({
+      connectedLibraryId: file.scanSession.connectedFolderId,
+      fileType: file.fileType,
+      id: file.id,
+      observationSessions: file.libraryDocument?.observationSessions ?? [],
+      previewText: file.previewText,
+      relativePath: file.relativePath,
+    })),
+    memory: memory as Array<ScanWorkingKnowledgeMemory & { evidence: Prisma.JsonValue }>,
+    scanSessionId,
+  });
+}

@@ -27,6 +27,10 @@ import {
   currentRecommendationGenerationVersion,
   isCurrentRecommendationGeneration,
 } from "./recommendation-generation";
+import type {
+  ScanWorkingKnowledgeCluster,
+  ScanWorkingKnowledgeIndex,
+} from "./scan-working-knowledge";
 import { scannedFileSummary } from "./scan-sessions";
 import { isImageFileType } from "./media-kind";
 import { isVideoFileType, jsonVideoHumanLabels } from "./video-metadata";
@@ -101,6 +105,7 @@ type SuggestionContext = {
       scannedFileId: string;
     }
   >;
+  provisionalWorkingEvidence: string[];
   siblingFiles: Array<{
     id: string;
     relativePath: string;
@@ -112,6 +117,7 @@ type SuggestionContext = {
     sizeBytes?: bigint | null;
   }>;
   reviewedObservationText: string[];
+  semanticClusters: ScanWorkingKnowledgeCluster[];
   memoryMatches: MemoryMatch[];
   preferredTerms: string[];
   audioMetadata: {
@@ -315,6 +321,7 @@ const topicRules: TopicRule[] = [
       "expense",
       "expenses",
       "financial",
+      "finance",
       "budget",
       "receipt",
       "accounting",
@@ -405,17 +412,21 @@ function rankedTerms(value: string, take = 10) {
 function semanticAnalysisText(input: {
   contentText: string;
   currentRelativePath: string;
+  provisionalWorkingEvidence: string[];
   reviewedObservationText: string[];
 }) {
   const contentTerms = new Set(tokenize(input.contentText));
   const pathTerms = new Set(tokenize(input.currentRelativePath));
-  const reviewedTerms = input.reviewedObservationText.flatMap((text) =>
+  const observationTerms = [
+    ...input.provisionalWorkingEvidence,
+    ...input.reviewedObservationText,
+  ].flatMap((text) =>
     tokenize(text).filter(
       (term) => !pathTerms.has(term) || contentTerms.has(term),
     ),
   );
 
-  return [input.contentText, reviewedTerms.join(" ")].join(" ");
+  return [input.contentText, observationTerms.join(" ")].join(" ");
 }
 
 function confidence(value: number) {
@@ -675,6 +686,25 @@ function reviewedObservationText(
     .filter((item) => item.trim().length > 0);
 }
 
+function provisionalObservationText(
+  sessions: Array<{
+    status: string;
+    observations: Prisma.JsonValue;
+    interpretations: Prisma.JsonValue;
+    explanation: Prisma.JsonValue;
+    planSuggestions: Prisma.JsonValue;
+  }>,
+) {
+  return sessions
+    .filter((session) => session.status === "AWAITING_REVIEW")
+    .flatMap((session) => [
+      ...textFromJson(session.observations),
+      ...textFromJson(session.interpretations),
+      ...textFromJson(session.explanation),
+    ])
+    .filter((item) => item.trim().length > 0);
+}
+
 function memoryText(entry: {
   title: string;
   description: string;
@@ -792,6 +822,10 @@ function bestRuleFor(context: SuggestionContext) {
 }
 
 function memorySupport(context: SuggestionContext) {
+  if (context.memoryMatches.length === 0) {
+    return ["Approved Memory: none used."];
+  }
+
   return context.memoryMatches.map(
     (memory) =>
       `Approved Memory used: ${memory.title} (${memory.overlap.join(", ")})`,
@@ -800,14 +834,48 @@ function memorySupport(context: SuggestionContext) {
 
 function reviewedObservationSupport(context: SuggestionContext) {
   if (context.reviewedObservationText.length === 0) {
-    return [
-      "No approved or modified observation was used as trusted evidence for this suggestion.",
-    ];
+    return ["Trusted observation: none used."];
   }
 
   return [
-    "Reviewed observation used: Deanne has already reviewed an observation for this item.",
+    "Trusted observation: Deanne has approved or modified an observation used here.",
   ];
+}
+
+function provisionalWorkingSupport(context: SuggestionContext) {
+  if (context.provisionalWorkingEvidence.length === 0) {
+    return ["Working understanding: no provisional observation was used."];
+  }
+
+  return [
+    "Working understanding: provisional observations informed this recommendation, but they are not approved Memory.",
+  ];
+}
+
+function semanticClusterSupport(context: SuggestionContext, rule: TopicRule) {
+  return context.semanticClusters
+    .map((cluster) => ({
+      cluster,
+      relatedPaths: cluster.memberRelativePaths.filter(
+        (relativePath) =>
+          normalizeText(relativePath) !== normalizeText(context.currentRelativePath),
+      ),
+      ruleTerms: cluster.sharedTerms.filter((term) =>
+        rule.terms.some((ruleTerm) => normalizeText(ruleTerm) === normalizeText(term)),
+      ),
+    }))
+    .filter(
+      (candidate) =>
+        candidate.relatedPaths.length > 0 &&
+        candidate.ruleTerms.length > 0 &&
+        candidate.cluster.confidence >= 0.45,
+    )
+    .sort(
+      (left, right) =>
+        right.relatedPaths.length - left.relatedPaths.length ||
+        right.ruleTerms.length - left.ruleTerms.length ||
+        right.cluster.confidence - left.cluster.confidence,
+    )[0];
 }
 
 function pathSupport(context: SuggestionContext) {
@@ -915,6 +983,7 @@ function makeDraft(
     requiredFolderPaths: draft.requiredFolderPaths ?? [],
     supportingInformation: [
       ...pathSupport(context),
+      ...provisionalWorkingSupport(context),
       ...memorySupport(context),
       ...reviewedObservationSupport(context),
       ...(draft.supportingInformation ?? []),
@@ -1448,12 +1517,15 @@ function moveAndFolderDrafts(context: SuggestionContext) {
   }
 
   const establishedFolder = establishedFolderForRule(best.rule, context);
+  const clusterSupport = semanticClusterSupport(context, best.rule);
   const hasSupportedMeaning =
     best.directMatches.length >= 2 ||
-    (best.directMatches.length >= 1 && best.memoryScore >= 1);
+    (best.directMatches.length >= 1 && best.memoryScore >= 1) ||
+    (best.directMatches.length >= 1 && Boolean(clusterSupport));
   const hasStrongMeaning =
     best.directMatches.length >= 3 ||
-    (best.directMatches.length >= 2 && best.memoryScore >= 1);
+    (best.directMatches.length >= 2 && best.memoryScore >= 1) ||
+    (best.directMatches.length >= 1 && Boolean(clusterSupport));
 
   if (
     (!establishedFolder && !hasStrongMeaning) ||
@@ -1469,12 +1541,17 @@ function moveAndFolderDrafts(context: SuggestionContext) {
   const matchedConcepts = best.directMatches.join(", ");
   const folderEvidence = establishedFolder
     ? `${establishedFolder.fileCount} existing files are already stored under ${establishedFolder.folder}.`
-    : `${matchedConcepts} appear together in the readable or reviewed content.`;
+    : clusterSupport
+      ? `${clusterSupport.relatedPaths.length} related ${clusterSupport.relatedPaths.length === 1 ? "file" : "files"} in this scan share the provisional concepts ${clusterSupport.ruleTerms.join(", ")}.`
+      : `${matchedConcepts} appear together in the readable or reviewed content.`;
 
   if (!establishedFolder) {
     drafts.push(
       makeDraft(context, {
-        confidence: 0.68 + Math.min(best.directMatches.length, 4) * 0.02,
+        confidence:
+          0.68 +
+          Math.min(best.directMatches.length, 4) * 0.02 +
+          (clusterSupport ? 0.04 : 0),
         evidenceStrength: "STRONG",
         explanation: `The readable or reviewed content repeatedly supports ${matchedConcepts}. There is no established matching folder in this scan, so creating ${best.rule.folder} is presented only as a dependency of the proposed move.`,
         proposedRelativePath: normalizeBridgeRelativePath(destinationFolder),
@@ -1486,6 +1563,11 @@ function moveAndFolderDrafts(context: SuggestionContext) {
         ],
         supportingInformation: [
           folderEvidence,
+          ...(clusterSupport
+            ? clusterSupport.relatedPaths
+                .slice(0, 3)
+                .map((relativePath) => `Related file: ${relativePath}`)
+            : []),
           "A category folder is proposed only because several related content signals agree.",
         ],
       }),
@@ -1498,7 +1580,8 @@ function moveAndFolderDrafts(context: SuggestionContext) {
         confidence:
           0.68 +
           Math.min(best.directMatches.length, 4) * 0.02 +
-          (establishedFolder ? 0.04 : 0),
+          (establishedFolder ? 0.04 : 0) +
+          (clusterSupport ? 0.04 : 0),
         evidenceStrength: "STRONG",
         explanation: `The readable or reviewed content includes the related concepts ${matchedConcepts}. ${folderEvidence} Together, that evidence supports reviewing ${destinationFolder} as a destination.`,
         proposedRelativePath,
@@ -1510,6 +1593,11 @@ function moveAndFolderDrafts(context: SuggestionContext) {
         ],
         supportingInformation: [
           folderEvidence,
+          ...(clusterSupport
+            ? clusterSupport.relatedPaths
+                .slice(0, 3)
+                .map((relativePath) => `Related file: ${relativePath}`)
+            : []),
           ...(best.memoryScore > 0
             ? ["Approved Memory corroborates this topic classification."]
             : []),
@@ -1887,7 +1975,7 @@ function draftContentSignatureFor(
 function normalizeSuggestionType(value: string): OrganizationSuggestionType {
   return organizationSuggestionTypes.has(value as OrganizationSuggestionType)
     ? (value as OrganizationSuggestionType)
-    : "KEEP_UNCHANGED";
+    : "INSUFFICIENT_EVIDENCE";
 }
 
 function normalizeSuggestionStatus(value: string): OrganizationSuggestionStatus {
@@ -2081,7 +2169,11 @@ function duplicateSignals(
   return [...new Set(signals)];
 }
 
-async function scannedFileContext(scannedFileId: string, contentText: string) {
+async function scannedFileContext(
+  scannedFileId: string,
+  contentText: string,
+  workingKnowledge?: ScanWorkingKnowledgeIndex,
+) {
   const prisma = getPrismaClient();
   const scannedFile = await prisma.scannedFile.findUnique({
     include: {
@@ -2221,9 +2313,13 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
   const reviewedText = reviewedObservationText(
     scannedFile.libraryDocument.observationSessions,
   );
+  const provisionalText = provisionalObservationText(
+    scannedFile.libraryDocument.observationSessions,
+  );
   const analysisText = semanticAnalysisText({
     contentText: contentText.slice(0, maxAnalysisCharacters),
     currentRelativePath: scannedFile.relativePath,
+    provisionalWorkingEvidence: provisionalText,
     reviewedObservationText: reviewedText,
   });
   const analysisTerms = new Set(tokenize(analysisText));
@@ -2368,9 +2464,14 @@ async function scannedFileContext(scannedFileId: string, contentText: string) {
     ),
     memoryMatches,
     preferredTerms,
+    provisionalWorkingEvidence: provisionalText,
     reviewedObservationText: reviewedText,
     scanSessionId: scannedFile.sessionId,
     scannedFileId: scannedFile.id,
+    semanticClusters:
+      workingKnowledge?.clusters.filter((cluster) =>
+        cluster.memberFileIds.includes(scannedFile.id),
+      ) ?? [],
     siblingFiles: scannedFile.scanSession.scannedFiles.map((file) => ({
       audioFingerprint: file.audioMetadata?.audioFingerprint ?? null,
       checksum: file.checksum,
@@ -2468,7 +2569,11 @@ function newRecommendationGenerationId(context: SuggestionContext) {
   return `org-rec-${context.scanSessionId}-${context.scannedFileId}-${randomUUID()}`;
 }
 
-async function persistDrafts(context: SuggestionContext, drafts: SuggestionDraft[]) {
+async function persistDrafts(
+  context: SuggestionContext,
+  drafts: SuggestionDraft[],
+  options: { replaceChecksumBootstrap?: boolean } = {},
+) {
   const prisma = getPrismaClient();
   const suggestions: BridgeOrganizationSuggestionSummary[] = [];
   const cleanedDrafts: SuggestionDraft[] = [];
@@ -2528,8 +2633,16 @@ async function persistDrafts(context: SuggestionContext, drafts: SuggestionDraft
           (suggestion) =>
             normalizeSuggestionStatus(suggestion.status) === "PENDING",
         );
+      const hasOnlyChecksumBootstrapSuggestions =
+        activeCurrentSuggestions.length > 0 &&
+        activeCurrentSuggestions.every((suggestion) =>
+          suggestion.recommendationGenerationId.startsWith("checksum-duplicates-"),
+        );
 
-      if (hasOnlyCurrentPendingSuggestions) {
+      if (
+        hasOnlyCurrentPendingSuggestions &&
+        !(options.replaceChecksumBootstrap && hasOnlyChecksumBootstrapSuggestions)
+      ) {
         existingCount = activeCurrentSuggestions.length;
         suggestions.push(
           ...activeCurrentSuggestions
@@ -2632,6 +2745,10 @@ export async function generateOrganizationSuggestionsForScannedFile(
 export async function generateOrganizationSuggestionsForScannedFileWithText(
   scannedFileId: string,
   contentText: string,
+  options: {
+    replaceChecksumBootstrap?: boolean;
+    workingKnowledge?: ScanWorkingKnowledgeIndex;
+  } = {},
 ) {
   const prisma = getPrismaClient();
 
@@ -2676,9 +2793,15 @@ export async function generateOrganizationSuggestionsForScannedFileWithText(
     );
   }
 
-  const context = await scannedFileContext(scannedFileId, contentText);
+  const context = await scannedFileContext(
+    scannedFileId,
+    contentText,
+    options.workingKnowledge,
+  );
   const drafts = buildDrafts(context);
-  const result = await persistDrafts(context, drafts);
+  const result = await persistDrafts(context, drafts, {
+    replaceChecksumBootstrap: options.replaceChecksumBootstrap,
+  });
 
   await prisma.scannedFile.update({
     data: {
