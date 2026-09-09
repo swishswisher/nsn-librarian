@@ -61,6 +61,7 @@ type FilterValue =
   | "AUDIO"
   | "VIDEO"
   | "WEBSITE_CANDIDATE"
+  | "INSUFFICIENT_EVIDENCE"
   | `LIBRARY:${string}`;
 
 type RecommendationGroup = {
@@ -84,6 +85,7 @@ const filterOptions: Array<{ label: string; value: FilterValue }> = [
   { label: "Audio", value: "AUDIO" },
   { label: "Video", value: "VIDEO" },
   { label: "Website Candidate", value: "WEBSITE_CANDIDATE" },
+  { label: "Needs more evidence", value: "INSUFFICIENT_EVIDENCE" },
 ];
 
 function suggestionTypeLabel(type: OrganizationSuggestionType) {
@@ -109,6 +111,10 @@ function suggestionTypeLabel(type: OrganizationSuggestionType) {
 
   if (type === "WEBSITE_CANDIDATE") {
     return "Website";
+  }
+
+  if (type === "INSUFFICIENT_EVIDENCE") {
+    return "Needs more evidence";
   }
 
   return "Keep";
@@ -174,6 +180,10 @@ function recommendedPath(suggestion: BridgeOrganizationSuggestionSummary) {
 
   if (suggestion.suggestionType === "KEEP_UNCHANGED") {
     return "Keep this file where it is.";
+  }
+
+  if (suggestion.suggestionType === "INSUFFICIENT_EVIDENCE") {
+    return "No change recommendation yet.";
   }
 
   if (suggestion.suggestionType === "RENAME_FILE") {
@@ -290,6 +300,10 @@ function filterMatches(
     return suggestion.supportingInformation.some((item) =>
       item.toLowerCase().includes("file type: video_"),
     );
+  }
+
+  if (filter === "INSUFFICIENT_EVIDENCE") {
+    return suggestion.suggestionType === "INSUFFICIENT_EVIDENCE";
   }
 
   return suggestion.suggestionType === "WEBSITE_CANDIDATE";
@@ -413,7 +427,10 @@ function canReviewSuggestion(suggestion: BridgeOrganizationSuggestionSummary) {
   return suggestion.status === "PENDING";
 }
 
-function decisionSavedMessage(action: ReviewAction) {
+function decisionSavedMessage(
+  suggestion: BridgeOrganizationSuggestionSummary,
+  action: ReviewAction,
+) {
   if (action === "APPROVE") {
     return "The recommendation was approved for planning. No filesystem action occurred.";
   }
@@ -426,7 +443,9 @@ function decisionSavedMessage(action: ReviewAction) {
     return "The recommendation was rejected. It will not be included in an Organization Plan.";
   }
 
-  return "The recommendation was marked to leave unchanged. It will not be included in an Organization Plan.";
+  return suggestion.suggestionType === "INSUFFICIENT_EVIDENCE"
+    ? "This item was left unresolved. It will not be included in an Organization Plan."
+    : "The recommendation was marked to leave unchanged. It will not be included in an Organization Plan.";
 }
 
 function toggleRecordValue(
@@ -731,7 +750,7 @@ export function OrganizationSuggestionsReviewPanel({
       }
 
       updateSuggestion(payload.suggestion);
-      setMessage(decisionSavedMessage(action));
+      setMessage(decisionSavedMessage(suggestion, action));
       closeEditSuggestion();
       router.refresh();
     } catch {
@@ -1011,6 +1030,8 @@ export function OrganizationSuggestionsReviewPanel({
                       const detailExpanded = Boolean(expandedDetails[suggestion.id]);
                       const basedOn = basedOnSummary(suggestion);
                       const canReview = canReviewSuggestion(suggestion);
+                      const isUncertainty =
+                        suggestion.suggestionType === "INSUFFICIENT_EVIDENCE";
                       const pendingAction = pendingReviews[suggestion.id] ?? null;
                       const isCardSaving = Boolean(pendingAction);
                       const canExamine = Boolean(
@@ -1073,6 +1094,17 @@ export function OrganizationSuggestionsReviewPanel({
                                       {recommendationSummary(suggestion)}
                                     </p>
                                   </div>
+
+                                  {isUncertainty ? (
+                                    <div className="grid min-w-0 gap-2 rounded-md border border-[var(--nsn-warm-beige)] bg-[var(--nsn-sand)] p-3">
+                                      <p className="font-semibold text-[var(--nsn-navy)]">
+                                        This is not a keep decision
+                                      </p>
+                                      <p className="break-words text-[var(--nsn-slate)]">
+                                        The Librarian does not have enough evidence to recommend a change yet. It cannot be approved as an organization action.
+                                      </p>
+                                    </div>
+                                  ) : null}
 
                                   <p className="font-semibold text-[var(--nsn-teal-dark)]">
                                     Confidence: {formatConfidence(suggestion.confidence)}
@@ -1189,42 +1221,48 @@ export function OrganizationSuggestionsReviewPanel({
                               </div>
 
                               <div className="grid min-w-0 gap-2 lg:min-w-48">
-                                <NsnButton
-                                  disabled={!canReview || isCardSaving}
-                                  onClick={() =>
-                                    submitReview(suggestion, "APPROVE")
-                                  }
-                                  type="button"
-                                  variant="primary"
-                                >
-                                  {pendingAction === "APPROVE"
-                                    ? "Approving..."
-                                    : "Approve"}
-                                </NsnButton>
-                                <NsnButton
-                                  disabled={!canReview || isCardSaving}
-                                  onClick={(event) =>
-                                    openEditSuggestion(
-                                      suggestion,
-                                      event.currentTarget,
-                                    )
-                                  }
-                                  type="button"
-                                  variant="accent"
-                                >
-                                  Edit Suggestion
-                                </NsnButton>
+                                {!isUncertainty ? (
+                                  <>
+                                    <NsnButton
+                                      disabled={!canReview || isCardSaving}
+                                      onClick={() =>
+                                        submitReview(suggestion, "APPROVE")
+                                      }
+                                      type="button"
+                                      variant="primary"
+                                    >
+                                      {pendingAction === "APPROVE"
+                                        ? "Approving..."
+                                        : "Approve"}
+                                    </NsnButton>
+                                    <NsnButton
+                                      disabled={!canReview || isCardSaving}
+                                      onClick={(event) =>
+                                        openEditSuggestion(
+                                          suggestion,
+                                          event.currentTarget,
+                                        )
+                                      }
+                                      type="button"
+                                      variant="accent"
+                                    >
+                                      Edit Suggestion
+                                    </NsnButton>
+                                  </>
+                                ) : null}
                                 <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-1">
-                                  <NsnButton
-                                    disabled={!canReview || isCardSaving}
-                                    onClick={() => submitReview(suggestion, "REJECT")}
-                                    type="button"
-                                    variant="secondary"
-                                  >
-                                    {pendingAction === "REJECT"
-                                      ? "Rejecting..."
-                                      : "Reject"}
-                                  </NsnButton>
+                                  {!isUncertainty ? (
+                                    <NsnButton
+                                      disabled={!canReview || isCardSaving}
+                                      onClick={() => submitReview(suggestion, "REJECT")}
+                                      type="button"
+                                      variant="secondary"
+                                    >
+                                      {pendingAction === "REJECT"
+                                        ? "Rejecting..."
+                                        : "Reject"}
+                                    </NsnButton>
+                                  ) : null}
                                   <NsnButton
                                     disabled={!canReview || isCardSaving}
                                     onClick={() =>
@@ -1235,7 +1273,9 @@ export function OrganizationSuggestionsReviewPanel({
                                   >
                                     {pendingAction === "LEAVE_UNCHANGED"
                                       ? "Saving..."
-                                      : "Leave Unchanged"}
+                                      : isUncertainty
+                                        ? "Leave for now"
+                                        : "Leave Unchanged"}
                                   </NsnButton>
                                   {showExamineLink && canExamine ? (
                                     <Link

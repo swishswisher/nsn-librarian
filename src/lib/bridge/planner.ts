@@ -356,7 +356,8 @@ function normalizeSuggestionType(value: string): OrganizationSuggestionType {
     value === "GROUP_WITH_FILES" ||
     value === "POSSIBLE_DUPLICATE" ||
     value === "WEBSITE_CANDIDATE" ||
-    value === "KEEP_UNCHANGED"
+    value === "KEEP_UNCHANGED" ||
+    value === "INSUFFICIENT_EVIDENCE"
   ) {
     return value;
   }
@@ -365,7 +366,7 @@ function normalizeSuggestionType(value: string): OrganizationSuggestionType {
 }
 
 function organizationSuggestionCounts(
-  suggestions: { status: string }[],
+  suggestions: { status: string; suggestionType?: string }[],
 ): OrganizationSuggestionCounts {
   const counts: OrganizationSuggestionCounts = {
     approved: 0,
@@ -382,12 +383,20 @@ function organizationSuggestionCounts(
 
     const status = normalizeSuggestionStatus(suggestion.status);
 
+    const type = normalizeSuggestionType(suggestion.suggestionType ?? "");
+    const canEnterPlan =
+      type !== "KEEP_UNCHANGED" && type !== "INSUFFICIENT_EVIDENCE";
+
     if (status === "APPROVED") {
       counts.approved += 1;
-      counts.eligibleForPlanning += 1;
+      if (canEnterPlan) {
+        counts.eligibleForPlanning += 1;
+      }
     } else if (status === "MODIFIED") {
       counts.modified += 1;
-      counts.eligibleForPlanning += 1;
+      if (canEnterPlan) {
+        counts.eligibleForPlanning += 1;
+      }
     } else if (status === "REJECTED") {
       counts.rejected += 1;
     } else if (status === "LEFT_UNCHANGED") {
@@ -602,7 +611,10 @@ function actionFromSuggestion(
 ): BridgeOrganizationPlanAction | null {
   const suggestionType = normalizeSuggestionType(suggestion.suggestionType);
 
-  if (suggestionType === "KEEP_UNCHANGED") {
+  if (
+    suggestionType === "KEEP_UNCHANGED" ||
+    suggestionType === "INSUFFICIENT_EVIDENCE"
+  ) {
     return null;
   }
 
@@ -788,7 +800,11 @@ function skippedItemFor(
       : !isCurrentRecommendationGeneration(
             suggestion.recommendationGenerationVersion,
           )
-        ? "This recommendation came from an older recommendation pass and must be regenerated before it can enter a new plan."
+      ? "This recommendation came from an older recommendation pass and must be regenerated before it can enter a new plan."
+        : suggestion.suggestionType === "INSUFFICIENT_EVIDENCE"
+          ? "The Librarian did not have enough evidence to recommend an organization change."
+          : suggestion.suggestionType === "KEEP_UNCHANGED"
+            ? "The current location has affirmative support, so this is not a filesystem action."
         : status === "REJECTED"
           ? "Deanne rejected this suggestion."
           : status === "LEFT_UNCHANGED"
@@ -1118,7 +1134,10 @@ function orderedActions(actions: BridgeOrganizationPlanAction[]) {
 function buildPlanSnapshot(input: PlanBuildInput) {
   const includedSuggestions = input.suggestions.filter((suggestion) =>
     suggestionBelongsToCurrentGeneration(suggestion) &&
-    includedStatuses.has(normalizeSuggestionStatus(suggestion.status)),
+    includedStatuses.has(normalizeSuggestionStatus(suggestion.status)) &&
+    !["KEEP_UNCHANGED", "INSUFFICIENT_EVIDENCE"].includes(
+      normalizeSuggestionType(suggestion.suggestionType),
+    ),
   );
   const skippedItems = input.suggestions
     .filter(

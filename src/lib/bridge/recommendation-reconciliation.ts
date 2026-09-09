@@ -58,6 +58,7 @@ const organizationSuggestionTypes = new Set<OrganizationSuggestionType>([
   "POSSIBLE_DUPLICATE",
   "WEBSITE_CANDIDATE",
   "KEEP_UNCHANGED",
+  "INSUFFICIENT_EVIDENCE",
 ]);
 
 function uniqueStrings(values: string[]) {
@@ -400,6 +401,9 @@ export function reconcileRecommendationDrafts(
   const keep = sortDrafts(
     viable.filter((draft) => draft.suggestionType === "KEEP_UNCHANGED"),
   )[0];
+  const insufficientEvidence = sortDrafts(
+    viable.filter((draft) => draft.suggestionType === "INSUFFICIENT_EVIDENCE"),
+  )[0];
   const primaryLocation = locationDrafts[0];
   const primaryRename = renameDrafts[0];
   let primary: RecommendationDraft | null =
@@ -480,6 +484,10 @@ export function reconcileRecommendationDrafts(
 
   if (reconciled.length === 0 && keep) {
     reconciled.push(keep);
+  }
+
+  if (reconciled.length === 0 && insufficientEvidence) {
+    reconciled.push(insufficientEvidence);
   }
 
   return sortDrafts(reconciled);

@@ -184,6 +184,7 @@ export const organizationSuggestionTypes = [
   "POSSIBLE_DUPLICATE",
   "WEBSITE_CANDIDATE",
   "KEEP_UNCHANGED",
+  "INSUFFICIENT_EVIDENCE",
 ] as const;
 
 export type OrganizationSuggestionType =

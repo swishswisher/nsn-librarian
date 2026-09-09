@@ -35,6 +35,7 @@ let createBridgeScanSessionFromScan: typeof import("../../src/lib/bridge/scan-se
 let readScannedFile: typeof import("../../src/lib/bridge/reader").readScannedFile;
 let createObservationSessionForScannedFileReadResult: typeof import("../../src/lib/bridge/scanned-file-observations").createObservationSessionForScannedFileReadResult;
 let generateOrganizationSuggestionsForScannedFileWithText: typeof import("../../src/lib/bridge/organization-suggestions").generateOrganizationSuggestionsForScannedFileWithText;
+let reviewOrganizationSuggestion: typeof import("../../src/lib/bridge/organization-suggestions").reviewOrganizationSuggestion;
 let generateOrganizationPlanForScanSession: typeof import("../../src/lib/bridge/planner").generateOrganizationPlanForScanSession;
 let approveOrganizationPlan: typeof import("../../src/lib/bridge/planner").approveOrganizationPlan;
 let saveOrganizationPlanSelection: typeof import("../../src/lib/bridge/planner").saveOrganizationPlanSelection;
@@ -353,6 +354,8 @@ before(async () => {
     scannedFileObservations.createObservationSessionForScannedFileReadResult;
   generateOrganizationSuggestionsForScannedFileWithText =
     organizationSuggestions.generateOrganizationSuggestionsForScannedFileWithText;
+  reviewOrganizationSuggestion =
+    organizationSuggestions.reviewOrganizationSuggestion;
   generateOrganizationPlanForScanSession =
     planner.generateOrganizationPlanForScanSession;
   approveOrganizationPlan = planner.approveOrganizationPlan;
@@ -893,7 +896,7 @@ test("regenerating recommendations invalidates stale approvals instead of reusin
   );
 });
 
-test("weak lexical, filename, and extension evidence falls back to a cautious keep recommendation", async () => {
+test("weak lexical, filename, and extension evidence stays explicitly uncertain", async () => {
   const longFileName = `${"carefully-described-".repeat(7)}archive-item.txt`;
   const relativePaths = [
     "Loose/same-content-copy-2.txt",
@@ -932,13 +935,13 @@ test("weak lexical, filename, and extension evidence falls back to a cautious ke
     );
     assert.deepEqual(
       result.suggestions.map((suggestion) => suggestion.suggestionType),
-      ["KEEP_UNCHANGED"],
+      ["INSUFFICIENT_EVIDENCE"],
     );
     assert.equal(result.suggestions[0]?.evidenceStrength, "LIMITED");
     assert.ok((result.suggestions[0]?.confidence ?? 1) < 0.5);
     assert.match(
       result.suggestions[0]?.explanation ?? "",
-      /not find enough reviewed evidence/i,
+      /does not have enough evidence to recommend a change yet/i,
     );
   }
 });
@@ -988,6 +991,112 @@ test("strong content and an established Clients folder pattern can produce one g
       (suggestion) => suggestion.suggestionType === "CREATE_FOLDER",
     ),
     false,
+  );
+});
+
+test("an established current folder can produce an affirmative keep recommendation", async () => {
+  const source = "Recovery/recovery-notes.txt";
+  const fixture = await createConnectedFixture("affirmative-keep", {
+    "Recovery/earlier-healing-notes.txt":
+      "Earlier recovery and healing notes.\n",
+    "Recovery/recovery-plan.txt":
+      "A recovery plan for repair and resilience.\n",
+    [source]: "Recovery healing repair and resilience notes.\n",
+  });
+  const file = scannedFileByRelativePath(fixture.scannedFiles, source);
+  const contentText = await readAndApproveScannedFile(file.id);
+  const result = await generateOrganizationSuggestionsForScannedFileWithText(
+    file.id,
+    contentText,
+  );
+
+  assert.equal(result.suggestions.length, 1);
+  assert.equal(result.suggestions[0]?.suggestionType, "KEEP_UNCHANGED");
+  assert.match(
+    result.suggestions[0]?.explanation ?? "",
+    /affirmative evidence/i,
+  );
+});
+
+test("insufficient evidence cannot be approved as an organization action", async () => {
+  const source = "Loose/unclear-note.txt";
+  const fixture = await createConnectedFixture("uncertain-recommendation", {
+    [source]: "A brief note about a quiet afternoon.\n",
+  });
+  const file = scannedFileByRelativePath(fixture.scannedFiles, source);
+  const contentText = await readAndApproveScannedFile(file.id);
+  const result = await generateOrganizationSuggestionsForScannedFileWithText(
+    file.id,
+    contentText,
+  );
+  const suggestion = result.suggestions[0];
+
+  assert.ok(suggestion);
+  assert.equal(suggestion.suggestionType, "INSUFFICIENT_EVIDENCE");
+  await assert.rejects(
+    () =>
+      reviewOrganizationSuggestion(suggestion.id, {
+        action: "APPROVE",
+        scanSessionId: fixture.session.id,
+      }),
+    /does not have enough evidence|needs more evidence/i,
+  );
+  const after = await prisma.organizationSuggestion.findUnique({
+    select: { status: true },
+    where: { id: suggestion.id },
+  });
+
+  assert.equal(after?.status, "PENDING");
+});
+
+test("strong operations and workshop meaning uses established folder patterns", async () => {
+  const fixture = await createConnectedFixture("operations-and-workshops", {
+    "Finance/invoice-template.txt": "invoice payment expense accounting notes.\n",
+    "Finance/payment-record.txt": "payment invoice expense budget accounting.\n",
+    "Operations_Mess/August_Office_Expenses.txt":
+      "August office expenses, invoice payment and budget review.\n",
+    "Workshops/workshop-overview.txt":
+      "Workshop orientation and facilitation overview.\n",
+    "Workshops/facilitation-guide.txt":
+      "Workshop training facilitation and orientation guide.\n",
+    "Workshops_Unsorted/Boundaries_Workshop_Outline.txt":
+      "Boundaries workshop facilitation orientation and training outline.\n",
+  });
+
+  const operationsFile = scannedFileByRelativePath(
+    fixture.scannedFiles,
+    "Operations_Mess/August_Office_Expenses.txt",
+  );
+  const workshopFile = scannedFileByRelativePath(
+    fixture.scannedFiles,
+    "Workshops_Unsorted/Boundaries_Workshop_Outline.txt",
+  );
+  const operationsText = await readAndApproveScannedFile(operationsFile.id);
+  const workshopText = await readAndApproveScannedFile(workshopFile.id);
+  const operationsResult =
+    await generateOrganizationSuggestionsForScannedFileWithText(
+      operationsFile.id,
+      operationsText,
+    );
+  const workshopResult =
+    await generateOrganizationSuggestionsForScannedFileWithText(
+      workshopFile.id,
+      workshopText,
+    );
+
+  assert.ok(
+    operationsResult.suggestions.some(
+      (suggestion) =>
+        ["MOVE_FILE", "GROUP_WITH_FILES"].includes(suggestion.suggestionType) &&
+        suggestion.evidenceStrength === "STRONG",
+    ),
+  );
+  assert.ok(
+    workshopResult.suggestions.some(
+      (suggestion) =>
+        ["MOVE_FILE", "GROUP_WITH_FILES"].includes(suggestion.suggestionType) &&
+        suggestion.evidenceStrength === "STRONG",
+    ),
   );
 });
 

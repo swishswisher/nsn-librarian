@@ -549,7 +549,10 @@ test("explicit regeneration revisits terminal files that no longer have current 
   assert.equal(processedFile.processingStage, "SUGGESTIONS_GENERATED");
   assert.equal(firstObservationCount, 1);
   assert.equal(firstActiveSuggestions.length, 1);
-  assert.equal(firstActiveSuggestions[0]?.suggestionType, "KEEP_UNCHANGED");
+  assert.equal(
+    firstActiveSuggestions[0]?.suggestionType,
+    "INSUFFICIENT_EVIDENCE",
+  );
 
   await prisma.organizationSuggestion.updateMany({
     data: {
@@ -602,7 +605,10 @@ test("explicit regeneration revisits terminal files that no longer have current 
   assert.equal(allSuggestions.length, 2);
   assert.equal(invalidatedSuggestions.length, 1);
   assert.equal(activeSuggestions.length, 1);
-  assert.equal(activeSuggestions[0]?.suggestionType, "KEEP_UNCHANGED");
+  assert.equal(
+    activeSuggestions[0]?.suggestionType,
+    "INSUFFICIENT_EVIDENCE",
+  );
 
   await processNextBridgeScanSessionFile(sessionId, {
     recordNotebook: false,

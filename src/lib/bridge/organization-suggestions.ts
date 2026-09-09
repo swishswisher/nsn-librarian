@@ -195,6 +195,7 @@ const organizationSuggestionTypes = new Set<OrganizationSuggestionType>([
   "POSSIBLE_DUPLICATE",
   "WEBSITE_CANDIDATE",
   "KEEP_UNCHANGED",
+  "INSUFFICIENT_EVIDENCE",
 ]);
 const invalidPathCharacters = /[<>:"\\|?*\u0000]/;
 const maxAnalysisCharacters = 60_000;
@@ -264,7 +265,6 @@ const stopWords = new Set([
   "text",
   "with",
   "without",
-  "workshop",
   "would",
   "html",
   "markdown",
@@ -305,6 +305,36 @@ const topicRules: TopicRule[] = [
     terms: ["worksheet", "exercise", "client", "practice", "clinical"],
     explanation:
       "The text appears practical enough to review as a clinical or teaching tool.",
+  },
+  {
+    id: "operations-finance",
+    folder: "Finance",
+    terms: [
+      "invoice",
+      "payment",
+      "expense",
+      "expenses",
+      "financial",
+      "budget",
+      "receipt",
+      "accounting",
+    ],
+    explanation:
+      "The text appears to concern operational finance, payments, expenses, or invoices.",
+  },
+  {
+    id: "workshops",
+    folder: "Workshops",
+    terms: [
+      "workshop",
+      "training",
+      "facilitation",
+      "orientation",
+      "curriculum",
+      "boundaries",
+    ],
+    explanation:
+      "The text appears to concern workshop, training, orientation, or facilitation material.",
   },
   {
     id: "research",
@@ -558,7 +588,7 @@ function establishedFolderForRule(
   rule: TopicRule,
   context: SuggestionContext,
 ) {
-  const normalizedRuleFolder = normalizeText(rule.folder);
+  const normalizedRuleFolder = normalizeText(path.posix.basename(rule.folder));
   const ruleTerms = new Set(tokenize(rule.folder));
 
   return context.folderStructure
@@ -1672,7 +1702,7 @@ function groupWithFilesDraft(context: SuggestionContext, topTerms: string[]) {
   });
 }
 
-function keepUnchangedDraft(context: SuggestionContext) {
+function fallbackRecommendationDraft(context: SuggestionContext) {
   if (isPrivateAudioContext(context)) {
     return makeDraft(context, {
       confidence: 0.72,
@@ -1715,15 +1745,49 @@ function keepUnchangedDraft(context: SuggestionContext) {
     });
   }
 
+  const best = bestRuleFor(context);
+  const establishedFolder = best
+    ? establishedFolderForRule(best.rule, context)
+    : null;
+  const currentFolder = folderFromRelativePath(context.currentRelativePath);
+  const affirmativePattern = Boolean(
+    best &&
+      ((establishedFolder &&
+        normalizeText(establishedFolder.folder) === normalizeText(currentFolder) &&
+        (best.directMatches.length >= 1 || best.memoryScore >= 1)) ||
+        (best.memoryScore >= 1 &&
+          best.directMatches.length >= 2 &&
+          normalizeText(best.rule.folder) === normalizeText(currentFolder))),
+  );
+
+  if (affirmativePattern) {
+    const evidence = establishedFolder
+      ? `${establishedFolder.fileCount} existing files are already stored under ${establishedFolder.folder}.`
+      : "Approved Memory and the readable content support this folder as an established topic location.";
+
+    return makeDraft(context, {
+      confidence: 0.76,
+      explanation: `The current folder is supported by an established organization pattern. ${evidence} The Librarian found affirmative evidence to leave this file here.`,
+      suggestionType: "KEEP_UNCHANGED",
+      title: "Keep this file in its supported folder",
+      whySuggested: [
+        "The current location matches a supported topic pattern.",
+        evidence,
+        "Nothing should move without Deanne's approval.",
+      ],
+      supportingInformation: [evidence],
+    });
+  }
+
   return makeDraft(context, {
     confidence: 0.42,
     explanation:
-      "The Librarian did not find enough reviewed evidence to justify changing this file's location or name right now.",
-    suggestionType: "KEEP_UNCHANGED",
-    title: "Keep this file unchanged for now",
+      "The Librarian does not have enough evidence to recommend a change yet.",
+    suggestionType: "INSUFFICIENT_EVIDENCE",
+    title: "Not enough evidence to recommend a change",
     whySuggested: [
-      "A cautious no-change plan is safer when the organization signal is weak.",
-      "Nothing should move without Deanne's approval.",
+      "The available organization evidence is limited or inconclusive.",
+      "This is not a recommendation that the current location is correct.",
     ],
   });
 }
@@ -1748,7 +1812,7 @@ function buildDrafts(context: SuggestionContext) {
   );
 
   if (usefulDrafts.length === 0) {
-    usefulDrafts.push(keepUnchangedDraft(context));
+    usefulDrafts.push(fallbackRecommendationDraft(context));
   }
 
   return usefulDrafts.sort((left, right) => {
@@ -2416,7 +2480,7 @@ async function persistDrafts(context: SuggestionContext, drafts: SuggestionDraft
   const draftsToPersist =
     reconciledDrafts.length > 0
       ? reconciledDrafts
-      : [cleanDraftPaths(keepUnchangedDraft(context))];
+      : [cleanDraftPaths(fallbackRecommendationDraft(context))];
 
   for (const draft of draftsToPersist) {
     const signature = draftContentSignatureFor(context, draft);
@@ -3055,6 +3119,16 @@ export async function reviewOrganizationSuggestion(
     throw new OrganizationSuggestionError(
       "This recommendation came from an older recommendation pass. Regenerate recommendations before reviewing it.",
       409,
+    );
+  }
+
+  if (
+    existing.suggestionType === "INSUFFICIENT_EVIDENCE" &&
+    input.action !== "LEAVE_UNCHANGED"
+  ) {
+    throw new OrganizationSuggestionError(
+      "This item needs more evidence before it can be treated as an organization action. You can leave it unresolved for now.",
+      422,
     );
   }
 

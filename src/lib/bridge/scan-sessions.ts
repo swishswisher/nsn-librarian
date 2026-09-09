@@ -274,7 +274,7 @@ function organizationSuggestionStatus(
 }
 
 export function organizationSuggestionCounts(
-  suggestions: { status: string }[] = [],
+  suggestions: { status: string; suggestionType?: string | null }[] = [],
 ): OrganizationSuggestionCounts {
   const counts = emptyOrganizationSuggestionCounts();
 
@@ -283,12 +283,20 @@ export function organizationSuggestionCounts(
 
     const status = organizationSuggestionStatus(suggestion.status);
 
+    const canEnterPlan =
+      suggestion.suggestionType !== "KEEP_UNCHANGED" &&
+      suggestion.suggestionType !== "INSUFFICIENT_EVIDENCE";
+
     if (status === "APPROVED") {
       counts.approved += 1;
-      counts.eligibleForPlanning += 1;
+      if (canEnterPlan) {
+        counts.eligibleForPlanning += 1;
+      }
     } else if (status === "MODIFIED") {
       counts.modified += 1;
-      counts.eligibleForPlanning += 1;
+      if (canEnterPlan) {
+        counts.eligibleForPlanning += 1;
+      }
     } else if (status === "REJECTED") {
       counts.rejected += 1;
     } else if (status === "LEFT_UNCHANGED") {

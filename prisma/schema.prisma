@@ -248,6 +248,7 @@ enum OrganizationSuggestionType {
   POSSIBLE_DUPLICATE
   WEBSITE_CANDIDATE
   KEEP_UNCHANGED
+  INSUFFICIENT_EVIDENCE
 }
 
 enum OrganizationSuggestionStatus {

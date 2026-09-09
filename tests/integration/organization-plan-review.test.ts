@@ -518,3 +518,14 @@ test("the recommendation review shows alternatives, dependencies, and duplicate 
   assert.match(sourceText, /File to compare/);
   assert.match(sourceText, /never deletes either file/i);
 });
+
+test("uncertain recommendations are presented as unresolved rather than as Keep actions", async () => {
+  const sourceText = await readFile(
+    "src/components/library/OrganizationSuggestionsReviewPanel.tsx",
+    "utf8",
+  );
+
+  assert.match(sourceText, /INSUFFICIENT_EVIDENCE/);
+  assert.match(sourceText, /This is not a keep decision/);
+  assert.match(sourceText, /Leave for now/);
+});

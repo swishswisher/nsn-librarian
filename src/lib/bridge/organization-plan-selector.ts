@@ -11,6 +11,7 @@ import type {
 
 type StatusRecord = {
   status: string;
+  suggestionType?: string;
 };
 
 export type OrganizationPlanSelectorSessionInput = {
@@ -184,6 +185,7 @@ export async function getOrganizationPlanScanSessionSelectorData(): Promise<Orga
           organizationSuggestions: {
             select: {
               status: true,
+              suggestionType: true,
             },
             where: {
               invalidatedAt: null,
