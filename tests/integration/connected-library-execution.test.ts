@@ -986,19 +986,31 @@ test("a stable batch uses provisional scan-wide understanding without trusting i
       data: {
         explanation: {
           summary:
-            "This appears to concern financial operations, payments, invoices, and expenses.",
+            relativePath.endsWith("a.txt")
+              ? "This appears to concern invoice administration and office billing."
+              : relativePath.endsWith("b.txt")
+                ? "This appears to concern payment transactions and office billing."
+                : "This appears to concern monthly expenses and office budgeting.",
         },
         interpretations: [
           {
             description:
-              "Financial operations and office accounting may be the shared subject.",
+              relativePath.endsWith("a.txt")
+                ? "Invoice administration may be part of office finance."
+                : relativePath.endsWith("b.txt")
+                  ? "Payment transactions may be part of office finance."
+                  : "Monthly expenses may be part of office finance.",
           },
         ],
         observations: [
           {
             description:
-              "The material discusses finance, payment, invoice, and expense records.",
-            evidence: ["financial operations"],
+              relativePath.endsWith("a.txt")
+                ? "The material discusses invoice records."
+                : relativePath.endsWith("b.txt")
+                  ? "The material discusses payment records."
+                  : "The material discusses expense records.",
+            evidence: ["office finance"],
           },
         ],
         status: "AWAITING_REVIEW",
@@ -1056,6 +1068,11 @@ test("a stable batch uses provisional scan-wide understanding without trusting i
       JSON.stringify(suggestion.supportingInformation).includes(
         "Working understanding",
       ),
+    ),
+  );
+  assert.ok(
+    suggestions.every((suggestion) =>
+      JSON.stringify(suggestion.supportingInformation).includes("Related file:"),
     ),
   );
   assert.ok(

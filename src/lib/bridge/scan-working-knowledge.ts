@@ -7,7 +7,8 @@ import { getPrismaClient } from "@/lib/db/prisma";
 export type WorkingEvidenceKind =
   | "PROVISIONAL_OBSERVATION"
   | "TRUSTED_OBSERVATION"
-  | "APPROVED_MEMORY";
+  | "APPROVED_MEMORY"
+  | "CONTENT";
 
 export type ScanWorkingKnowledgeInputFile = {
   connectedLibraryId: string;
@@ -37,6 +38,7 @@ export type ScanWorkingKnowledgeRelationship = {
   evidenceKinds: WorkingEvidenceKind[];
   leftFileId: string;
   rightFileId: string;
+  sharedTopics: string[];
   sharedTerms: string[];
 };
 
@@ -46,7 +48,9 @@ export type ScanWorkingKnowledgeCluster = {
   label: string;
   memberFileIds: string[];
   memberRelativePaths: string[];
+  semanticTopics: string[];
   sharedTerms: string[];
+  sharedSubjects: string[];
 };
 
 export type ScanWorkingKnowledgeFile = {
@@ -148,6 +152,70 @@ const ignoredJsonKeys = new Set([
   "uncertainty",
 ]);
 
+const semanticTopicFamilies = [
+  {
+    id: "becoming",
+    label: "growth and becoming",
+    terms: ["becoming", "growth", "identity", "change", "future"],
+  },
+  {
+    id: "recovery",
+    label: "recovery and healing",
+    terms: ["recovery", "healing", "repair", "restore", "resilience"],
+  },
+  {
+    id: "attachment-regulation",
+    label: "attachment and regulation",
+    terms: ["attachment", "regulation", "nervous", "safety"],
+  },
+  {
+    id: "clinical-tools",
+    label: "clinical and teaching tools",
+    terms: ["worksheet", "exercise", "practice", "clinical"],
+  },
+  {
+    id: "operations-finance",
+    label: "finance and office operations",
+    terms: [
+      "invoice",
+      "invoicing",
+      "payment",
+      "pay",
+      "paying",
+      "expense",
+      "expenses",
+      "financial",
+      "finance",
+      "budget",
+      "receipt",
+      "accounting",
+    ],
+  },
+  {
+    id: "workshops",
+    label: "workshops and facilitation",
+    terms: [
+      "workshop",
+      "training",
+      "facilitation",
+      "facilitator",
+      "orientation",
+      "curriculum",
+      "boundaries",
+    ],
+  },
+  {
+    id: "research",
+    label: "research and references",
+    terms: ["research", "study", "source", "citation", "reference"],
+  },
+  {
+    id: "website",
+    label: "website and public material",
+    terms: ["article", "newsletter", "website", "public", "blog"],
+  },
+] as const;
+
 function normalizedText(value: string) {
   return value
     .normalize("NFKD")
@@ -156,11 +224,34 @@ function normalizedText(value: string) {
 }
 
 function normalizedTerm(value: string) {
-  if (value.length > 4 && value.endsWith("s") && !value.endsWith("ss")) {
-    return value.slice(0, -1);
+  let normalized = value;
+
+  if (normalized.length > 4 && normalized.endsWith("ies")) {
+    normalized = `${normalized.slice(0, -3)}y`;
+  } else if (normalized.length > 4 && normalized.endsWith("s") && !normalized.endsWith("ss")) {
+    normalized = normalized.slice(0, -1);
   }
 
-  return value;
+  for (const suffix of [
+    "ation",
+    "ition",
+    "ial",
+    "ment",
+    "ing",
+    "ator",
+    "er",
+    "or",
+    "al",
+    "ate",
+    "e",
+  ]) {
+    if (normalized.length - suffix.length >= 4 && normalized.endsWith(suffix)) {
+      normalized = normalized.slice(0, -suffix.length);
+      break;
+    }
+  }
+
+  return normalized;
 }
 
 export function workingKnowledgeTerms(value: string) {
@@ -176,6 +267,39 @@ export function workingKnowledgeTerms(value: string) {
         ),
     ),
   ];
+}
+
+function semanticTopicTerms(topicId: string) {
+  const topic = semanticTopicFamilies.find((candidate) => candidate.id === topicId);
+  return new Set(topic?.terms.flatMap(workingKnowledgeTerms) ?? []);
+}
+
+function semanticTopicsForTerms(terms: Iterable<string>) {
+  const availableTerms = new Set(terms);
+
+  return semanticTopicFamilies
+    .filter((topic) =>
+      topic.terms.some((term) =>
+        availableTerms.has(workingKnowledgeTerms(term)[0] ?? ""),
+      ),
+    )
+    .map((topic) => topic.id);
+}
+
+function semanticTopicLabel(topicId: string) {
+  return semanticTopicFamilies.find((topic) => topic.id === topicId)?.label ?? topicId;
+}
+
+function displaySemanticTerm(term: string) {
+  const displayTerms: Record<string, string> = {
+    expens: "expense",
+    facilit: "facilitation",
+    financ: "finance",
+    invoic: "invoice",
+    pay: "payment",
+  };
+
+  return displayTerms[term] ?? term;
 }
 
 function jsonText(value: unknown, parentKey = ""): string[] {
@@ -300,13 +424,59 @@ function evidenceKindsForSharedTerm(
     kinds.push("APPROVED_MEMORY");
   }
 
+  if (leftSources.has("CONTENT") && rightSources.has("CONTENT")) {
+    kinds.push("CONTENT");
+  }
+
   return kinds;
+}
+
+function evidenceKindsForSharedTopic(
+  left: WeightedTerms,
+  right: WeightedTerms,
+  topicId: string,
+) {
+  const topicTerms = semanticTopicTerms(topicId);
+  const leftSources = new Set<WorkingEvidenceKind>();
+  const rightSources = new Set<WorkingEvidenceKind>();
+
+  for (const term of topicTerms) {
+    for (const source of left.get(term)?.sources ?? []) {
+      leftSources.add(source);
+    }
+    for (const source of right.get(term)?.sources ?? []) {
+      rightSources.add(source);
+    }
+  }
+
+  if (
+    leftSources.has("TRUSTED_OBSERVATION") &&
+    rightSources.has("TRUSTED_OBSERVATION")
+  ) {
+    return ["TRUSTED_OBSERVATION"] as WorkingEvidenceKind[];
+  }
+
+  if (
+    (leftSources.has("TRUSTED_OBSERVATION") ||
+      leftSources.has("PROVISIONAL_OBSERVATION")) &&
+    (rightSources.has("TRUSTED_OBSERVATION") ||
+      rightSources.has("PROVISIONAL_OBSERVATION"))
+  ) {
+    return ["PROVISIONAL_OBSERVATION"] as WorkingEvidenceKind[];
+  }
+
+  if (leftSources.has("CONTENT") && rightSources.has("CONTENT")) {
+    return ["CONTENT"] as WorkingEvidenceKind[];
+  }
+
+  return [];
 }
 
 function relationshipConfidence(
   left: WeightedTerms,
   right: WeightedTerms,
   sharedTerms: string[],
+  sharedTopics: string[],
 ) {
   let score = 0;
 
@@ -321,6 +491,26 @@ function relationshipConfidence(
       score += 0.28;
     } else {
       score += 0.14;
+    }
+  }
+
+  for (const topic of sharedTopics) {
+    const topicAlreadyRepresented = sharedTerms.some((term) =>
+      semanticTopicTerms(topic).has(term),
+    );
+
+    if (topicAlreadyRepresented) {
+      continue;
+    }
+
+    const evidenceKinds = evidenceKindsForSharedTopic(left, right, topic);
+
+    if (evidenceKinds.includes("TRUSTED_OBSERVATION")) {
+      score += 0.38;
+    } else if (evidenceKinds.includes("PROVISIONAL_OBSERVATION")) {
+      score += 0.28;
+    } else if (evidenceKinds.includes("CONTENT")) {
+      score += 0.2;
     }
   }
 
@@ -411,18 +601,32 @@ export function buildScanWorkingKnowledge(input: {
           return bWeight - aWeight || a.localeCompare(b);
         })
         .slice(0, 8);
+      const leftTopics = semanticTopicsForTerms(leftTerms.keys());
+      const rightTopics = semanticTopicsForTerms(rightTerms.keys());
+      const sharedTopics = leftTopics.filter((topic) => rightTopics.includes(topic));
       const evidenceKinds = [
         ...new Set(
-          sharedTerms.flatMap((term) =>
-            evidenceKindsForSharedTerm(leftTerms, rightTerms, term),
-          ),
+          [
+            ...sharedTerms.flatMap((term) =>
+              evidenceKindsForSharedTerm(leftTerms, rightTerms, term),
+            ),
+            ...sharedTopics.flatMap((topic) =>
+              evidenceKindsForSharedTopic(leftTerms, rightTerms, topic),
+            ),
+          ],
         ),
       ];
-      const confidence = relationshipConfidence(leftTerms, rightTerms, sharedTerms);
+      const confidence = relationshipConfidence(
+        leftTerms,
+        rightTerms,
+        sharedTerms,
+        sharedTopics,
+      );
       const hasStructuredAgreement = evidenceKinds.length > 0;
       const qualifies =
         (hasStructuredAgreement && confidence >= 0.45) ||
-        (sharedTerms.length >= 3 && confidence >= 0.42);
+        (sharedTerms.length >= 3 && confidence >= 0.42) ||
+        (sharedTopics.length > 0 && confidence >= 0.2);
 
       if (qualifies) {
         relationships.push({
@@ -430,7 +634,8 @@ export function buildScanWorkingKnowledge(input: {
           evidenceKinds,
           leftFileId: left.id,
           rightFileId: right.id,
-          sharedTerms,
+          sharedTopics,
+          sharedTerms: sharedTerms.map(displaySemanticTerm),
         });
       }
     }
@@ -476,15 +681,22 @@ export function buildScanWorkingKnowledge(input: {
         memberSet.has(relation.leftFileId) && memberSet.has(relation.rightFileId),
     );
     const termCounts = new Map<string, number>();
+    const topicCounts = new Map<string, number>();
     for (const relation of memberRelationships) {
       for (const term of relation.sharedTerms) {
         termCounts.set(term, (termCounts.get(term) ?? 0) + 1);
+      }
+      for (const topic of relation.sharedTopics) {
+        topicCounts.set(topic, (topicCounts.get(topic) ?? 0) + 1);
       }
     }
     const sharedTerms = [...termCounts.entries()]
       .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
       .slice(0, 8)
       .map(([term]) => term);
+    const semanticTopics = [...topicCounts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .map(([topic]) => topic);
     const sortedMembers = memberIds
       .map((id) => fileById.get(id))
       .filter((item): item is ScanWorkingKnowledgeFile => Boolean(item))
@@ -496,10 +708,15 @@ export function buildScanWorkingKnowledge(input: {
     clusters.push({
       confidence: Math.round(confidence * 100) / 100,
       id: `working-cluster-${clusters.length + 1}`,
-      label: titleCaseTerms(sharedTerms) || "Related material",
+      label:
+        titleCaseTerms(sharedTerms) ||
+        semanticTopics.map(semanticTopicLabel).slice(0, 2).join(" / ") ||
+        "Related material",
       memberFileIds: sortedMembers.map((member) => member.id),
       memberRelativePaths: sortedMembers.map((member) => member.relativePath),
+      semanticTopics,
       sharedTerms,
+      sharedSubjects: semanticTopics.map(semanticTopicLabel),
     });
   }
 

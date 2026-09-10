@@ -31,6 +31,7 @@ import type {
   ScanWorkingKnowledgeCluster,
   ScanWorkingKnowledgeIndex,
 } from "./scan-working-knowledge";
+import { workingKnowledgeTerms } from "./scan-working-knowledge";
 import { scannedFileSummary } from "./scan-sessions";
 import { isImageFileType } from "./media-kind";
 import { isVideoFileType, jsonVideoHumanLabels } from "./video-metadata";
@@ -786,7 +787,11 @@ function scoreRule(
   semanticTerms: Set<string>,
   memoryMatches: MemoryMatch[],
 ) {
-  const directMatches = rule.terms.filter((term) => semanticTerms.has(term));
+  const directMatches = rule.terms.filter(
+    (term) =>
+      semanticTerms.has(term) ||
+      workingKnowledgeTerms(term).some((normalized) => semanticTerms.has(normalized)),
+  );
   const memoryScore = memoryMatches.filter((memory) =>
     memory.overlap.some((term) => rule.terms.includes(term)),
   ).length;
@@ -800,7 +805,7 @@ function scoreRule(
 
 function bestRuleFor(context: SuggestionContext) {
   const semanticTerms = new Set(
-    tokenize(semanticAnalysisText(context)),
+    workingKnowledgeTerms(semanticAnalysisText(context)),
   );
 
   for (const preferredTerm of context.preferredTerms) {
@@ -861,19 +866,28 @@ function semanticClusterSupport(context: SuggestionContext, rule: TopicRule) {
           normalizeText(relativePath) !== normalizeText(context.currentRelativePath),
       ),
       ruleTerms: cluster.sharedTerms.filter((term) =>
-        rule.terms.some((ruleTerm) => normalizeText(ruleTerm) === normalizeText(term)),
+        rule.terms.some((ruleTerm) =>
+          workingKnowledgeTerms(ruleTerm).some(
+            (normalized) => normalized === workingKnowledgeTerms(term)[0],
+          ),
+        ),
+      ),
+      sharedSubjects: cluster.sharedSubjects.filter((subject) =>
+        normalizeText(subject).includes(normalizeText(rule.folder)) ||
+        normalizeText(rule.explanation).includes(normalizeText(subject)),
       ),
     }))
     .filter(
       (candidate) =>
         candidate.relatedPaths.length > 0 &&
-        candidate.ruleTerms.length > 0 &&
-        candidate.cluster.confidence >= 0.45,
+        (candidate.ruleTerms.length > 0 || candidate.cluster.semanticTopics.includes(rule.id)) &&
+        candidate.cluster.confidence >= 0.2,
     )
     .sort(
       (left, right) =>
         right.relatedPaths.length - left.relatedPaths.length ||
-        right.ruleTerms.length - left.ruleTerms.length ||
+        (right.ruleTerms.length + right.sharedSubjects.length) -
+          (left.ruleTerms.length + left.sharedSubjects.length) ||
         right.cluster.confidence - left.cluster.confidence,
     )[0];
 }
@@ -1542,7 +1556,10 @@ function moveAndFolderDrafts(context: SuggestionContext) {
   const folderEvidence = establishedFolder
     ? `${establishedFolder.fileCount} existing files are already stored under ${establishedFolder.folder}.`
     : clusterSupport
-      ? `${clusterSupport.relatedPaths.length} related ${clusterSupport.relatedPaths.length === 1 ? "file" : "files"} in this scan share the provisional concepts ${clusterSupport.ruleTerms.join(", ")}.`
+      ? `${clusterSupport.relatedPaths.length} related ${clusterSupport.relatedPaths.length === 1 ? "file" : "files"} in this scan share the working subjects ${[
+          ...clusterSupport.sharedSubjects,
+          ...clusterSupport.ruleTerms,
+        ].join(", ")}.`
       : `${matchedConcepts} appear together in the readable or reviewed content.`;
 
   if (!establishedFolder) {
@@ -1567,6 +1584,9 @@ function moveAndFolderDrafts(context: SuggestionContext) {
             ? clusterSupport.relatedPaths
                 .slice(0, 3)
                 .map((relativePath) => `Related file: ${relativePath}`)
+            : []),
+          ...(clusterSupport?.sharedSubjects.length
+            ? [`Shared working subjects: ${clusterSupport.sharedSubjects.join(", ")}`]
             : []),
           "A category folder is proposed only because several related content signals agree.",
         ],
@@ -1597,6 +1617,9 @@ function moveAndFolderDrafts(context: SuggestionContext) {
             ? clusterSupport.relatedPaths
                 .slice(0, 3)
                 .map((relativePath) => `Related file: ${relativePath}`)
+            : []),
+          ...(clusterSupport?.sharedSubjects.length
+            ? [`Shared working subjects: ${clusterSupport.sharedSubjects.join(", ")}`]
             : []),
           ...(best.memoryScore > 0
             ? ["Approved Memory corroborates this topic classification."]

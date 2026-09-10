@@ -82,7 +82,7 @@ test("provisional observations form deterministic scan-wide semantic clusters", 
     "invoice",
     "payments",
   ]);
-  assert.ok(forward.clusters[0]?.sharedTerms.includes("financial"));
+  assert.ok(forward.clusters[0]?.sharedTerms.includes("finance"));
   assert.ok(
     forward.relationships.every((relationship) =>
       relationship.evidenceKinds.includes("PROVISIONAL_OBSERVATION"),
@@ -149,6 +149,28 @@ test("workshop files cluster from content and provisional meaning, not filenames
   assert.equal(result.clusters.length, 1);
   assert.deepEqual(result.clusters[0]?.memberFileIds, ["agenda", "outline"]);
   assert.ok(result.clusters[0]?.sharedTerms.includes("workshop"));
+});
+
+test("different finance terms reinforce a cluster through semantic normalization", () => {
+  const result = buildScanWorkingKnowledge({
+    files: [
+      file("invoice", "Loose/alpha.dat", "Invoice issued for office supplies."),
+      file("payment", "Loose/beta.dat", "Payment received for office supplies."),
+      file("expense", "Loose/gamma.dat", "Monthly expenses for office supplies."),
+    ],
+    scanSessionId: "scan-finance-normalization",
+  });
+
+  assert.equal(result.clusters.length, 1);
+  assert.deepEqual(result.clusters[0]?.memberFileIds, [
+    "invoice",
+    "payment",
+    "expense",
+  ]);
+  assert.ok(result.clusters[0]?.semanticTopics.includes("operations-finance"));
+  assert.ok(
+    result.clusters[0]?.sharedSubjects.includes("finance and office operations"),
+  );
 });
 
 test("trusted observations remain distinct and receive stronger relationship weight", () => {
