@@ -341,8 +341,8 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
       ["music", "Audio/piano-recital.m4a", "Piano recital recording from the evening."],
       ["school", "Archive/history-reading.txt", "History reading list about early cities."],
       ["inventory", "Operations_Mess/office-inventory.csv", "Inventory of desks and storage boxes."],
-      ["garden-two", "Personal/compost-notes.txt", "Compost temperature observations."],
-      ["archive", "Archive/old-correspondence.txt", "Correspondence about a community event."],
+      ["client", "Clients/Loose/client-intake.docx", "Client intake form and appointment details."],
+      ["bridge", "Mixed/bridge.txt", "General project planning and logistics overview."],
     ].map(([id, relativePath, previewText]) =>
       productionFile(
         id,
@@ -363,16 +363,27 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
   });
 
   assert.equal(files.length, 21);
-  assert.equal(result.clusters.length, 2);
-  assert.deepEqual(
-    result.clusters.map((cluster) => cluster.memberFileIds),
-    [
-      ["expenses", "invoice", "payments"],
-      ["outline", "proposal"],
-    ],
+  const financeCluster = result.clusters.find((cluster) =>
+    cluster.semanticTopics.includes("operations-finance"),
   );
-  assert.ok(result.clusters[0]?.sharedTerms.includes("finance"));
-  assert.ok(result.clusters[1]?.sharedTerms.includes("workshop"));
+  const workshopCluster = result.clusters.find((cluster) =>
+    cluster.semanticTopics.includes("workshops"),
+  );
+  assert.deepEqual(financeCluster?.memberFileIds, [
+    "expenses",
+    "invoice",
+    "payments",
+  ]);
+  assert.deepEqual(workshopCluster?.memberFileIds, ["outline", "proposal"]);
+  assert.ok(financeCluster?.sharedTerms.includes("finance"));
+  assert.ok(workshopCluster?.sharedTerms.includes("workshop"));
+  assert.equal(
+    result.clusters.some((cluster) =>
+      ["client", "bridge"].some((id) => cluster.memberFileIds.includes(id)),
+    ),
+    false,
+  );
+  assert.ok(result.clusters.every((cluster) => cluster.semanticTopics.length === 1));
   assert.ok(
     result.clusters.every((cluster) =>
       cluster.sharedTerms.every(
@@ -381,6 +392,65 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
     ),
   );
   assert.deepEqual(reverse, result);
+});
+
+test("a multi-subject bridge cannot leak one subject into another cluster", () => {
+  const result = buildScanWorkingKnowledge({
+    files: [
+      file("finance-a", "Loose/invoice.txt", "Invoice planning."),
+      file("finance-b", "Loose/expenses.txt", "Payment planning."),
+      file(
+        "bridge",
+        "Loose/bridge.txt",
+        "Expense planning workshop facilitation training.",
+      ),
+      file("workshop-a", "Loose/workshop.txt", "Workshop facilitation training."),
+      file("workshop-b", "Loose/facilitation.txt", "Workshop facilitation training."),
+    ],
+    scanSessionId: "scan-subject-bridge",
+  });
+  assert.ok(
+    result.clusters.some(
+      (cluster) =>
+        cluster.semanticTopics.length === 1 &&
+        cluster.semanticTopics.includes("operations-finance") &&
+        cluster.memberFileIds.includes("finance-a") &&
+        cluster.memberFileIds.includes("finance-b"),
+    ),
+  );
+  assert.ok(
+    result.clusters.some(
+      (cluster) =>
+        cluster.semanticTopics.length === 1 &&
+        cluster.semanticTopics.includes("workshops") &&
+        cluster.memberFileIds.includes("workshop-a") &&
+        cluster.memberFileIds.includes("workshop-b"),
+    ),
+  );
+  assert.ok(result.clusters.every((cluster) => cluster.semanticTopics.length === 1));
+});
+
+test("cluster confidence reflects relationship strength rather than member count", () => {
+  const files = [
+    file("one", "Loose/one.txt", "Invoice payment expense."),
+    file("two", "Loose/two.txt", "Invoice payment expense."),
+  ];
+  const twoFileResult = buildScanWorkingKnowledge({
+    files,
+    scanSessionId: "scan-confidence-two",
+  });
+  const threeFileResult = buildScanWorkingKnowledge({
+    files: [...files, file("three", "Loose/three.txt", "Invoice payment expense.")],
+    scanSessionId: "scan-confidence-three",
+  });
+  const twoFileCluster = twoFileResult.clusters.find((cluster) =>
+    cluster.semanticTopics.includes("operations-finance"),
+  );
+  const threeFileCluster = threeFileResult.clusters.find((cluster) =>
+    cluster.semanticTopics.includes("operations-finance"),
+  );
+
+  assert.equal(twoFileCluster?.confidence, threeFileCluster?.confidence);
 });
 
 test("sparse technical fixtures remain outside semantic clusters", () => {
@@ -396,17 +466,17 @@ test("sparse technical fixtures remain outside semantic clusters", () => {
   assert.equal(result.clusters.length, 0);
 });
 
-test("v6 is current and v5 cannot masquerade as the active generation", () => {
+test("v7 is current and v6 cannot masquerade as the active generation", () => {
   assert.equal(
     currentRecommendationGenerationVersion,
-    "organization-recommendations-v6",
+    "organization-recommendations-v7",
   );
   assert.equal(
-    isCurrentRecommendationGeneration("organization-recommendations-v6"),
+    isCurrentRecommendationGeneration("organization-recommendations-v7"),
     true,
   );
   assert.equal(
-    isCurrentRecommendationGeneration("organization-recommendations-v5"),
+    isCurrentRecommendationGeneration("organization-recommendations-v6"),
     false,
   );
 });

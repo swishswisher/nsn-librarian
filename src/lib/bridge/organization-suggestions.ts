@@ -858,6 +858,21 @@ function provisionalWorkingSupport(context: SuggestionContext) {
 }
 
 function semanticClusterSupport(context: SuggestionContext, rule: TopicRule) {
+  const currentSemanticTerms = new Set(
+    workingKnowledgeTerms(semanticAnalysisText(context)),
+  );
+  const currentSupportsRule = rule.terms.some(
+    (term) =>
+      currentSemanticTerms.has(term) ||
+      workingKnowledgeTerms(term).some((normalized) =>
+        currentSemanticTerms.has(normalized),
+      ),
+  );
+
+  if (!currentSupportsRule) {
+    return undefined;
+  }
+
   return context.semanticClusters
     .map((cluster) => ({
       cluster,

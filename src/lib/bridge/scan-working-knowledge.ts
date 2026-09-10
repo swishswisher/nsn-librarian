@@ -688,83 +688,90 @@ export function buildScanWorkingKnowledge(input: {
     }
   }
 
-  const adjacency = new Map<string, Set<string>>();
-  for (const relation of relationships) {
-    const left = adjacency.get(relation.leftFileId) ?? new Set<string>();
-    const right = adjacency.get(relation.rightFileId) ?? new Set<string>();
-    left.add(relation.rightFileId);
-    right.add(relation.leftFileId);
-    adjacency.set(relation.leftFileId, left);
-    adjacency.set(relation.rightFileId, right);
-  }
-
   const fileById = new Map(files.map((file) => [file.id, file]));
-  const visited = new Set<string>();
   const clusters: ScanWorkingKnowledgeCluster[] = [];
 
-  for (const file of files) {
-    if (visited.has(file.id) || !adjacency.has(file.id)) {
-      continue;
+  // Build one connected component per semantic subject. A global component
+  // would let a weak bridge transfer every subject to every member.
+  for (const topic of semanticTopicFamilies) {
+    const topicRelationships = relationships.filter((relation) =>
+      relation.sharedTopics.includes(topic.id),
+    );
+    const adjacency = new Map<string, Set<string>>();
+
+    for (const relation of topicRelationships) {
+      const left = adjacency.get(relation.leftFileId) ?? new Set<string>();
+      const right = adjacency.get(relation.rightFileId) ?? new Set<string>();
+      left.add(relation.rightFileId);
+      right.add(relation.leftFileId);
+      adjacency.set(relation.leftFileId, left);
+      adjacency.set(relation.rightFileId, right);
     }
 
-    const pending = [file.id];
-    const memberIds: string[] = [];
-    visited.add(file.id);
+    const visited = new Set<string>();
+    for (const file of files) {
+      if (visited.has(file.id) || !adjacency.has(file.id)) {
+        continue;
+      }
 
-    while (pending.length > 0) {
-      const current = pending.shift() as string;
-      memberIds.push(current);
-      for (const related of [...(adjacency.get(current) ?? [])].sort()) {
-        if (!visited.has(related)) {
-          visited.add(related);
-          pending.push(related);
+      const pending = [file.id];
+      const memberIds: string[] = [];
+      visited.add(file.id);
+
+      while (pending.length > 0) {
+        const current = pending.shift() as string;
+        memberIds.push(current);
+        for (const related of [...(adjacency.get(current) ?? [])].sort()) {
+          if (!visited.has(related)) {
+            visited.add(related);
+            pending.push(related);
+          }
         }
       }
-    }
 
-    const memberSet = new Set(memberIds);
-    const memberRelationships = relationships.filter(
-      (relation) =>
-        memberSet.has(relation.leftFileId) && memberSet.has(relation.rightFileId),
-    );
-    const termCounts = new Map<string, number>();
-    const topicCounts = new Map<string, number>();
-    for (const relation of memberRelationships) {
-      for (const term of relation.sharedTerms) {
-        termCounts.set(term, (termCounts.get(term) ?? 0) + 1);
-      }
-      for (const topic of relation.sharedTopics) {
-        topicCounts.set(topic, (topicCounts.get(topic) ?? 0) + 1);
-      }
-    }
-    const sharedTerms = [...termCounts.entries()]
-      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
-      .slice(0, 8)
-      .map(([term]) => term);
-    const semanticTopics = [...topicCounts.entries()]
-      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
-      .map(([topic]) => topic);
-    const sortedMembers = memberIds
-      .map((id) => fileById.get(id))
-      .filter((item): item is ScanWorkingKnowledgeFile => Boolean(item))
-      .sort((left, right) => left.relativePath.localeCompare(right.relativePath));
-    const confidence =
-      memberRelationships.reduce((sum, relation) => sum + relation.confidence, 0) /
-      memberRelationships.length;
+      const memberSet = new Set(memberIds);
+      const memberRelationships = topicRelationships.filter(
+        (relation) =>
+          memberSet.has(relation.leftFileId) && memberSet.has(relation.rightFileId),
+      );
+      const topicTerms = semanticTopicTerms(topic.id);
+      const termCounts = new Map<string, number>();
 
-    clusters.push({
-      confidence: Math.round(confidence * 100) / 100,
-      id: `working-cluster-${clusters.length + 1}`,
-      label:
-        titleCaseTerms(sharedTerms) ||
-        semanticTopics.map(semanticTopicLabel).slice(0, 2).join(" / ") ||
-        "Related material",
-      memberFileIds: sortedMembers.map((member) => member.id),
-      memberRelativePaths: sortedMembers.map((member) => member.relativePath),
-      semanticTopics,
-      sharedTerms,
-      sharedSubjects: semanticTopics.map(semanticTopicLabel),
-    });
+      for (const relation of memberRelationships) {
+        for (const term of relation.sharedTerms) {
+          const normalized = workingKnowledgeTerms(term)[0] ?? term;
+          if (topicTerms.has(normalized)) {
+            termCounts.set(term, (termCounts.get(term) ?? 0) + 1);
+          }
+        }
+      }
+
+      const sharedTerms = [...termCounts.entries()]
+        .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+        .slice(0, 8)
+        .map(([term]) => term);
+      const sortedMembers = memberIds
+        .map((id) => fileById.get(id))
+        .filter((item): item is ScanWorkingKnowledgeFile => Boolean(item))
+        .sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+      const confidence =
+        memberRelationships.reduce((sum, relation) => sum + relation.confidence, 0) /
+        memberRelationships.length;
+
+      clusters.push({
+        confidence: Math.round(confidence * 100) / 100,
+        id: `working-cluster-${clusters.length + 1}`,
+        label:
+          titleCaseTerms(sharedTerms) ||
+          semanticTopicLabel(topic.id) ||
+          "Related material",
+        memberFileIds: sortedMembers.map((member) => member.id),
+        memberRelativePaths: sortedMembers.map((member) => member.relativePath),
+        semanticTopics: [topic.id],
+        sharedTerms,
+        sharedSubjects: [semanticTopicLabel(topic.id)],
+      });
+    }
   }
 
   return {
