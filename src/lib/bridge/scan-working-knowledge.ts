@@ -87,44 +87,72 @@ const ignoredSemanticTerms = new Set([
   "after",
   "again",
   "also",
+  "appears",
+  "associated",
   "approved",
   "assistance",
+  "assistant",
   "automatic",
+  "based",
   "because",
   "before",
   "being",
+  "belong",
   "cautious",
   "content",
+  "contains",
   "could",
   "deanne",
   "decision",
+  "distinct",
   "document",
   "documentation",
   "evidence",
   "file",
+  "fictional",
+  "fixture",
   "generated",
+  "have",
   "help",
   "human",
   "information",
+  "intended",
+  "include",
+  "included",
+  "includes",
   "item",
   "librarian",
+  "later",
+  "listed",
+  "made",
+  "meaning",
   "material",
   "memory",
   "might",
   "needs",
+  "note",
+  "notes",
   "observation",
   "openai",
   "possible",
   "present",
   "provisional",
   "readable",
+  "record",
+  "records",
   "remain",
   "related",
   "relationship",
+  "recommendation",
+  "recommendations",
   "review",
+  "required",
   "signal",
+  "subject",
   "suggestion",
+  "suggests",
   "summary",
+  "synthetic",
   "their",
   "theme",
   "there",
@@ -136,6 +164,8 @@ const ignoredSemanticTerms = new Set([
   "uncertainty",
   "used",
   "using",
+  "useful",
+  "working",
   "which",
   "while",
   "with",
@@ -254,6 +284,12 @@ function normalizedTerm(value: string) {
   return normalized;
 }
 
+// Clustering works with stemmed terms, so generic-language filtering must use
+// that same representation rather than the original surface words.
+const normalizedIgnoredSemanticTerms = new Set(
+  [...ignoredSemanticTerms].map((term) => normalizedTerm(term)),
+);
+
 export function workingKnowledgeTerms(value: string) {
   return [
     ...new Set(
@@ -262,7 +298,7 @@ export function workingKnowledgeTerms(value: string) {
         .filter(
           (term) =>
             term.length >= 4 &&
-            !ignoredSemanticTerms.has(term) &&
+            !normalizedIgnoredSemanticTerms.has(term) &&
             !/^\d+$/.test(term),
         ),
     ),
@@ -604,13 +640,17 @@ export function buildScanWorkingKnowledge(input: {
       const leftTopics = semanticTopicsForTerms(leftTerms.keys());
       const rightTopics = semanticTopicsForTerms(rightTerms.keys());
       const sharedTopics = leftTopics.filter((topic) => rightTopics.includes(topic));
+      const meaningfulSharedTopics = sharedTopics.filter(
+        (topic) =>
+          evidenceKindsForSharedTopic(leftTerms, rightTerms, topic).length > 0,
+      );
       const evidenceKinds = [
         ...new Set(
           [
             ...sharedTerms.flatMap((term) =>
               evidenceKindsForSharedTerm(leftTerms, rightTerms, term),
             ),
-            ...sharedTopics.flatMap((topic) =>
+            ...meaningfulSharedTopics.flatMap((topic) =>
               evidenceKindsForSharedTopic(leftTerms, rightTerms, topic),
             ),
           ],
@@ -620,13 +660,20 @@ export function buildScanWorkingKnowledge(input: {
         leftTerms,
         rightTerms,
         sharedTerms,
-        sharedTopics,
+        meaningfulSharedTopics,
       );
-      const hasStructuredAgreement = evidenceKinds.length > 0;
+      const hasMeaningfulSharedTerm = sharedTerms.length > 0;
+      const hasMeaningfulTopicEvidence = meaningfulSharedTopics.some(
+        (topic) =>
+          evidenceKindsForSharedTopic(leftTerms, rightTerms, topic).length > 0,
+      );
+      const hasStructuredAgreement =
+        evidenceKinds.length > 0 &&
+        (hasMeaningfulSharedTerm || hasMeaningfulTopicEvidence);
       const qualifies =
         (hasStructuredAgreement && confidence >= 0.45) ||
         (sharedTerms.length >= 3 && confidence >= 0.42) ||
-        (sharedTopics.length > 0 && confidence >= 0.2);
+        (hasMeaningfulTopicEvidence && confidence >= 0.2);
 
       if (qualifies) {
         relationships.push({
@@ -634,7 +681,7 @@ export function buildScanWorkingKnowledge(input: {
           evidenceKinds,
           leftFileId: left.id,
           rightFileId: right.id,
-          sharedTopics,
+          sharedTopics: meaningfulSharedTopics,
           sharedTerms: sharedTerms.map(displaySemanticTerm),
         });
       }

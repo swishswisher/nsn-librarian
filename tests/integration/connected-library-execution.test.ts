@@ -1079,7 +1079,7 @@ test("a stable batch uses provisional scan-wide understanding without trusting i
     suggestions.every(
       (suggestion) =>
         suggestion.recommendationGenerationVersion ===
-        "organization-recommendations-v5",
+        currentRecommendationGenerationVersion,
     ),
   );
   assert.ok(storedDocuments.every((document) => document.rawText === null));
