@@ -483,17 +483,17 @@ test("sparse technical fixtures remain outside semantic clusters", () => {
   assert.equal(result.clusters.length, 0);
 });
 
-test("v8 is current and v7 cannot masquerade as the active generation", () => {
+test("v9 is current and v8 cannot masquerade as the active generation", () => {
   assert.equal(
     currentRecommendationGenerationVersion,
-    "organization-recommendations-v8",
+    "organization-recommendations-v9",
   );
   assert.equal(
-    isCurrentRecommendationGeneration("organization-recommendations-v8"),
+    isCurrentRecommendationGeneration("organization-recommendations-v9"),
     true,
   );
   assert.equal(
-    isCurrentRecommendationGeneration("organization-recommendations-v7"),
+    isCurrentRecommendationGeneration("organization-recommendations-v8"),
     false,
   );
 });

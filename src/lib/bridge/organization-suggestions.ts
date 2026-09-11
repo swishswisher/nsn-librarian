@@ -35,6 +35,7 @@ import {
   workingKnowledgeSupportsTopic,
   workingKnowledgeTerms,
 } from "./scan-working-knowledge";
+import { samePhysicalFile } from "./physical-file-identity";
 import { scannedFileSummary } from "./scan-sessions";
 import { isImageFileType } from "./media-kind";
 import { isVideoFileType, jsonVideoHumanLabels } from "./video-metadata";
@@ -2276,8 +2277,13 @@ async function scannedFileContext(
         include: {
           connectedFolder: {
             select: {
+              bridgeRootId: true,
+              canonicalConnectedLibraryId: true,
               displayName: true,
+              folderFingerprint: true,
               id: true,
+              localPath: true,
+              platform: true,
             },
           },
           scannedFiles: {
@@ -2400,8 +2406,13 @@ async function scannedFileContext(
               select: {
                 connectedFolder: {
                   select: {
+                    bridgeRootId: true,
+                    canonicalConnectedLibraryId: true,
                     displayName: true,
+                    folderFingerprint: true,
                     id: true,
+                    localPath: true,
+                    platform: true,
                   },
                 },
               },
@@ -2449,9 +2460,16 @@ async function scannedFileContext(
   };
   const duplicateMatches = duplicateTargets.flatMap((target) => {
     if (
-      target.scanSession.connectedFolder.id === sourceEvidence.connectedLibraryId &&
-      normalizeBridgeRelativePath(target.relativePath).toLowerCase() ===
-        normalizeBridgeRelativePath(sourceEvidence.relativePath).toLowerCase()
+      samePhysicalFile(
+        {
+          relativePath: scannedFile.relativePath,
+          scanSession: { connectedFolder: scannedFile.scanSession.connectedFolder },
+        },
+        {
+          relativePath: target.relativePath,
+          scanSession: { connectedFolder: target.scanSession.connectedFolder },
+        },
+      )
     ) {
       return [];
     }

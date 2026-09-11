@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import path from "node:path";
 
 import type { Prisma } from "@prisma/client";
 
@@ -10,6 +9,7 @@ import { recommendationSupportForStorage } from "./recommendation-reconciliation
 import { isImageFileType } from "./media-kind";
 import { isAudioFileType } from "./audio-metadata";
 import { isVideoFileType } from "./video-metadata";
+import { samePhysicalFile, samePhysicalRoot } from "./physical-file-identity";
 
 type DuplicateCandidate = {
   checksum: string | null;
@@ -33,9 +33,6 @@ type DuplicateCandidate = {
   };
 };
 
-type ConnectedRootIdentity =
-  DuplicateCandidate["scanSession"]["connectedFolder"];
-
 const exactDuplicateConfidence = 0.98;
 const reusableSnapshotStatuses = [
   "READING",
@@ -47,91 +44,6 @@ const reusableSnapshotStatuses = [
 
 function jsonInput(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
-}
-
-function caseInsensitivePlatform(platform: string) {
-  return platform === "MACOS" || platform === "WINDOWS";
-}
-
-function normalizeRelativePathKey(value: string, caseInsensitive: boolean) {
-  const withForwardSlashes = value.trim().replace(/\\/g, "/");
-
-  if (!withForwardSlashes) {
-    return "";
-  }
-
-  const normalized = path.posix
-    .normalize(`/${withForwardSlashes}`)
-    .replace(/^\/+/, "");
-
-  return caseInsensitive ? normalized.toLowerCase() : normalized;
-}
-
-function bridgeRootIdFromUri(value: string) {
-  return /^bridge:\/\/([^/]+)(?:\/.*)?$/i.exec(value.trim())?.[1] ?? null;
-}
-
-function normalizeRootPathKey(value: string, platform: string) {
-  const normalized = value
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/\/+$/, "");
-
-  return caseInsensitivePlatform(platform)
-    ? normalized.toLowerCase()
-    : normalized;
-}
-
-function connectedRootAliases(root: ConnectedRootIdentity) {
-  const bridgeUriRootId = bridgeRootIdFromUri(root.localPath);
-  const aliases = [
-    `library:${root.id}`,
-    root.canonicalConnectedLibraryId
-      ? `library:${root.canonicalConnectedLibraryId}`
-      : null,
-    root.bridgeRootId ? `root:${root.bridgeRootId.toLowerCase()}` : null,
-    root.folderFingerprint
-      ? `root:${root.folderFingerprint.toLowerCase()}`
-      : null,
-    bridgeUriRootId ? `root:${bridgeUriRootId.toLowerCase()}` : null,
-    bridgeUriRootId
-      ? null
-      : `path:${root.platform}:${normalizeRootPathKey(root.localPath, root.platform)}`,
-  ].filter((alias): alias is string => Boolean(alias));
-
-  return new Set(aliases);
-}
-
-function sameConnectedRoot(
-  left: ConnectedRootIdentity,
-  right: ConnectedRootIdentity,
-) {
-  const leftAliases = connectedRootAliases(left);
-
-  return [...connectedRootAliases(right)].some((alias) =>
-    leftAliases.has(alias),
-  );
-}
-
-function samePhysicalFile(
-  left: DuplicateCandidate,
-  right: DuplicateCandidate,
-) {
-  if (!sameConnectedRoot(
-    left.scanSession.connectedFolder,
-    right.scanSession.connectedFolder,
-  )) {
-    return false;
-  }
-
-  const caseInsensitive =
-    caseInsensitivePlatform(left.scanSession.connectedFolder.platform) ||
-    caseInsensitivePlatform(right.scanSession.connectedFolder.platform);
-
-  return (
-    normalizeRelativePathKey(left.relativePath, caseInsensitive) ===
-    normalizeRelativePathKey(right.relativePath, caseInsensitive)
-  );
 }
 
 function hasUsefulChecksum(file: Pick<DuplicateCandidate, "checksum" | "sizeBytes">) {
@@ -260,12 +172,12 @@ async function comparableSessionIdsFor(scanSessionId: string) {
 
   for (const otherSession of otherSessions) {
     if (
-      sameConnectedRoot(
+      samePhysicalRoot(
         session.connectedFolder,
         otherSession.connectedFolder,
       ) ||
       latestOtherRoots.some((latest) =>
-        sameConnectedRoot(
+        samePhysicalRoot(
           latest.connectedFolder,
           otherSession.connectedFolder,
         ),
