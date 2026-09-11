@@ -716,6 +716,229 @@ test("Bridge root aliases and hidden superseded roots cannot duplicate the same 
   );
 });
 
+test("stale media metadata cannot turn historical file aliases into self-duplicates", async () => {
+  const currentRootId = "root-production-media-identity";
+  const staleRootId = "root-stale-media-history";
+  const currentLibrary = await prisma.connectedLibrary.create({
+    data: {
+      bridgeRootId: currentRootId,
+      displayName: "SCAN_ROOT_A_GENERAL_INBOX",
+      folderFingerprint: currentRootId,
+      localPath: `bridge://${currentRootId}`,
+      platform: "MACOS",
+      status: "CONNECTED",
+    },
+  });
+  const staleLibrary = await prisma.connectedLibrary.create({
+    data: {
+      bridgeRootId: staleRootId,
+      displayName: "SCAN_ROOT_A_GENERAL_INBOX history",
+      folderFingerprint: staleRootId,
+      localPath: `bridge://${staleRootId}`,
+      platform: "MACOS",
+      status: "CONNECTED",
+    },
+  });
+  const historicalSession = await prisma.scanSession.create({
+    data: {
+      completedAt: new Date("2026-08-01T00:10:00.000Z"),
+      connectedFolderId: staleLibrary.id,
+      filesScanned: 3,
+      startedAt: new Date("2026-08-01T00:00:00.000Z"),
+      status: "COMPLETED",
+    },
+  });
+  const currentSession = await prisma.scanSession.create({
+    data: {
+      completedAt: new Date("2026-09-01T00:10:00.000Z"),
+      connectedFolderId: currentLibrary.id,
+      filesScanned: 5,
+      startedAt: new Date("2026-09-01T00:00:00.000Z"),
+      status: "COMPLETED",
+    },
+  });
+  const mediaFiles = [
+    ["broken-video-checksum", "VIDEO_MP4", "Damaged/broken-video.mp4"],
+    ["broken-audio-checksum", "AUDIO_MP3", "Damaged/broken-audio.mp3"],
+    [
+      "workshop-voice-checksum",
+      "AUDIO_M4A",
+      "Workshops_Unsorted/Workshop_Voice_Memo.m4a",
+    ],
+  ] as const;
+  const currentMediaIds: Array<{ id: string; relativePath: string }> = [];
+
+  for (const [checksum, fileType, relativePath] of mediaFiles) {
+    const historical = await prisma.scannedFile.create({
+      data: {
+        checksum,
+        fileType,
+        localPath: `bridge://${currentRootId}/${relativePath}`,
+        relativePath,
+        sessionId: historicalSession.id,
+        sizeBytes: BigInt(2048),
+      },
+    });
+    const current = await prisma.scannedFile.create({
+      data: {
+        checksum,
+        fileType,
+        localPath: `bridge://${currentRootId}/${relativePath}`,
+        relativePath,
+        sessionId: currentSession.id,
+        sizeBytes: BigInt(2048),
+      },
+    });
+    currentMediaIds.push({ id: current.id, relativePath });
+
+    if (fileType.startsWith("AUDIO_")) {
+      await prisma.audioRecordingMetadata.create({
+        data: {
+          duplicateConfidence: 0.98,
+          duplicateKind: "EXACT_DUPLICATE",
+          duplicateOfScannedFileId: historical.id,
+          humanLabels: [],
+          machineLabels: [],
+          provisionalActionItems: [],
+          provisionalPeople: [],
+          provisionalProjects: [],
+          provisionalQuestions: [],
+          provisionalTopics: [],
+          scannedFileId: current.id,
+        },
+      });
+    } else {
+      await prisma.videoRecordingMetadata.create({
+        data: {
+          chapterSuggestions: [],
+          duplicateConfidence: 0.98,
+          duplicateKind: "EXACT_DUPLICATE",
+          duplicateOfScannedFileId: historical.id,
+          humanLabels: [],
+          machineLabels: [],
+          provisionalPeople: [],
+          provisionalProjects: [],
+          provisionalQuestions: [],
+          provisionalTopics: [],
+          relatedSignals: [],
+          scannedFileId: current.id,
+          selectedFrameDescriptions: [],
+        },
+      });
+    }
+  }
+
+  const examinedVideo = currentMediaIds.find(
+    (file) => file.relativePath === "Damaged/broken-video.mp4",
+  );
+  assert.ok(examinedVideo);
+  const batch = await prisma.libraryBatch.create({
+    data: { name: "Production stale media identity" },
+  });
+  const document = await prisma.libraryDocument.create({
+    data: {
+      batchId: batch.id,
+      extractionStatus: "COMPLETED",
+      itemKind: "VIDEO",
+      normalizedFileName: "broken-video.mp4",
+      originalFileName: "broken-video.mp4",
+      previewText: "Damaged video fixture requiring review.",
+    },
+  });
+  await prisma.observationSession.create({
+    data: {
+      confidence: 0.35,
+      explanation: { summary: "The damaged video needs human review." },
+      interpretations: [],
+      libraryDocumentId: document.id,
+      observations: [
+        {
+          description: "The file could not provide useful visual content.",
+          evidence: ["Damaged video fixture requiring review."],
+        },
+      ],
+      observerType: "DETERMINISTIC",
+      planSuggestions: [],
+      warnings: ["The media was damaged."],
+    },
+  });
+  await prisma.scannedFile.update({
+    data: {
+      extractionStatus: "COMPLETED",
+      libraryDocumentId: document.id,
+      readingStatus: "READ",
+      readStatus: "SUPPORTED",
+    },
+    where: { id: examinedVideo.id },
+  });
+  const generated = await generateOrganizationSuggestionsForScannedFileWithText(
+    examinedVideo.id,
+    "Damaged video fixture requiring review.",
+    { replaceChecksumBootstrap: true },
+  );
+
+  assert.equal(
+    generated.suggestions.some(
+      (suggestion) => suggestion.suggestionType === "POSSIBLE_DUPLICATE",
+    ),
+    false,
+  );
+
+  for (const relativePath of [
+    "Mixed_Loose/same-content-copy-1.txt",
+    "Mixed_Loose/same-content-copy-2.txt",
+  ]) {
+    await prisma.scannedFile.create({
+      data: {
+        checksum: "legitimate-copy-checksum",
+        fileType: "TXT",
+        localPath: `bridge://${currentRootId}/${relativePath}`,
+        relativePath,
+        sessionId: currentSession.id,
+        sizeBytes: BigInt(512),
+      },
+    });
+  }
+
+  const result = await recordChecksumDuplicateSuggestionsForSession(
+    currentSession.id,
+  );
+  const activeDuplicates = await prisma.organizationSuggestion.findMany({
+    orderBy: { currentRelativePath: "asc" },
+    where: {
+      confidence: { gte: 0.98 },
+      invalidatedAt: null,
+      scanSessionId: currentSession.id,
+      suggestionType: "POSSIBLE_DUPLICATE",
+    },
+  });
+  const currentMedia = await prisma.scannedFile.findMany({
+    include: { audioMetadata: true, videoMetadata: true },
+    where: {
+      relativePath: { in: mediaFiles.map((media) => media[2]) },
+      sessionId: currentSession.id,
+    },
+  });
+
+  assert.equal(result.duplicateFiles, 2);
+  assert.equal(result.duplicateGroups, 1);
+  assert.deepEqual(
+    activeDuplicates.map((suggestion) => suggestion.currentRelativePath),
+    [
+      "Mixed_Loose/same-content-copy-1.txt",
+      "Mixed_Loose/same-content-copy-2.txt",
+    ],
+  );
+  assert.ok(
+    currentMedia.every(
+      (file) =>
+        (file.audioMetadata?.duplicateOfScannedFileId ??
+          file.videoMetadata?.duplicateOfScannedFileId ??
+          null) === null,
+    ),
+  );
+});
+
 test("non-empty checksum duplicates remain detectable within and across roots", async () => {
   const rootA = await createConnectedFixture("duplicate-root-a", {
     "Mixed_Loose/same-content-copy-1.txt": "duplicate body\n",
@@ -1261,16 +1484,78 @@ test("destination-specific cluster provenance excludes broad boundary relationsh
       "Client intake information about personal boundaries and appointments.\n",
     "Mixed/boundary-notes.txt":
       "General notes about boundaries and personal reflections.\n",
+    "Mixed_Loose/large-notes-200kb.txt":
+      "Long generic notes about weather, travel, and household tasks.\n",
+    "Mixed_Loose/Résumé - Café Notes.txt":
+      "Résumé notes about café work experience and menu planning.\n",
+    "Mixed_Loose/WATCH_CREATED_AFTER_CONNECT.txt":
+      "A watcher fixture created after the folder was connected.\n",
   });
   const file = scannedFileByRelativePath(
     fixture.scannedFiles,
     "Workshops_Unsorted/Workshop_Proposal.txt",
   );
+  const protectedPaths = [
+    "Workshops_Unsorted/Workshop_Proposal.txt",
+    "Workshops_Unsorted/Boundaries_Workshop_Outline.txt",
+    "Mixed_Loose/large-notes-200kb.txt",
+  ].map((relativePath) =>
+    path.join(fixture.folderPath, ...relativePath.split("/")),
+  );
+  const fileContentsBefore = await Promise.all(
+    protectedPaths.map((filePath) => readFile(filePath, "utf8")),
+  );
+  const memoryCountBefore = await prisma.memoryEntry.count();
   const contentText = await readAndApproveScannedFile(file.id);
   for (const relatedFile of fixture.scannedFiles) {
     if (relatedFile.id !== file.id) {
       await readAndApproveScannedFile(relatedFile.id);
     }
+  }
+  const contaminatedPaths = [
+    "Mixed_Loose/large-notes-200kb.txt",
+    "Mixed_Loose/Résumé - Café Notes.txt",
+    "Mixed_Loose/WATCH_CREATED_AFTER_CONNECT.txt",
+  ];
+  const contaminatedFiles = await prisma.scannedFile.findMany({
+    select: { libraryDocumentId: true },
+    where: {
+      relativePath: { in: contaminatedPaths },
+      sessionId: fixture.session.id,
+    },
+  });
+
+  for (const contaminatedFile of contaminatedFiles) {
+    assert.ok(contaminatedFile.libraryDocumentId);
+    await prisma.observationSession.create({
+      data: {
+        confidence: 0.51,
+        explanation: {
+          summary:
+            "AI assistance suggests comparing this with workshop material during review.",
+        },
+        interpretations: [
+          {
+            description:
+              "This may have a workshop or facilitation connection, but no file-specific evidence was observed.",
+          },
+        ],
+        libraryDocumentId: contaminatedFile.libraryDocumentId,
+        observations: [
+          {
+            description:
+              "Generic provisional workshop language without supporting source content.",
+            evidence: [
+              "The source content contains no workshop-specific evidence.",
+            ],
+          },
+        ],
+        observerType: "OPENAI",
+        planSuggestions: [],
+        status: "AWAITING_REVIEW",
+        warnings: ["Human review is required."],
+      },
+    });
   }
   const workingKnowledge = await loadScanWorkingKnowledge(fixture.session.id);
   const result = await generateOrganizationSuggestionsForScannedFileWithText(
@@ -1288,7 +1573,15 @@ test("destination-specific cluster provenance excludes broad boundary relationsh
     actionableEvidence,
     /Related file: Workshops_Unsorted\/Boundaries_Workshop_Outline\.txt/,
   );
-  assert.doesNotMatch(actionableEvidence, /Clients\/Loose|Mixed\/boundary-notes/);
+  assert.doesNotMatch(
+    actionableEvidence,
+    /Clients\/Loose|Mixed\/boundary-notes|large-notes-200kb|Résumé - Café Notes|WATCH_CREATED_AFTER_CONNECT/,
+  );
+  assert.deepEqual(
+    await Promise.all(protectedPaths.map((filePath) => readFile(filePath, "utf8"))),
+    fileContentsBefore,
+  );
+  assert.equal(await prisma.memoryEntry.count(), memoryCountBefore);
 });
 
 test("legacy and invalidated recommendations cannot enter selected or approved plans", async () => {

@@ -9,7 +9,10 @@ import {
 import { getPrismaClient } from "@/lib/db/prisma";
 import { sanitizeReadingWarning } from "@/lib/reading-room/utils";
 
-import { findExactChecksumDuplicateForScannedFile } from "./checksum-duplicates";
+import {
+  distinctPhysicalScannedFileIds,
+  findExactChecksumDuplicateForScannedFile,
+} from "./checksum-duplicates";
 import {
   ConnectedLibraryFileResolutionError,
   resolveConnectedLibraryFile,
@@ -349,10 +352,11 @@ async function detectAudioDuplicate(
   }
 
   if (metadata.audioFingerprint) {
-    const likely = await prisma.audioRecordingMetadata.findFirst({
+    const fingerprintCandidates = await prisma.audioRecordingMetadata.findMany({
       select: {
         scannedFileId: true,
       },
+      take: 30,
       where: {
         audioFingerprint: metadata.audioFingerprint,
         scannedFileId: {
@@ -360,6 +364,13 @@ async function detectAudioDuplicate(
         },
       },
     });
+    const distinctIds = await distinctPhysicalScannedFileIds(
+      scannedFile.id,
+      fingerprintCandidates.map((candidate) => candidate.scannedFileId),
+    );
+    const likely = fingerprintCandidates.find((candidate) =>
+      distinctIds.has(candidate.scannedFileId),
+    );
 
     if (likely) {
       return {
@@ -386,8 +397,13 @@ async function detectAudioDuplicate(
         },
       },
     });
+    const distinctIds = await distinctPhysicalScannedFileIds(
+      scannedFile.id,
+      candidates.map((candidate) => candidate.scannedFileId),
+    );
     const trimmed = candidates.find(
       (candidate) =>
+        distinctIds.has(candidate.scannedFileId) &&
         candidate.durationSeconds !== null &&
         Math.abs(candidate.durationSeconds - metadata.durationSeconds!) <= 3,
     );

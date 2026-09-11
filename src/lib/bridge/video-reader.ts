@@ -13,7 +13,10 @@ import {
 import { getPrismaClient } from "@/lib/db/prisma";
 import { sanitizeReadingWarning } from "@/lib/reading-room/utils";
 
-import { findExactChecksumDuplicateForScannedFile } from "./checksum-duplicates";
+import {
+  distinctPhysicalScannedFileIds,
+  findExactChecksumDuplicateForScannedFile,
+} from "./checksum-duplicates";
 import {
   ConnectedLibraryFileResolutionError,
   resolveConnectedLibraryFile,
@@ -651,13 +654,21 @@ async function detectVideoDuplicate(
   }
 
   if (metadata.videoFingerprint) {
-    const likely = await prisma.videoRecordingMetadata.findFirst({
+    const fingerprintCandidates = await prisma.videoRecordingMetadata.findMany({
       select: { scannedFileId: true },
+      take: 30,
       where: {
         scannedFileId: { not: scannedFile.id },
         videoFingerprint: metadata.videoFingerprint,
       },
     });
+    const distinctIds = await distinctPhysicalScannedFileIds(
+      scannedFile.id,
+      fingerprintCandidates.map((candidate) => candidate.scannedFileId),
+    );
+    const likely = fingerprintCandidates.find((candidate) =>
+      distinctIds.has(candidate.scannedFileId),
+    );
 
     if (likely) {
       return {
@@ -682,8 +693,13 @@ async function detectVideoDuplicate(
         scannedFileId: { not: scannedFile.id },
       },
     });
+    const distinctIds = await distinctPhysicalScannedFileIds(
+      scannedFile.id,
+      candidates.map((candidate) => candidate.scannedFileId),
+    );
     const nearDuration = candidates.find(
       (candidate) =>
+        distinctIds.has(candidate.scannedFileId) &&
         candidate.durationSeconds !== null &&
         Math.abs(candidate.durationSeconds - metadata.durationSeconds!) <= 5,
     );

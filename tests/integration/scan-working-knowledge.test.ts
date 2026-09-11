@@ -326,6 +326,27 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
       "The file describes workshop exercises for healthy boundaries.",
       "It may belong with workshop and facilitation material.",
     ),
+    productionFile(
+      "large-notes",
+      "Mixed_Loose/large-notes-200kb.txt",
+      "A long collection of generic notes about weather, travel, and household tasks.",
+      "The Librarian may compare this with workshop material as part of a broad review.",
+      "AI assistance suggests workshop review, but provides no file-specific workshop evidence.",
+    ),
+    productionFile(
+      "resume",
+      "Mixed_Loose/Résumé - Café Notes.txt",
+      "Résumé notes about café work experience and menu planning.",
+      "The Librarian may compare this with workshop material as part of a broad review.",
+      "AI assistance suggests workshop review, but provides no file-specific workshop evidence.",
+    ),
+    productionFile(
+      "watch-created",
+      "Mixed_Loose/WATCH_CREATED_AFTER_CONNECT.txt",
+      "A watcher fixture created after a connected folder was registered.",
+      "The Librarian may compare this with workshop material as part of a broad review.",
+      "AI assistance suggests workshop review, but provides no file-specific workshop evidence.",
+    ),
     ...[
       ["research", "Research/source-notes.txt", "Research citations about coastal ecology."],
       ["garden", "Personal/garden-log.txt", "Seed germination dates and soil moisture."],
@@ -369,8 +390,12 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
     files: [...files].reverse(),
     scanSessionId: "scan-production-shaped",
   });
+  const workshopOnly = buildScanWorkingKnowledge({
+    files: files.filter((file) => ["outline", "proposal"].includes(file.id)),
+    scanSessionId: "scan-production-shaped-workshops-only",
+  });
 
-  assert.equal(files.length, 21);
+  assert.equal(files.length, 24);
   const financeCluster = result.clusters.find((cluster) =>
     cluster.semanticTopics.includes("operations-finance"),
   );
@@ -383,6 +408,12 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
     "payments",
   ]);
   assert.deepEqual(workshopCluster?.memberFileIds, ["outline", "proposal"]);
+  assert.equal(
+    workshopCluster?.confidence,
+    workshopOnly.clusters.find((cluster) =>
+      cluster.semanticTopics.includes("workshops"),
+    )?.confidence,
+  );
   assert.ok(financeCluster?.sharedTerms.includes("finance"));
   assert.ok(workshopCluster?.sharedTerms.includes("workshop"));
   assert.equal(
@@ -392,6 +423,11 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
       ),
     ),
     false,
+  );
+  assert.ok(
+    ["large-notes", "resume", "watch-created"].every(
+      (id) => !workshopCluster?.memberFileIds.includes(id),
+    ),
   );
   assert.ok(result.clusters.every((cluster) => cluster.semanticTopics.length === 1));
   assert.ok(
@@ -483,17 +519,17 @@ test("sparse technical fixtures remain outside semantic clusters", () => {
   assert.equal(result.clusters.length, 0);
 });
 
-test("v9 is current and v8 cannot masquerade as the active generation", () => {
+test("v10 is current and v9 cannot masquerade as the active generation", () => {
   assert.equal(
     currentRecommendationGenerationVersion,
-    "organization-recommendations-v9",
+    "organization-recommendations-v10",
   );
   assert.equal(
-    isCurrentRecommendationGeneration("organization-recommendations-v9"),
+    isCurrentRecommendationGeneration("organization-recommendations-v10"),
     true,
   );
   assert.equal(
-    isCurrentRecommendationGeneration("organization-recommendations-v8"),
+    isCurrentRecommendationGeneration("organization-recommendations-v9"),
     false,
   );
 });

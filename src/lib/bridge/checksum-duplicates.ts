@@ -16,6 +16,7 @@ type DuplicateCandidate = {
   fileType: string;
   id: string;
   lastModified: Date | null;
+  localPath: string;
   relativePath: string;
   sessionId: string;
   sizeBytes: bigint | null;
@@ -237,6 +238,7 @@ async function duplicateCandidatesForChecksums(
       fileType: true,
       id: true,
       lastModified: true,
+      localPath: true,
       relativePath: true,
       scanSession: {
         select: {
@@ -276,6 +278,59 @@ async function duplicateCandidatesForChecksums(
   );
 }
 
+export async function distinctPhysicalScannedFileIds(
+  scannedFileId: string,
+  candidateIds: string[],
+) {
+  const uniqueCandidateIds = [
+    ...new Set(candidateIds.filter((id) => id && id !== scannedFileId)),
+  ];
+
+  if (uniqueCandidateIds.length === 0) {
+    return new Set<string>();
+  }
+
+  const prisma = getPrismaClient();
+  const files = await prisma.scannedFile.findMany({
+    select: {
+      id: true,
+      localPath: true,
+      relativePath: true,
+      scanSession: {
+        select: {
+          connectedFolder: {
+            select: {
+              bridgeRootId: true,
+              canonicalConnectedLibraryId: true,
+              folderFingerprint: true,
+              id: true,
+              localPath: true,
+              platform: true,
+            },
+          },
+        },
+      },
+    },
+    where: {
+      id: { in: [scannedFileId, ...uniqueCandidateIds] },
+    },
+  });
+  const source = files.find((file) => file.id === scannedFileId);
+
+  if (!source) {
+    return new Set<string>();
+  }
+
+  return new Set(
+    files
+      .filter(
+        (candidate) =>
+          candidate.id !== source.id && !samePhysicalFile(source, candidate),
+      )
+      .map((candidate) => candidate.id),
+  );
+}
+
 export async function findExactChecksumDuplicateForScannedFile(
   scannedFileId: string,
 ) {
@@ -286,6 +341,7 @@ export async function findExactChecksumDuplicateForScannedFile(
       fileType: true,
       id: true,
       lastModified: true,
+      localPath: true,
       relativePath: true,
       scanSession: {
         select: {

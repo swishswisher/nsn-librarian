@@ -5,7 +5,10 @@ import {
   ConnectedLibraryFileResolutionError,
   resolveConnectedLibraryFile,
 } from "./connected-library-file-resolver";
-import { findExactChecksumDuplicateForScannedFile } from "./checksum-duplicates";
+import {
+  distinctPhysicalScannedFileIds,
+  findExactChecksumDuplicateForScannedFile,
+} from "./checksum-duplicates";
 import {
   extractImageMetadata,
   imageDimensionsText,
@@ -316,7 +319,7 @@ async function detectImageDuplicate(
   }
 
   if (metadata.imageFingerprint) {
-    const matchingFingerprint = await prisma.imageAssetMetadata.findFirst({
+    const fingerprintCandidates = await prisma.imageAssetMetadata.findMany({
       select: { scannedFileId: true },
       where: {
         imageFingerprint: metadata.imageFingerprint,
@@ -326,6 +329,13 @@ async function detectImageDuplicate(
         scannedFileId: { not: scannedFile.id },
       },
     });
+    const distinctIds = await distinctPhysicalScannedFileIds(
+      scannedFile.id,
+      fingerprintCandidates.map((candidate) => candidate.scannedFileId),
+    );
+    const matchingFingerprint = fingerprintCandidates.find((candidate) =>
+      distinctIds.has(candidate.scannedFileId),
+    );
 
     if (matchingFingerprint) {
       return {
@@ -354,11 +364,15 @@ async function detectImageDuplicate(
       sessionId: scannedFile.sessionId,
     },
   });
+  const distinctSiblingIds = await distinctPhysicalScannedFileIds(
+    scannedFile.id,
+    siblings.map((sibling) => sibling.id),
+  );
   const likely = siblings.find((sibling) => {
     const candidateStem = normalizeImageStem(sibling.relativePath);
     const overlap = imageStemOverlap(currentStem, candidateStem);
 
-    return (
+    return distinctSiblingIds.has(sibling.id) && (
       candidateStem === currentStem ||
       overlap.length >= 2 ||
       /\b(duplicate|copy|small|resized|thumbnail)\b/.test(pathText)

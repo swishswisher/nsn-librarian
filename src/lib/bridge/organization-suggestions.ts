@@ -35,7 +35,10 @@ import {
   workingKnowledgeSupportsTopic,
   workingKnowledgeTerms,
 } from "./scan-working-knowledge";
-import { samePhysicalFile } from "./physical-file-identity";
+import {
+  normalizePhysicalRelativePath,
+  samePhysicalFile,
+} from "./physical-file-identity";
 import { scannedFileSummary } from "./scan-sessions";
 import { isImageFileType } from "./media-kind";
 import { isVideoFileType, jsonVideoHumanLabels } from "./video-metadata";
@@ -113,6 +116,7 @@ type SuggestionContext = {
   provisionalWorkingEvidence: string[];
   siblingFiles: Array<{
     id: string;
+    localPath: string;
     relativePath: string;
     fileType: string;
     checksum: string | null;
@@ -1119,7 +1123,10 @@ function imageDuplicateDraft(context: SuggestionContext) {
   const candidates = context.siblingFiles
     .filter(
       (file) =>
-        file.id !== context.scannedFileId && isImageFileType(file.fileType),
+        file.id !== context.scannedFileId &&
+        normalizePhysicalRelativePath(file.relativePath) !==
+          normalizePhysicalRelativePath(context.currentRelativePath) &&
+        isImageFileType(file.fileType),
     )
     .map((file) => {
       const candidateStem = normalizedImageStem(file.relativePath);
@@ -2312,6 +2319,7 @@ async function scannedFileContext(
               checksum: true,
               fileType: true,
               id: true,
+              localPath: true,
               relativePath: true,
               sizeBytes: true,
             },
@@ -2401,6 +2409,7 @@ async function scannedFileContext(
                 width: true,
               },
             },
+            localPath: true,
             relativePath: true,
             scanSession: {
               select: {
@@ -2462,10 +2471,12 @@ async function scannedFileContext(
     if (
       samePhysicalFile(
         {
+          localPath: scannedFile.localPath,
           relativePath: scannedFile.relativePath,
           scanSession: { connectedFolder: scannedFile.scanSession.connectedFolder },
         },
         {
+          localPath: target.localPath,
           relativePath: target.relativePath,
           scanSession: { connectedFolder: target.scanSession.connectedFolder },
         },
@@ -2531,6 +2542,7 @@ async function scannedFileContext(
       fileType: file.fileType,
       imageFingerprint: file.imageMetadata?.imageFingerprint ?? null,
       id: file.id,
+      localPath: file.localPath,
       relativePath: file.relativePath,
       sizeBytes: file.sizeBytes,
       videoFingerprint: file.videoMetadata?.videoFingerprint ?? null,

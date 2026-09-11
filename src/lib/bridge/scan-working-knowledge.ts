@@ -38,6 +38,7 @@ export type ScanWorkingKnowledgeRelationship = {
   evidenceKinds: WorkingEvidenceKind[];
   leftFileId: string;
   rightFileId: string;
+  supportingTopicConfidence: Record<string, number>;
   supportingTopics: string[];
   sharedTopics: string[];
   sharedTerms: string[];
@@ -65,6 +66,7 @@ export type ScanWorkingKnowledgeFile = {
   relativePath: string;
   semanticPreview: string;
   semanticTerms: string[];
+  supportingTopics: string[];
   trustedObservationEvidence: string[];
 };
 
@@ -370,6 +372,45 @@ function semanticSupportingTopicsForTerms(terms: Iterable<string>) {
     .map((topic) => topic.id);
 }
 
+function independentlySupportingTopics(weightedTerms: WeightedTerms) {
+  return semanticTopicFamilies
+    .filter((topic) =>
+      topic.supportTerms.some((term) => {
+        const normalized = workingKnowledgeTerms(term)[0] ?? "";
+        const sources = weightedTerms.get(normalized)?.sources;
+
+        return Boolean(
+          sources?.has("CONTENT") || sources?.has("TRUSTED_OBSERVATION"),
+        );
+      }),
+    )
+    .map((topic) => topic.id);
+}
+
+function destinationSupportStrength(
+  weightedTerms: WeightedTerms,
+  topicId: string,
+) {
+  const supportTerms = semanticTopicSupportTerms(topicId);
+  const matchingTerms = [...supportTerms].filter((term) => weightedTerms.has(term));
+  const sources = new Set<WorkingEvidenceKind>();
+
+  for (const term of matchingTerms) {
+    for (const source of weightedTerms.get(term)?.sources ?? []) {
+      sources.add(source);
+    }
+  }
+
+  let score = sources.has("TRUSTED_OBSERVATION") ? 0.78 : 0.66;
+  score += Math.min(Math.max(matchingTerms.length - 1, 0), 3) * 0.04;
+
+  if (sources.has("APPROVED_MEMORY")) {
+    score += 0.04;
+  }
+
+  return Math.min(0.92, Math.round(score * 100) / 100);
+}
+
 export function workingKnowledgeSupportsTopic(value: string, topicId: string) {
   return semanticSupportingTopicsForTerms(workingKnowledgeTerms(value)).some(
     (topic) => topic === topicId,
@@ -653,6 +694,7 @@ export function buildScanWorkingKnowledge(input: {
         3,
       );
       weightedByFileId.set(file.id, weightedTerms);
+      const supportingTopics = independentlySupportingTopics(weightedTerms);
 
       return {
         approvedMemoryEvidence,
@@ -670,6 +712,7 @@ export function buildScanWorkingKnowledge(input: {
               right[1].weight - left[1].weight || left[0].localeCompare(right[0]),
           )
           .map(([term]) => term),
+        supportingTopics,
         trustedObservationEvidence: evidence.trustedObservationEvidence,
       };
     });
@@ -694,10 +737,19 @@ export function buildScanWorkingKnowledge(input: {
       const leftTopics = semanticTopicsForTerms(leftTerms.keys());
       const rightTopics = semanticTopicsForTerms(rightTerms.keys());
       const sharedTopics = leftTopics.filter((topic) => rightTopics.includes(topic));
-      const leftSupportingTopics = semanticSupportingTopicsForTerms(leftTerms.keys());
-      const rightSupportingTopics = semanticSupportingTopicsForTerms(rightTerms.keys());
+      const leftSupportingTopics = left.supportingTopics;
+      const rightSupportingTopics = right.supportingTopics;
       const supportingTopics = leftSupportingTopics.filter((topic) =>
         rightSupportingTopics.includes(topic),
+      );
+      const supportingTopicConfidence = Object.fromEntries(
+        supportingTopics.map((topic) => [
+          topic,
+          Math.min(
+            destinationSupportStrength(leftTerms, topic),
+            destinationSupportStrength(rightTerms, topic),
+          ),
+        ]),
       );
       const meaningfulSharedTopics = sharedTopics.filter(
         (topic) =>
@@ -740,6 +792,7 @@ export function buildScanWorkingKnowledge(input: {
           evidenceKinds,
           leftFileId: left.id,
           rightFileId: right.id,
+          supportingTopicConfidence,
           supportingTopics,
           sharedTopics: meaningfulSharedTopics,
           sharedTerms: sharedTerms.map(displaySemanticTerm),
@@ -815,7 +868,11 @@ export function buildScanWorkingKnowledge(input: {
         .filter((item): item is ScanWorkingKnowledgeFile => Boolean(item))
         .sort((left, right) => left.relativePath.localeCompare(right.relativePath));
       const confidence =
-        memberRelationships.reduce((sum, relation) => sum + relation.confidence, 0) /
+        memberRelationships.reduce(
+          (sum, relation) =>
+            sum + (relation.supportingTopicConfidence[topic.id] ?? 0),
+          0,
+        ) /
         memberRelationships.length;
 
       clusters.push({
