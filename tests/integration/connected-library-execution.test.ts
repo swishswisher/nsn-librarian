@@ -32,6 +32,7 @@ let registerLocalBridgeRoot: typeof import("../../src/lib/bridge/local-bridge-cl
 let scanLocalBridgeRoot: typeof import("../../src/lib/bridge/local-bridge-client").scanLocalBridgeRoot;
 let updateLocalBridgeRoot: typeof import("../../src/lib/bridge/local-bridge-client").updateLocalBridgeRoot;
 let createBridgeScanSessionFromScan: typeof import("../../src/lib/bridge/scan-sessions").createBridgeScanSessionFromScan;
+let loadScanWorkingKnowledge: typeof import("../../src/lib/bridge/scan-working-knowledge").loadScanWorkingKnowledge;
 let readScannedFile: typeof import("../../src/lib/bridge/reader").readScannedFile;
 let createObservationSessionForScannedFileReadResult: typeof import("../../src/lib/bridge/scanned-file-observations").createObservationSessionForScannedFileReadResult;
 let generateOrganizationSuggestionsForScannedFileWithText: typeof import("../../src/lib/bridge/organization-suggestions").generateOrganizationSuggestionsForScannedFileWithText;
@@ -331,6 +332,9 @@ before(async () => {
   const connectedLibraries = await import("../../src/lib/bridge/connected-libraries");
   const localBridgeClient = await import("../../src/lib/bridge/local-bridge-client");
   const scanSessions = await import("../../src/lib/bridge/scan-sessions");
+  const scanWorkingKnowledge = await import(
+    "../../src/lib/bridge/scan-working-knowledge"
+  );
   const reader = await import("../../src/lib/bridge/reader");
   const scannedFileObservations = await import(
     "../../src/lib/bridge/scanned-file-observations"
@@ -353,6 +357,7 @@ before(async () => {
   updateLocalBridgeRoot = localBridgeClient.updateLocalBridgeRoot;
   createBridgeScanSessionFromScan =
     scanSessions.createBridgeScanSessionFromScan;
+  loadScanWorkingKnowledge = scanWorkingKnowledge.loadScanWorkingKnowledge;
   readScannedFile = reader.readScannedFile;
   createObservationSessionForScannedFileReadResult =
     scannedFileObservations.createObservationSessionForScannedFileReadResult;
@@ -1244,6 +1249,46 @@ test("strong operations and workshop meaning uses established folder patterns", 
         suggestion.evidenceStrength === "STRONG",
     ),
   );
+});
+
+test("destination-specific cluster provenance excludes broad boundary relationships", async () => {
+  const fixture = await createConnectedFixture("destination-cluster-provenance", {
+    "Workshops_Unsorted/Workshop_Proposal.txt":
+      "Workshop proposal for boundaries and communication facilitation.\n",
+    "Workshops_Unsorted/Boundaries_Workshop_Outline.txt":
+      "Boundaries workshop facilitation orientation and training outline.\n",
+    "Clients/Loose/client-intake.txt":
+      "Client intake information about personal boundaries and appointments.\n",
+    "Mixed/boundary-notes.txt":
+      "General notes about boundaries and personal reflections.\n",
+  });
+  const file = scannedFileByRelativePath(
+    fixture.scannedFiles,
+    "Workshops_Unsorted/Workshop_Proposal.txt",
+  );
+  const contentText = await readAndApproveScannedFile(file.id);
+  for (const relatedFile of fixture.scannedFiles) {
+    if (relatedFile.id !== file.id) {
+      await readAndApproveScannedFile(relatedFile.id);
+    }
+  }
+  const workingKnowledge = await loadScanWorkingKnowledge(fixture.session.id);
+  const result = await generateOrganizationSuggestionsForScannedFileWithText(
+    file.id,
+    contentText,
+    { workingKnowledge },
+  );
+  const actionableEvidence = JSON.stringify(
+    result.suggestions.filter((suggestion) =>
+      ["MOVE_FILE", "CREATE_FOLDER"].includes(suggestion.suggestionType),
+    ),
+  );
+
+  assert.match(
+    actionableEvidence,
+    /Related file: Workshops_Unsorted\/Boundaries_Workshop_Outline\.txt/,
+  );
+  assert.doesNotMatch(actionableEvidence, /Clients\/Loose|Mixed\/boundary-notes/);
 });
 
 test("legacy and invalidated recommendations cannot enter selected or approved plans", async () => {

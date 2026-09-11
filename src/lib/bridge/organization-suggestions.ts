@@ -31,7 +31,10 @@ import type {
   ScanWorkingKnowledgeCluster,
   ScanWorkingKnowledgeIndex,
 } from "./scan-working-knowledge";
-import { workingKnowledgeTerms } from "./scan-working-knowledge";
+import {
+  workingKnowledgeSupportsTopic,
+  workingKnowledgeTerms,
+} from "./scan-working-knowledge";
 import { scannedFileSummary } from "./scan-sessions";
 import { isImageFileType } from "./media-kind";
 import { isVideoFileType, jsonVideoHumanLabels } from "./video-metadata";
@@ -858,15 +861,9 @@ function provisionalWorkingSupport(context: SuggestionContext) {
 }
 
 function semanticClusterSupport(context: SuggestionContext, rule: TopicRule) {
-  const currentSemanticTerms = new Set(
-    workingKnowledgeTerms(semanticAnalysisText(context)),
-  );
-  const currentSupportsRule = rule.terms.some(
-    (term) =>
-      currentSemanticTerms.has(term) ||
-      workingKnowledgeTerms(term).some((normalized) =>
-        currentSemanticTerms.has(normalized),
-      ),
+  const currentSupportsRule = workingKnowledgeSupportsTopic(
+    semanticAnalysisText(context),
+    rule.id,
   );
 
   if (!currentSupportsRule) {

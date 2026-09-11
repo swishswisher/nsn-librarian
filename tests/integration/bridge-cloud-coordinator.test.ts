@@ -1753,3 +1753,4 @@ test("production cloud monitoring dashboard does not drain localhost events", as
   assert.equal(afterDashboard.monitoringState, "WATCHING");
   assert.equal(afterDashboard.monitoringErrorCategory, null);
 });
+

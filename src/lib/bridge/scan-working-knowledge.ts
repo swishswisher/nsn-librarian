@@ -38,6 +38,7 @@ export type ScanWorkingKnowledgeRelationship = {
   evidenceKinds: WorkingEvidenceKind[];
   leftFileId: string;
   rightFileId: string;
+  supportingTopics: string[];
   sharedTopics: string[];
   sharedTerms: string[];
 };
@@ -187,26 +188,44 @@ const semanticTopicFamilies = [
     id: "becoming",
     label: "growth and becoming",
     terms: ["becoming", "growth", "identity", "change", "future"],
+    supportTerms: ["becoming", "growth", "identity", "change", "future"],
   },
   {
     id: "recovery",
     label: "recovery and healing",
     terms: ["recovery", "healing", "repair", "restore", "resilience"],
+    supportTerms: ["recovery", "healing", "repair", "restore", "resilience"],
   },
   {
     id: "attachment-regulation",
     label: "attachment and regulation",
     terms: ["attachment", "regulation", "nervous", "safety"],
+    supportTerms: ["attachment", "regulation", "nervous", "safety"],
   },
   {
     id: "clinical-tools",
     label: "clinical and teaching tools",
     terms: ["worksheet", "exercise", "practice", "clinical"],
+    supportTerms: ["worksheet", "exercise", "practice", "clinical"],
   },
   {
     id: "operations-finance",
     label: "finance and office operations",
     terms: [
+      "invoice",
+      "invoicing",
+      "payment",
+      "pay",
+      "paying",
+      "expense",
+      "expenses",
+      "financial",
+      "finance",
+      "budget",
+      "receipt",
+      "accounting",
+    ],
+    supportTerms: [
       "invoice",
       "invoicing",
       "payment",
@@ -233,16 +252,28 @@ const semanticTopicFamilies = [
       "curriculum",
       "boundaries",
     ],
+    supportTerms: [
+      "workshop",
+      "training",
+      "facilitation",
+      "facilitator",
+      "orientation",
+      "curriculum",
+      "seminar",
+      "course",
+    ],
   },
   {
     id: "research",
     label: "research and references",
     terms: ["research", "study", "source", "citation", "reference"],
+    supportTerms: ["research", "study", "source", "citation", "reference"],
   },
   {
     id: "website",
     label: "website and public material",
     terms: ["article", "newsletter", "website", "public", "blog"],
+    supportTerms: ["article", "newsletter", "website", "public", "blog"],
   },
 ] as const;
 
@@ -310,6 +341,11 @@ function semanticTopicTerms(topicId: string) {
   return new Set(topic?.terms.flatMap(workingKnowledgeTerms) ?? []);
 }
 
+function semanticTopicSupportTerms(topicId: string) {
+  const topic = semanticTopicFamilies.find((candidate) => candidate.id === topicId);
+  return new Set(topic?.supportTerms.flatMap(workingKnowledgeTerms) ?? []);
+}
+
 function semanticTopicsForTerms(terms: Iterable<string>) {
   const availableTerms = new Set(terms);
 
@@ -320,6 +356,24 @@ function semanticTopicsForTerms(terms: Iterable<string>) {
       ),
     )
     .map((topic) => topic.id);
+}
+
+function semanticSupportingTopicsForTerms(terms: Iterable<string>) {
+  const availableTerms = new Set(terms);
+
+  return semanticTopicFamilies
+    .filter((topic) =>
+      topic.supportTerms.some((term) =>
+        availableTerms.has(workingKnowledgeTerms(term)[0] ?? ""),
+      ),
+    )
+    .map((topic) => topic.id);
+}
+
+export function workingKnowledgeSupportsTopic(value: string, topicId: string) {
+  return semanticSupportingTopicsForTerms(workingKnowledgeTerms(value)).some(
+    (topic) => topic === topicId,
+  );
 }
 
 function semanticTopicLabel(topicId: string) {
@@ -640,6 +694,11 @@ export function buildScanWorkingKnowledge(input: {
       const leftTopics = semanticTopicsForTerms(leftTerms.keys());
       const rightTopics = semanticTopicsForTerms(rightTerms.keys());
       const sharedTopics = leftTopics.filter((topic) => rightTopics.includes(topic));
+      const leftSupportingTopics = semanticSupportingTopicsForTerms(leftTerms.keys());
+      const rightSupportingTopics = semanticSupportingTopicsForTerms(rightTerms.keys());
+      const supportingTopics = leftSupportingTopics.filter((topic) =>
+        rightSupportingTopics.includes(topic),
+      );
       const meaningfulSharedTopics = sharedTopics.filter(
         (topic) =>
           evidenceKindsForSharedTopic(leftTerms, rightTerms, topic).length > 0,
@@ -681,6 +740,7 @@ export function buildScanWorkingKnowledge(input: {
           evidenceKinds,
           leftFileId: left.id,
           rightFileId: right.id,
+          supportingTopics,
           sharedTopics: meaningfulSharedTopics,
           sharedTerms: sharedTerms.map(displaySemanticTerm),
         });
@@ -695,7 +755,7 @@ export function buildScanWorkingKnowledge(input: {
   // would let a weak bridge transfer every subject to every member.
   for (const topic of semanticTopicFamilies) {
     const topicRelationships = relationships.filter((relation) =>
-      relation.sharedTopics.includes(topic.id),
+      relation.supportingTopics.includes(topic.id),
     );
     const adjacency = new Map<string, Set<string>>();
 
@@ -734,7 +794,7 @@ export function buildScanWorkingKnowledge(input: {
         (relation) =>
           memberSet.has(relation.leftFileId) && memberSet.has(relation.rightFileId),
       );
-      const topicTerms = semanticTopicTerms(topic.id);
+      const topicTerms = semanticTopicSupportTerms(topic.id);
       const termCounts = new Map<string, number>();
 
       for (const relation of memberRelationships) {

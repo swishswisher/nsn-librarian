@@ -341,8 +341,16 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
       ["music", "Audio/piano-recital.m4a", "Piano recital recording from the evening."],
       ["school", "Archive/history-reading.txt", "History reading list about early cities."],
       ["inventory", "Operations_Mess/office-inventory.csv", "Inventory of desks and storage boxes."],
-      ["client", "Clients/Loose/client-intake.docx", "Client intake form and appointment details."],
-      ["bridge", "Mixed/bridge.txt", "General project planning and logistics overview."],
+      [
+        "client",
+        "Clients/Loose/client-intake.docx",
+        "Client intake form about personal boundaries and appointment details.",
+      ],
+      [
+        "boundary-notes",
+        "Mixed/boundary-notes.txt",
+        "General notes about boundaries and personal reflections.",
+      ],
     ].map(([id, relativePath, previewText]) =>
       productionFile(
         id,
@@ -379,7 +387,9 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
   assert.ok(workshopCluster?.sharedTerms.includes("workshop"));
   assert.equal(
     result.clusters.some((cluster) =>
-      ["client", "bridge"].some((id) => cluster.memberFileIds.includes(id)),
+      ["client", "boundary-notes"].some((id) =>
+        cluster.memberFileIds.includes(id),
+      ),
     ),
     false,
   );
@@ -391,6 +401,13 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
       ),
     ),
   );
+  const boundaryRelation = result.relationships.find(
+    (relationship) =>
+      relationship.leftFileId === "client" &&
+      relationship.rightFileId === "proposal",
+  );
+  assert.ok(boundaryRelation?.sharedTopics.includes("workshops"));
+  assert.equal(boundaryRelation?.supportingTopics.includes("workshops"), false);
   assert.deepEqual(reverse, result);
 });
 
@@ -466,17 +483,17 @@ test("sparse technical fixtures remain outside semantic clusters", () => {
   assert.equal(result.clusters.length, 0);
 });
 
-test("v7 is current and v6 cannot masquerade as the active generation", () => {
+test("v8 is current and v7 cannot masquerade as the active generation", () => {
   assert.equal(
     currentRecommendationGenerationVersion,
-    "organization-recommendations-v7",
+    "organization-recommendations-v8",
   );
   assert.equal(
-    isCurrentRecommendationGeneration("organization-recommendations-v7"),
+    isCurrentRecommendationGeneration("organization-recommendations-v8"),
     true,
   );
   assert.equal(
-    isCurrentRecommendationGeneration("organization-recommendations-v6"),
+    isCurrentRecommendationGeneration("organization-recommendations-v7"),
     false,
   );
 });
