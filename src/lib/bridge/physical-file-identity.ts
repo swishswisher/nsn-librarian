@@ -7,6 +7,7 @@ export type PhysicalFileIdentityInput = {
     connectedFolder: {
       bridgeRootId: string | null;
       canonicalConnectedLibraryId: string | null;
+      displayName?: string;
       folderFingerprint: string | null;
       id: string;
       localPath: string;
@@ -16,6 +17,11 @@ export type PhysicalFileIdentityInput = {
 };
 
 export type PhysicalRootIdentity = PhysicalFileIdentityInput["scanSession"]["connectedFolder"];
+
+export type PhysicalFilePresentationInput = {
+  connectedLibraryName: string;
+  relativePath: string;
+};
 
 function caseInsensitivePlatform(platform: string) {
   return ["MACOS", "WINDOWS"].includes(platform.trim().toUpperCase());
@@ -101,6 +107,18 @@ export function normalizePhysicalRelativePath(
   return caseInsensitive ? normalized.toLowerCase() : normalized;
 }
 
+export function samePhysicalFilePresentation(
+  left: PhysicalFilePresentationInput,
+  right: PhysicalFilePresentationInput,
+) {
+  return (
+    normalizedAlias(left.connectedLibraryName) ===
+      normalizedAlias(right.connectedLibraryName) &&
+    normalizePhysicalRelativePath(left.relativePath) ===
+      normalizePhysicalRelativePath(right.relativePath)
+  );
+}
+
 function connectedRootAliases(
   root: PhysicalRootIdentity,
   fileLocalPath?: string | null,
@@ -182,4 +200,35 @@ export function samePhysicalFile(
     normalizePhysicalRelativePath(left.relativePath, caseInsensitive) ===
     normalizePhysicalRelativePath(right.relativePath, caseInsensitive)
   );
+}
+
+export function demonstrablyDistinctPhysicalFiles(
+  left: PhysicalFileIdentityInput,
+  right: PhysicalFileIdentityInput,
+) {
+  if (samePhysicalFile(left, right)) {
+    return false;
+  }
+
+  const leftName = left.scanSession.connectedFolder.displayName;
+  const rightName = right.scanSession.connectedFolder.displayName;
+
+  if (
+    leftName &&
+    rightName &&
+    samePhysicalFilePresentation(
+      {
+        connectedLibraryName: leftName,
+        relativePath: left.relativePath,
+      },
+      {
+        connectedLibraryName: rightName,
+        relativePath: right.relativePath,
+      },
+    )
+  ) {
+    return false;
+  }
+
+  return true;
 }

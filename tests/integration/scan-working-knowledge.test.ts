@@ -315,35 +315,35 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
     productionFile(
       "proposal",
       "Workshops_Unsorted/Workshop_Proposal.pdf",
-      "Workshop proposal for boundaries and communication practice.",
+      "Workshop proposal with facilitator notes and communication practice.",
       "The file outlines a boundaries communication workshop.",
       "It may belong with workshop facilitation material.",
     ),
     productionFile(
       "outline",
       "Workshops_Unsorted/Boundaries_Workshop_Outline.docx",
-      "Boundaries and communication workshop outline for adults.",
+      "Boundaries and communication workshop outline with an audience section.",
       "The file describes workshop exercises for healthy boundaries.",
       "It may belong with workshop and facilitation material.",
     ),
     productionFile(
       "large-notes",
       "Mixed_Loose/large-notes-200kb.txt",
-      "A long collection of generic notes about weather, travel, and household tasks.",
+      "Generic notes about website planning, workshop materials, office administration, and follow-up tasks.",
       "The Librarian may compare this with workshop material as part of a broad review.",
       "AI assistance suggests workshop review, but provides no file-specific workshop evidence.",
     ),
     productionFile(
       "resume",
       "Mixed_Loose/Résumé - Café Notes.txt",
-      "Résumé notes about café work experience and menu planning.",
+      "Notes from a café meeting discussing website copy and workshop planning.",
       "The Librarian may compare this with workshop material as part of a broad review.",
       "AI assistance suggests workshop review, but provides no file-specific workshop evidence.",
     ),
     productionFile(
       "watch-created",
       "Mixed_Loose/WATCH_CREATED_AFTER_CONNECT.txt",
-      "A watcher fixture created after a connected folder was registered.",
+      "A watcher fixture about website follow-up and workshop scheduling.",
       "The Librarian may compare this with workshop material as part of a broad review.",
       "AI assistance suggests workshop review, but provides no file-specific workshop evidence.",
     ),
@@ -427,6 +427,13 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
   assert.ok(
     ["large-notes", "resume", "watch-created"].every(
       (id) => !workshopCluster?.memberFileIds.includes(id),
+    ),
+  );
+  assert.ok(
+    result.relationships.some(
+      (relationship) =>
+        relationship.sharedTopics.includes("workshops") &&
+        !relationship.supportingTopics.includes("workshops"),
     ),
   );
   assert.ok(result.clusters.every((cluster) => cluster.semanticTopics.length === 1));
@@ -519,17 +526,17 @@ test("sparse technical fixtures remain outside semantic clusters", () => {
   assert.equal(result.clusters.length, 0);
 });
 
-test("v10 is current and v9 cannot masquerade as the active generation", () => {
+test("v11 is current and v10 cannot masquerade as the active generation", () => {
   assert.equal(
     currentRecommendationGenerationVersion,
-    "organization-recommendations-v10",
+    "organization-recommendations-v11",
   );
   assert.equal(
-    isCurrentRecommendationGeneration("organization-recommendations-v10"),
+    isCurrentRecommendationGeneration("organization-recommendations-v11"),
     true,
   );
   assert.equal(
-    isCurrentRecommendationGeneration("organization-recommendations-v9"),
+    isCurrentRecommendationGeneration("organization-recommendations-v10"),
     false,
   );
 });

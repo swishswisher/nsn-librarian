@@ -263,6 +263,11 @@ const semanticTopicFamilies = [
       "curriculum",
       "seminar",
       "course",
+      "participant",
+      "audience",
+      "agenda",
+      "handout",
+      "exercise",
     ],
   },
   {
@@ -374,16 +379,28 @@ function semanticSupportingTopicsForTerms(terms: Iterable<string>) {
 
 function independentlySupportingTopics(weightedTerms: WeightedTerms) {
   return semanticTopicFamilies
-    .filter((topic) =>
-      topic.supportTerms.some((term) => {
+    .filter((topic) => {
+      const directContentTerms = new Set<string>();
+      const trustedTerms = new Set<string>();
+
+      for (const term of topic.supportTerms) {
         const normalized = workingKnowledgeTerms(term)[0] ?? "";
         const sources = weightedTerms.get(normalized)?.sources;
 
-        return Boolean(
-          sources?.has("CONTENT") || sources?.has("TRUSTED_OBSERVATION"),
-        );
-      }),
-    )
+        if (sources?.has("CONTENT")) {
+          directContentTerms.add(normalized);
+        }
+        if (sources?.has("TRUSTED_OBSERVATION")) {
+          trustedTerms.add(normalized);
+        }
+      }
+
+      const requiredContentTerms = topic.id === "workshops" ? 2 : 1;
+
+      return (
+        trustedTerms.size > 0 || directContentTerms.size >= requiredContentTerms
+      );
+    })
     .map((topic) => topic.id);
 }
 
@@ -392,7 +409,13 @@ function destinationSupportStrength(
   topicId: string,
 ) {
   const supportTerms = semanticTopicSupportTerms(topicId);
-  const matchingTerms = [...supportTerms].filter((term) => weightedTerms.has(term));
+  const matchingTerms = [...supportTerms].filter((term) => {
+    const sources = weightedTerms.get(term)?.sources;
+
+    return Boolean(
+      sources?.has("CONTENT") || sources?.has("TRUSTED_OBSERVATION"),
+    );
+  });
   const sources = new Set<WorkingEvidenceKind>();
 
   for (const term of matchingTerms) {

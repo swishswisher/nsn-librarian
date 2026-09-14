@@ -9,7 +9,11 @@ import { recommendationSupportForStorage } from "./recommendation-reconciliation
 import { isImageFileType } from "./media-kind";
 import { isAudioFileType } from "./audio-metadata";
 import { isVideoFileType } from "./video-metadata";
-import { samePhysicalFile, samePhysicalRoot } from "./physical-file-identity";
+import {
+  demonstrablyDistinctPhysicalFiles,
+  samePhysicalFile,
+  samePhysicalRoot,
+} from "./physical-file-identity";
 
 type DuplicateCandidate = {
   checksum: string | null;
@@ -91,7 +95,7 @@ function duplicateTargetFor(file: DuplicateCandidate, group: DuplicateCandidate[
     .filter(
       (candidate) =>
         candidate.id !== file.id &&
-        !samePhysicalFile(candidate, file),
+        demonstrablyDistinctPhysicalFiles(candidate, file),
     )
     .sort(
       (left, right) =>
@@ -302,6 +306,7 @@ export async function distinctPhysicalScannedFileIds(
             select: {
               bridgeRootId: true,
               canonicalConnectedLibraryId: true,
+              displayName: true,
               folderFingerprint: true,
               id: true,
               localPath: true,
@@ -325,7 +330,8 @@ export async function distinctPhysicalScannedFileIds(
     files
       .filter(
         (candidate) =>
-          candidate.id !== source.id && !samePhysicalFile(source, candidate),
+          candidate.id !== source.id &&
+          demonstrablyDistinctPhysicalFiles(source, candidate),
       )
       .map((candidate) => candidate.id),
   );
@@ -523,6 +529,10 @@ async function markMediaDuplicate(
   file: DuplicateCandidate,
   target: DuplicateCandidate,
 ) {
+  if (!demonstrablyDistinctPhysicalFiles(file, target)) {
+    return;
+  }
+
   if (isAudioFileType(file.fileType)) {
     await markAudioDuplicate(file, target);
     return;
@@ -580,6 +590,10 @@ async function upsertDuplicateSuggestion(
   file: DuplicateCandidate,
   target: DuplicateCandidate,
 ) {
+  if (!demonstrablyDistinctPhysicalFiles(file, target)) {
+    return false;
+  }
+
   const prisma = getPrismaClient();
   const copy = duplicateSuggestionCopy(file, target);
   const recommendationGenerationId = `checksum-duplicates-${file.sessionId}`;
@@ -635,6 +649,8 @@ async function upsertDuplicateSuggestion(
       suggestionKey: suggestionKeyFor(file),
     },
   });
+
+  return true;
 }
 
 export async function recordChecksumDuplicateSuggestionsForSession(
@@ -690,7 +706,7 @@ export async function recordChecksumDuplicateSuggestionsForSession(
       continue;
     }
 
-    duplicateGroups += 1;
+    let groupHasDistinctFiles = false;
 
     for (const file of group) {
       const target = duplicateTargetFor(file, group);
@@ -699,10 +715,20 @@ export async function recordChecksumDuplicateSuggestionsForSession(
         continue;
       }
 
+      await markMediaDuplicate(file, target);
+      const persisted = await upsertDuplicateSuggestion(file, target);
+
+      if (!persisted) {
+        continue;
+      }
+
       duplicateFiles += 1;
       duplicateFileIds.add(file.id);
-      await markMediaDuplicate(file, target);
-      await upsertDuplicateSuggestion(file, target);
+      groupHasDistinctFiles = true;
+    }
+
+    if (groupHasDistinctFiles) {
+      duplicateGroups += 1;
     }
   }
 

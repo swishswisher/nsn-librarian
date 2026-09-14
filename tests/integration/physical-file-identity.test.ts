@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  demonstrablyDistinctPhysicalFiles,
   samePhysicalFile,
+  samePhysicalFilePresentation,
   type PhysicalFileIdentityInput,
 } from "../../src/lib/bridge/physical-file-identity";
 
@@ -17,6 +19,7 @@ function file(
 const canonicalRoot = {
   bridgeRootId: "root-a",
   canonicalConnectedLibraryId: null,
+  displayName: "Root A",
   folderFingerprint: "root-a",
   id: "canonical-library",
   localPath: "bridge://root-a",
@@ -102,6 +105,7 @@ test("identical relative paths remain distinct when stable Bridge file paths use
   const otherRoot = {
     ...canonicalRoot,
     bridgeRootId: "root-b",
+    displayName: "Root B",
     folderFingerprint: "root-b",
     id: "other-library",
     localPath: "bridge://root-b",
@@ -121,5 +125,66 @@ test("identical relative paths remain distinct when stable Bridge file paths use
       ),
     ),
     false,
+  );
+});
+
+test("reconnected root ids cannot establish a distinct file when presentation resolves to the source", () => {
+  const reconnectedRoot = {
+    ...canonicalRoot,
+    bridgeRootId: "replacement-root-id",
+    folderFingerprint: "replacement-root-id",
+    id: "replacement-library",
+    localPath: "bridge://replacement-root-id",
+  };
+
+  assert.equal(
+    demonstrablyDistinctPhysicalFiles(
+      file(
+        canonicalRoot,
+        "Damaged/broken-video.mp4",
+        "bridge://root-a/Damaged/broken-video.mp4",
+      ),
+      file(
+        reconnectedRoot,
+        "damaged\\BROKEN-VIDEO.mp4",
+        "bridge://replacement-root-id/damaged/BROKEN-VIDEO.mp4",
+      ),
+    ),
+    false,
+  );
+});
+
+test("distinct roots and paths remain demonstrably distinct", () => {
+  const otherRoot = {
+    ...canonicalRoot,
+    bridgeRootId: "root-b",
+    displayName: "Root B",
+    folderFingerprint: "root-b",
+    id: "other-library",
+    localPath: "bridge://root-b",
+  };
+
+  assert.equal(
+    demonstrablyDistinctPhysicalFiles(
+      file(canonicalRoot, "Mixed/same-content-copy-1.txt"),
+      file(otherRoot, "Archive/same-content-copy-2.txt"),
+    ),
+    true,
+  );
+});
+
+test("duplicate presentation identity normalizes case and separators", () => {
+  assert.equal(
+    samePhysicalFilePresentation(
+      {
+        connectedLibraryName: "SCAN_ROOT_A_GENERAL_INBOX",
+        relativePath: "Damaged/broken-audio.mp3",
+      },
+      {
+        connectedLibraryName: "scan_root_a_general_inbox",
+        relativePath: "damaged\\BROKEN-AUDIO.mp3",
+      },
+    ),
+    true,
   );
 });

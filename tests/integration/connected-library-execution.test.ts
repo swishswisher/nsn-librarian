@@ -13,6 +13,7 @@ import { createBridgeServer } from "../../bridge-app/src/api/server";
 import { createFolderSelection } from "../../bridge-app/src/main/registry";
 import { currentRecommendationGenerationVersion } from "../../src/lib/bridge/recommendation-generation";
 import { recommendationSupportFromJson } from "../../src/lib/bridge/recommendation-reconciliation";
+import { samePhysicalFilePresentation } from "../../src/lib/bridge/physical-file-identity";
 import type { ConnectedLibraryPermissions } from "../../src/lib/bridge/types";
 
 let prisma: PrismaClient;
@@ -732,7 +733,7 @@ test("stale media metadata cannot turn historical file aliases into self-duplica
   const staleLibrary = await prisma.connectedLibrary.create({
     data: {
       bridgeRootId: staleRootId,
-      displayName: "SCAN_ROOT_A_GENERAL_INBOX history",
+      displayName: "SCAN_ROOT_A_GENERAL_INBOX",
       folderFingerprint: staleRootId,
       localPath: `bridge://${staleRootId}`,
       platform: "MACOS",
@@ -773,7 +774,7 @@ test("stale media metadata cannot turn historical file aliases into self-duplica
       data: {
         checksum,
         fileType,
-        localPath: `bridge://${currentRootId}/${relativePath}`,
+        localPath: `bridge://${staleRootId}/${relativePath}`,
         relativePath,
         sessionId: historicalSession.id,
         sizeBytes: BigInt(2048),
@@ -828,61 +829,61 @@ test("stale media metadata cannot turn historical file aliases into self-duplica
     }
   }
 
-  const examinedVideo = currentMediaIds.find(
-    (file) => file.relativePath === "Damaged/broken-video.mp4",
-  );
-  assert.ok(examinedVideo);
   const batch = await prisma.libraryBatch.create({
     data: { name: "Production stale media identity" },
   });
-  const document = await prisma.libraryDocument.create({
-    data: {
-      batchId: batch.id,
-      extractionStatus: "COMPLETED",
-      itemKind: "VIDEO",
-      normalizedFileName: "broken-video.mp4",
-      originalFileName: "broken-video.mp4",
-      previewText: "Damaged video fixture requiring review.",
-    },
-  });
-  await prisma.observationSession.create({
-    data: {
-      confidence: 0.35,
-      explanation: { summary: "The damaged video needs human review." },
-      interpretations: [],
-      libraryDocumentId: document.id,
-      observations: [
-        {
-          description: "The file could not provide useful visual content.",
-          evidence: ["Damaged video fixture requiring review."],
-        },
-      ],
-      observerType: "DETERMINISTIC",
-      planSuggestions: [],
-      warnings: ["The media was damaged."],
-    },
-  });
-  await prisma.scannedFile.update({
-    data: {
-      extractionStatus: "COMPLETED",
-      libraryDocumentId: document.id,
-      readingStatus: "READ",
-      readStatus: "SUPPORTED",
-    },
-    where: { id: examinedVideo.id },
-  });
-  const generated = await generateOrganizationSuggestionsForScannedFileWithText(
-    examinedVideo.id,
-    "Damaged video fixture requiring review.",
-    { replaceChecksumBootstrap: true },
-  );
 
-  assert.equal(
-    generated.suggestions.some(
-      (suggestion) => suggestion.suggestionType === "POSSIBLE_DUPLICATE",
-    ),
-    false,
-  );
+  for (const mediaFile of currentMediaIds) {
+    const document = await prisma.libraryDocument.create({
+      data: {
+        batchId: batch.id,
+        extractionStatus: "COMPLETED",
+        itemKind: mediaFile.relativePath.endsWith(".mp4") ? "VIDEO" : "AUDIO",
+        normalizedFileName: path.posix.basename(mediaFile.relativePath),
+        originalFileName: path.posix.basename(mediaFile.relativePath),
+        previewText: "Damaged media fixture requiring review.",
+      },
+    });
+    await prisma.observationSession.create({
+      data: {
+        confidence: 0.35,
+        explanation: { summary: "The media needs human review." },
+        interpretations: [],
+        libraryDocumentId: document.id,
+        observations: [
+          {
+            description: "The file could not provide useful media content.",
+            evidence: ["Damaged media fixture requiring review."],
+          },
+        ],
+        observerType: "DETERMINISTIC",
+        planSuggestions: [],
+        warnings: ["The media was damaged."],
+      },
+    });
+    await prisma.scannedFile.update({
+      data: {
+        extractionStatus: "COMPLETED",
+        libraryDocumentId: document.id,
+        readingStatus: "READ",
+        readStatus: "SUPPORTED",
+      },
+      where: { id: mediaFile.id },
+    });
+    const generated = await generateOrganizationSuggestionsForScannedFileWithText(
+      mediaFile.id,
+      "Damaged media fixture requiring review.",
+      { replaceChecksumBootstrap: true },
+    );
+
+    assert.equal(
+      generated.suggestions.some(
+        (suggestion) => suggestion.suggestionType === "POSSIBLE_DUPLICATE",
+      ),
+      false,
+      mediaFile.relativePath,
+    );
+  }
 
   for (const relativePath of [
     "Mixed_Loose/same-content-copy-1.txt",
@@ -928,6 +929,21 @@ test("stale media metadata cannot turn historical file aliases into self-duplica
       "Mixed_Loose/same-content-copy-1.txt",
       "Mixed_Loose/same-content-copy-2.txt",
     ],
+  );
+  assert.ok(
+    activeDuplicates.every((suggestion) =>
+      recommendationSupportFromJson(suggestion.supportingInformation)
+        .duplicateEvidence.every(
+          (match) =>
+            !samePhysicalFilePresentation(
+              {
+                connectedLibraryName: currentLibrary.displayName,
+                relativePath: suggestion.currentRelativePath,
+              },
+              match,
+            ),
+        ),
+    ),
   );
   assert.ok(
     currentMedia.every(
@@ -1485,11 +1501,11 @@ test("destination-specific cluster provenance excludes broad boundary relationsh
     "Mixed/boundary-notes.txt":
       "General notes about boundaries and personal reflections.\n",
     "Mixed_Loose/large-notes-200kb.txt":
-      "Long generic notes about weather, travel, and household tasks.\n",
+      "Generic notes about website planning, workshop materials, office administration, and follow-up tasks.\n",
     "Mixed_Loose/Résumé - Café Notes.txt":
-      "Résumé notes about café work experience and menu planning.\n",
+      "Notes from a café meeting discussing website copy and workshop planning.\n",
     "Mixed_Loose/WATCH_CREATED_AFTER_CONNECT.txt":
-      "A watcher fixture created after the folder was connected.\n",
+      "A watcher fixture about website follow-up and workshop scheduling.\n",
   });
   const file = scannedFileByRelativePath(
     fixture.scannedFiles,
@@ -1507,16 +1523,24 @@ test("destination-specific cluster provenance excludes broad boundary relationsh
   );
   const memoryCountBefore = await prisma.memoryEntry.count();
   const contentText = await readAndApproveScannedFile(file.id);
-  for (const relatedFile of fixture.scannedFiles) {
-    if (relatedFile.id !== file.id) {
-      await readAndApproveScannedFile(relatedFile.id);
-    }
-  }
   const contaminatedPaths = [
     "Mixed_Loose/large-notes-200kb.txt",
     "Mixed_Loose/Résumé - Café Notes.txt",
     "Mixed_Loose/WATCH_CREATED_AFTER_CONNECT.txt",
   ];
+  for (const relatedFile of fixture.scannedFiles) {
+    if (relatedFile.id !== file.id) {
+      if (contaminatedPaths.includes(relatedFile.relativePath)) {
+        const readResult = await readScannedFile(relatedFile.id);
+        await createObservationSessionForScannedFileReadResult(
+          relatedFile.id,
+          readResult,
+        );
+      } else {
+        await readAndApproveScannedFile(relatedFile.id);
+      }
+    }
+  }
   const contaminatedFiles = await prisma.scannedFile.findMany({
     select: { libraryDocumentId: true },
     where: {

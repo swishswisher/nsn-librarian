@@ -29,15 +29,18 @@ import {
 } from "./recommendation-generation";
 import type {
   ScanWorkingKnowledgeCluster,
+  ScanWorkingKnowledgeFile,
   ScanWorkingKnowledgeIndex,
+  ScanWorkingKnowledgeRelationship,
 } from "./scan-working-knowledge";
 import {
   workingKnowledgeSupportsTopic,
   workingKnowledgeTerms,
 } from "./scan-working-knowledge";
 import {
+  demonstrablyDistinctPhysicalFiles,
   normalizePhysicalRelativePath,
-  samePhysicalFile,
+  samePhysicalFilePresentation,
 } from "./physical-file-identity";
 import { scannedFileSummary } from "./scan-sessions";
 import { isImageFileType } from "./media-kind";
@@ -127,6 +130,8 @@ type SuggestionContext = {
   }>;
   reviewedObservationText: string[];
   semanticClusters: ScanWorkingKnowledgeCluster[];
+  semanticFiles: ScanWorkingKnowledgeFile[];
+  semanticRelationships: ScanWorkingKnowledgeRelationship[];
   memoryMatches: MemoryMatch[];
   preferredTerms: string[];
   audioMetadata: {
@@ -875,38 +880,69 @@ function semanticClusterSupport(context: SuggestionContext, rule: TopicRule) {
     return undefined;
   }
 
-  return context.semanticClusters
-    .map((cluster) => ({
-      cluster,
-      relatedPaths: cluster.memberRelativePaths.filter(
-        (relativePath) =>
-          normalizeText(relativePath) !== normalizeText(context.currentRelativePath),
-      ),
-      ruleTerms: cluster.sharedTerms.filter((term) =>
-        rule.terms.some((ruleTerm) =>
-          workingKnowledgeTerms(ruleTerm).some(
-            (normalized) => normalized === workingKnowledgeTerms(term)[0],
+  const fileById = new Map(context.semanticFiles.map((file) => [file.id, file]));
+  const directSupport = context.semanticRelationships.flatMap((relationship) => {
+    if (!relationship.supportingTopics.includes(rule.id)) {
+      return [];
+    }
+
+    const relatedFileId =
+      relationship.leftFileId === context.scannedFileId
+        ? relationship.rightFileId
+        : relationship.rightFileId === context.scannedFileId
+          ? relationship.leftFileId
+          : null;
+    const relatedFile = relatedFileId ? fileById.get(relatedFileId) : null;
+
+    if (!relatedFile?.supportingTopics.includes(rule.id)) {
+      return [];
+    }
+
+    return [
+      {
+        confidence: relationship.supportingTopicConfidence[rule.id] ?? 0,
+        relatedPath: relatedFile.relativePath,
+        sharedTerms: relationship.sharedTerms,
+      },
+    ];
+  });
+
+  if (directSupport.length === 0) {
+    return undefined;
+  }
+
+  const relatedPaths = [
+    ...new Set(directSupport.map((support) => support.relatedPath)),
+  ].sort((left, right) => left.localeCompare(right));
+  const ruleTerms = [
+    ...new Set(
+      directSupport.flatMap((support) =>
+        support.sharedTerms.filter((term) =>
+          rule.terms.some((ruleTerm) =>
+            workingKnowledgeTerms(ruleTerm).some(
+              (normalized) => normalized === workingKnowledgeTerms(term)[0],
+            ),
           ),
         ),
       ),
-      sharedSubjects: cluster.sharedSubjects.filter((subject) =>
-        normalizeText(subject).includes(normalizeText(rule.folder)) ||
-        normalizeText(rule.explanation).includes(normalizeText(subject)),
-      ),
-    }))
-    .filter(
-      (candidate) =>
-        candidate.relatedPaths.length > 0 &&
-        (candidate.ruleTerms.length > 0 || candidate.cluster.semanticTopics.includes(rule.id)) &&
-        candidate.cluster.confidence >= 0.2,
-    )
-    .sort(
-      (left, right) =>
-        right.relatedPaths.length - left.relatedPaths.length ||
-        (right.ruleTerms.length + right.sharedSubjects.length) -
-          (left.ruleTerms.length + left.sharedSubjects.length) ||
-        right.cluster.confidence - left.cluster.confidence,
-    )[0];
+    ),
+  ];
+  const sharedSubjects = [
+    ...new Set(
+      context.semanticClusters
+        .filter((cluster) => cluster.semanticTopics.includes(rule.id))
+        .flatMap((cluster) => cluster.sharedSubjects),
+    ),
+  ];
+
+  return {
+    confidence:
+      directSupport.reduce((sum, support) => sum + support.confidence, 0) /
+      directSupport.length,
+    relatedPaths,
+    ruleTerms,
+    sharedSubjects,
+  };
 }
 
 function pathSupport(context: SuggestionContext) {
@@ -2469,7 +2505,7 @@ async function scannedFileContext(
   };
   const duplicateMatches = duplicateTargets.flatMap((target) => {
     if (
-      samePhysicalFile(
+      !demonstrablyDistinctPhysicalFiles(
         {
           localPath: scannedFile.localPath,
           relativePath: scannedFile.relativePath,
@@ -2535,6 +2571,13 @@ async function scannedFileContext(
     semanticClusters:
       workingKnowledge?.clusters.filter((cluster) =>
         cluster.memberFileIds.includes(scannedFile.id),
+      ) ?? [],
+    semanticFiles: workingKnowledge?.files ?? [],
+    semanticRelationships:
+      workingKnowledge?.relationships.filter(
+        (relationship) =>
+          relationship.leftFileId === scannedFile.id ||
+          relationship.rightFileId === scannedFile.id,
       ) ?? [],
     siblingFiles: scannedFile.scanSession.scannedFiles.map((file) => ({
       audioFingerprint: file.audioMetadata?.audioFingerprint ?? null,
@@ -2647,9 +2690,43 @@ async function persistDrafts(
     context.currentRelativePath,
     drafts.map(cleanDraftPaths),
   );
+  const safeReconciledDrafts = reconciledDrafts.flatMap((draft) => {
+    if (draft.suggestionType !== "POSSIBLE_DUPLICATE") {
+      return [draft];
+    }
+
+    const duplicateEvidence = draft.duplicateEvidence.filter(
+      (match) =>
+        !samePhysicalFilePresentation(
+          {
+            connectedLibraryName: context.connectedLibraryName,
+            relativePath: context.currentRelativePath,
+          },
+          match,
+        ),
+    );
+
+    return duplicateEvidence.length > 0
+      ? [
+          {
+            ...draft,
+            duplicateEvidence,
+            supportingInformation: draft.supportingInformation.filter(
+              (detail) =>
+                !draft.duplicateEvidence.some(
+                  (match) =>
+                    !duplicateEvidence.includes(match) &&
+                    detail ===
+                      `Specific file to compare: ${match.connectedLibraryName} -> ${match.relativePath}`,
+                ),
+            ),
+          },
+        ]
+      : [];
+  });
   const draftsToPersist =
-    reconciledDrafts.length > 0
-      ? reconciledDrafts
+    safeReconciledDrafts.length > 0
+      ? safeReconciledDrafts
       : [cleanDraftPaths(fallbackRecommendationDraft(context))];
 
   for (const draft of draftsToPersist) {
