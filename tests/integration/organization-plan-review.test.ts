@@ -99,12 +99,14 @@ test("the page explains that choices do not move files and exposes the required 
     "utf8",
   );
 
-  assert.match(sourceText, /Choose which changes to include/);
-  assert.match(sourceText, /Nothing will move yet/);
-  assert.match(sourceText, /Choose file destinations/);
-  assert.match(sourceText, /Save choices/);
+  assert.match(sourceText, /Review approved changes/);
+  assert.match(sourceText, /Approved organization recommendations are included here automatically/);
+  assert.match(sourceText, /Review approved destinations/);
+  assert.match(sourceText, /Save plan choices/);
   assert.match(sourceText, /Review final plan/);
   assert.match(sourceText, /Authorize execution/);
+  assert.match(sourceText, /Exclude from this plan/);
+  assert.doesNotMatch(sourceText, /Keep it in .*default/);
   assert.match(sourceText, /type="radio"/);
   assert.doesNotMatch(sourceText, /type="checkbox"/);
 });

@@ -40,6 +40,7 @@ let generateOrganizationSuggestionsForScannedFileWithText: typeof import("../../
 let generateScanRecommendationBatch: typeof import("../../src/lib/bridge/scan-recommendation-batch").generateScanRecommendationBatch;
 let reviewOrganizationSuggestion: typeof import("../../src/lib/bridge/organization-suggestions").reviewOrganizationSuggestion;
 let generateOrganizationPlanForScanSession: typeof import("../../src/lib/bridge/planner").generateOrganizationPlanForScanSession;
+let getOrganizationPlanPageData: typeof import("../../src/lib/bridge/planner").getOrganizationPlanPageData;
 let approveOrganizationPlan: typeof import("../../src/lib/bridge/planner").approveOrganizationPlan;
 let saveOrganizationPlanSelection: typeof import("../../src/lib/bridge/planner").saveOrganizationPlanSelection;
 let clearOrganizationPlanSelection: typeof import("../../src/lib/bridge/planner").clearOrganizationPlanSelection;
@@ -370,6 +371,7 @@ before(async () => {
     organizationSuggestions.reviewOrganizationSuggestion;
   generateOrganizationPlanForScanSession =
     planner.generateOrganizationPlanForScanSession;
+  getOrganizationPlanPageData = planner.getOrganizationPlanPageData;
   approveOrganizationPlan = planner.approveOrganizationPlan;
   saveOrganizationPlanSelection = planner.saveOrganizationPlanSelection;
   clearOrganizationPlanSelection = planner.clearOrganizationPlanSelection;
@@ -499,11 +501,25 @@ test("reviewed recommendations produce one folder-specific plan with deduped fol
     (action) => action.selectableForExecution,
   );
 
-  assert.equal(draftPlan.summary.estimatedOperations, 0);
-  assert.equal(draftPlan.summary.selectedFileActions, 0);
+  assert.equal(draftPlan.summary.estimatedOperations, 4);
+  assert.equal(draftPlan.summary.selectedFileActions, 2);
   assert.equal(
-    draftPlan.actions.some((action) => action.selectedForExecution),
-    false,
+    draftPlan.actions.filter(
+      (action) => action.selectableForExecution && action.selectedForExecution,
+    ).length,
+    2,
+  );
+  assert.deepEqual(
+    draftPlan.actions
+      .filter(
+        (action) => action.selectableForExecution && action.selectedForExecution,
+      )
+      .map((action) => action.plannedRelativePath)
+      .sort(),
+    [
+      "Knowledge/Attachment/attachment-session-notes.txt",
+      "Knowledge/Attachment/becoming-note.txt",
+    ],
   );
 
   const plan = await saveOrganizationPlanSelection(
@@ -538,6 +554,79 @@ test("reviewed recommendations produce one folder-specific plan with deduped fol
     !plan.actions.some(
       (action) => action.plannedRelativePath === "Knowledge/Attachment/rejected-note.txt",
     ),
+  );
+});
+
+test("five approved moves enter the draft with their destinations already included", async () => {
+  const sources = [
+    "Loose/finance-one.pdf",
+    "Loose/finance-two.pdf",
+    "Loose/workshop-one.pdf",
+    "Loose/workshop-two.pdf",
+    "Loose/workshop-three.pdf",
+  ];
+  const fixture = await createConnectedFixture(
+    "approved-plan-defaults",
+    Object.fromEntries(sources.map((source) => [source, "reviewed content\n"])),
+  );
+
+  for (const [index, source] of sources.entries()) {
+    const file = scannedFileByRelativePath(fixture.scannedFiles, source);
+    const destinationFolder = index < 2 ? "Finance" : "Workshops";
+
+    await createSuggestion({
+      currentRelativePath: source,
+      proposedRelativePath: `${destinationFolder}/${path.basename(source)}`,
+      scannedFileId: file.id,
+      scanSessionId: fixture.session.id,
+      suggestionKey: `approved-${index}`,
+    });
+  }
+
+  const draftPlan = await generateOrganizationPlanForScanSession(
+    fixture.session.id,
+  );
+  const selectedFileActions = draftPlan.actions.filter(
+    (action) => action.selectableForExecution && action.selectedForExecution,
+  );
+
+  assert.equal(selectedFileActions.length, 5);
+  assert.equal(draftPlan.summary.selectedFileActions, 5);
+  assert.equal(draftPlan.summary.estimatedOperations, 7);
+  assert.deepEqual(
+    selectedFileActions
+      .map((action) => action.plannedRelativePath)
+      .sort(),
+    [
+      "Finance/finance-one.pdf",
+      "Finance/finance-two.pdf",
+      "Workshops/workshop-one.pdf",
+      "Workshops/workshop-three.pdf",
+      "Workshops/workshop-two.pdf",
+    ],
+  );
+  assert.deepEqual(
+    draftPlan.actions
+      .filter((action) => action.actionType === "CREATE_FOLDER")
+      .map((action) => action.plannedFolderPath)
+      .sort(),
+    ["Finance", "Workshops"],
+  );
+  assert.equal(
+    draftPlan.actions.some(
+      (action) =>
+        action.selectableForExecution &&
+        action.plannedRelativePath === "Loose/finance-one.pdf",
+    ),
+    false,
+  );
+  assert.equal(
+    await exists(path.join(fixture.folderPath, "Loose", "finance-one.pdf")),
+    true,
+  );
+  assert.equal(
+    await exists(path.join(fixture.folderPath, "Finance", "finance-one.pdf")),
+    false,
   );
 });
 
@@ -1615,7 +1704,7 @@ test("legacy and invalidated recommendations cannot enter selected or approved p
   });
   const file = scannedFileByRelativePath(fixture.scannedFiles, source);
 
-  await prisma.organizationSuggestion.create({
+  const legacy = await prisma.organizationSuggestion.create({
     data: {
       confidence: 0.81,
       currentRelativePath: source,
@@ -1647,10 +1736,41 @@ test("legacy and invalidated recommendations cannot enter selected or approved p
     fixture.session.id,
   );
   const fileAction = draftPlan.actions.find(
-    (action) => action.suggestionId === currentSuggestion.id,
+    (action) =>
+      action.suggestionId === currentSuggestion.id &&
+      action.selectableForExecution === true,
   );
 
   assert.ok(fileAction);
+  assert.equal(
+    draftPlan.skippedItems.some((item) => item.suggestionId === legacy.id),
+    false,
+  );
+
+  await prisma.organizationPlan.update({
+    data: {
+      skippedItems: [
+        {
+          currentRelativePath: source,
+          id: "historical-skipped-item",
+          reason: "This recommendation was replaced by a newer recommendation generation.",
+          status: "APPROVED",
+          suggestionId: legacy.id,
+          title: "Legacy recommendation",
+        },
+      ],
+    },
+    where: {
+      id: draftPlan.id,
+    },
+  });
+  const pageData = await getOrganizationPlanPageData(fixture.session.id);
+
+  assert.ok(pageData?.plan);
+  assert.equal(
+    pageData.plan.skippedItems.some((item) => item.suggestionId === legacy.id),
+    false,
+  );
 
   await prisma.organizationSuggestion.update({
     data: {
@@ -1688,7 +1808,7 @@ test("legacy and invalidated recommendations cannot enter selected or approved p
   );
 });
 
-test("plan selection starts empty, derives folder dependencies, and excludes review-only notes", async () => {
+test("approved plan actions start included, derive folder dependencies, and exclude review-only notes", async () => {
   const source = "Loose/Alice_Client_Intake.docx";
   const websiteNote = "Website/becoming-hero.jpg";
   const fixture = await createConnectedFixture("plan-selection", {
@@ -1729,12 +1849,15 @@ test("plan selection starts empty, derives folder dependencies, and excludes rev
 
   assert.ok(fileAction);
   assert.ok(reviewOnly);
-  assert.equal(draftPlan.summary.selectedFileActions, 0);
-  assert.equal(draftPlan.summary.estimatedOperations, 0);
+  assert.equal(draftPlan.summary.selectedFileActions, 1);
+  assert.equal(draftPlan.summary.estimatedOperations, 3);
   await assert.rejects(
-    () => approveOrganizationPlan(draftPlan.id),
-    /Select and save at least one file action/,
+    () => saveOrganizationPlanSelection(draftPlan.id, []),
+    /Select at least one file action/,
   );
+
+  assert.equal(await exists(sourcePath), true);
+  assert.equal(await exists(destinationPath), false);
 
   const selectedPlan = await saveOrganizationPlanSelection(draftPlan.id, [
     fileAction.id,

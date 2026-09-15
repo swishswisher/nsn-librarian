@@ -45,7 +45,7 @@ type PlanDecision = "APPROVE" | "CANCEL";
 
 function statusLabel(status: OrganizationPlanStatus) {
   if (status === "DRAFT") {
-    return "Choosing destinations";
+    return "Reviewing approved changes";
   }
 
   if (status === "READY_FOR_EXECUTION") {
@@ -1350,17 +1350,19 @@ export function OrganizationPlanReviewPanel({
         <div className="grid min-w-0 gap-5">
           <div className="min-w-0">
             <h2 className="nsn-display text-3xl text-[var(--nsn-navy)]">
-              Choose which changes to include
+              Review approved changes
             </h2>
             <p className="mt-3 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-              Nothing will move yet. Select where each file should go, save your
-              choices, and review the final changes before execution.
+              Approved organization recommendations are included here automatically.
+              Nothing will move yet. Review the proposed changes, make any intentional
+              exclusions or edits, and authorize the final plan separately.
             </p>
           </div>
           <ol className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-label="Organization process">
             {[
-              "Choose file destinations",
-              "Save choices",
+              "Review approved destinations",
+              "Exclude or change if needed",
+              "Save plan choices",
               "Review final plan",
               "Authorize execution",
             ].map((step, index) => (
@@ -1420,10 +1422,10 @@ export function OrganizationPlanReviewPanel({
                 {statusLabel(currentPlan.status)}
               </NsnBadge>
               <NsnBadge tone="source">
-                {decisionGroups.length} files to decide
+                {decisionGroups.length} approved changes
               </NsnBadge>
               <NsnBadge tone="approved">
-                {currentPlan.summary.selectedFileActions} saved changes
+                {currentPlan.summary.selectedFileActions} approved changes included
               </NsnBadge>
               <NsnBadge tone="migration">
                 {currentPlan.summary.estimatedOperations} steps after authorization
@@ -1433,8 +1435,9 @@ export function OrganizationPlanReviewPanel({
               </NsnBadge>
             </div>
             <p className="mt-4 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-              NSN can only organize files after you save, review, and authorize
-              the final plan. It will not overwrite or delete files.
+              NSN can only organize files after you review and authorize the final
+              plan. Approved recommendations are included automatically, and you can
+              still exclude or change them here. It will not overwrite or delete files.
             </p>
           </div>
           <div className="grid min-w-0 gap-3 sm:grid-cols-3 lg:min-w-80 lg:grid-cols-1">
@@ -1532,12 +1535,12 @@ export function OrganizationPlanReviewPanel({
         />
       ) : null}
 
-      <Section title="Choose file destinations">
+      <Section title="Review approved changes">
         <NsnCard className="min-w-0">
           <div className="grid min-w-0 gap-4">
             <div className="flex flex-wrap gap-2">
               <NsnBadge tone="source">
-                {counted(decisionGroups.length, "file")} {decisionGroups.length === 1 ? "needs" : "need"} a choice
+                {counted(decisionGroups.length, "approved change")} included from recommendations
               </NsnBadge>
               <NsnBadge tone={selectedActionCount > 0 ? "approved" : "pending"}>
                 {selectedActionCount} moves or renames included
@@ -1551,9 +1554,10 @@ export function OrganizationPlanReviewPanel({
               )}
             </div>
             <p className="break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-              Each file has one choice. Keeping the current location is the
-              default. Choosing a destination includes that move in the plan; it
-              does not move the file now.
+              Each approved move or rename is included automatically. Choose the
+              current location to exclude an action from this plan, or choose another
+              reviewed destination where one is available. These choices do not move
+              files now.
             </p>
             <div className="grid min-w-0 gap-3 sm:grid-cols-2">
               <NsnButton
@@ -1569,7 +1573,7 @@ export function OrganizationPlanReviewPanel({
                 {isSavingSelection
                   ? "Saving choices..."
                   : selectedActionCount === 0
-                    ? "Save choice to keep every file where it is"
+                    ? "Save exclusions"
                     : `Save ${selectedActionCount} choice${
                         selectedActionCount === 1 ? "" : "s"
                       }`}
@@ -1580,7 +1584,7 @@ export function OrganizationPlanReviewPanel({
                 type="button"
                 variant="secondary"
               >
-                Leave every file where it is
+                Exclude all file actions
               </NsnButton>
             </div>
             {hasUnsavedChoices ? (
@@ -1649,7 +1653,7 @@ export function OrganizationPlanReviewPanel({
                       />
                       <span className="grid min-w-0 gap-1">
                         <span className="break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
-                          Keep it in {sourceFolder || rootLabel} — default
+                          Exclude from this plan — keep it in {sourceFolder || rootLabel}
                         </span>
                         <span className="text-sm text-[var(--nsn-slate)]">
                           Leave this file where it is

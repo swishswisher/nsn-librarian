@@ -610,6 +610,7 @@ function actionFromSuggestion(
   suggestion: StoredSuggestion,
 ): BridgeOrganizationPlanAction | null {
   const suggestionType = normalizeSuggestionType(suggestion.suggestionType);
+  const suggestionStatus = normalizeSuggestionStatus(suggestion.status);
 
   if (
     suggestionType === "KEEP_UNCHANGED" ||
@@ -691,7 +692,9 @@ function actionFromSuggestion(
       actionType === "MOVE_FILE" ||
       actionType === "RENAME_FILE" ||
       actionType === "MOVE_AND_RENAME_FILE",
-    selectedForExecution: false,
+    selectedForExecution:
+      selectableFileActionTypes.has(actionType) &&
+      includedStatuses.has(suggestionStatus),
     sourceSnapshot: {
       checksum: suggestion.scannedFile.checksum,
       lastModified: suggestion.scannedFile.lastModified?.toISOString() ?? null,
@@ -1142,8 +1145,11 @@ function buildPlanSnapshot(input: PlanBuildInput) {
   const skippedItems = input.suggestions
     .filter(
       (suggestion) =>
-        !suggestionBelongsToCurrentGeneration(suggestion) ||
-        !includedStatuses.has(normalizeSuggestionStatus(suggestion.status)),
+        suggestionBelongsToCurrentGeneration(suggestion) &&
+        (!includedStatuses.has(normalizeSuggestionStatus(suggestion.status)) ||
+          ["KEEP_UNCHANGED", "INSUFFICIENT_EVIDENCE"].includes(
+            normalizeSuggestionType(suggestion.suggestionType),
+          )),
     )
     .map(skippedItemFor);
   const suggestedActions: BridgeOrganizationPlanAction[] = [];
@@ -1172,7 +1178,7 @@ function buildPlanSnapshot(input: PlanBuildInput) {
     }
   }
   const actions = orderedActions(
-    withRequiredFolderPaths(
+    withGeneratedFolderActionsForSelection(
       storedCandidateActions(suggestedActions),
       input.scannedFiles,
     ),
@@ -1220,12 +1226,17 @@ function buildPlanSnapshot(input: PlanBuildInput) {
 function summarizePlan(
   plan: StoredPlan,
   scannedFiles?: ExistingScanFile[],
+  currentSuggestionIds?: Set<string>,
 ): BridgeOrganizationPlan {
   const storedActions = normalizePlanActions(asPlanActions(plan.actions));
   const actions = scannedFiles
     ? withRequiredFolderPaths(storedActions, scannedFiles)
     : storedActions;
   const warnings = asPlanWarnings(plan.warnings);
+  const skippedItems = asSkippedItems(plan.skippedItems).filter(
+    (item) =>
+      !currentSuggestionIds || currentSuggestionIds.has(item.suggestionId),
+  );
 
   return {
     actions,
@@ -1238,7 +1249,7 @@ function summarizePlan(
     modifiedActions: plan.modifiedActions,
     rejectedActions: plan.rejectedActions,
     scanSessionId: plan.scanSessionId,
-    skippedItems: asSkippedItems(plan.skippedItems),
+    skippedItems,
     status: normalizePlanStatus(plan.status),
     summary: planSummary(actions, warnings),
     totalActions: plan.totalActions,
@@ -1457,6 +1468,7 @@ export async function getOrganizationPlanPageData(
       },
       organizationSuggestions: {
         select: {
+          id: true,
           status: true,
         },
         where: {
@@ -1481,6 +1493,9 @@ export async function getOrganizationPlanPageData(
   }
 
   const plan = await latestDisplayPlanForScanSession(scanSessionId);
+  const currentSuggestionIds = new Set(
+    session.organizationSuggestions.map((suggestion) => suggestion.id),
+  );
   const latestExecution: BridgeExecutionRunSummary | null =
     plan?.executionRuns[0]
       ? summarizeExecutionRun(plan.executionRuns[0])
@@ -1492,6 +1507,7 @@ export async function getOrganizationPlanPageData(
       ? summarizePlan(
           plan as StoredPlanWithExecutionRuns,
           session.scannedFiles,
+          currentSuggestionIds,
         )
       : null,
     planningEligibility: organizationSuggestionCounts(

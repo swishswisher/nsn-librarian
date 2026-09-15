@@ -145,12 +145,12 @@ export default async function OrganizationPlanPage({
     <LibraryShell active="review">
       <div className="grid min-w-0 gap-8">
         <NsnPageHeader
-          description="Nothing will move yet. Select where each file should go, save your choices, and review the final changes before execution."
+          description="Approved recommendations are carried forward automatically. Nothing will move yet; review the proposed changes, make any intentional exclusions or edits, and authorize execution separately."
           eyebrow="Organization Plan"
           subtitle={`${data.session.folderDisplayName}. Started ${formatScanDate(
             data.session.startedAt,
           )}.`}
-          title="Choose which changes to include"
+          title="Review approved changes"
         >
           <div className="flex w-full flex-col gap-3 sm:w-auto sm:flex-row">
             {hasReviewedSuggestions ? (
