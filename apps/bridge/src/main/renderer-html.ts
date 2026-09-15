@@ -151,7 +151,7 @@ export function bridgeRendererHtml() {
   <body>
     <main>
       <header>
-        <span class="badge warning" id="statusBadge">Checking</span>
+        <span class="badge warning" id="statusBadge">Starting Bridge</span>
         <h1>NSN Bridge</h1>
         <p id="stateCopy">Checking this Mac's connection to NSN Librarian.</p>
       </header>
@@ -160,7 +160,7 @@ export function bridgeRendererHtml() {
         <h2>Connection</h2>
         <p id="connectionCopy">The Bridge works only with folders Deanne explicitly chooses.</p>
         <div class="actions">
-          <button class="primary" id="pairButton">Pair This Mac</button>
+          <button class="primary" id="pairButton" hidden>Pair This Mac</button>
           <button id="openWebButton">Open NSN Librarian</button>
         </div>
         <form class="pairing-form" id="pairingForm" hidden>
@@ -259,10 +259,15 @@ export function bridgeRendererHtml() {
       const openUpdateButton = document.getElementById("openUpdateButton");
       const cancelUpdateButton = document.getElementById("cancelUpdateButton");
       let pairingFormDismissed = false;
+      let pairingFormOpen = false;
+      let statusRefreshRequest = 0;
       let removeStatusChangedListener = null;
       let removeUpdateStatusListener = null;
       let statusRefreshInterval = null;
       const statusFallbackRefreshMs = 20 * 1000;
+
+      pairButton.hidden = true;
+      pairingForm.hidden = true;
 
       function showNotice(message, isError) {
         notice.textContent = message;
@@ -345,6 +350,7 @@ export function bridgeRendererHtml() {
 
       function showPairingForm(shouldFocus) {
         pairingFormDismissed = false;
+        pairingFormOpen = true;
         pairingForm.hidden = false;
         pairButton.hidden = true;
         if (shouldFocus) {
@@ -353,6 +359,7 @@ export function bridgeRendererHtml() {
       }
 
       function hidePairingForm() {
+        pairingFormOpen = false;
         pairingForm.hidden = true;
         pairButton.hidden = false;
         clearPairingCode();
@@ -714,7 +721,7 @@ export function bridgeRendererHtml() {
         return status && typeof status === "object" && typeof status.pairingState === "string"
           ? status.pairingState
           : status && status.paired
-            ? "PAIRED_AND_READY"
+            ? "PAIRED_CONNECTING"
             : "NOT_PAIRED";
       }
 
@@ -751,8 +758,8 @@ export function bridgeRendererHtml() {
 
         if (cloudConnectionState === "NETWORK_UNAVAILABLE") {
           return rootCount === 0
-            ? "This Mac is paired, but NSN Librarian has not heard from it yet."
-            : "This Mac is paired with " + rootCount + " connected folder" + (rootCount === 1 ? ", but NSN Librarian has not received the latest folder update." : "s, but NSN Librarian has not received the latest folder update.");
+            ? "This Mac is paired, but NSN Librarian cannot currently reach it."
+            : "This Mac is paired with " + rootCount + " connected folder" + (rootCount === 1 ? ", but NSN Librarian cannot currently reach it." : "s, but NSN Librarian cannot currently reach it.");
         }
 
         if (cloudConnectionState === "AUTH_UNAVAILABLE") {
@@ -766,22 +773,32 @@ export function bridgeRendererHtml() {
         }
 
         return rootCount === 0
-          ? "This Mac is paired. Choose folders when Deanne is ready."
-          : "This Mac is paired with " + rootCount + " connected folder" + (rootCount === 1 ? "." : "s.");
+          ? "This Mac is connected to NSN Librarian. Choose folders when Deanne is ready."
+          : "This Mac is connected to NSN Librarian with " + rootCount + " connected folder" + (rootCount === 1 ? "." : "s.");
       }
 
       async function refreshStatus() {
+        const requestId = ++statusRefreshRequest;
+
         try {
           const status = await window.nsnBridge.getStatus();
+          if (requestId !== statusRefreshRequest) {
+            return status;
+          }
+
           connectedRoots = status && Array.isArray(status.roots) ? status.roots : [];
           const connectedRootCount = connectedRoots.filter((root) => root && root.status !== "DISCONNECTED").length;
           const watchingCount = connectedRoots.filter((root) => root && root.watcherState === "WATCHING").length;
           const pairingState = statusPairingState(status);
           const cloudConnectionState = statusCloudState(status);
           const latestSafeCloudErrorCategory = statusLatestCloudErrorCategory(status);
-          if (pairingState === "PAIRED_AND_READY") {
+          const hasPairedCredentials = pairingState === "PAIRED_AND_READY" ||
+            pairingState === "PAIRED_CONNECTING" ||
+            pairingState === "PAIRED_CONNECTED" ||
+            pairingState === "PAIRED_OFFLINE";
+          if (hasPairedCredentials) {
             if (cloudConnectionState === "ONLINE") {
-              statusBadge.textContent = "Paired and ready";
+              statusBadge.textContent = "Paired and connected";
               statusBadge.className = "badge";
             } else if (cloudConnectionState === "UNKNOWN") {
               statusBadge.textContent = "Paired, checking connection";
@@ -790,10 +807,10 @@ export function bridgeRendererHtml() {
               statusBadge.textContent = "Paired, check Mac clock";
               statusBadge.className = "badge warning";
             } else if (cloudConnectionState === "ROOT_SYNC_FAILED") {
-              statusBadge.textContent = "Connected, folder sync pending";
+              statusBadge.textContent = "Paired and connected";
               statusBadge.className = "badge warning";
             } else {
-              statusBadge.textContent = "Paired, connection unavailable";
+              statusBadge.textContent = "Paired - reconnecting";
               statusBadge.className = "badge warning";
             }
             stateCopy.textContent = pairedStateCopy(connectedRootCount, cloudConnectionState, latestSafeCloudErrorCategory);
@@ -805,16 +822,16 @@ export function bridgeRendererHtml() {
             statusBadge.className = "badge warning";
             stateCopy.textContent = "NSN Bridge cannot access its saved device credentials. Pair this Mac again.";
             pairButton.textContent = "Pair Again";
-            if (!pairingFormDismissed) {
-              showPairingForm(false);
+            if (!pairingFormOpen) {
+              hidePairingForm();
             }
           } else if (pairingState === "KEYCHAIN_UNAVAILABLE") {
             statusBadge.textContent = "Keychain unavailable";
             statusBadge.className = "badge warning";
             stateCopy.textContent = "NSN Bridge could not access its saved pairing credentials.";
             pairButton.textContent = "Pair Again";
-            if (!pairingFormDismissed) {
-              showPairingForm(false);
+            if (!pairingFormOpen) {
+              hidePairingForm();
             }
           } else {
             statusBadge.textContent = "Not paired";
@@ -831,6 +848,13 @@ export function bridgeRendererHtml() {
           renderFolders();
           return status;
         } catch {
+          if (requestId !== statusRefreshRequest) {
+            return null;
+          }
+
+          statusBadge.textContent = "Starting Bridge";
+          statusBadge.className = "badge warning";
+          stateCopy.textContent = "Checking this Mac's connection to NSN Librarian.";
           showNotice("The Bridge could not refresh its local status.", true);
           return null;
         }

@@ -335,6 +335,8 @@ describe("Bridge desktop renderer", () => {
     const html = bridgeRendererHtml();
 
     assert.equal(html.includes("window.prompt"), false);
+    assert.match(html, /id="pairButton" hidden/);
+    assert.match(html, /id="pairingForm" hidden/);
     assert.match(html, /<label for="pairingCodeInput">Pairing code<\/label>/);
     assert.match(html, /id="pairingCodeInput"/);
     assert.match(html, /autocomplete="off"/);
@@ -342,6 +344,33 @@ describe("Bridge desktop renderer", () => {
     assert.match(html, /maxlength="16"/);
     assert.equal(html.includes("localStorage"), false);
     assert.equal(html.includes("sessionStorage"), false);
+  });
+
+  it("keeps pairing UI neutral until persisted state has hydrated", async () => {
+    let resolveStatus!: (status: Record<string, unknown>) => void;
+    const pendingStatus = new Promise<Record<string, unknown>>((resolve) => {
+      resolveStatus = resolve;
+    });
+    const harness = await createRendererHarness({
+      statusOverride: () => pendingStatus,
+    });
+
+    assert.equal(harness.elements.pairButton.hidden, true);
+    assert.equal(harness.elements.pairingForm.hidden, true);
+
+    resolveStatus({
+      cloud: {
+        cloudConnectionState: "ONLINE",
+        latestSafeCloudErrorCategory: null,
+      },
+      paired: true,
+      pairingState: "PAIRED_CONNECTED",
+      roots: [],
+    });
+    await settleRenderer();
+
+    assert.equal(harness.elements.pairingForm.hidden, true);
+    assert.equal(harness.elements.pairButton.textContent, "Pair Again");
   });
 
   it("submits a typed pairing code to pairWithCode", async () => {
@@ -397,7 +426,7 @@ describe("Bridge desktop renderer", () => {
       harness.elements.notice.textContent,
       "This Mac is paired and connected to NSN Librarian.",
     );
-    assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
+    assert.equal(harness.elements.statusBadge.textContent, "Paired and connected");
   });
 
   it("shows pairing attention when saved credentials are incomplete", async () => {
@@ -421,6 +450,31 @@ describe("Bridge desktop renderer", () => {
     );
   });
 
+  it("keeps paired offline state separate from the pairing form", async () => {
+    const harness = await createRendererHarness({
+      statusOverride: async () => ({
+        cloud: {
+          cloudConnectionState: "NETWORK_UNAVAILABLE",
+          latestSafeCloudErrorCategory: "NETWORK_UNAVAILABLE",
+        },
+        paired: true,
+        pairingState: "PAIRED_OFFLINE",
+        roots: [
+          {
+            displayName: "Inbox",
+            status: "CONNECTED",
+            watcherState: "STOPPED",
+          },
+        ],
+      }),
+    });
+
+    assert.equal(harness.elements.pairingForm.hidden, true);
+    assert.equal(harness.elements.pairButton.hidden, false);
+    assert.equal(harness.elements.pairButton.textContent, "Pair Again");
+    assert.equal(harness.elements.statusBadge.textContent, "Paired - reconnecting");
+  });
+
   it("shows folder sync pending when heartbeat succeeds but root sync fails", async () => {
     const harness = await createRendererHarness({
       statusOverride: async () => ({
@@ -442,7 +496,7 @@ describe("Bridge desktop renderer", () => {
 
     assert.equal(
       harness.elements.statusBadge.textContent,
-      "Connected, folder sync pending",
+      "Paired and connected",
     );
     assert.match(
       harness.elements.stateCopy.textContent,
@@ -649,10 +703,10 @@ describe("Bridge desktop renderer", () => {
     cloudConnectionState = "ONLINE";
     await harness.triggerStatusChanged();
 
-    assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
+    assert.equal(harness.elements.statusBadge.textContent, "Paired and connected");
     assert.equal(
       harness.elements.stateCopy.textContent,
-      "This Mac is paired. Choose folders when Deanne is ready.",
+      "This Mac is connected to NSN Librarian. Choose folders when Deanne is ready.",
     );
   });
 
@@ -671,14 +725,14 @@ describe("Bridge desktop renderer", () => {
       }),
     });
 
-    assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
+    assert.equal(harness.elements.statusBadge.textContent, "Paired and connected");
 
     cloudConnectionState = "NETWORK_UNAVAILABLE";
     await harness.triggerStatusChanged();
 
     assert.equal(
       harness.elements.statusBadge.textContent,
-      "Paired, connection unavailable",
+      "Paired - reconnecting",
     );
   });
 
@@ -699,13 +753,13 @@ describe("Bridge desktop renderer", () => {
 
     assert.equal(
       harness.elements.statusBadge.textContent,
-      "Paired, connection unavailable",
+      "Paired - reconnecting",
     );
 
     cloudConnectionState = "ONLINE";
     await harness.triggerStatusChanged();
 
-    assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
+    assert.equal(harness.elements.statusBadge.textContent, "Paired and connected");
   });
 
   it("uses a low-frequency fallback refresh and removes listeners on unload", async () => {
@@ -732,7 +786,7 @@ describe("Bridge desktop renderer", () => {
     cloudConnectionState = "ONLINE";
     await harness.runFallbackRefresh();
 
-    assert.equal(harness.elements.statusBadge.textContent, "Paired and ready");
+    assert.equal(harness.elements.statusBadge.textContent, "Paired and connected");
 
     await harness.unload();
 
@@ -1136,7 +1190,9 @@ describe("Bridge desktop app lifecycle", () => {
   it("recovers cloud heartbeat and root sync immediately on startup", async () => {
     const source = await readFile("apps/bridge/src/main/electron-main.ts", "utf8");
 
-    assert.match(source, /void restorePersistedBridgeWatchers\(\)/);
+    assert.match(source, /const watcherRestore = restorePersistedBridgeWatchers\(\)/);
+    assert.match(source, /const immediateReconnect = recoverCloudConnection\(false\)/);
+    assert.match(source, /Promise\.all\(\[watcherRestore, immediateReconnect\]\)/);
     assert.match(source, /\.then\(\(\) => recoverCloudConnection\(true\)\)/);
     assert.match(source, /await sendBridgeHeartbeat\(\);/);
     assert.match(source, /cloudState\.recordHeartbeatSuccess\(\);/);

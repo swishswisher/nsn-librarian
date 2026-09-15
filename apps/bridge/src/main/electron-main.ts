@@ -317,7 +317,20 @@ export async function startElectronBridgeApp() {
     identity: Awaited<ReturnType<typeof getCompletePairedBridgeIdentity>>,
   ) {
     if (bridgeIdentityCanAuthenticate(identity)) {
-      return "PAIRED_AND_READY";
+      const cloudConnectionState = cloudState.getState().cloudConnectionState;
+
+      if (
+        cloudConnectionState === "ONLINE" ||
+        cloudConnectionState === "ROOT_SYNC_FAILED"
+      ) {
+        return "PAIRED_CONNECTED";
+      }
+
+      if (cloudConnectionState === "UNKNOWN") {
+        return "PAIRED_CONNECTING";
+      }
+
+      return "PAIRED_OFFLINE";
     }
 
     if (identity.status === "UNAVAILABLE") {
@@ -724,8 +737,10 @@ export async function startElectronBridgeApp() {
   buildMenu();
   createMainWindow();
 
-  void restorePersistedBridgeWatchers()
-    .catch(() => undefined)
+  const watcherRestore = restorePersistedBridgeWatchers().catch(() => undefined);
+  const immediateReconnect = recoverCloudConnection(false).catch(() => undefined);
+
+  void Promise.all([watcherRestore, immediateReconnect])
     .then(() => recoverCloudConnection(true))
     .then(() => pollCloud())
     .catch(() => undefined)
