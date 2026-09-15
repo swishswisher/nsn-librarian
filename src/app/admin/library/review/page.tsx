@@ -17,6 +17,16 @@ export default async function LibraryReviewPage() {
   const topicsBySuggestionId = await getKnowledgeContextForRecommendations(
     organizationRecommendations.suggestions.map((suggestion) => suggestion.id),
   );
+  const organizationRecommendationsStateKey = organizationRecommendations.suggestions
+    .map((suggestion) =>
+      [
+        suggestion.id,
+        suggestion.status,
+        suggestion.reviewedAt ?? "",
+        suggestion.recommendationGenerationId,
+      ].join(":"),
+    )
+    .join("|");
 
   return (
     <LibraryShell active="review">
@@ -38,6 +48,7 @@ export default async function LibraryReviewPage() {
         </NsnCard>
 
         <OrganizationSuggestionsReviewPanel
+          key={organizationRecommendationsStateKey}
           libraryIdBySuggestionId={
             organizationRecommendations.libraryIdBySuggestionId
           }

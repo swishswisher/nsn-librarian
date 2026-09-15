@@ -3331,6 +3331,51 @@ function assertPendingReviewStatus(status: OrganizationSuggestionStatus) {
   );
 }
 
+async function assertReviewUpdateSucceeded(
+  suggestionId: string,
+  scanSessionId: string,
+  updatedCount: number,
+) {
+  if (updatedCount === 1) {
+    return;
+  }
+
+  const latest = await storedSuggestionById(suggestionId);
+
+  if (!latest || latest.scanSessionId !== scanSessionId) {
+    throw new OrganizationSuggestionError(
+      "The Librarian could not find that recommendation in this scan session.",
+      404,
+    );
+  }
+
+  if (latest.invalidatedAt) {
+    throw new OrganizationSuggestionError(
+      "This recommendation has been replaced by newer review information. Refresh the page before reviewing it.",
+      409,
+    );
+  }
+
+  if (!isCurrentRecommendationGeneration(latest.recommendationGenerationVersion)) {
+    throw new OrganizationSuggestionError(
+      "This recommendation came from an older recommendation pass. Regenerate recommendations before reviewing it.",
+      409,
+    );
+  }
+
+  if (normalizeSuggestionStatus(latest.status) !== "PENDING") {
+    throw new OrganizationSuggestionError(
+      "This recommendation has already been reviewed. Refresh the page to see its current status.",
+      409,
+    );
+  }
+
+  throw new OrganizationSuggestionError(
+    "This recommendation was updated by another review. Refresh the page and try again.",
+    409,
+  );
+}
+
 export async function reviewOrganizationSuggestion(
   suggestionId: string,
   input: ReviewOrganizationSuggestionInput,
@@ -3426,17 +3471,19 @@ export async function reviewOrganizationSuggestion(
         },
         where: {
           id: suggestionId,
+          invalidatedAt: null,
+          recommendationGenerationId: existing.recommendationGenerationId,
+          recommendationGenerationVersion: currentRecommendationGenerationVersion,
           scanSessionId,
           status: "PENDING",
         },
       });
 
-      if (updated.count !== 1) {
-        throw new OrganizationSuggestionError(
-          "This recommendation was updated by another review. Refresh the page and try again.",
-          409,
-        );
-      }
+      await assertReviewUpdateSucceeded(
+        suggestionId,
+        scanSessionId,
+        updated.count,
+      );
 
       await transaction.organizationSuggestionRevision.create({
         data: {
@@ -3457,17 +3504,15 @@ export async function reviewOrganizationSuggestion(
       },
       where: {
         id: suggestionId,
+        invalidatedAt: null,
+        recommendationGenerationId: existing.recommendationGenerationId,
+        recommendationGenerationVersion: currentRecommendationGenerationVersion,
         scanSessionId,
         status: "PENDING",
       },
     });
 
-    if (updated.count !== 1) {
-      throw new OrganizationSuggestionError(
-        "This recommendation was updated by another review. Refresh the page and try again.",
-        409,
-      );
-    }
+    await assertReviewUpdateSucceeded(suggestionId, scanSessionId, updated.count);
   }
 
   const updated = await storedSuggestionById(suggestionId);

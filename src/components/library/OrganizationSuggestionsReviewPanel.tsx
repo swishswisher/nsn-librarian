@@ -490,6 +490,7 @@ export function OrganizationSuggestionsReviewPanel({
     {},
   );
   const [pendingReviews, setPendingReviews] = useState<PendingReviews>({});
+  const [reviewErrors, setReviewErrors] = useState<Record<string, string>>({});
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
   const [resetConfirmation, setResetConfirmation] = useState("");
   const [isResettingSession, setIsResettingSession] = useState(false);
@@ -720,6 +721,13 @@ export function OrganizationSuggestionsReviewPanel({
     }));
     setMessage(null);
     setError(null);
+    setReviewErrors((current) => {
+      const next = { ...current };
+
+      delete next[suggestion.id];
+
+      return next;
+    });
 
     const body =
       action === "MODIFY" && editState?.suggestionId === suggestion.id
@@ -749,16 +757,36 @@ export function OrganizationSuggestionsReviewPanel({
         (await response.json()) as BridgeOrganizationSuggestionMutationResponse;
 
       if (!payload.ok) {
-        setError(payload.error);
+        const nextError =
+          payload.error || "The recommendation could not be saved right now.";
+
+        setError(nextError);
+        setReviewErrors((current) => ({
+          ...current,
+          [suggestion.id]: nextError,
+        }));
         return;
       }
 
       updateSuggestion(payload.suggestion);
       setMessage(decisionSavedMessage(suggestion, action));
+      setReviewErrors((current) => {
+        const next = { ...current };
+
+        delete next[suggestion.id];
+
+        return next;
+      });
       closeEditSuggestion();
       router.refresh();
     } catch {
-      setError("The recommendation could not be saved right now.");
+      const nextError = "The recommendation could not be saved right now.";
+
+      setError(nextError);
+      setReviewErrors((current) => ({
+        ...current,
+        [suggestion.id]: nextError,
+      }));
     } finally {
       setPendingReviews((current) => {
         const remaining = { ...current };
@@ -781,6 +809,13 @@ export function OrganizationSuggestionsReviewPanel({
     }));
     setMessage(null);
     setError(null);
+    setReviewErrors((current) => {
+      const next = { ...current };
+
+      delete next[suggestion.id];
+
+      return next;
+    });
 
     try {
       const response = await fetch(
@@ -802,7 +837,14 @@ export function OrganizationSuggestionsReviewPanel({
         (await response.json()) as BridgeOrganizationSuggestionMutationResponse;
 
       if (!payload.ok) {
-        setError(payload.error);
+        const nextError =
+          payload.error || "The recommendation could not be reopened right now.";
+
+        setError(nextError);
+        setReviewErrors((current) => ({
+          ...current,
+          [suggestion.id]: nextError,
+        }));
         return;
       }
 
@@ -810,9 +852,22 @@ export function OrganizationSuggestionsReviewPanel({
       setMessage(
         "The recommendation is pending again. Choose the decision that fits now.",
       );
+      setReviewErrors((current) => {
+        const next = { ...current };
+
+        delete next[suggestion.id];
+
+        return next;
+      });
       router.refresh();
     } catch {
-      setError("The recommendation could not be reopened right now.");
+      const nextError = "The recommendation could not be reopened right now.";
+
+      setError(nextError);
+      setReviewErrors((current) => ({
+        ...current,
+        [suggestion.id]: nextError,
+      }));
     } finally {
       setPendingReviews((current) => {
         const remaining = { ...current };
@@ -856,7 +911,10 @@ export function OrganizationSuggestionsReviewPanel({
         | { ok: false; error: string };
 
       if (!payload.ok) {
-        setError(payload.error);
+        const nextError =
+          payload.error || "The recommendation decisions could not be reset right now.";
+
+        setError(nextError);
         return;
       }
 
@@ -1042,6 +1100,7 @@ export function OrganizationSuggestionsReviewPanel({
                         suggestion.scanSessionId && suggestion.id,
                       );
                       const relatedTopics = topicsBySuggestionId[suggestion.id] ?? [];
+                      const reviewError = reviewErrors[suggestion.id] ?? null;
 
                       return (
                         <NsnCard className="min-w-0" key={suggestion.id}>
@@ -1317,6 +1376,14 @@ export function OrganizationSuggestionsReviewPanel({
                                       This recommendation has been reviewed.
                                     </p>
                                   </div>
+                                ) : null}
+                                {reviewError ? (
+                                  <p
+                                    className="rounded-md border border-[var(--nsn-warm-beige)] bg-[var(--nsn-sand)] p-3 text-sm leading-6 text-[var(--nsn-warning)]"
+                                    role="alert"
+                                  >
+                                    {reviewError}
+                                  </p>
                                 ) : null}
                               </div>
                             </div>

@@ -61,6 +61,16 @@ export default async function RecommendationsPage({
   const hasActiveRecommendations =
     data.regeneration.activeRecommendationCount > 0;
   const canBuildPlan = recommendationCounts.eligibleForPlanning > 0;
+  const suggestionsStateKey = data.suggestions
+    .map((suggestion) =>
+      [
+        suggestion.id,
+        suggestion.status,
+        suggestion.reviewedAt ?? "",
+        suggestion.recommendationGenerationId,
+      ].join(":"),
+    )
+    .join("|");
 
   return (
     <LibraryShell active="review">
@@ -248,6 +258,7 @@ export default async function RecommendationsPage({
 
         {hasRecommendations ? (
           <OrganizationSuggestionsReviewPanel
+            key={suggestionsStateKey}
             notebookHref={
               notebookReflection
                 ? getNotebookEntryRoute(notebookReflection.id)
