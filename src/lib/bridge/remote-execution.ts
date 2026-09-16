@@ -18,6 +18,7 @@ import {
   BridgeExecutorError,
   summarizeExecutionRun,
 } from "./executor";
+import { bridgeDeviceIsOnline } from "./effective-health";
 import { getOrganizationPlanPageData } from "./planner";
 import { isCurrentRecommendationGeneration } from "./recommendation-generation";
 import type {
@@ -90,8 +91,6 @@ type LoadedRemotePlan = {
   normalizedActions: RemotePlanAction[];
   preview: BridgeExecutionPreview;
 };
-
-const onlineWindowMs = 90_000;
 
 function jsonInput(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
@@ -210,13 +209,7 @@ function issue(input: {
 }
 
 function deviceIsOnline(device: { lastSeenAt: Date | null; status: string } | null) {
-  const lastSeenAt = device?.lastSeenAt?.getTime() ?? Number.NaN;
-
-  return (
-    device?.status === "ONLINE" &&
-    Number.isFinite(lastSeenAt) &&
-    Date.now() - lastSeenAt <= onlineWindowMs
-  );
+  return bridgeDeviceIsOnline(device);
 }
 
 function requiresPermission(

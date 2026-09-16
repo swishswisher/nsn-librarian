@@ -14,6 +14,7 @@ import {
   takeLocalBridgeWatcherEvents,
   type LocalBridgeExecutionActionInput,
 } from "./local-bridge-client";
+import { bridgeDeviceIsOnline } from "./effective-health";
 import { isCurrentRecommendationGeneration } from "./recommendation-generation";
 import type {
   BridgeExecutionIssue,
@@ -142,6 +143,11 @@ type StoredPlanForExecution = {
   history: Prisma.JsonValue;
   scanSession: {
     connectedFolder: {
+      bridgeDevice: {
+        lastSeenAt: Date | null;
+        status: string;
+      } | null;
+      bridgeDeviceId: string | null;
       bridgeRootId: string | null;
       createFolderPermission: boolean;
       id: string;
@@ -1224,6 +1230,12 @@ async function loadPlanForExecution(planId: string) {
         select: {
           connectedFolder: {
             select: {
+              bridgeDevice: {
+                select: {
+                  lastSeenAt: true,
+                  status: true,
+                },
+              },
               bridgeDeviceId: true,
               createFolderPermission: true,
               bridgeRootId: true,
@@ -1489,7 +1501,17 @@ async function buildExecutionPreview(
   validateExecutableActionSet(executableActions, issues);
   validateExecutionPermissions(plan, executableActions, issues);
 
-  if (!plan.scanSession.connectedFolder.bridgeRootId) {
+  if (plan.scanSession.connectedFolder.bridgeDeviceId) {
+    if (!bridgeDeviceIsOnline(plan.scanSession.connectedFolder.bridgeDevice)) {
+      issues.push(
+        issue(
+          "BRIDGE_UNAVAILABLE",
+          "The connected Mac Bridge is offline",
+          "Open NSN Bridge on the paired Mac and wait for it to report online.",
+        ),
+      );
+    }
+  } else if (!plan.scanSession.connectedFolder.bridgeRootId) {
     issues.push(
       issue(
         "BRIDGE_UNAVAILABLE",
@@ -2128,6 +2150,13 @@ export async function executeOrganizationPlan(
           select: {
             connectedFolder: {
               select: {
+                bridgeDevice: {
+                  select: {
+                    lastSeenAt: true,
+                    status: true,
+                  },
+                },
+                bridgeDeviceId: true,
                 bridgeRootId: true,
                 createFolderPermission: true,
                 id: true,

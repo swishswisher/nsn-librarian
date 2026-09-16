@@ -1,22 +1,13 @@
 import type { BridgeDeviceSummary } from "../../../packages/bridge-protocol/src";
 
 import type { ConnectedLibrarySummary } from "./types";
-
-const onlineWindowMs = 90_000;
+import { bridgeDeviceIsOnline } from "./effective-health";
 
 function onlineDeviceIds(devices: BridgeDeviceSummary[], now = new Date()) {
   return new Set(
     devices
       .filter((device) => {
-        if (device.status !== "ONLINE" || !device.lastSeenAt) {
-          return false;
-        }
-
-        const lastSeenAt = new Date(device.lastSeenAt).getTime();
-        return (
-          Number.isFinite(lastSeenAt) &&
-          now.getTime() - lastSeenAt <= onlineWindowMs
-        );
+        return bridgeDeviceIsOnline(device, now);
       })
       .map((device) => device.bridgeDeviceId),
   );

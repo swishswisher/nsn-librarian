@@ -12,6 +12,7 @@ import {
   createBridgeCloudCommand,
 } from "./cloud-coordinator";
 import { summarizeExecutionRun } from "./executor";
+import { bridgeDeviceIsOnline } from "./effective-health";
 import type {
   BridgeExecutionIssue,
   BridgeUndoActionType,
@@ -31,8 +32,6 @@ type RemoteUndoAction = {
   sourceRelativePath: string;
   sourceSizeBytes: string | null;
 };
-
-const onlineWindowMs = 90_000;
 
 function objectValue(value: unknown) {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -68,13 +67,7 @@ function undoStatus(value: unknown): UndoStatus {
 }
 
 function deviceIsOnline(device: { lastSeenAt: Date | null; status: string } | null) {
-  const lastSeenAt = device?.lastSeenAt?.getTime() ?? Number.NaN;
-
-  return (
-    device?.status === "ONLINE" &&
-    Number.isFinite(lastSeenAt) &&
-    Date.now() - lastSeenAt <= onlineWindowMs
-  );
+  return bridgeDeviceIsOnline(device);
 }
 
 async function loadRemoteUndo(executionRunId: string) {

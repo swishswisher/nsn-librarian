@@ -7,6 +7,7 @@ import {
   createBridgeCloudCommand,
 } from "@/lib/bridge/cloud-coordinator";
 import { requireScanSessionPermission } from "@/lib/bridge/connected-libraries";
+import { bridgeDeviceIsOnline } from "./effective-health";
 
 import { currentRecommendationGenerationVersion } from "./recommendation-generation";
 import { prepareOrganizationRecommendationRegeneration } from "./organization-suggestions";
@@ -20,7 +21,6 @@ import type {
   BridgeScannedFileSummary,
 } from "./types";
 
-const onlineWindowMs = 90_000;
 const readCommandLifetimeMs = 10 * 60 * 1000;
 const regenerationReadCommandLifetimeMs = 24 * 60 * 60 * 1000;
 const activeReadCommandStatuses = [
@@ -528,11 +528,7 @@ export async function queueRemoteRecommendationRegenerationForSession(
     );
   }
 
-  const lastSeenAt = library.bridgeDevice.lastSeenAt?.getTime() ?? Number.NaN;
-  const bridgeIsOnline =
-    library.bridgeDevice.status === "ONLINE" &&
-    Number.isFinite(lastSeenAt) &&
-    Date.now() - lastSeenAt <= onlineWindowMs;
+  const bridgeIsOnline = bridgeDeviceIsOnline(library.bridgeDevice);
 
   if (!bridgeIsOnline) {
     throw new BridgeCloudError(
@@ -857,12 +853,7 @@ export async function queueRemoteReadRetryForScannedFile(scannedFileId: string) 
     );
   }
 
-  const device = library.bridgeDevice;
-  const lastSeenAt = device?.lastSeenAt?.getTime() ?? Number.NaN;
-  const deviceOnline =
-    device?.status === "ONLINE" &&
-    Number.isFinite(lastSeenAt) &&
-    Date.now() - lastSeenAt <= onlineWindowMs;
+  const deviceOnline = bridgeDeviceIsOnline(library.bridgeDevice);
 
   if (!deviceOnline) {
     throw new BridgeCloudError(
@@ -909,4 +900,3 @@ export async function queueRemoteReadRetryForScannedFile(scannedFileId: string) 
     scannedFileId,
   });
 }
-

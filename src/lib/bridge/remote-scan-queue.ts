@@ -13,6 +13,7 @@ import {
 } from "@/lib/bridge/cloud-coordinator";
 
 import { getBridgeScanSessionProgress } from "./scan-sessions";
+import { bridgeDeviceIsOnline } from "./effective-health";
 import { queueRemoteReadCommand } from "./remote-read-commands";
 import { ingestBridgeWatchEvents } from "./monitor";
 import { recordChecksumDuplicateSuggestionsForSession } from "./checksum-duplicates";
@@ -33,8 +34,6 @@ const activeScanStatuses = [
   "GENERATING_SUGGESTIONS",
 ] as const;
 const maxScanFiles = 20_000;
-const onlineWindowMs = 90_000;
-
 function objectValue(value: unknown) {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -517,11 +516,7 @@ export async function queueRemoteBridgeScan(connectedLibraryId: string) {
     );
   }
 
-  const lastSeenAt = library.bridgeDevice.lastSeenAt?.getTime() ?? Number.NaN;
-  const online =
-    library.bridgeDevice.status === "ONLINE" &&
-    Number.isFinite(lastSeenAt) &&
-    Date.now() - lastSeenAt <= onlineWindowMs;
+  const online = bridgeDeviceIsOnline(library.bridgeDevice);
 
   if (!online) {
     throw new BridgeCloudError(

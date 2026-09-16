@@ -5,10 +5,9 @@ import {
 } from "@/lib/bridge/cloud-coordinator";
 
 import { getConnectedLibraries, getConnectedLibrary } from "./connected-libraries";
+import { bridgeDeviceIsOnline } from "./effective-health";
 
 type RemoteMonitoringAction = "start" | "pause" | "resume";
-
-const onlineWindowMs = 90_000;
 
 function commandTypeFor(action: RemoteMonitoringAction) {
   if (action === "pause") {
@@ -51,11 +50,7 @@ export async function queueRemoteMonitoringAction(
     );
   }
 
-  const lastSeenAt = library.bridgeDevice.lastSeenAt?.getTime() ?? Number.NaN;
-  const online =
-    library.bridgeDevice.status === "ONLINE" &&
-    Number.isFinite(lastSeenAt) &&
-    Date.now() - lastSeenAt <= onlineWindowMs;
+  const online = bridgeDeviceIsOnline(library.bridgeDevice);
 
   if (!online) {
     throw new BridgeCloudError(

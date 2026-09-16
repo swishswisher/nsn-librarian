@@ -19,6 +19,7 @@ import {
 } from "../../packages/bridge-protocol/src";
 import { validateBridgeRelativePath } from "../../packages/filesystem-plans/src";
 import {
+  bridgeDeviceIsOnline,
   cloudBridgeHealth,
   effectiveBridgeHealth,
 } from "../../src/lib/bridge/effective-health";
@@ -482,6 +483,21 @@ describe("Bridge effective Home health", () => {
       home.versionLabel,
       "0.1.0, last seen 18 Aug 2026, 12:00 PM",
     );
+  });
+
+  it("uses the same recent heartbeat predicate for a specific Bridge device", () => {
+    const recent = device();
+    const stale = device({
+      lastSeenAt: new Date(now.getTime() - 90_001).toISOString(),
+    });
+
+    assert.equal(bridgeDeviceIsOnline(recent, now), true);
+    assert.equal(bridgeDeviceIsOnline(stale, now), false);
+    assert.equal(
+      bridgeDeviceIsOnline({ ...recent, status: "PAIRED" }, now),
+      false,
+    );
+    assert.equal(bridgeDeviceIsOnline(null, now), false);
   });
 
   it("does not treat pairing alone as a recent cloud heartbeat", () => {

@@ -10,11 +10,13 @@ import { getPrismaClient } from "@/lib/db/prisma";
 import {
   BridgeCloudError,
   createBridgeCloudCommand,
+  listBridgeDevices,
 } from "@/lib/bridge/cloud-coordinator";
 import {
   bridgePermissionSnapshot,
   logBridgePermissionDiagnostic,
 } from "@/lib/bridge/permission-diagnostics";
+import { bridgeDeviceIsOnline } from "@/lib/bridge/effective-health";
 
 import type {
   ConnectedLibraryPermissions,
@@ -296,11 +298,7 @@ function hasPermissionChanges(input: Partial<ConnectedLibraryPermissions>) {
 }
 
 function onlineBridgeDevice(device: { lastSeenAt: Date | null; status: string } | null) {
-  if (!device || device.status !== "ONLINE" || !device.lastSeenAt) {
-    return false;
-  }
-
-  return Date.now() - device.lastSeenAt.getTime() <= 90_000;
+  return bridgeDeviceIsOnline(device);
 }
 
 function safePermissionCommandPayload(
@@ -811,10 +809,25 @@ async function markLegacyConnections() {
   });
 }
 
-async function bridgeReachability() {
+async function bridgeReachability(bridgeDeviceId: string | null = null) {
   const health = await getLocalBridgeHealth();
 
-  return health.ok && health.status === "BRIDGE_READY";
+  if (health.ok && health.status === "BRIDGE_READY") {
+    return true;
+  }
+
+  if (!bridgeDeviceId) {
+    return false;
+  }
+
+  try {
+    const devices = await listBridgeDevices();
+    return bridgeDeviceIsOnline(
+      devices.find((device) => device.bridgeDeviceId === bridgeDeviceId),
+    );
+  } catch {
+    return false;
+  }
 }
 
 export async function getConnectedLibraries() {
@@ -825,8 +838,6 @@ export async function getConnectedLibraries() {
   if (developerFallbackEnabled()) {
     await ensureDeveloperFallbackConnectedLibrary();
   }
-
-  const bridgeReachable = await bridgeReachability();
 
   const libraries = await prisma.connectedLibrary.findMany({
     orderBy: [{ status: "asc" }, { updatedAt: "desc" }],
@@ -846,12 +857,15 @@ export async function getConnectedLibraries() {
     latestDetectedChangesByLibraryId(libraryIds),
   ]);
 
-  return libraries.map((library) =>
-    librarySummary(
-      library,
-      attentionCounts.get(library.id) ?? 0,
-      bridgeReachable && Boolean(library.bridgeRootId),
-      latestDetectedChanges.get(library.id) ?? null,
+  return Promise.all(
+    libraries.map(async (library) =>
+      librarySummary(
+        library,
+        attentionCounts.get(library.id) ?? 0,
+        (await bridgeReachability(library.bridgeDeviceId)) &&
+          Boolean(library.bridgeRootId),
+        latestDetectedChanges.get(library.id) ?? null,
+      ),
     ),
   );
 }
@@ -880,7 +894,7 @@ export async function getConnectedLibrary(libraryId: string) {
     await Promise.all([
       attentionCountsByLibraryId([library.id]),
       latestDetectedChangesByLibraryId([library.id]),
-      bridgeReachability(),
+      bridgeReachability(library.bridgeDeviceId),
     ]);
 
   return librarySummary(
@@ -926,7 +940,7 @@ export async function getConnectedLibraryByFolderFingerprint(
   }
 
   const attentionCounts = await attentionCountsByLibraryId([library.id]);
-  const bridgeReachable = await bridgeReachability();
+  const bridgeReachable = await bridgeReachability(library.bridgeDeviceId);
 
   return librarySummary(
     library,
