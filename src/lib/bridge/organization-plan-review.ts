@@ -90,6 +90,19 @@ export function selectedActionIdsFromActions(
     .map((action) => action.id);
 }
 
+export function selectionMatchesSavedPlan(
+  selectedActionIds: string[],
+  actions: BridgeOrganizationPlanAction[],
+) {
+  const selected = [...selectedActionIds].sort();
+  const saved = selectedActionIdsFromActions(actions).sort();
+
+  return (
+    selected.length === saved.length &&
+    selected.every((value, index) => value === saved[index])
+  );
+}
+
 export function chooseActionForSource(
   selectedActionIds: string[],
   actions: BridgeOrganizationPlanAction[],

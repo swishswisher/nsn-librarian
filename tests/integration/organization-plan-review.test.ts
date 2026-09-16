@@ -8,6 +8,7 @@ import {
   organizationPlanDecisionGroups,
   organizationPlanDownload,
   organizationPlanLiveSummary,
+  selectionMatchesSavedPlan,
 } from "../../src/lib/bridge/organization-plan-review";
 import { currentRecommendationGenerationVersion } from "../../src/lib/bridge/recommendation-generation";
 import {
@@ -102,13 +103,38 @@ test("the page explains that choices do not move files and exposes the required 
   assert.match(sourceText, /Review approved changes/);
   assert.match(sourceText, /Approved organization recommendations are included here automatically/);
   assert.match(sourceText, /Review approved destinations/);
-  assert.match(sourceText, /Save plan choices/);
+  assert.match(sourceText, /Save changes when needed/);
+  assert.match(sourceText, /Save changes/);
   assert.match(sourceText, /Review final plan/);
+  assert.match(sourceText, /Final Organization Plan/);
+  assert.match(sourceText, /Folders to create/);
+  assert.match(sourceText, /Files to move/);
   assert.match(sourceText, /Authorize execution/);
   assert.match(sourceText, /Exclude from this plan/);
   assert.doesNotMatch(sourceText, /Keep it in .*default/);
   assert.match(sourceText, /type="radio"/);
   assert.doesNotMatch(sourceText, /type="checkbox"/);
+});
+
+test("automatic inclusion is clean until a saved plan choice changes", () => {
+  const included = action({
+    id: "included",
+    plannedRelativePath: "Finance/invoice.pdf",
+    selectedForExecution: true,
+    sourceRelativePath: "Loose/invoice.pdf",
+  });
+  const excluded = action({
+    id: "excluded",
+    plannedRelativePath: "Workshops/outline.docx",
+    sourceRelativePath: "Loose/outline.docx",
+  });
+
+  assert.equal(selectionMatchesSavedPlan([included.id], [included, excluded]), true);
+  assert.equal(selectionMatchesSavedPlan([], [included, excluded]), false);
+  assert.equal(
+    selectionMatchesSavedPlan([included.id, "unknown"], [included, excluded]),
+    false,
+  );
 });
 
 test("two destinations for one source become one mutually exclusive group with keep as the default", () => {
