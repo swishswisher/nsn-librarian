@@ -3,6 +3,10 @@ import type { ReactNode } from "react";
 import type { NsnBadgeTone } from "@/components/library/NsnBadge";
 import { LibraryQuickNav } from "@/components/library/LibraryQuickNav";
 import { NsnSidebar, type LibrarySection } from "@/components/library/NsnSidebar";
+import { getBridgeCloudStatus } from "@/lib/bridge/cloud-coordinator";
+import { effectiveBridgeHealth } from "@/lib/bridge/effective-health";
+import { bridgeHomeHealthDisplay } from "@/lib/bridge/home-health";
+import { getLocalBridgeHealth } from "@/lib/bridge/local-bridge-client";
 
 type LibraryShellProps = {
   active: LibrarySection;
@@ -11,12 +15,34 @@ type LibraryShellProps = {
   children: ReactNode;
 };
 
-export function LibraryShell({
+export async function LibraryShell({
   active,
-  bridgeLabel = "Bridge not connected",
-  bridgeTone = "pending",
+  bridgeLabel,
+  bridgeTone,
   children,
 }: LibraryShellProps) {
+  let resolvedBridgeLabel = bridgeLabel;
+  let resolvedBridgeTone = bridgeTone;
+
+  if (!resolvedBridgeLabel || !resolvedBridgeTone) {
+    const [localBridgeHealth, cloudBridgeStatus] = await Promise.all([
+      getLocalBridgeHealth(),
+      getBridgeCloudStatus().catch(() => ({ devices: [] })),
+    ]);
+    const bridgeHealth = effectiveBridgeHealth(
+      localBridgeHealth,
+      cloudBridgeStatus.devices,
+    );
+    const bridgeDisplay = bridgeHomeHealthDisplay({
+      bridgeHealth,
+      devices: cloudBridgeStatus.devices,
+      formatLastSeen: (value) => value,
+    });
+
+    resolvedBridgeLabel ??= bridgeDisplay.badgeLabel;
+    resolvedBridgeTone ??= bridgeDisplay.badgeTone;
+  }
+
   return (
     <main className="min-h-screen bg-[var(--nsn-cream)] text-[var(--nsn-navy)] lg:grid lg:grid-cols-[280px_minmax(0,1fr)]">
       <NsnSidebar active={active} />
@@ -30,16 +56,16 @@ export function LibraryShell({
                   aria-hidden="true"
                   className={[
                     "h-2.5 w-2.5 rounded-full",
-                    bridgeTone === "review"
+                    resolvedBridgeTone === "review"
                       ? "bg-[var(--nsn-warning)]"
-                      : bridgeTone === "migration"
+                      : resolvedBridgeTone === "migration"
                         ? "bg-[var(--nsn-gold)]"
-                        : bridgeTone === "approved"
+                        : resolvedBridgeTone === "approved"
                           ? "bg-[var(--nsn-success)]"
                           : "bg-[var(--nsn-warm-gray)]",
                   ].join(" ")}
                 />
-                <span>Bridge: {bridgeLabel}</span>
+                <span>Bridge: {resolvedBridgeLabel}</span>
               </div>
               <div
                 aria-hidden="true"
