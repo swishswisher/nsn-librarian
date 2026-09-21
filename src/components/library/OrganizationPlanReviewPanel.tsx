@@ -34,9 +34,14 @@ import {
   selectionMatchesSavedPlan,
   selectedActionIdsFromActions,
 } from "@/lib/bridge/organization-plan-review";
+import {
+  organizationPlanUiState,
+  type OrganizationPlanUiState,
+} from "@/lib/bridge/organization-plan-state";
 import { getConnectedLibrariesRoute } from "@/lib/library/routes";
 
 type OrganizationPlanReviewPanelProps = {
+  executionHistory?: BridgeExecutionRunSummary[];
   latestExecution?: BridgeExecutionRunSummary | null;
   plan: BridgeOrganizationPlan;
   rootLabel: string;
@@ -256,6 +261,14 @@ function executionStatusLabel(status: string) {
   return status.replaceAll("_", " ").toLowerCase();
 }
 
+function executionActionStatusLabel(status: string, wasRestored: boolean) {
+  if (wasRestored && status === "COMPLETED") {
+    return "Completed during execution";
+  }
+
+  return executionStatusLabel(status);
+}
+
 function executionStatusTone(status: string): NsnBadgeTone {
   if (status === "COMPLETED") {
     return "approved";
@@ -314,6 +327,82 @@ function undoStatusTone(status: string): NsnBadgeTone {
   }
 
   return "pending";
+}
+
+function planUiStateLabel(state: OrganizationPlanUiState) {
+  if (state === "REVIEWING") {
+    return "Reviewing approved changes";
+  }
+
+  if (state === "AWAITING_EXECUTION") {
+    return "Ready for final authorization";
+  }
+
+  if (state === "EXECUTING") {
+    return "Organization in progress";
+  }
+
+  if (state === "COMPLETED") {
+    return "Organization completed";
+  }
+
+  if (state === "UNDOING") {
+    return "Restoring changes";
+  }
+
+  if (state === "UNDONE") {
+    return "Changes restored";
+  }
+
+  if (state === "CANCELLED") {
+    return "Plan cancelled";
+  }
+
+  return "Organization needs attention";
+}
+
+function planUiStateTone(state: OrganizationPlanUiState): NsnBadgeTone {
+  if (state === "EXECUTING" || state === "UNDOING") {
+    return "migration";
+  }
+
+  if (state === "COMPLETED" || state === "UNDONE") {
+    return "approved";
+  }
+
+  if (state === "NEEDS_ATTENTION" || state === "CANCELLED") {
+    return "review";
+  }
+
+  return "pending";
+}
+
+function planSafetyMessage(state: OrganizationPlanUiState) {
+  if (state === "EXECUTING") {
+    return "The Bridge is processing the approved operations. The saved execution record will show each result.";
+  }
+
+  if (state === "COMPLETED") {
+    return "Organization completed. These counts describe the recorded execution, not a claim about the current filesystem state.";
+  }
+
+  if (state === "UNDOING") {
+    return "The Bridge is restoring the recorded organization. The saved undo record will show each result.";
+  }
+
+  if (state === "UNDONE") {
+    return "Changes restored. The recorded execution will not run again automatically; a new organization requires fresh review and authorization.";
+  }
+
+  if (state === "NEEDS_ATTENTION") {
+    return "The saved operation history needs attention before another safe preview can be requested.";
+  }
+
+  if (state === "CANCELLED") {
+    return "This plan was cancelled and did not authorize filesystem changes.";
+  }
+
+  return "Nothing has changed yet. These are proposed filesystem operations only.";
 }
 
 function undoActionTypeLabel(actionType: string) {
@@ -486,6 +575,76 @@ function formatStoredDuration(
   const seconds = Math.max(1, Math.round(durationMs / 1000));
 
   return `${seconds} second${seconds === 1 ? "" : "s"}`;
+}
+
+function PlanLifecycleCard({
+  executionRun,
+  state,
+  undoRun,
+}: {
+  executionRun: BridgeExecutionRunSummary | null;
+  state: OrganizationPlanUiState;
+  undoRun: BridgeUndoRunSummary | null;
+}) {
+  const restored = state === "UNDONE";
+  const completed = state === "COMPLETED" || restored;
+
+  return (
+    <NsnCard
+      className="min-w-0"
+      tone={state === "NEEDS_ATTENTION" ? "sand" : restored ? "aqua" : undefined}
+    >
+      <div className="grid min-w-0 gap-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <NsnBadge tone={planUiStateTone(state)}>
+            {planUiStateLabel(state)}
+          </NsnBadge>
+          {executionRun ? (
+            <NsnBadge tone="source">
+              {executionRun.completedActions} of {executionRun.totalActions} actions
+            </NsnBadge>
+          ) : null}
+          {undoRun ? (
+            <NsnBadge tone={undoStatusTone(undoRun.status)}>
+              {undoStatusLabel(undoRun.status)}
+            </NsnBadge>
+          ) : null}
+        </div>
+
+        <div className="min-w-0">
+          <h2 className="nsn-display break-words text-2xl text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+            {restored ? "Changes restored" : planUiStateLabel(state)}
+          </h2>
+          <p className="mt-2 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+            {restored
+              ? "The files have returned to their original locations. This completed organization remains in the history above and will not run again automatically."
+              : state === "COMPLETED"
+                ? "The Bridge completed the approved organization. These results are historical; the current filesystem state is shown separately from this execution record."
+                : state === "EXECUTING"
+                  ? "The Bridge is processing this approved plan. The persisted execution record will remain available when processing finishes."
+                  : state === "UNDOING"
+                    ? "The Bridge is restoring the completed changes. The persisted undo record will show each result when it finishes."
+                    : "Review the saved history and resolve the reported issue before requesting another safe preview."}
+          </p>
+        </div>
+
+        {completed && executionRun ? (
+          <div className="grid gap-2 rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3 text-sm leading-6 text-[var(--nsn-slate)] sm:grid-cols-3">
+            <p>{executionRun.completedActions} actions completed during execution</p>
+            <p>Execution started: {formatDateTime(executionRun.startedAt)}</p>
+            <p>Execution completed: {formatDateTime(executionRun.completedAt)}</p>
+          </div>
+        ) : null}
+
+        {restored && undoRun ? (
+          <div className="grid gap-2 rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3 text-sm leading-6 text-[var(--nsn-teal-dark)] sm:grid-cols-2">
+            <p>Changes restored: {formatDateTime(undoRun.completedAt)}</p>
+            <p>{undoRun.completedActions} restore actions completed</p>
+          </div>
+        ) : null}
+      </div>
+    </NsnCard>
+  );
 }
 
 function IssueList({
@@ -743,6 +902,9 @@ function UndoRunPanel({ run }: { run: BridgeUndoRunSummary }) {
                 {safeErrorLabel(action.safeErrorCategory)}
               </p>
             ) : null}
+            <p className="break-words text-xs leading-5 text-[var(--nsn-warm-gray)] [overflow-wrap:anywhere]">
+              Started: {formatDateTime(action.startedAt)} · Completed: {formatDateTime(action.completedAt)}
+            </p>
           </div>
         ))}
       </div>
@@ -756,9 +918,11 @@ function ExecutionRunPanel({
   onOpenUndoDialog,
   onPreviewUndo,
   run,
+  isUndone,
   undoPreview,
 }: {
   isUndoPreviewing: boolean;
+  isUndone: boolean;
   latestUndoRun: BridgeUndoRunSummary | null;
   onOpenUndoDialog: () => void;
   onPreviewUndo: () => void;
@@ -788,7 +952,7 @@ function ExecutionRunPanel({
               {executionStatusLabel(run.status)}
             </NsnBadge>
             <NsnBadge tone="approved">
-              {run.completedActions} organized
+              {run.completedActions} {isUndone ? "completed during execution" : "organized"}
             </NsnBadge>
             <NsnBadge tone={run.failedActions > 0 ? "review" : "source"}>
               {run.failedActions} need attention
@@ -860,7 +1024,7 @@ function ExecutionRunPanel({
               >
                 <div className="flex flex-wrap gap-2">
                   <NsnBadge tone={executionStatusTone(action.status)}>
-                    {executionStatusLabel(action.status)}
+                    {executionActionStatusLabel(action.status, isUndone)}
                   </NsnBadge>
                   <NsnBadge tone="source">
                     {action.sequence}. {executionActionTypeLabel(action.actionType)}
@@ -879,6 +1043,9 @@ function ExecutionRunPanel({
                     {safeErrorLabel(action.safeErrorCategory)}
                   </p>
                 ) : null}
+                <p className="break-words text-xs leading-5 text-[var(--nsn-warm-gray)] [overflow-wrap:anywhere]">
+                  Started: {formatDateTime(action.startedAt)} · Completed: {formatDateTime(action.completedAt)}
+                </p>
               </div>
             ))}
           </div>
@@ -889,7 +1056,113 @@ function ExecutionRunPanel({
   );
 }
 
+function HistoricalExecutionHistory({
+  runs,
+}: {
+  runs: BridgeExecutionRunSummary[];
+}) {
+  if (runs.length < 2) {
+    return null;
+  }
+
+  return (
+    <Section title="Earlier organization history">
+      <div className="grid min-w-0 gap-4">
+        {runs.slice(1).map((run) => (
+          <NsnCard className="min-w-0" key={run.id}>
+            <div className="grid min-w-0 gap-4">
+              <div className="flex flex-wrap gap-2">
+                <NsnBadge tone={executionStatusTone(run.status)}>
+                  {executionStatusLabel(run.status)}
+                </NsnBadge>
+                <NsnBadge tone="source">
+                  {run.completedActions} of {run.totalActions} actions completed
+                </NsnBadge>
+              </div>
+              <div className="grid gap-2 text-sm leading-6 text-[var(--nsn-slate)]">
+                <p>Started: {formatDateTime(run.startedAt)}</p>
+                <p>Completed: {formatDateTime(run.completedAt)}</p>
+                <p>
+                  Organization time: {formatStoredDuration(
+                    run.startedAt,
+                    run.completedAt,
+                    run.durationMs,
+                  )}
+                </p>
+              </div>
+              <div className="grid min-w-0 gap-3">
+                {run.actions.map((action) => (
+                  <div
+                    className="grid min-w-0 gap-2 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-3"
+                    key={action.id}
+                  >
+                    <div className="flex flex-wrap gap-2">
+                      <NsnBadge tone={executionStatusTone(action.status)}>
+                        {executionActionStatusLabel(
+                          action.status,
+                          run.latestUndoRun?.status === "COMPLETED",
+                        )}
+                      </NsnBadge>
+                      <NsnBadge tone="source">
+                        {action.sequence}. {executionActionTypeLabel(action.actionType)}
+                      </NsnBadge>
+                    </div>
+                    {action.sourceRelativePath ? (
+                      <p className="break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                        Current: {action.sourceRelativePath}
+                      </p>
+                    ) : null}
+                    <p className="break-words text-sm font-semibold leading-6 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                      Planned: {action.destinationRelativePath}
+                    </p>
+                    <p className="break-words text-xs leading-5 text-[var(--nsn-warm-gray)] [overflow-wrap:anywhere]">
+                      Started: {formatDateTime(action.startedAt)} - Completed: {formatDateTime(action.completedAt)}
+                    </p>
+                  </div>
+                ))}
+              </div>
+              {run.undoRuns.map((undo) => (
+                <div
+                  className="grid min-w-0 gap-3 rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3"
+                  key={undo.id}
+                >
+                  <div className="flex flex-wrap gap-2">
+                    <NsnBadge tone={undoStatusTone(undo.status)}>
+                      {undoStatusLabel(undo.status)}
+                    </NsnBadge>
+                    <NsnBadge tone="source">
+                      {undo.completedActions} restore actions completed
+                    </NsnBadge>
+                  </div>
+                  <div className="grid gap-2 text-sm leading-6 text-[var(--nsn-slate)]">
+                    <p>Started: {formatDateTime(undo.startedAt)}</p>
+                    <p>Completed: {formatDateTime(undo.completedAt)}</p>
+                  </div>
+                  {undo.actions.map((action) => (
+                    <div
+                      className="grid min-w-0 gap-1 border-t border-[var(--nsn-soft-aqua)] pt-3 text-sm leading-6"
+                      key={action.id}
+                    >
+                      <p className="break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                        {undoActionTypeLabel(action.actionType)}: {action.destinationRelativePath}
+                      </p>
+                      <p className="break-words text-xs text-[var(--nsn-warm-gray)] [overflow-wrap:anywhere]">
+                        Started: {formatDateTime(action.startedAt)} - Completed: {formatDateTime(action.completedAt)}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </NsnCard>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
 export function OrganizationPlanReviewPanel({
+  executionHistory = [],
   latestExecution = null,
   plan,
   rootLabel,
@@ -900,6 +1173,14 @@ export function OrganizationPlanReviewPanel({
     useState<BridgeExecutionPreview | null>(null);
   const [executionRun, setExecutionRun] =
     useState<BridgeExecutionRunSummary | null>(latestExecution);
+  const [executionRuns, setExecutionRuns] =
+    useState<BridgeExecutionRunSummary[]>(() =>
+      executionHistory.length > 0
+        ? executionHistory
+        : latestExecution
+          ? [latestExecution]
+          : [],
+    );
   const [undoPreview, setUndoPreview] = useState<BridgeUndoPreview | null>(null);
   const [undoRun, setUndoRun] = useState<BridgeUndoRunSummary | null>(
     latestExecution?.latestUndoRun ?? null,
@@ -1188,10 +1469,15 @@ export function OrganizationPlanReviewPanel({
       replaceCurrentPlan(payload.plan);
       setExecutionPreview(payload.preview);
       setExecutionRun(payload.run);
+      setExecutionRuns((current) => [
+        payload.run,
+        ...current.filter((run) => run.id !== payload.run.id),
+      ]);
       setUndoPreview(null);
       setUndoRun(null);
       setExecuteConfirmation("");
       setIsExecuteDialogOpen(false);
+      setIsFinalReviewOpen(false);
       setMessage(
         payload.run.status === "COMPLETED"
           ? "The Bridge organized the approved files. No files were overwritten or deleted."
@@ -1283,6 +1569,10 @@ export function OrganizationPlanReviewPanel({
       }
 
       setExecutionRun(payload.executionRun);
+      setExecutionRuns((current) => [
+        payload.executionRun,
+        ...current.filter((run) => run.id !== payload.executionRun.id),
+      ]);
       setUndoPreview(null);
       setUndoRun(payload.run);
       setUndoConfirmation("");
@@ -1338,54 +1628,75 @@ export function OrganizationPlanReviewPanel({
       organizationPlanLiveSummary(currentPlan.actions, selectedActionIds),
     [currentPlan.actions, selectedActionIds],
   );
-  const hasExecutionStarted =
-    currentPlan.status === "EXECUTED" ||
-    executionRun?.status === "COMPLETED" ||
-    executionRun?.status === "PARTIALLY_COMPLETED" ||
-    executionRun?.status === "RUNNING";
+  const visibleUndoRun = undoRun ?? executionRun?.latestUndoRun ?? null;
+  const planUiState = organizationPlanUiState({
+    executionStatus: executionRun?.status,
+    planStatus: currentPlan.status,
+    undoStatus: visibleUndoRun?.status,
+  });
+  const executionLifecycleLocked =
+    planUiState === "EXECUTING" ||
+    planUiState === "COMPLETED" ||
+    planUiState === "UNDOING" ||
+    planUiState === "UNDONE" ||
+    executionRun?.status === "PARTIALLY_COMPLETED";
+  const hasExecutionStarted = executionLifecycleLocked;
+  const showLifecycleCard =
+    executionRun !== null &&
+    planUiState !== "REVIEWING" &&
+    planUiState !== "AWAITING_EXECUTION";
   const canPreviewExecution =
     currentPlan.summary.estimatedOperations > 0 &&
     currentPlan.status === "READY_FOR_EXECUTION" &&
-    !hasExecutionStarted;
+    !executionLifecycleLocked;
   const canExecutePlan =
     canPreviewExecution && executionPreview?.canExecute === true;
-  const visibleUndoRun = undoRun ?? executionRun?.latestUndoRun ?? null;
 
   return (
     <div className="grid min-w-0 gap-8">
-      <NsnCard tone="aqua">
-        <div className="grid min-w-0 gap-5">
-          <div className="min-w-0">
-            <h2 className="nsn-display text-3xl text-[var(--nsn-navy)]">
-              Review approved changes
-            </h2>
-            <p className="mt-3 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-              Approved organization recommendations are included here automatically.
-              Nothing will move yet. Review the proposed changes, make any intentional
-              exclusions or edits, and authorize the final plan separately.
-            </p>
+      {showLifecycleCard ? (
+        <PlanLifecycleCard
+          executionRun={executionRun}
+          state={planUiState}
+          undoRun={visibleUndoRun}
+        />
+      ) : null}
+
+      {!executionLifecycleLocked ? (
+        <NsnCard tone="aqua">
+          <div className="grid min-w-0 gap-5">
+            <div className="min-w-0">
+              <h2 className="nsn-display text-3xl text-[var(--nsn-navy)]">
+                Review approved changes
+              </h2>
+              <p className="mt-3 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                Approved organization recommendations are included here automatically.
+                Nothing will move yet. Review the proposed changes, make any intentional
+                exclusions or edits, and authorize the final plan separately.
+              </p>
+            </div>
+            <ol className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-label="Organization process">
+              {[
+                "Review approved destinations",
+                "Exclude or change if needed",
+                "Save changes when needed",
+                "Review final plan",
+                "Authorize execution",
+              ].map((step, index) => (
+                <li
+                  className="flex min-w-0 items-center gap-3 rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-card)] p-3 text-sm font-semibold text-[var(--nsn-navy)]"
+                  key={step}
+                >
+                  <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-[var(--nsn-teal)] text-xs text-white">
+                    {index + 1}
+                  </span>
+                  <span className="break-words [overflow-wrap:anywhere]">{step}</span>
+                </li>
+              ))}
+            </ol>
           </div>
-          <ol className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-label="Organization process">
-            {[
-              "Review approved destinations",
-              "Exclude or change if needed",
-              "Save changes when needed",
-              "Review final plan",
-              "Authorize execution",
-            ].map((step, index) => (
-              <li
-                className="flex min-w-0 items-center gap-3 rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-card)] p-3 text-sm font-semibold text-[var(--nsn-navy)]"
-                key={step}
-              >
-                <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-[var(--nsn-teal)] text-xs text-white">
-                  {index + 1}
-                </span>
-                <span className="break-words [overflow-wrap:anywhere]">{step}</span>
-              </li>
-            ))}
-          </ol>
-        </div>
-      </NsnCard>
+        </NsnCard>
+      ) : null}
 
       <section
         aria-label="Live safety summary"
@@ -1399,28 +1710,43 @@ export function OrganizationPlanReviewPanel({
                 Safety summary
               </h2>
               <p className="mt-1 text-sm font-semibold text-[var(--nsn-teal-dark)]">
-                Nothing has happened yet
+                {planSafetyMessage(planUiState)}
               </p>
             </div>
             <ul className="grid min-w-0 gap-2 text-sm text-[var(--nsn-slate)] sm:grid-cols-2 xl:grid-cols-5">
-              <li>{counted(liveSummary.filesMoved, "file")} will move</li>
-              <li>
-                {counted(liveSummary.foldersCreated, "folder")} will be created
-              </li>
-              <li>
-                {counted(liveSummary.filesRenamed, "file")} will be renamed
-              </li>
-              <li>
-                {counted(liveSummary.filesDeleted, "file")} will be deleted
-              </li>
-              <li>
-                {counted(liveSummary.filesOverwritten, "file")} will be overwritten
-              </li>
+               <li>
+                 {counted(liveSummary.filesMoved, "file")} {planUiState === "UNDONE"
+                   ? "moved during execution and restored"
+                   : planUiState === "COMPLETED"
+                     ? "moved during execution"
+                     : "will move"}
+               </li>
+               <li>
+                {counted(liveSummary.foldersCreated, "folder")} {planUiState === "UNDONE"
+                  ? "created during execution and are historical"
+                  : planUiState === "COMPLETED"
+                    ? "created during execution"
+                    : "will be created"}
+               </li>
+               <li>
+                {counted(liveSummary.filesRenamed, "file")} {planUiState === "UNDONE"
+                  ? "renamed during execution and restored"
+                  : planUiState === "COMPLETED"
+                    ? "renamed during execution"
+                    : "will be renamed"}
+               </li>
+               <li>
+                {counted(liveSummary.filesDeleted, "file")} would be deleted
+               </li>
+               <li>
+                {counted(liveSummary.filesOverwritten, "file")} would be overwritten
+               </li>
             </ul>
           </div>
         </NsnCard>
       </section>
 
+      {!executionLifecycleLocked ? (
       <NsnCard tone="aqua">
         <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
           <div className="min-w-0">
@@ -1525,6 +1851,7 @@ export function OrganizationPlanReviewPanel({
           ) : null}
         </div>
       </NsnCard>
+      ) : null}
 
       {executionPreview ? (
         <ExecutionPreviewPanel preview={executionPreview} />
@@ -1534,6 +1861,7 @@ export function OrganizationPlanReviewPanel({
 
       {executionRun ? (
         <ExecutionRunPanel
+          isUndone={planUiState === "UNDONE"}
           isUndoPreviewing={isUndoPreviewing}
           latestUndoRun={visibleUndoRun}
           onOpenUndoDialog={() => setIsUndoDialogOpen(true)}
@@ -1543,7 +1871,9 @@ export function OrganizationPlanReviewPanel({
         />
       ) : null}
 
-      <Section title="Review approved changes">
+      <HistoricalExecutionHistory runs={executionRuns} />
+
+      {!executionLifecycleLocked ? <Section title="Review approved changes">
         <NsnCard className="min-w-0">
           <div className="grid min-w-0 gap-4">
             <div className="flex flex-wrap gap-2">
@@ -1741,7 +2071,7 @@ export function OrganizationPlanReviewPanel({
             })}
           </div>
         )}
-      </Section>
+      </Section> : null}
 
       <Section
         title={isFinalReviewOpen ? "Final Organization Plan" : "Saved final plan"}

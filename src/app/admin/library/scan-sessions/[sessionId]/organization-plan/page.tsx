@@ -180,6 +180,7 @@ export default async function OrganizationPlanPage({
 
         {hasUsablePlan && data.plan ? (
           <OrganizationPlanReviewPanel
+            executionHistory={data.executionHistory}
             latestExecution={data.latestExecution}
             plan={data.plan}
             rootLabel={data.session.folderDisplayName}

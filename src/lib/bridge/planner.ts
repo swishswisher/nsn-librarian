@@ -1496,12 +1496,12 @@ export async function getOrganizationPlanPageData(
   const currentSuggestionIds = new Set(
     session.organizationSuggestions.map((suggestion) => suggestion.id),
   );
+  const executionHistory = plan?.executionRuns.map(summarizeExecutionRun) ?? [];
   const latestExecution: BridgeExecutionRunSummary | null =
-    plan?.executionRuns[0]
-      ? summarizeExecutionRun(plan.executionRuns[0])
-      : null;
+    executionHistory[0] ?? null;
 
   return {
+    executionHistory,
     latestExecution,
     plan: plan
       ? summarizePlan(

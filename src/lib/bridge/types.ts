@@ -1255,6 +1255,7 @@ export type BridgeOrganizationPlan = {
 };
 
 export type BridgeOrganizationPlanPageData = {
+  executionHistory: BridgeExecutionRunSummary[];
   session: BridgeScanSessionSummary;
   plan: BridgeOrganizationPlan | null;
   planningEligibility: OrganizationSuggestionCounts;
