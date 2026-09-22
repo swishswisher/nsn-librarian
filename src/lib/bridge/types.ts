@@ -425,6 +425,10 @@ export type ConnectedLibrarySummary = ConnectedLibraryPermissions & {
   isMergedDuplicate: boolean;
   legacyReason: string | null;
   requiresReconnect: boolean;
+  latestOrganizationPlanSessionId: string | null;
+  latestOrganizationPlanStatus: string | null;
+  latestOrganizationPlanUpdatedAt: string | null;
+  latestScanSessionId: string | null;
 };
 
 export type ConnectedFolder = {

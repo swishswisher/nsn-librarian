@@ -28,6 +28,7 @@ import {
 } from "@/lib/bridge/permission-ux";
 import {
   getBridgeMonitoringRoute,
+  getOrganizationPlanRoute,
   getScanSessionsRoute,
 } from "@/lib/library/routes";
 import type {
@@ -1061,8 +1062,12 @@ export function ConnectedLibrariesManager({
             replaceLibrary(statusPayload.library);
           }
 
-          if (!statusPayload.ok && statusPayload.done) {
-            setError(statusPayload.error);
+          if (!statusResponse.ok || !statusPayload.ok) {
+            setError(
+              "error" in statusPayload
+                ? statusPayload.error
+                : "The Bridge could not confirm the watching update.",
+            );
             router.refresh();
             return;
           }
@@ -2020,6 +2025,30 @@ export function ConnectedLibrariesManager({
                   >
                     Review Recommendations
                   </Link>
+                  {library.latestOrganizationPlanSessionId ? (
+                    <Link
+                      className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-gold)] bg-[var(--nsn-warm-beige)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sand)]"
+                      href={getOrganizationPlanRoute(
+                        library.latestOrganizationPlanSessionId,
+                      )}
+                    >
+                      View Organization Plan
+                    </Link>
+                  ) : library.latestScanSessionId ? (
+                    <div className="grid min-w-0 gap-2 sm:col-span-2 xl:col-span-4">
+                      <p className="break-words text-xs leading-5 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                        No Organization Plan has been saved for the latest completed scan yet.
+                      </p>
+                      <Link
+                        className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-gold)] bg-[var(--nsn-warm-beige)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sand)]"
+                        href={getOrganizationPlanRoute(
+                          library.latestScanSessionId,
+                        )}
+                      >
+                        View Organization Plan
+                      </Link>
+                    </div>
+                  ) : null}
                   <Link
                     className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sage-mist)]"
                     href={getBridgeMonitoringRoute()}

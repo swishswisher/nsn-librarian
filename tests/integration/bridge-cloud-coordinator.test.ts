@@ -1508,6 +1508,32 @@ test("remote monitoring commands persist only after native watcher confirmation"
   assert.notEqual(afterComplete.monitoringHeartbeatAt, null);
 });
 
+test("remote monitoring rejects conflicting in-flight commands", async () => {
+  const bridgeRootId = "root_121212121212121212121212";
+  const { library } = await createCloudScannedFile({
+    bridgeRootId,
+    relativePath: "Notes/in-flight-watching.txt",
+  });
+
+  await prisma.connectedLibrary.update({
+    data: {
+      monitoringState: "PAUSED",
+      readPermission: true,
+      watchPermission: true,
+    },
+    where: { id: library.id },
+  });
+
+  const queued = await queueRemoteMonitoringAction(library.id, "resume");
+  const repeated = await queueRemoteMonitoringAction(library.id, "resume");
+
+  assert.equal(repeated.commandId, queued.commandId);
+  await assert.rejects(
+    queueRemoteMonitoringAction(library.id, "pause"),
+    /Another watching update is still waiting/u,
+  );
+});
+
 test("failed remote monitoring command keeps the previous confirmed watcher state", async () => {
   const bridgeRootId = "root_eeeeeeeeeeeeeeeeeeeeeeee";
   const { device, library } = await createCloudScannedFile({
@@ -1753,6 +1779,5 @@ test("production cloud monitoring dashboard does not drain localhost events", as
   assert.equal(afterDashboard.monitoringState, "WATCHING");
   assert.equal(afterDashboard.monitoringErrorCategory, null);
 });
-
 
 

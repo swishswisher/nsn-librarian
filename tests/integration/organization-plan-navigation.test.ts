@@ -201,6 +201,27 @@ describe("Organization Plan navigation workflow", () => {
     );
   });
 
+  it("offers connected-folder plan navigation without creating a plan", () => {
+    const connectedLibrariesSource = readFileSync(
+      "src/components/library/ConnectedLibrariesManager.tsx",
+      "utf8",
+    );
+    const connectedLibrarySource = readFileSync(
+      "src/lib/bridge/connected-libraries.ts",
+      "utf8",
+    );
+
+    assert.match(connectedLibrariesSource, /View Organization Plan/);
+    assert.match(connectedLibrariesSource, /getOrganizationPlanRoute/);
+    assert.match(connectedLibrariesSource, /latestOrganizationPlanSessionId/);
+    assert.match(connectedLibrariesSource, /latestScanSessionId/);
+    assert.match(connectedLibrarySource, /connectedLibraryNavigation/);
+    assert.doesNotMatch(
+      connectedLibrariesSource,
+      /generateOrganizationPlanForScanSession/,
+    );
+  });
+
   it("offers safe recommendation regeneration for an existing scan", () => {
     const recommendationsPageSource = readFileSync(
       "src/app/admin/library/scan-sessions/[sessionId]/recommendations/page.tsx",

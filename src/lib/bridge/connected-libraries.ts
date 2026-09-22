@@ -392,6 +392,10 @@ function librarySummary(
     isLegacyConnection: library.isLegacyConnection,
     isMergedDuplicate,
     itemsNeedingAttention,
+    latestOrganizationPlanSessionId: null,
+    latestOrganizationPlanStatus: null,
+    latestOrganizationPlanUpdatedAt: null,
+    latestScanSessionId: null,
     lastBridgeCheckAt: library.lastBridgeCheckAt?.toISOString() ?? null,
     lastDetectedChangeAt: lastDetectedChangeAt?.toISOString() ?? null,
     lastMonitoringAt: library.lastMonitoringAt?.toISOString() ?? null,
@@ -429,6 +433,93 @@ function librarySummary(
     scanSessionCount: library._count?.scanSessions ?? 0,
     status: normalizedStatus,
     watchPermission: library.watchPermission,
+  };
+}
+
+type ConnectedLibraryNavigation = {
+  latestOrganizationPlanSessionId: string | null;
+  latestOrganizationPlanStatus: string | null;
+  latestOrganizationPlanUpdatedAt: string | null;
+  latestScanSessionId: string | null;
+};
+
+async function connectedLibraryNavigation(libraryIds: string[]) {
+  const navigation = new Map<string, ConnectedLibraryNavigation>();
+
+  for (const libraryId of libraryIds) {
+    navigation.set(libraryId, {
+      latestOrganizationPlanSessionId: null,
+      latestOrganizationPlanStatus: null,
+      latestOrganizationPlanUpdatedAt: null,
+      latestScanSessionId: null,
+    });
+  }
+
+  if (libraryIds.length === 0) {
+    return navigation;
+  }
+
+  const prisma = getPrismaClient();
+  const [plans, sessions] = await Promise.all([
+    prisma.organizationPlan.findMany({
+      orderBy: { updatedAt: "desc" },
+      select: {
+        connectedLibraryId: true,
+        scanSessionId: true,
+        status: true,
+        updatedAt: true,
+      },
+      where: {
+        connectedLibraryId: { in: libraryIds },
+        status: { in: ["DRAFT", "READY_FOR_EXECUTION", "EXECUTED"] },
+      },
+    }),
+    prisma.scanSession.findMany({
+      orderBy: { startedAt: "desc" },
+      select: {
+        connectedFolderId: true,
+        id: true,
+      },
+      where: {
+        connectedFolderId: { in: libraryIds },
+        status: { in: ["COMPLETED", "COMPLETED_WITH_ERRORS"] },
+      },
+    }),
+  ]);
+
+  for (const plan of plans) {
+    const item = navigation.get(plan.connectedLibraryId);
+
+    if (item && !item.latestOrganizationPlanSessionId) {
+      item.latestOrganizationPlanSessionId = plan.scanSessionId;
+      item.latestOrganizationPlanStatus = plan.status;
+      item.latestOrganizationPlanUpdatedAt = plan.updatedAt.toISOString();
+    }
+  }
+
+  for (const session of sessions) {
+    const item = navigation.get(session.connectedFolderId);
+
+    if (item && !item.latestScanSessionId) {
+      item.latestScanSessionId = session.id;
+    }
+  }
+
+  return navigation;
+}
+
+function withConnectedLibraryNavigation(
+  summary: ConnectedLibrarySummary,
+  navigation: ConnectedLibraryNavigation | undefined,
+) {
+  return {
+    ...summary,
+    ...(navigation ?? {
+      latestOrganizationPlanSessionId: null,
+      latestOrganizationPlanStatus: null,
+      latestOrganizationPlanUpdatedAt: null,
+      latestScanSessionId: null,
+    }),
   };
 }
 
@@ -856,15 +947,19 @@ export async function getConnectedLibraries() {
     attentionCountsByLibraryId(libraryIds),
     latestDetectedChangesByLibraryId(libraryIds),
   ]);
+  const navigation = await connectedLibraryNavigation(libraryIds);
 
   return Promise.all(
     libraries.map(async (library) =>
-      librarySummary(
-        library,
-        attentionCounts.get(library.id) ?? 0,
-        (await bridgeReachability(library.bridgeDeviceId)) &&
-          Boolean(library.bridgeRootId),
-        latestDetectedChanges.get(library.id) ?? null,
+      withConnectedLibraryNavigation(
+        librarySummary(
+          library,
+          attentionCounts.get(library.id) ?? 0,
+          (await bridgeReachability(library.bridgeDeviceId)) &&
+            Boolean(library.bridgeRootId),
+          latestDetectedChanges.get(library.id) ?? null,
+        ),
+        navigation.get(library.id),
       ),
     ),
   );
@@ -897,11 +992,16 @@ export async function getConnectedLibrary(libraryId: string) {
       bridgeReachability(library.bridgeDeviceId),
     ]);
 
-  return librarySummary(
-    library,
-    attentionCounts.get(library.id) ?? 0,
-    bridgeReachable && Boolean(library.bridgeRootId),
-    latestDetectedChanges.get(library.id) ?? null,
+  const navigation = await connectedLibraryNavigation([library.id]);
+
+  return withConnectedLibraryNavigation(
+    librarySummary(
+      library,
+      attentionCounts.get(library.id) ?? 0,
+      bridgeReachable && Boolean(library.bridgeRootId),
+      latestDetectedChanges.get(library.id) ?? null,
+    ),
+    navigation.get(library.id),
   );
 }
 

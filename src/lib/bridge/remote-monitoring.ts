@@ -59,6 +59,48 @@ export async function queueRemoteMonitoringAction(
     );
   }
 
+  const pendingCommand = await prisma.bridgeCommand.findFirst({
+    orderBy: { issuedAt: "desc" },
+    where: {
+      bridgeRootId: library.bridgeRootId,
+      commandType: {
+        in: ["START_WATCHING", "PAUSE_WATCHING", "RESUME_WATCHING"],
+      },
+      connectedLibraryId,
+      status: { in: ["PENDING", "ACKNOWLEDGED", "RUNNING"] },
+    },
+  });
+
+  if (pendingCommand) {
+    if (pendingCommand.commandType === commandTypeFor(action)) {
+      const libraries = await getConnectedLibraries();
+      const updatedLibrary = libraries.find(
+        (item) => item.id === connectedLibraryId,
+      );
+
+      if (!updatedLibrary) {
+        throw new BridgeCloudError(
+          "The Librarian could not refresh this connected folder.",
+          500,
+        );
+      }
+
+      return {
+        commandId: pendingCommand.commandId,
+        library: {
+          ...updatedLibrary,
+          bridgeReachable: true,
+        },
+        message: "That watching update is already waiting for the Bridge.",
+      };
+    }
+
+    throw new BridgeCloudError(
+      "Another watching update is still waiting for this Mac. Wait for it to finish before trying a different action.",
+      409,
+    );
+  }
+
   const command = await createBridgeCloudCommand({
     authorizationContext: {
       initiatedBy: "Deanne",
