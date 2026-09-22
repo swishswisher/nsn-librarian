@@ -8,6 +8,10 @@ import { OrganizationPlanGenerateButton } from "@/components/library/Organizatio
 import { OrganizationPlanReviewPanel } from "@/components/library/OrganizationPlanReviewPanel";
 import { RetryAutomaticProcessingButton } from "@/components/library/RetryAutomaticProcessingButton";
 import { getOrganizationPlanPageData } from "@/lib/bridge/planner";
+import {
+  organizationPlanUiState,
+  type OrganizationPlanUiState,
+} from "@/lib/bridge/organization-plan-state";
 import type {
   BridgeScanSessionSummary,
   OrganizationSuggestionCounts,
@@ -36,6 +40,62 @@ function formatScanDate(value: string | null) {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
+}
+
+function pageTitle(state: OrganizationPlanUiState) {
+  if (state === "EXECUTING") {
+    return "Organizing files";
+  }
+
+  if (state === "COMPLETED") {
+    return "Organization completed";
+  }
+
+  if (state === "UNDOING") {
+    return "Restoring files";
+  }
+
+  if (state === "UNDONE") {
+    return "Changes restored";
+  }
+
+  if (state === "NEEDS_ATTENTION") {
+    return "Organization needs attention";
+  }
+
+  if (state === "CANCELLED") {
+    return "Organization plan cancelled";
+  }
+
+  return "Review Organization Plan";
+}
+
+function pageDescription(state: OrganizationPlanUiState) {
+  if (state === "EXECUTING") {
+    return "The Bridge is carrying out the saved, authorized operations. Each result is recorded below.";
+  }
+
+  if (state === "COMPLETED") {
+    return "The Bridge completed this approved organization. Review the historical results below; they do not replace a fresh check of the current filesystem.";
+  }
+
+  if (state === "UNDOING") {
+    return "The Bridge is restoring the recorded organization. The saved Undo history will show each result.";
+  }
+
+  if (state === "UNDONE") {
+    return "The files have returned to their original locations. This plan will not execute again automatically; any new organization needs fresh review and authorization.";
+  }
+
+  if (state === "NEEDS_ATTENTION") {
+    return "A saved execution or Undo record needs attention. Review the persisted results before requesting another safe preview.";
+  }
+
+  if (state === "CANCELLED") {
+    return "This Organization Plan was cancelled and did not authorize filesystem changes.";
+  }
+
+  return "Approved recommendations are carried forward automatically. Nothing will move yet; review the proposed changes, make any intentional exclusions or edits, and authorize execution separately.";
 }
 
 function EmptyPlanningState({
@@ -137,6 +197,19 @@ export default async function OrganizationPlanPage({
   const hasReviewedSuggestions =
     data.planningEligibility.eligibleForPlanning > 0;
   const hasUsablePlan = Boolean(data.plan && data.plan.totalActions > 0);
+  const planState = data.plan
+    ? organizationPlanUiState({
+        executionStatus: data.latestExecution?.status,
+        planStatus: data.plan.status,
+        undoStatus: data.latestExecution?.latestUndoRun?.status,
+      })
+    : "REVIEWING";
+  const canRegeneratePlan = ![
+    "EXECUTING",
+    "COMPLETED",
+    "UNDOING",
+    "UNDONE",
+  ].includes(planState);
   const notebookReflection = data.plan
     ? await getNotebookEntryForOrganizationPlan(data.plan.id)
     : null;
@@ -145,15 +218,15 @@ export default async function OrganizationPlanPage({
     <LibraryShell active="review">
       <div className="grid min-w-0 gap-8">
         <NsnPageHeader
-          description="Approved recommendations are carried forward automatically. Nothing will move yet; review the proposed changes, make any intentional exclusions or edits, and authorize execution separately."
+          description={pageDescription(planState)}
           eyebrow="Organization Plan"
           subtitle={`${data.session.folderDisplayName}. Started ${formatScanDate(
             data.session.startedAt,
           )}.`}
-          title="Review approved changes"
+          title={pageTitle(planState)}
         >
           <div className="flex w-full flex-col gap-3 sm:w-auto sm:flex-row">
-            {hasReviewedSuggestions ? (
+            {hasReviewedSuggestions && canRegeneratePlan ? (
               <OrganizationPlanGenerateButton
                 label={
                   data.plan ? "Regenerate Plan" : "Generate Organization Plan"

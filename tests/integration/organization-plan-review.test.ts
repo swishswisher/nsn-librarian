@@ -111,6 +111,11 @@ test("the page explains that choices do not move files and exposes the required 
   assert.match(sourceText, /Files to move/);
   assert.match(sourceText, /Authorize execution/);
   assert.match(sourceText, /Exclude from this plan/);
+  assert.match(sourceText, /Organization completed/);
+  assert.match(sourceText, /Changes restored/);
+  assert.match(sourceText, /historical record/);
+  assert.match(sourceText, /Recommendations not included in this plan/);
+  assert.match(sourceText, /Earlier plan events and audit history/);
   assert.doesNotMatch(sourceText, /Keep it in .*default/);
   assert.match(sourceText, /type="radio"/);
   assert.doesNotMatch(sourceText, /type="checkbox"/);

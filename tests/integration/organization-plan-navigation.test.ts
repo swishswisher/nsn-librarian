@@ -188,6 +188,7 @@ describe("Organization Plan navigation workflow", () => {
       "/admin/library/scan-sessions/session-a-completed",
     );
     assert.match(planPageSource, /getRecommendationsRoute\(session\.id\)/);
+    assert.match(planPageSource, /canRegeneratePlan/);
     assert.match(recommendationsPageSource, /getScanSessionRoute\(data\.session\.id\)/);
     assert.match(
       recommendationsPageSource,

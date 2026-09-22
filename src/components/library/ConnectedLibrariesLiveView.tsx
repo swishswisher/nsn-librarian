@@ -17,21 +17,28 @@ type ConnectedLibrariesLiveViewProps = {
 const watchingRefreshDelayMs = 4_000;
 const idleRefreshDelayMs = 10_000;
 
-function monitoringSignature(libraries: ConnectedLibrarySummary[]) {
-  return [...libraries]
-    .sort((left, right) => left.id.localeCompare(right.id))
-    .map((library) =>
-      [
-        library.id,
-        library.bridgeReachable ? "reachable" : "unreachable",
-        library.status,
-        library.monitoringState,
-        library.recentChangeCount,
-        library.itemsNeedingAttention,
-        library.lastDetectedChangeAt ?? "",
-      ].join(":"),
-    )
-    .join("|");
+function managerSignature(
+  libraries: ConnectedLibrarySummary[],
+  bridgeHealth: LocalBridgeHealth,
+) {
+  return [
+    bridgeHealth.ok ? "ready" : "unavailable",
+    bridgeHealth.status,
+    ...[...libraries]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((library) =>
+        [
+          library.id,
+          library.bridgeReachable ? "reachable" : "unreachable",
+          library.status,
+          library.monitoringState,
+          library.isEnabled ? "enabled" : "disabled",
+          library.requiresReconnect ? "reconnect" : "connected",
+          library.readPermission ? "read" : "no-read",
+          library.watchPermission ? "watch" : "no-watch",
+        ].join(":"),
+      ),
+  ].join("|");
 }
 
 function userIsEditing() {
@@ -66,7 +73,10 @@ export function ConnectedLibrariesLiveView({
   const refreshDelayMs = hasWatchingLibrary
     ? watchingRefreshDelayMs
     : idleRefreshDelayMs;
-  const signature = useMemo(() => monitoringSignature(libraries), [libraries]);
+  const signature = useMemo(
+    () => managerSignature(libraries, initialBridgeHealth),
+    [initialBridgeHealth, libraries],
+  );
 
   useEffect(() => {
     let cancelled = false;

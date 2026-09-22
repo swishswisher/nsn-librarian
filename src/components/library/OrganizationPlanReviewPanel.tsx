@@ -361,6 +361,34 @@ function planUiStateLabel(state: OrganizationPlanUiState) {
   return "Organization needs attention";
 }
 
+function planUiStateDescription(state: OrganizationPlanUiState) {
+  if (state === "EXECUTING") {
+    return "The Bridge is carrying out the saved organization. The operation results will remain available below.";
+  }
+
+  if (state === "COMPLETED") {
+    return "The Bridge completed this organization. The execution record is historical and does not by itself describe the current filesystem.";
+  }
+
+  if (state === "UNDOING") {
+    return "The Bridge is restoring the completed organization. Review the saved Undo results when it finishes.";
+  }
+
+  if (state === "UNDONE") {
+    return "The files have returned to their original locations. A new organization requires fresh validation, preview, and authorization.";
+  }
+
+  if (state === "NEEDS_ATTENTION") {
+    return "Review the persisted operation results before requesting another safe preview.";
+  }
+
+  if (state === "CANCELLED") {
+    return "This plan was cancelled and did not authorize filesystem changes.";
+  }
+
+  return "Approved organization recommendations are included here automatically. Review them before the separate final authorization step.";
+}
+
 function planUiStateTone(state: OrganizationPlanUiState): NsnBadgeTone {
   if (state === "EXECUTING" || state === "UNDOING") {
     return "migration";
@@ -521,6 +549,32 @@ function warningTypeLabel(warningType: OrganizationPlanWarningType) {
   return "Invalid path";
 }
 
+function skippedStatusLabel(status: BridgeOrganizationPlanAction["originatingSuggestion"]["status"]) {
+  if (status === "PENDING") {
+    return "Still needs review";
+  }
+
+  if (status === "APPROVED") {
+    return "Not selected for this plan";
+  }
+
+  if (status === "MODIFIED") {
+    return "Edited recommendation not selected";
+  }
+
+  if (status === "REJECTED") {
+    return "Rejected recommendation";
+  }
+
+  return "Left unchanged";
+}
+
+function skippedStatusTone(
+  status: BridgeOrganizationPlanAction["originatingSuggestion"]["status"],
+): NsnBadgeTone {
+  return status === "PENDING" ? "pending" : "source";
+}
+
 function Section({
   children,
   id,
@@ -535,6 +589,25 @@ function Section({
       <h2 className="nsn-display text-2xl text-[var(--nsn-navy)]">{title}</h2>
       {children}
     </section>
+  );
+}
+
+function CollapsibleSection({
+  children,
+  open = false,
+  title,
+}: {
+  children: ReactNode;
+  open?: boolean;
+  title: string;
+}) {
+  return (
+    <details className="grid min-w-0 gap-4" open={open}>
+      <summary className="cursor-pointer break-words nsn-display text-2xl text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+        {title}
+      </summary>
+      <div className="grid min-w-0 gap-4">{children}</div>
+    </details>
   );
 }
 
@@ -993,22 +1066,31 @@ function ExecutionRunPanel({
             >
               View Details
             </NsnButton>
-            <NsnButton
-              disabled={!canRequestUndo || isUndoPreviewing}
-              onClick={onPreviewUndo}
-              type="button"
-              variant="accent"
-            >
-              {isUndoPreviewing ? "Previewing..." : "Preview Undo"}
-            </NsnButton>
-            <NsnButton
-              disabled={!canRequestUndo || undoPreview?.canUndo !== true}
-              onClick={onOpenUndoDialog}
-              type="button"
-              variant="primary"
-            >
-              Undo Changes
-            </NsnButton>
+            {undoCompleted ? (
+              <p className="sm:col-span-2 rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3 text-sm leading-6 text-[var(--nsn-teal-dark)]">
+                These changes have already been restored. Undo is no longer
+                available for this execution.
+              </p>
+            ) : (
+              <>
+                <NsnButton
+                  disabled={!canRequestUndo || isUndoPreviewing}
+                  onClick={onPreviewUndo}
+                  type="button"
+                  variant="accent"
+                >
+                  {isUndoPreviewing ? "Previewing..." : "Preview Undo"}
+                </NsnButton>
+                <NsnButton
+                  disabled={!canRequestUndo || undoPreview?.canUndo !== true}
+                  onClick={onOpenUndoDialog}
+                  type="button"
+                  variant="primary"
+                >
+                  Undo Changes
+                </NsnButton>
+              </>
+            )}
           </div>
           {undoCompleted ? (
             <p className="rounded-md border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] p-3 text-sm leading-6 text-[var(--nsn-teal-dark)]">
@@ -1066,8 +1148,11 @@ function HistoricalExecutionHistory({
   }
 
   return (
-    <Section title="Earlier organization history">
-      <div className="grid min-w-0 gap-4">
+    <details className="grid min-w-0 gap-4 rounded-lg border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-5">
+      <summary className="cursor-pointer break-words nsn-display text-2xl text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+        Earlier organization history ({runs.length - 1})
+      </summary>
+      <div className="grid min-w-0 gap-4 pt-2">
         {runs.slice(1).map((run) => (
           <NsnCard className="min-w-0" key={run.id}>
             <div className="grid min-w-0 gap-4">
@@ -1157,7 +1242,7 @@ function HistoricalExecutionHistory({
           </NsnCard>
         ))}
       </div>
-    </Section>
+    </details>
   );
 }
 
@@ -1651,6 +1736,10 @@ export function OrganizationPlanReviewPanel({
     !executionLifecycleLocked;
   const canExecutePlan =
     canPreviewExecution && executionPreview?.canExecute === true;
+  const historicalPlan =
+    planUiState === "COMPLETED" ||
+    planUiState === "UNDONE" ||
+    currentPlan.status === "EXECUTED";
 
   return (
     <div className="grid min-w-0 gap-8">
@@ -1667,12 +1756,10 @@ export function OrganizationPlanReviewPanel({
           <div className="grid min-w-0 gap-5">
             <div className="min-w-0">
               <h2 className="nsn-display text-3xl text-[var(--nsn-navy)]">
-                Review approved changes
+                {planUiStateLabel(planUiState)}
               </h2>
               <p className="mt-3 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                Approved organization recommendations are included here automatically.
-                Nothing will move yet. Review the proposed changes, make any intentional
-                exclusions or edits, and authorize the final plan separately.
+                {planUiStateDescription(planUiState)}
               </p>
             </div>
             <ol className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-label="Organization process">
@@ -1853,7 +1940,7 @@ export function OrganizationPlanReviewPanel({
       </NsnCard>
       ) : null}
 
-      {executionPreview ? (
+      {executionPreview && !executionLifecycleLocked ? (
         <ExecutionPreviewPanel preview={executionPreview} />
       ) : null}
 
@@ -2074,7 +2161,13 @@ export function OrganizationPlanReviewPanel({
       </Section> : null}
 
       <Section
-        title={isFinalReviewOpen ? "Final Organization Plan" : "Saved final plan"}
+        title={
+          isFinalReviewOpen
+            ? "Final Organization Plan"
+            : historicalPlan
+              ? "Saved final plan - historical record"
+              : "Saved final plan"
+        }
       >
         {isFinalReviewOpen ? (
           <NsnCard className="min-w-0">
@@ -2228,8 +2321,14 @@ export function OrganizationPlanReviewPanel({
 
                   {actionIsRequiredDependency(action) ? (
                     <p className="break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                      {historicalPlan ? (
+                        "The original plan included creation of this folder because a saved file destination needed it."
+                      ) : (
+                        <>
                       NSN will create the folder ‘{action.plannedFolderPath}’
                       because a saved file destination needs it.
+                        </>
+                      )}
                     </p>
                   ) : (
                     <div className="grid min-w-0 gap-3 text-sm leading-6">
@@ -2260,7 +2359,7 @@ export function OrganizationPlanReviewPanel({
         )}
       </Section>
 
-      <Section title="Other review information">
+      <CollapsibleSection title="Other review information">
         <NsnCard className="min-w-0">
           <details className="group min-w-0">
             <summary className="cursor-pointer break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
@@ -2320,20 +2419,23 @@ export function OrganizationPlanReviewPanel({
             )}
           </details>
         </NsnCard>
-      </Section>
+      </CollapsibleSection>
 
-      <Section title="Skipped Items">
+      <CollapsibleSection title="Recommendations not included in this plan">
         {currentPlan.skippedItems.length === 0 ? (
           <NsnCard>
             <p className="text-sm leading-6 text-[var(--nsn-slate)]">
-              Nothing was skipped.
+              Every current reviewed recommendation was either included or has no
+              filesystem action.
             </p>
           </NsnCard>
         ) : (
           <div className="grid gap-3">
             {currentPlan.skippedItems.map((item) => (
               <NsnCard className="min-w-0" key={item.id}>
-                <NsnBadge tone="source">{item.status}</NsnBadge>
+                <NsnBadge tone={skippedStatusTone(item.status)}>
+                  {skippedStatusLabel(item.status)}
+                </NsnBadge>
                 <p className="mt-3 break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
                   {item.title}
                 </p>
@@ -2341,15 +2443,17 @@ export function OrganizationPlanReviewPanel({
                   {item.currentRelativePath}
                 </p>
                 <p className="mt-2 break-words text-sm leading-6 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-                  {item.reason}
+                  {item.status === "PENDING"
+                    ? `This recommendation was not part of the execution because it still requires separate review. ${item.reason}`
+                    : `This recommendation was not part of the execution. ${item.reason}`}
                 </p>
               </NsnCard>
             ))}
           </div>
         )}
-      </Section>
+      </CollapsibleSection>
 
-      <Section title="History">
+      <CollapsibleSection title="Earlier plan events and audit history">
         <div className="grid gap-3">
           {currentPlan.history.map((item) => (
             <NsnCard className="min-w-0" key={item.id}>
@@ -2368,7 +2472,7 @@ export function OrganizationPlanReviewPanel({
             </NsnCard>
           ))}
         </div>
-      </Section>
+      </CollapsibleSection>
 
       {isExecuteDialogOpen ? (
         <div

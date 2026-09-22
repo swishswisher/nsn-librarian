@@ -1,4 +1,7 @@
-import type { ConnectedLibraryPermissions } from "./types";
+import type {
+  ConnectedLibraryPermissions,
+  ConnectedLibrarySummary,
+} from "./types";
 
 export type PermissionKey = keyof ConnectedLibraryPermissions;
 
@@ -19,6 +22,18 @@ export type PendingPermissionMap = Partial<
 export type PermissionFeedbackMap = Partial<
   Record<PermissionKey, PermissionFeedbackState>
 >;
+
+export type ScanAvailability = {
+  available: boolean;
+  message: string;
+  reason:
+    | "AVAILABLE"
+    | "BRIDGE_UNAVAILABLE"
+    | "NOT_CONNECTED"
+    | "READ_PERMISSION_REQUIRED"
+    | "RECONNECT_REQUIRED"
+    | "UPDATING";
+};
 
 export const permissionKeys: PermissionKey[] = [
   "readPermission",
@@ -141,4 +156,62 @@ export function confirmedCanStartWatching(input: {
   }
 
   return true;
+}
+
+export function scanAvailability(input: {
+  library: Pick<
+    ConnectedLibrarySummary,
+    | "bridgeReachable"
+    | "isEnabled"
+    | "readPermission"
+    | "requiresReconnect"
+    | "status"
+  >;
+  pending: PendingPermissionMap;
+}): ScanAvailability {
+  if (input.pending.readPermission) {
+    return {
+      available: false,
+      message: "Read permission is being updated. Scan Now will return when the Bridge confirms it.",
+      reason: "UPDATING",
+    };
+  }
+
+  if (input.library.requiresReconnect) {
+    return {
+      available: false,
+      message: "Reconnect this folder through the NSN Bridge before scanning.",
+      reason: "RECONNECT_REQUIRED",
+    };
+  }
+
+  if (!input.library.bridgeReachable) {
+    return {
+      available: false,
+      message: "The paired Bridge is not reachable right now. Open the NSN Bridge and try again.",
+      reason: "BRIDGE_UNAVAILABLE",
+    };
+  }
+
+  if (!input.library.isEnabled || input.library.status !== "CONNECTED") {
+    return {
+      available: false,
+      message: "This connected folder is not ready to scan yet.",
+      reason: "NOT_CONNECTED",
+    };
+  }
+
+  if (!input.library.readPermission) {
+    return {
+      available: false,
+      message: "Turn on read permission for this folder before scanning.",
+      reason: "READ_PERMISSION_REQUIRED",
+    };
+  }
+
+  return {
+    available: true,
+    message: "Ready to scan this connected folder.",
+    reason: "AVAILABLE",
+  };
 }

@@ -21,6 +21,7 @@ import {
   permissionInlineStatus,
   permissionPatchFromBody,
   permissionPatchKeys,
+  scanAvailability,
   visiblePermissionValue,
   type PendingPermissionMap,
   type PermissionFeedbackMap,
@@ -1654,7 +1655,11 @@ export function ConnectedLibrariesManager({
             library.bridgeReachable &&
             !library.requiresReconnect &&
             library.status === "CONNECTED";
-          const canScan = canUse && library.readPermission;
+           const scanState = scanAvailability({
+             library,
+             pending: libraryPendingPermissions,
+           });
+           const canScan = canUse && scanState.available;
           const canWatch =
             canUse &&
             confirmedCanStartWatching({
@@ -1921,17 +1926,38 @@ export function ConnectedLibrariesManager({
                     </>
                   ) : (
                     <>
-                  {canScan ? (
-                    <BridgeScanControl
+                   {canScan ? (
+                     <BridgeScanControl
                       connectedLibraryId={library.id}
                       isDevelopment={false}
                       scanLabel="Scan Now"
                     />
-                  ) : (
-                    <NsnButton disabled type="button" variant="secondary">
-                      Scan Now
-                    </NsnButton>
-                  )}
+                   ) : (
+                     <div className="grid min-w-0 gap-2">
+                       <NsnButton
+                         disabled
+                         type="button"
+                         variant="secondary"
+                       >
+                         Scan Now
+                       </NsnButton>
+                       <p className="break-words text-xs leading-5 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                         {scanState.message}
+                       </p>
+                       {scanState.reason === "BRIDGE_UNAVAILABLE" ? (
+                         <NsnButton
+                           disabled={busyId === "status"}
+                           onClick={() => void refreshBridgeStatus()}
+                           type="button"
+                           variant="secondary"
+                         >
+                           {busyId === "status"
+                             ? "Checking Bridge..."
+                             : "Check Bridge Status"}
+                         </NsnButton>
+                       ) : null}
+                     </div>
+                   )}
                   {library.monitoringState === "WATCHING" ? (
                     <NsnButton
                       disabled={isBusy}
