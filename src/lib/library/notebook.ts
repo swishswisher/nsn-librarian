@@ -831,6 +831,60 @@ export async function recordRecommendationDecisionNotebookEntry(
   });
 }
 
+export async function recordOrganizationPreferenceNotebookEntry(preferenceId: string) {
+  const prisma = getPrismaClient();
+  const preference = await prisma.organizationPreference.findUnique({
+    include: {
+      revisions: { orderBy: { createdAt: "desc" }, take: 20 },
+    },
+    where: { id: preferenceId },
+  });
+  if (!preference) return null;
+  const scope = Array.isArray(preference.scopeTerms)
+    ? preference.scopeTerms.filter((term): term is string => typeof term === "string")
+    : [];
+  const status = preference.status.toLowerCase().replaceAll("_", " ");
+  return createOrUpdateNotebookEntry({
+    body: `Deanne's organization preference for ${scope.join(" and ")} is ${status}. It applies only inside its connected library and does not move files.`,
+    entryType: "MEMORY_LEARNING",
+    history: preference.revisions.slice().reverse().map((revision) =>
+      `${formatDateTime(revision.createdAt)}: ${revision.action.toLowerCase().replaceAll("_", " ")} (${revision.previousStatus.toLowerCase()} to ${revision.nextStatus.toLowerCase()})${revision.note ? `. Context: ${revision.note}` : ""}`,
+    ),
+    provenanceSummary: "This note follows Deanne's separate review of a proposed reusable organization preference.",
+    sourceId: preference.id,
+    sourceKey: `ORGANIZATION_PREFERENCE:${preference.id}`,
+    sourceType: "ORGANIZATION_PREFERENCE",
+    summary: `A scoped organization preference is ${status}.`,
+    title: "An organization preference was reviewed",
+  });
+}
+
+export async function recordDocumentRelationshipNotebookEntry(relationshipId: string) {
+  const connection = await getPrismaClient().knowledgeConnection.findUnique({
+    include: { decisions: { orderBy: { createdAt: "desc" }, take: 20 } },
+    where: { id: relationshipId },
+  });
+  if (!connection || connection.decisions.length === 0) return null;
+  const subject = connection.relationshipKind === "PROBABLE_REVISION"
+    ? "document revision"
+    : "document identity";
+  const status = connection.status === "CONFIRMED" ? "confirmed" :
+    connection.status === "REJECTED" ? "rejected" : "open for reconsideration";
+  return createOrUpdateNotebookEntry({
+    body: `Deanne reviewed a proposed ${subject} link. It is now ${status}. This decision does not organize or change any files.`,
+    entryType: "MEMORY_LEARNING",
+    history: connection.decisions.slice().reverse().map((decision) =>
+      `${formatDateTime(decision.createdAt)}: ${decision.action.toLowerCase()} (${decision.previousStatus.toLowerCase()} to ${decision.nextStatus.toLowerCase()})${decision.note ? `. Context: ${decision.note}` : ""}`,
+    ),
+    provenanceSummary: "This note records Deanne's review of a source-backed document relationship.",
+    sourceId: connection.id,
+    sourceKey: `DOCUMENT_RELATIONSHIP:${connection.id}`,
+    sourceType: "DOCUMENT_RELATIONSHIP",
+    summary: `A proposed ${subject} link was ${status}.`,
+    title: `A ${subject} link was reviewed`,
+  });
+}
+
 export async function recordOrganizationPlanNotebookEntry(planId: string) {
   const prisma = getPrismaClient();
   const plan = await prisma.organizationPlan.findUnique({

@@ -141,6 +141,10 @@ export function remoteReadFailureCategoryFor(
       : normalized;
   }
 
+  if (normalized === "IMAGE_DECODE_FAILED" || normalized === "IMAGE_METADATA_FAILED") {
+    return normalized;
+  }
+
   if (
     normalized === "PDF_PARSE_FAILED" ||
     (normalized === "BRIDGE_COMMAND_FAILED" && extension === ".pdf")
@@ -154,6 +158,10 @@ export function remoteReadFailureCategoryFor(
 
   if (normalized === "FILE_CORRUPT") {
     return "FILE_CORRUPT";
+  }
+
+  if (normalized === "FILE_CHANGED_SINCE_SCAN" || normalized === "FILE_CHANGED_DURING_READ") {
+    return "FILE_CHANGED_SINCE_SCAN";
   }
 
   return "READ_COMMAND_FAILED";
@@ -175,6 +183,10 @@ export function remoteReadFailureMessageFor(
     return "This file appears damaged or could not be read safely.";
   }
 
+  if (category === "FILE_CHANGED_SINCE_SCAN") {
+    return "This file changed after the scan. Scan the folder again before examining it.";
+  }
+
   if (category === "FILE_NOT_FOUND") {
     return "This file is no longer available at its scanned location.";
   }
@@ -189,6 +201,14 @@ export function remoteReadFailureMessageFor(
 
   if (category === "VIDEO_DECODE_FAILED") {
     return "This video file appears damaged or could not be read safely.";
+  }
+
+  if (category === "IMAGE_DECODE_FAILED") {
+    return "This image appears damaged or could not be read safely.";
+  }
+
+  if (category === "IMAGE_METADATA_FAILED") {
+    return "The Bridge could not read this image's technical information safely.";
   }
 
   if (
@@ -264,6 +284,7 @@ export async function markRemoteReadFailure(input: {
       extractedAt: new Date(),
       extractionErrorCategory: category,
       extractionStatus: unsupported ? "UNSUPPORTED" : "FAILED",
+      observationClaimedAt: null,
       processedAt: new Date(),
       processingErrorCategory: category,
       processingStage: unsupported ? "UNSUPPORTED" : "FAILED",

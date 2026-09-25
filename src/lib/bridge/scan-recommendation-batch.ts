@@ -1,8 +1,10 @@
 import { getPrismaClient } from "@/lib/db/prisma";
 import { recordScanSessionNotebookEntry } from "@/lib/library/notebook";
+import { indexScanKnowledge } from "@/lib/library/search-index";
 
 import { generateOrganizationSuggestionsForScannedFileWithText } from "./organization-suggestions";
 import { loadScanWorkingKnowledge } from "./scan-working-knowledge";
+import { persistScanWorkingKnowledge } from "./persistent-knowledge";
 
 type BatchOptions = {
   recordNotebook?: boolean;
@@ -104,6 +106,29 @@ export async function generateScanRecommendationBatch(
 ) {
   const prisma = getPrismaClient();
   const workingKnowledge = await loadScanWorkingKnowledge(sessionId);
+  try {
+    await persistScanWorkingKnowledge(workingKnowledge);
+    await prisma.scanSession.update({
+      data: { knowledgePersistenceStatus: "COMPLETED" },
+      where: { id: sessionId },
+    });
+  } catch {
+    await prisma.scanSession.update({
+      data: { knowledgePersistenceStatus: "INCOMPLETE" },
+      where: { id: sessionId },
+    });
+    // Partial knowledge must not stop current-scan recommendations.
+  }
+  try {
+    await indexScanKnowledge(workingKnowledge);
+    await prisma.scanSession.update({
+      data: { searchIndexStatus: "COMPLETED" }, where: { id: sessionId },
+    });
+  } catch {
+    await prisma.scanSession.update({
+      data: { searchIndexStatus: "INCOMPLETE" }, where: { id: sessionId },
+    });
+  }
   const files = await prisma.scannedFile.findMany({
     orderBy: { relativePath: "asc" },
     select: {
@@ -126,10 +151,11 @@ export async function generateScanRecommendationBatch(
 
   for (const file of files) {
     try {
+      const sourceEvidence = workingKnowledge.files.find((item) => item.id === file.id)?.sourceEvidenceText ?? "";
       const result = await withTimeout(
         generateOrganizationSuggestionsForScannedFileWithText(
           file.id,
-          file.previewText ?? "",
+          [file.previewText, sourceEvidence].filter(Boolean).join("\n"),
           {
             replaceChecksumBootstrap: true,
             workingKnowledge,

@@ -76,6 +76,7 @@ export async function getLibraryExplorerData(): Promise<LibraryExplorerData> {
           },
           startedAt: true,
           status: true,
+          searchIndexStatus: true,
         },
         take: 1,
       },
@@ -109,6 +110,7 @@ export async function getLibraryExplorerData(): Promise<LibraryExplorerData> {
               id: latestScanSession.id,
               startedAt: latestScanSession.startedAt.toISOString(),
               status: latestScanSession.status,
+              searchIndexStatus: latestScanSession.searchIndexStatus,
             }
           : null,
         platform: library.platform,

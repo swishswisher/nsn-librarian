@@ -41,6 +41,7 @@ export type LibraryExplorerScanSession = {
   startedAt: string;
   completedAt: string | null;
   status: BridgeScanSessionStatus;
+  searchIndexStatus: string;
 };
 
 export type LibraryExplorerRoot = {

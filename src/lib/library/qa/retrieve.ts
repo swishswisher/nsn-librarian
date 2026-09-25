@@ -1,0 +1,244 @@
+import path from "node:path";
+
+import { getPrismaClient } from "@/lib/db/prisma";
+import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/document-signals";
+import { humanIdentityCorrectionVersion, relationshipGenerationVersion } from "@/lib/bridge/persistent-knowledge";
+import { workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
+import { searchLibrary } from "@/lib/library/search";
+import { librarySearchIndexVersion } from "@/lib/library/search-index";
+import { routeLibraryQuestion } from "./route-question";
+import { maxAnswerSources, type AnswerContext, type AnswerContextSource, type AnswerVersion } from "./types";
+
+type StoredExcerpt = { start: number; end: number; text: string };
+
+function excerpts(value: unknown): StoredExcerpt[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => item && typeof item === "object" &&
+    typeof item.start === "number" && typeof item.end === "number" &&
+    typeof item.text === "string" && item.text.length <= 240 &&
+    item.end - item.start === item.text.length
+      ? [{ start: item.start, end: item.end, text: item.text }] : []).slice(0, 8);
+}
+
+function bestExcerpt(value: unknown, terms: string[]) {
+  const available = excerpts(value);
+  return available.sort((a, b) => {
+    const score = (item: StoredExcerpt) => terms.filter((term) =>
+      workingKnowledgeTerms(item.text).includes(term)).length;
+    return score(b) - score(a) || a.start - b.start;
+  })[0] ?? null;
+}
+
+const readableRoot = {
+  isEnabled: true, readPermission: true, status: "CONNECTED" as const,
+  disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null,
+  canonicalConnectedLibraryId: null,
+};
+
+export async function retrieveQuestionContext(question: string, permittedRootIds?: string[]): Promise<AnswerContext> {
+  const route = routeLibraryQuestion(question);
+  const prisma = getPrismaClient();
+  const roots = await prisma.connectedLibrary.findMany({
+    select: { id: true, displayName: true, scanSessions: {
+      select: { id: true, searchIndexStatus: true, startedAt: true }, take: 1,
+      orderBy: { startedAt: "desc" },
+      where: { status: { in: ["COMPLETED", "COMPLETED_WITH_ERRORS"] } },
+    } },
+    where: { ...readableRoot, ...(permittedRootIds ? { id: { in: permittedRootIds } } : {}) },
+  });
+  const rootById = new Map(roots.map((root) => [root.id, root]));
+  const rootIds = roots.map((root) => root.id);
+  const latestIds = new Set(roots.flatMap((root) => root.scanSessions.map((session) => session.id)));
+  if (!rootIds.length) return { route, sources: [], relationships: [], versions: [],
+    indexIncomplete: false, ambiguousEntity: false };
+  const newestSessions = await Promise.all(roots.map((root) => prisma.scanSession.findFirst({
+    where: { connectedFolderId: root.id }, orderBy: { startedAt: "desc" },
+    select: { id: true },
+  })));
+  const indexIncomplete = roots.some((root, index) => !root.scanSessions.length ||
+    root.scanSessions[0].searchIndexStatus !== "COMPLETED" ||
+    newestSessions[index]?.id !== root.scanSessions[0].id);
+
+  const results = await searchLibrary(route.searchQuery, rootIds);
+  const indexIds = results.filter((result) => result.kind === "FILE").map((result) => result.id);
+  const [entries, memories, metadataFiles] = await Promise.all([
+    prisma.librarySearchEntry.findMany({
+      where: { id: { in: indexIds }, connectedLibraryId: { in: rootIds },
+        indexVersion: librarySearchIndexVersion, connectedLibrary: readableRoot,
+        scannedFile: { sourceUnavailableAt: null } },
+      include: { scannedFile: { select: { libraryDocumentId: true, checksum: true,
+        relativePath: true, sessionId: true, scanSession: { select: { connectedFolderId: true } } } } },
+    }),
+    prisma.memoryEntry.findMany({
+      where: { id: { in: results.filter((result) => result.kind === "MEMORY").map((result) => result.id) },
+        status: "ACTIVE", searchProvenanceComplete: true,
+        searchSources: { some: {}, every: {
+          connectedLibraryId: { in: rootIds },
+          observationSession: { status: { in: ["APPROVED", "MODIFIED"] } },
+        } } },
+      include: { searchSources: { select: { connectedLibraryId: true, observationSession: {
+        select: { status: true, libraryDocument: { select: { scannedFiles: {
+          select: { checksum: true, relativePath: true, scanSession: { select: { connectedFolderId: true } } },
+        } } } },
+      } } } },
+    }),
+    prisma.scannedFile.findMany({
+      where: { id: { in: indexIds }, sourceUnavailableAt: null,
+        scanSession: { connectedFolderId: { in: rootIds }, connectedFolder: readableRoot } },
+      select: { id: true, checksum: true, relativePath: true, sessionId: true,
+        scanSession: { select: { connectedFolderId: true } } },
+    }),
+  ]);
+  const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
+  const memoriesById = new Map(memories.map((entry) => [entry.id, entry]));
+  const metadataById = new Map(metadataFiles.map((file) => [file.id, file]));
+  const sources: AnswerContextSource[] = [];
+  const sourceEntryById = new Map<string, (typeof entries)[number]>();
+  const physicalSeen = new Set<string>();
+  for (const result of results) {
+    if (sources.length >= maxAnswerSources) break;
+    if (result.kind === "MEMORY") {
+      const entry = memoriesById.get(result.id);
+      if (!entry || !entry.searchSources.length || entry.searchSourceCount !== entry.searchSources.length ||
+        entry.searchSources.some((source) => !rootById.has(source.connectedLibraryId) ||
+          !["APPROVED", "MODIFIED"].includes(source.observationSession.status))) continue;
+      sources.push({ id: `S${sources.length + 1}`, sourceType: "APPROVED_MEMORY",
+        title: entry.title.slice(0, 160), rootName: [...new Set(entry.searchSources.map((source) =>
+          rootById.get(source.connectedLibraryId)!.displayName))].join("; "),
+        relativePath: null, href: "/admin/library/memory", trustState: "Human-approved Memory",
+        timeState: "Active", text: `${entry.title}. ${entry.description}`.slice(0, 400),
+        sourceRange: null, physicalIdentity: `memory:${entry.id}`,
+        corroborationKeys: [...new Set(entry.searchSources.flatMap((source) =>
+          source.observationSession.libraryDocument.scannedFiles
+            .filter((file) => file.scanSession.connectedFolderId === source.connectedLibraryId)
+            .map((file) => file.checksum ? `sha256:${file.checksum}` :
+              `${source.connectedLibraryId}:${file.relativePath}`)))],
+      });
+      continue;
+    }
+    const entry = entriesById.get(result.id);
+    if (entry) {
+      const root = rootById.get(entry.connectedLibraryId);
+      if (!root || entry.checksum !== entry.scannedFile.checksum ||
+        entry.relativePath !== entry.scannedFile.relativePath ||
+        entry.scanSessionId !== entry.scannedFile.sessionId ||
+        entry.connectedLibraryId !== entry.scannedFile.scanSession.connectedFolderId ||
+        (!route.wantsHistory && (!entry.isCurrent || !latestIds.has(entry.scanSessionId)))) continue;
+      const physicalIdentity = entry.checksum ? `sha256:${entry.checksum}` : entry.fileKey;
+      if (physicalSeen.has(physicalIdentity)) continue;
+      physicalSeen.add(physicalIdentity);
+      const excerpt = bestExcerpt(entry.sourceExcerpts, workingKnowledgeTerms(route.searchQuery));
+      const source: AnswerContextSource = { id: `S${sources.length + 1}`,
+        sourceType: excerpt ? "SOURCE_EXCERPT" : "FILE_METADATA",
+        title: path.posix.basename(entry.relativePath), rootName: root.displayName,
+        relativePath: entry.relativePath, href: result.href,
+        trustState: entry.knowledgeState === "APPROVED" ? "Human reviewed" : "Provisional source evidence",
+        timeState: entry.isCurrent ? "Current scan" : "Historical scan",
+        text: excerpt?.text ?? `File name: ${path.posix.basename(entry.relativePath)}`,
+        sourceRange: excerpt ? { start: excerpt.start, end: excerpt.end } : null,
+        physicalIdentity, corroborationKeys: [physicalIdentity] };
+      sources.push(source);
+      sourceEntryById.set(source.id, entry);
+      continue;
+    }
+    const file = metadataById.get(result.id);
+    if (!file || !latestIds.has(file.sessionId)) continue;
+    const root = rootById.get(file.scanSession.connectedFolderId);
+    if (!root) continue;
+    const physicalIdentity = file.checksum ? `sha256:${file.checksum}` : `${root.id}:${file.relativePath}`;
+    if (physicalSeen.has(physicalIdentity)) continue;
+    physicalSeen.add(physicalIdentity);
+    sources.push({ id: `S${sources.length + 1}`, sourceType: "FILE_METADATA",
+      title: path.posix.basename(file.relativePath), rootName: root.displayName,
+      relativePath: file.relativePath, href: result.href, trustState: "Metadata only",
+      timeState: "Current scan", text: `File name: ${path.posix.basename(file.relativePath)}`,
+      sourceRange: null, physicalIdentity, corroborationKeys: [physicalIdentity] });
+  }
+
+  const fileEntries = [...sourceEntryById.values()];
+  const signals = fileEntries.length ? await prisma.knowledgeDocumentSignal.findMany({
+    take: 80,
+    where: { status: "ACTIVE", supersededAt: null, generationVersion: documentSignalVersion,
+      connectedLibraryId: { in: rootIds },
+      fileKey: { in: fileEntries.map((entry) => entry.fileKey) },
+      kind: { in: ["DOCUMENT_FAMILY", "CLIENT", "PROJECT"] } },
+    select: { fileKey: true, checksum: true, connectedLibraryId: true,
+      identityHash: true, kind: true, revisionNumber: true, revisionDate: true },
+  }) : [];
+  const byEntry = new Map([...sourceEntryById.entries()]);
+  const versions: AnswerVersion[] = [];
+  const sourceIds = [...byEntry.keys()];
+  for (let i = 0; i < sourceIds.length; i += 1) {
+    for (let j = i + 1; j < sourceIds.length; j += 1) {
+      const leftId = sourceIds[i], rightId = sourceIds[j];
+      const left = byEntry.get(leftId)!; const right = byEntry.get(rightId)!;
+      const leftSignal = signals.find((signal) => signal.kind === "DOCUMENT_FAMILY" &&
+        signal.fileKey === left.fileKey && signal.checksum === left.checksum);
+      const rightSignal = signals.find((signal) => signal.kind === "DOCUMENT_FAMILY" &&
+        signal.fileKey === right.fileKey && signal.checksum === right.checksum &&
+        signal.connectedLibraryId === leftSignal?.connectedLibraryId &&
+        signal.identityHash === leftSignal?.identityHash);
+      if (!leftSignal || !rightSignal) continue;
+      const order = compareDocumentVersions(leftSignal, rightSignal);
+      versions.push({ leftSourceId: leftId, rightSourceId: rightId,
+        newerSourceId: order === null ? null : order === 1 ? leftId : rightId,
+        ordering: order === null ? "AMBIGUOUS" : "ORDERED" });
+    }
+  }
+  for (const version of versions) {
+    if (version.ordering !== "ORDERED") continue;
+    const olderId = version.newerSourceId === version.leftSourceId
+      ? version.rightSourceId : version.leftSourceId;
+    const older = sources.find((source) => source.id === olderId);
+    if (older?.timeState === "Current scan") older.timeState = "Earlier document version";
+  }
+
+  const documentIds = fileEntries.flatMap((entry) => entry.scannedFile.libraryDocumentId
+    ? [entry.scannedFile.libraryDocumentId] : []);
+  const observations = documentIds.length ? await prisma.observationSession.findMany({
+    where: { libraryDocumentId: { in: documentIds } },
+    select: { id: true, libraryDocumentId: true, status: true }, take: 80,
+    orderBy: { createdAt: "desc" },
+  }) : [];
+  const latestObservationByDocument = new Map<string, { id: string; status: string }>();
+  for (const observation of observations) {
+    if (!latestObservationByDocument.has(observation.libraryDocumentId)) {
+      latestObservationByDocument.set(observation.libraryDocumentId, observation);
+    }
+  }
+  const sourceIdByObservation = new Map([...latestObservationByDocument].flatMap(([documentId, observation]) =>
+    observation.status === "REJECTED" ? [] :
+    [...sourceEntryById.entries()].filter(([, entry]) =>
+      entry.scannedFile.libraryDocumentId === documentId)
+      .map(([sourceId]) => [observation.id, sourceId] as const)));
+  const connections = sourceIdByObservation.size > 1 ? await prisma.knowledgeConnection.findMany({
+    take: 24,
+    where: { status: { in: ["CONFIRMED", "NEW"] },
+      supersededAt: null,
+      generationVersion: { in: [relationshipGenerationVersion, documentSignalVersion,
+        humanIdentityCorrectionVersion] },
+      sourceChecksum: { not: null }, targetChecksum: { not: null },
+      sourceObservationSessionId: { in: [...sourceIdByObservation.keys()] },
+      targetObservationSessionId: { in: [...sourceIdByObservation.keys()] } },
+    select: { sourceObservationSessionId: true, targetObservationSessionId: true,
+      sourceChecksum: true, targetChecksum: true, status: true, reasoning: true },
+  }) : [];
+  const relationships = connections.flatMap((connection) => {
+    const leftSourceId = sourceIdByObservation.get(connection.sourceObservationSessionId);
+    const rightSourceId = sourceIdByObservation.get(connection.targetObservationSessionId);
+    const left = leftSourceId ? sourceEntryById.get(leftSourceId) : null;
+    const right = rightSourceId ? sourceEntryById.get(rightSourceId) : null;
+    return leftSourceId && rightSourceId && leftSourceId !== rightSourceId &&
+      left?.checksum === connection.sourceChecksum && right?.checksum === connection.targetChecksum
+      ? [{ leftSourceId, rightSourceId, status: connection.status === "CONFIRMED"
+        ? "CONFIRMED" as const : "PROVISIONAL" as const,
+        explanation: connection.reasoning.slice(0, 240) }] : [];
+  });
+  const identityKind = route.kind === "CLIENT" ? "CLIENT" : route.kind === "PROJECT" ? "PROJECT" : null;
+  const entityHashes = identityKind ? new Set(signals.filter((signal) => signal.kind === identityKind &&
+    fileEntries.some((entry) => entry.fileKey === signal.fileKey && entry.checksum === signal.checksum))
+    .map((signal) => `${signal.connectedLibraryId}:${signal.identityHash}`)) : new Set<string>();
+  return { route, sources, relationships, versions,
+    indexIncomplete: indexIncomplete || sources.some((source) => source.trustState === "Metadata only"),
+    ambiguousEntity: entityHashes.size > 1 };
+}

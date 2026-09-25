@@ -259,6 +259,15 @@ enum OrganizationSuggestionStatus {
   LEFT_UNCHANGED
 }
 
+enum OrganizationPreferenceStatus {
+  PROPOSED
+  DEFERRED
+  APPROVED
+  REJECTED
+  ARCHIVED
+  SUPERSEDED
+}
+
 enum OrganizationPlanStatus {
   DRAFT
   READY_FOR_EXECUTION
@@ -642,6 +651,7 @@ model ObservationSession {
   updatedAt         DateTime                 @updatedAt
   libraryDocument   LibraryDocument          @relation(fields: [libraryDocumentId], references: [id], onDelete: Cascade)
   humanDecisions    HumanDecision[]
+  memorySources     MemorySearchSource[]
   sourceConnections KnowledgeConnection[]    @relation("SourceObservationConnection")
   targetConnections KnowledgeConnection[]    @relation("TargetObservationConnection")
 
@@ -674,13 +684,63 @@ model KnowledgeConnection {
   sharedTerms                Json
   reasoning                  String
   status                     KnowledgeConnectionStatus @default(NEW)
+  relationshipKey            String?                   @unique
+  relationshipKind           String?
+  sourceFileKey              String?
+  targetFileKey              String?
+  sourceChecksum             String?
+  targetChecksum             String?
+  generationVersion          String?
+  sourceEvidence             Json?
+  lastSeenAt                 DateTime?
+  supersededAt               DateTime?
   sourceObservationSession   ObservationSession        @relation("SourceObservationConnection", fields: [sourceObservationSessionId], references: [id], onDelete: Cascade)
   targetObservationSession   ObservationSession        @relation("TargetObservationConnection", fields: [targetObservationSessionId], references: [id], onDelete: Cascade)
+  decisions                  KnowledgeConnectionDecision[]
 
   @@index([sourceObservationSessionId])
   @@index([targetObservationSessionId])
   @@index([status])
+  @@index([sourceFileKey])
+  @@index([targetFileKey])
   @@index([createdAt])
+}
+
+model KnowledgeConnectionDecision {
+  id                    String              @id @default(cuid())
+  knowledgeConnectionId String
+  action                String
+  previousStatus        KnowledgeConnectionStatus
+  nextStatus            KnowledgeConnectionStatus
+  note                  String?
+  createdAt             DateTime            @default(now())
+  connection            KnowledgeConnection @relation(fields: [knowledgeConnectionId], references: [id], onDelete: Cascade)
+
+  @@index([knowledgeConnectionId, createdAt])
+}
+
+model KnowledgeDocumentSignal {
+  id                   String   @id @default(cuid())
+  signalKey            String   @unique
+  connectedLibraryId   String
+  fileKey              String
+  relativePath         String
+  checksum             String
+  kind                 String
+  identityHash         String
+  supportHash          String?
+  revisionNumber       String?
+  revisionDate         String?
+  sourceRanges         Json
+  observationSessionId String
+  generationVersion    String
+  status               String   @default("ACTIVE")
+  createdAt            DateTime @default(now())
+  lastSeenAt           DateTime @default(now())
+  supersededAt         DateTime?
+
+  @@index([connectedLibraryId, kind, identityHash, status])
+  @@index([fileKey, status])
 }
 
 model MemoryEntry {
@@ -697,14 +757,33 @@ model MemoryEntry {
   lastSeen        DateTime     @default(now())
   occurrenceCount Int          @default(1)
   memoryKey       String       @unique
+  searchProvenanceComplete Boolean @default(false)
+  searchSourceCount Int @default(0)
+  searchProvenanceCheckedAt DateTime?
+  searchSources   MemorySearchSource[]
 
   @@index([memoryType])
   @@index([status])
   @@index([lastSeen])
 }
 
+model MemorySearchSource {
+  id                   String @id @default(cuid())
+  memoryEntryId        String
+  observationSessionId String
+  connectedLibraryId   String
+  createdAt            DateTime @default(now())
+  memoryEntry          MemoryEntry @relation(fields: [memoryEntryId], references: [id], onDelete: Cascade)
+  observationSession   ObservationSession @relation(fields: [observationSessionId], references: [id], onDelete: Cascade)
+  connectedLibrary     ConnectedLibrary @relation(fields: [connectedLibraryId], references: [id], onDelete: Cascade)
+
+  @@unique([memoryEntryId, observationSessionId, connectedLibraryId])
+  @@index([connectedLibraryId, memoryEntryId])
+}
+
 model ConnectedLibrary {
   id                               String                   @id @default(cuid())
+  memorySearchSources              MemorySearchSource[]
   displayName                      String
   localPath                        String                   @unique
   bridgeRootId                     String?                  @unique
@@ -745,6 +824,7 @@ model ConnectedLibrary {
   updatedAt                        DateTime                 @updatedAt
   bridgeDevice                     BridgeDevice?            @relation(fields: [bridgeDeviceId], references: [bridgeDeviceId], onDelete: SetNull)
   scanSessions                     ScanSession[]
+  searchEntries                    LibrarySearchEntry[]
   monitoringEvents                 MonitoringEvent[]
   monitoringBatches                MonitoringBatch[]
   organizationPlans                OrganizationPlan[]
@@ -884,8 +964,11 @@ model ScanSession {
   unsupportedFiles        Int                      @default(0)
   failedFiles             Int                      @default(0)
   observationsCreated     Int                      @default(0)
+  knowledgePersistenceStatus String                 @default("NOT_ATTEMPTED")
+  searchIndexStatus       String                   @default("NOT_ATTEMPTED")
   connectedFolder         ConnectedLibrary         @relation(fields: [connectedFolderId], references: [id], onDelete: Cascade)
   scannedFiles            ScannedFile[]
+  searchBackfillFiles     LibrarySearchBackfillFile[]
   organizationSuggestions OrganizationSuggestion[]
   organizationPlans       OrganizationPlan[]
   monitoringEvents        MonitoringEvent[]
@@ -894,6 +977,65 @@ model ScanSession {
   @@index([connectedFolderId])
   @@index([status])
   @@index([startedAt])
+}
+
+model LibrarySearchBackfillFile {
+  id            String @id @default(cuid())
+  scanSessionId String
+  scannedFileId String
+  indexVersion  String
+  status        String
+  updatedAt     DateTime @updatedAt
+  scanSession   ScanSession @relation(fields: [scanSessionId], references: [id], onDelete: Cascade)
+  scannedFile   ScannedFile @relation(fields: [scannedFileId], references: [id], onDelete: Cascade)
+
+  @@unique([scanSessionId, scannedFileId, indexVersion])
+  @@index([scanSessionId, indexVersion, status])
+}
+
+model LibraryAnswerUsage {
+  id                String   @id @default(cuid())
+  createdAt         DateTime @default(now())
+  status            String
+  model             String?
+  inputTokens       Int?
+  outputTokens      Int?
+  httpAttempts      Int      @default(0)
+  sourceCount       Int
+  processingVersion String
+  errorCategory     String?
+
+  @@index([createdAt])
+  @@index([status])
+}
+
+model LibrarySearchEntry {
+  id                 String   @id @default(cuid())
+  entryKey           String   @unique
+  fileKey            String
+  connectedLibraryId String
+  scannedFileId      String
+  scanSessionId      String
+  relativePath       String
+  fileName           String
+  checksum           String
+  fileType           String
+  indexVersion       String
+  fingerprint        String
+  isCurrent          Boolean  @default(true)
+  knowledgeState     String
+  sourceExcerpts     Json
+  sourceTerms        String[]
+  reviewedTerms      String[]
+  concepts           String[]
+  entityHashes       String[]
+  indexedAt          DateTime @default(now())
+  connectedLibrary   ConnectedLibrary @relation(fields: [connectedLibraryId], references: [id], onDelete: Cascade)
+  scannedFile        ScannedFile @relation(fields: [scannedFileId], references: [id], onDelete: Cascade)
+
+  @@index([connectedLibraryId, isCurrent, scanSessionId])
+  @@index([fileKey, isCurrent])
+  @@index([connectedLibraryId, fileName])
 }
 
 model ScannedFile {
@@ -920,10 +1062,21 @@ model ScannedFile {
   sourceUnavailableAt     DateTime?
   sourceUnavailableReason String?
   sourceCreatedAt         DateTime?
+  observationFingerprint  String?
+  observationVersion      String?
+  observationOrigin       String?
+  observationClaimedAt    DateTime?
+  aiRequestCount          Int                        @default(0)
+  aiHttpAttempts          Int                        @default(0)
+  aiInputTokens           Int?
+  aiOutputTokens          Int?
+  aiModel                 String?
   createdAt               DateTime                   @default(now())
   scanSession             ScanSession                @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   libraryDocument         LibraryDocument?           @relation(fields: [libraryDocumentId], references: [id], onDelete: SetNull)
   organizationSuggestions OrganizationSuggestion[]
+  searchEntries           LibrarySearchEntry[]
+  searchBackfillFiles     LibrarySearchBackfillFile[]
   audioMetadata           AudioRecordingMetadata?
   imageMetadata           ImageAssetMetadata?
   videoMetadata           VideoRecordingMetadata?
@@ -937,6 +1090,7 @@ model ScannedFile {
   @@index([checksum])
   @@index([libraryDocumentId])
   @@index([sourceUnavailableAt])
+  @@index([observationFingerprint])
 }
 
 model AudioRecordingMetadata {
@@ -1185,6 +1339,59 @@ model OrganizationSuggestionRevision {
   @@index([createdAt])
 }
 
+model OrganizationSuggestionDecisionEvent {
+  id             String   @id @default(cuid())
+  suggestionId   String
+  scanSessionId  String
+  action         String
+  previousStatus String
+  nextStatus     String
+  context        String?
+  destination    String?
+  createdAt      DateTime @default(now())
+
+  @@index([suggestionId, createdAt])
+  @@index([scanSessionId, createdAt])
+}
+
+model OrganizationPreference {
+  id                      String                       @id @default(cuid())
+  connectedLibraryId      String
+  destinationRelativePath String
+  scopeTerms              Json
+  sourceDecisionIds       Json
+  evidence                Json
+  proposalKey             String                       @unique
+  status                  OrganizationPreferenceStatus @default(PROPOSED)
+  version                 Int                          @default(1)
+  approvedAt              DateTime?
+  disputedAt              DateTime?
+  supersededById          String?
+  createdAt               DateTime                     @default(now())
+  updatedAt               DateTime                     @updatedAt
+  revisions               OrganizationPreferenceRevision[]
+
+  @@index([connectedLibraryId, status])
+  @@index([createdAt])
+}
+
+model OrganizationPreferenceRevision {
+  id                  String                 @id @default(cuid())
+  preferenceId        String
+  action              String
+  previousStatus      String
+  nextStatus          String
+  previousDestination String?
+  nextDestination     String?
+  previousScopeTerms  Json?
+  nextScopeTerms      Json?
+  note                String?
+  createdAt           DateTime               @default(now())
+  preference          OrganizationPreference @relation(fields: [preferenceId], references: [id], onDelete: Cascade)
+
+  @@index([preferenceId, createdAt])
+}
+
 model OrganizationPlan {
   id                 String                 @id @default(cuid())
   scanSessionId      String
@@ -1264,6 +1471,7 @@ model ExecutionAction {
   undoActions              UndoAction[]
 
   @@index([executionRunId])
+  @@index([destinationRelativePath])
   @@index([status])
   @@index([sequence])
 }

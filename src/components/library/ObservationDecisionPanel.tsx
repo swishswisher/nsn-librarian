@@ -34,7 +34,7 @@ const reviewActions: {
   {
     value: "MODIFY",
     label: "Revise Observation",
-    helper: "Save Deanne's corrected observation or wording.",
+    helper: "Approve Deanne's corrected wording for Memory; the original remains in review history.",
   },
   {
     value: "REJECT",

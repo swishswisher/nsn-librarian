@@ -566,6 +566,19 @@ describe("NSN Bridge core", () => {
     assert.equal(video.videoMetadata?.transcriptSnippet, null);
   });
 
+  it("caps long temporary document text and reports partial analysis", async () => {
+    const folder = await makeSafeFolder("library-long-document");
+    const root = await connectFolder(folder);
+    const content = `${"Routine notes. ".repeat(150_000)}Late evidence.`;
+    await writeFile(path.join(folder, "long.txt"), content);
+
+    const read = await readBridgeRootFile(root.id, "long.txt");
+
+    assert.equal(read.characterCount, content.length);
+    assert.equal(read.extractedText.length, 2_000_000);
+    assert.ok(read.warnings.some((warning) => warning.includes("later content was not examined")));
+  });
+
   it("keeps damaged supported media in media-specific failure categories", async () => {
     const folder = await makeSafeFolder("library-media-damaged");
     const root = await connectFolder(folder);

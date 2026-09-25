@@ -52,6 +52,13 @@ type StoredScanSession = {
 };
 
 export type StoredScannedFile = {
+  observationOrigin?: string | null;
+  observationVersion?: string | null;
+  aiModel?: string | null;
+  aiRequestCount?: number;
+  aiHttpAttempts?: number;
+  aiInputTokens?: number | null;
+  aiOutputTokens?: number | null;
   id: string;
   relativePath: string;
   fileType: string;
@@ -363,6 +370,13 @@ export function scannedFileSummary(
     : "FAILED";
 
   return {
+    observationOrigin: file.observationOrigin ?? null,
+    observationVersion: file.observationVersion ?? null,
+    aiModel: file.aiModel ?? null,
+    aiRequestCount: file.aiRequestCount ?? 0,
+    aiHttpAttempts: file.aiHttpAttempts ?? 0,
+    aiInputTokens: file.aiInputTokens ?? null,
+    aiOutputTokens: file.aiOutputTokens ?? null,
     characterCount: file.characterCount,
     checksum: file.checksum,
     extractedAt: file.extractedAt?.toISOString() ?? null,
@@ -1064,6 +1078,7 @@ function scanProgressForSession(
     isActive && Date.now() - lastActivityAt.getTime() > staleScanSessionThresholdMs;
 
   return {
+    aiUsage: summarizeScanAIUsage(fileSummaries),
     completedAt: summary.completedAt,
     currentStage: summary.status,
     failedFiles,
@@ -1083,6 +1098,28 @@ function scanProgressForSession(
     suggestionsGenerated,
     supportedFiles: summary.supportedFiles,
     unsupportedFiles: summary.unsupportedFiles,
+  };
+}
+
+export function summarizeScanAIUsage(files: BridgeScannedFileSummary[]) {
+  const documents = files.filter((file) => !/^(?:IMAGE|AUDIO|VIDEO)_/.test(file.fileType) && file.readStatus === "SUPPORTED");
+
+  return {
+    models: [...new Set(documents.map((file) => file.aiModel).filter((model): model is string => Boolean(model)))].sort(),
+    processingVersions: [...new Set(documents.map((file) => file.observationVersion).filter((version): version is string => Boolean(version)))].sort(),
+    requests: documents.reduce((total, file) => total + (file.aiRequestCount ?? 0), 0),
+    httpAttempts: documents.reduce((total, file) => total + (file.aiHttpAttempts ?? 0), 0),
+    inputTokens: documents.reduce((total, file) => total + (file.aiInputTokens ?? 0), 0),
+    outputTokens: documents.reduce((total, file) => total + (file.aiOutputTokens ?? 0), 0),
+    unreportedTokenRequests: documents.filter((file) =>
+      (file.aiRequestCount ?? 0) > 0 && (file.aiInputTokens === null || file.aiInputTokens === undefined ||
+        file.aiOutputTokens === null || file.aiOutputTokens === undefined),
+    ).length,
+    newlyObserved: documents.filter((file) => file.observationOrigin === "NEW_AI").length,
+    reusedObservations: documents.filter((file) => file.observationOrigin === "REUSED_AI").length,
+    failedObservations: documents.filter((file) => file.observationOrigin === "BASIC" && (file.aiRequestCount ?? 0) > 0).length,
+    pendingDocuments: documents.filter((file) => !file.observationOrigin && file.processingStage !== "FAILED").length,
+    avoidedRequests: documents.filter((file) => file.observationOrigin === "REUSED_AI").length,
   };
 }
 
@@ -1246,6 +1283,7 @@ export async function getBridgeScanSessionDetail(
 
   return {
     ...scanSessionSummary(session),
+    knowledgePersistenceStatus: session.knowledgePersistenceStatus,
     organizationSummary,
     scannedFiles,
   };

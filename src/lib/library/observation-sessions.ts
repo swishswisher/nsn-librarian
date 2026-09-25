@@ -1,6 +1,7 @@
 import type { Prisma } from "@prisma/client";
 
 import { runOpenAIObservation } from "@/lib/ai/openai-observer";
+import { OpenAIProviderError } from "@/lib/ai/openai-client";
 import type { AIObservationResult } from "@/lib/ai/types";
 import { getPrismaClient } from "@/lib/db/prisma";
 import {
@@ -357,6 +358,39 @@ async function observeWithOpenAIOrFallback(
   document: ReadableObservationDocument,
   source: MindInput["source"] = "READING_ROOM",
 ) {
+  const metadataOnly = source === "BRIDGE" &&
+    /^(?:Image technical metadata only|Audio review material|Video review material)/.test(
+      document.rawText ?? "",
+    );
+
+  if (metadataOnly) {
+    const format = document.itemKind.toLowerCase();
+    return {
+      observerType: "DETERMINISTIC" as const,
+      result: {
+        observations: [{
+          id: "observation-metadata-only",
+          label: "MISSING_OR_EMPTY_CONTENT" as const,
+          description: `I recorded ${format} metadata, but did not examine the ${format}'s contents.`,
+          evidence: [],
+          confidence: 0.95,
+          uncertainty: "A transcript, OCR result, or visual analysis is not available for this item.",
+        }],
+        interpretations: [],
+        connections: [],
+        explanation: {
+          summary: `Only ${format} metadata was available for review.`,
+          evidence: [],
+          uncertainty: "The content itself was not interpreted.",
+          confidence: 0.95,
+        },
+        planSuggestions: [],
+        overallConfidence: 0.95,
+        warnings: [`Only ${format} metadata was examined; content understanding is unavailable.`],
+      } satisfies MindResult,
+    };
+  }
+
   if (!hasOpenAIKey()) {
     return observeWithDeterministicMind(document, [
       aiUnavailableObservationMessage,
@@ -382,11 +416,31 @@ async function observeWithOpenAIOrFallback(
         aiResult,
       ),
       observerType: "OPENAI" as const,
+      aiUsage: {
+        requestCount: 1,
+        httpAttempts: aiResult.usage?.httpAttempts ?? 0,
+        inputTokens: aiResult.usage?.inputTokens ?? null,
+        outputTokens: aiResult.usage?.outputTokens ?? null,
+        model: aiResult.model,
+        sourceComplete: aiResult.usage?.sourceComplete ?? false,
+      },
     };
-  } catch {
-    return observeWithDeterministicMind(document, [
+  } catch (error) {
+    const fallback = await observeWithDeterministicMind(document, [
       aiUnavailableObservationMessage,
     ], source);
+
+    return {
+      ...fallback,
+      aiUsage: {
+        requestCount: 1,
+        httpAttempts: error instanceof OpenAIProviderError ? error.httpAttempts : 0,
+        inputTokens: null,
+        outputTokens: null,
+        model: null,
+        sourceComplete: false,
+      },
+    };
   }
 }
 
@@ -415,28 +469,34 @@ export function isHumanDecisionType(value: unknown): value is HumanDecisionType 
 export async function createObservationSessionFromReadableDocument(
   document: ReadableObservationDocument,
   source: MindInput["source"] = "READING_ROOM",
+  readWarnings: string[] = [],
 ) {
   if (!document.rawText || document.rawText.trim().length === 0) {
     throw new ObservationSessionError(unreadObservationMessage, 409);
   }
 
   const prisma = getPrismaClient();
-  const { observerType, result } = await observeWithOpenAIOrFallback(
+  const observed = await observeWithOpenAIOrFallback(
     document,
     source,
   );
+  const { observerType, result } = observed;
+  const observedResult = {
+    ...result,
+    warnings: [...result.warnings, ...readWarnings.slice(0, 20)],
+  };
 
   const session = await prisma.observationSession.create({
     data: {
       libraryDocumentId: document.id,
       observerType,
       status: "AWAITING_REVIEW",
-      observations: toJsonInput(result.observations),
-      interpretations: toJsonInput(result.interpretations),
-      explanation: toJsonInput(result.explanation),
-      planSuggestions: toJsonInput(result.planSuggestions),
-      confidence: result.overallConfidence,
-      warnings: toJsonInput(result.warnings),
+      observations: toJsonInput(observedResult.observations),
+      interpretations: toJsonInput(observedResult.interpretations),
+      explanation: toJsonInput(observedResult.explanation),
+      planSuggestions: toJsonInput(observedResult.planSuggestions),
+      confidence: observedResult.overallConfidence,
+      warnings: toJsonInput(observedResult.warnings),
     },
     select: {
       id: true,
@@ -446,9 +506,10 @@ export async function createObservationSessionFromReadableDocument(
 
   return {
     sessionId: session.id,
-    result,
+    result: observedResult,
     observerType,
     connectionCount,
+    aiUsage: "aiUsage" in observed ? observed.aiUsage : null,
   };
 }
 
@@ -583,6 +644,10 @@ export async function saveHumanDecision(
   const note = input.note?.trim() || null;
   const editedSuggestion = input.editedSuggestion?.trim() || null;
 
+  if (input.decisionType === "MODIFY" && !editedSuggestion) {
+    throw new ObservationSessionError("Write the corrected observation before saving it.", 400);
+  }
+
   return prisma.$transaction(async (tx) => {
     const existingSession = await tx.observationSession.findUnique({
       where: { id: sessionId },
@@ -597,6 +662,24 @@ export async function saveHumanDecision(
         "The Librarian could not find that observation.",
         404,
       );
+    }
+
+    const latestDecision = await tx.humanDecision.findFirst({
+      orderBy: { createdAt: "desc" },
+      where: { observationSessionId: sessionId },
+    });
+    const intendedStatus = decisionStatusFor(input.decisionType);
+
+    if (
+      latestDecision?.decisionType === input.decisionType &&
+      latestDecision.note === note &&
+      latestDecision.editedSuggestion === editedSuggestion &&
+      (!intendedStatus || existingSession.status === intendedStatus)
+    ) {
+      return {
+        decisionId: latestDecision.id,
+        status: existingSession.status as ObservationSessionStatus,
+      };
     }
 
     const decision = await tx.humanDecision.create({

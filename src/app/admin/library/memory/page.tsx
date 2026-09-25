@@ -3,7 +3,9 @@ import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
 import { NsnCard } from "@/components/library/NsnCard";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
 import { NsnPageHeader } from "@/components/library/NsnPageHeader";
+import { OrganizationPreferenceReviewPanel } from "@/components/library/OrganizationPreferenceReviewPanel";
 import { getMemoryPageData } from "@/lib/library/memory";
+import { getOrganizationPreferencePageData } from "@/lib/library/organization-preferences";
 import type { MemoryEntrySummary, MemoryType } from "@/types/library";
 
 export const dynamic = "force-dynamic";
@@ -136,7 +138,10 @@ function MemorySection({
 }
 
 export default async function LibraryMemoryPage() {
-  const memory = await getMemoryPageData();
+  const [memory, organizationPreferences] = await Promise.all([
+    getMemoryPageData(),
+    getOrganizationPreferencePageData(),
+  ]);
 
   return (
     <LibraryShell active="memory">
@@ -192,6 +197,8 @@ export default async function LibraryMemoryPage() {
           entries={memory.humanPreferences}
           title="Human preferences"
         />
+
+        <OrganizationPreferenceReviewPanel preferences={organizationPreferences} />
 
         <MemorySection
           description="Recently learned entries show what Memory has updated most recently."

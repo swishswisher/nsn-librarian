@@ -11,6 +11,7 @@ import {
 } from "../types";
 import { bridgeRootUri, isPathInsideRoot, pathKey } from "./safety";
 import { requireRootPermission, updateRoot } from "../main/registry";
+import { extractImageMetadata } from "../../../src/lib/bridge/image-metadata";
 
 const supportedExtensions = new Map<string, string>([
   [".txt", "TEXT"],
@@ -144,6 +145,9 @@ async function fileDraft(rootId: string, rootPath: string, filePath: string) {
     return {
       checksum: await checksumFile(filePath),
       fileType,
+      imageMetadata: fileType.startsWith("IMAGE_")
+        ? await extractImageMetadata(filePath, relativePath, stats).catch(() => null)
+        : null,
       lastModified: stats.mtime,
       localPath: bridgeRootUri(rootId, relativePath),
       readStatus: "SUPPORTED",

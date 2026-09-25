@@ -504,6 +504,7 @@ async function applyCompletedScan(input: {
 function remoteReadResult(value: unknown) {
   const result = objectValue(value);
   const extractedText = stringValue(result?.extractedText, 2_000_000);
+  const reportedCharacterCount = numberValue(result?.characterCount);
   const relativePath = safeRelativePath(result?.relativePath);
 
   if (!result || !extractedText || !relativePath) {
@@ -515,17 +516,25 @@ function remoteReadResult(value: unknown) {
 
   return {
     audioMetadata: remoteAudioReadMetadata(result.audioMetadata),
-    characterCount: extractedText.length,
+    sourceChecksum: stringValue(result.sourceChecksum, 64),
+    characterCount: reportedCharacterCount && reportedCharacterCount >= extractedText.length
+      ? reportedCharacterCount
+      : extractedText.length,
     extractedText,
     fileName: stringValue(result.fileName, 500) ?? path.posix.basename(relativePath),
     fileType: stringValue(result.fileType, 100) ?? "DOCUMENT",
     relativePath,
     videoMetadata: remoteVideoReadMetadata(result.videoMetadata),
-    warnings: Array.isArray(result.warnings)
-      ? result.warnings
-          .filter((warning): warning is string => typeof warning === "string")
-          .slice(0, 20)
-      : [],
+    warnings: [
+      ...(Array.isArray(result.warnings)
+        ? result.warnings
+            .filter((warning): warning is string => typeof warning === "string")
+            .slice(0, 20)
+        : []),
+      ...(reportedCharacterCount && reportedCharacterCount > extractedText.length
+        ? ["Only part of this document was sent for analysis; later content was not examined."]
+        : []),
+    ],
   };
 }
 
@@ -626,6 +635,34 @@ async function storeRemoteReadMediaMetadata(
   if (result.videoMetadata) {
     await storeRemoteReadVideoMetadata(scannedFileId, result.videoMetadata);
   }
+
+  if (result.fileType.startsWith("IMAGE_")) {
+    await getPrismaClient().imageAssetMetadata.upsert({
+      create: {
+        format: result.fileType.replace("IMAGE_", "").toLowerCase(),
+        humanLabels: jsonInput([]),
+        machineLabels: jsonInput([]),
+        ocrErrorCategory: "IMAGE_OCR_UNAVAILABLE",
+        ocrStatus: "UNAVAILABLE",
+        privacyState: "REVIEW_REQUIRED",
+        provisionalQuestions: jsonInput([]),
+        provisionalTopics: jsonInput([]),
+        relatedSignals: jsonInput([]),
+        scannedFileId,
+        summary: "Only technical image metadata was examined; OCR and visual interpretation were unavailable.",
+        visualAnalysisErrorCategory: "IMAGE_VISUAL_ANALYSIS_UNAVAILABLE",
+        visualAnalysisStatus: "UNAVAILABLE",
+      },
+      update: {
+        ocrErrorCategory: "IMAGE_OCR_UNAVAILABLE",
+        ocrStatus: "UNAVAILABLE",
+        summary: "Only technical image metadata was examined; OCR and visual interpretation were unavailable.",
+        visualAnalysisErrorCategory: "IMAGE_VISUAL_ANALYSIS_UNAVAILABLE",
+        visualAnalysisStatus: "UNAVAILABLE",
+      },
+      where: { scannedFileId },
+    });
+  }
 }
 
 async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
@@ -654,6 +691,24 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
       "The temporary read result does not match the scanned file.",
       409,
     );
+  }
+
+  if (result.sourceChecksum && stored.checksum?.toLowerCase() !== result.sourceChecksum.toLowerCase()) {
+    await markRemoteReadFailure({
+      safeErrorCategory: "FILE_CHANGED_SINCE_SCAN",
+      scanSessionId,
+      scannedFileId,
+    });
+    await generateScanRecommendationBatchIfReady(scanSessionId);
+
+    return {
+      characterCount: result.characterCount,
+      observationPrepared: false,
+      observationReused: false,
+      scannedFileId,
+      suggestionsCreated: 0,
+      suggestionsReused: 0,
+    } satisfies BridgeJson;
   }
 
   await prisma.scannedFile.update({
@@ -690,6 +745,7 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
       fileType: result.fileType,
       relativePath: result.relativePath,
       scannedFileId,
+      sourceChecksum: result.sourceChecksum,
       warnings: result.warnings,
     },
   };
@@ -707,10 +763,58 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
       },
     });
   } else {
-    await createObservationSessionForScannedFileReadResult(
-      scannedFileId,
-      readResult,
-    );
+    const claimedAt = new Date();
+    const claim = await prisma.scannedFile.updateMany({
+      data: { observationClaimedAt: claimedAt },
+      where: {
+        id: scannedFileId,
+        OR: [
+          { observationClaimedAt: null },
+          { observationClaimedAt: { lt: new Date(claimedAt.getTime() - 10 * 60_000) } },
+        ],
+        sessionId: scanSessionId,
+      },
+    });
+
+    if (claim.count === 0) {
+      return {
+        characterCount: result.characterCount,
+        observationPrepared: false,
+        observationReused: false,
+        scannedFileId,
+        suggestionsCreated: 0,
+        suggestionsReused: 0,
+      } satisfies BridgeJson;
+    }
+
+    try {
+      const current = await prisma.scannedFile.findUnique({
+        select: {
+          libraryDocument: {
+            select: { observationSessions: { select: { id: true }, take: 1 } },
+          },
+        },
+        where: { id: scannedFileId },
+      });
+
+      if (current?.libraryDocument?.observationSessions.length) {
+        await prisma.scannedFile.update({
+          data: { observationClaimedAt: null, processingStage: "EXAMINED" },
+          where: { id: scannedFileId },
+        });
+      } else {
+        await createObservationSessionForScannedFileReadResult(
+          scannedFileId,
+          readResult,
+        );
+      }
+    } catch (error) {
+      await prisma.scannedFile.updateMany({
+        data: { observationClaimedAt: null },
+        where: { id: scannedFileId, observationClaimedAt: claimedAt },
+      });
+      throw error;
+    }
   }
 
   const batch = await generateScanRecommendationBatchIfReady(scanSessionId);

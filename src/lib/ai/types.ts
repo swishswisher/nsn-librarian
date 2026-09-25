@@ -68,6 +68,12 @@ export type AIObservationResult = {
   confidence: number;
   uncertainty: string;
   warnings: string[];
+  usage?: {
+    httpAttempts: number;
+    inputTokens: number | null;
+    outputTokens: number | null;
+    sourceComplete: boolean;
+  };
 };
 
 export type AIReflectionMemoryEntry = {

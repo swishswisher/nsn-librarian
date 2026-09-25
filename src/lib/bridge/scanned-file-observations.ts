@@ -1,5 +1,6 @@
 import path from "node:path";
 
+import { observationFingerprint, observationProcessingVersion } from "@/lib/ai/observation-processing";
 import { getPrismaClient } from "@/lib/db/prisma";
 import {
   createObservationSessionFromReadableDocument,
@@ -170,7 +171,9 @@ async function metadataDocumentForScannedFile(
       },
     });
 
-    if (existingDocument) {
+    if (existingDocument && await prisma.scannedFile.count({
+      where: { libraryDocumentId: existingDocument.id },
+    }) <= 1) {
       return prisma.libraryDocument.update({
         data: documentData,
         where: {
@@ -260,9 +263,25 @@ export async function createObservationSessionForScannedFileReadResult(
       wordCount,
     },
     "BRIDGE",
+    readResult.preview.warnings,
   );
   const scannedFile = await prisma.scannedFile.findUnique({
     select: {
+      checksum: true,
+      fileType: true,
+      relativePath: true,
+      scanSession: {
+        select: {
+          connectedFolder: {
+            select: {
+              bridgeDeviceId: true,
+              bridgeRootId: true,
+              bridgeDevice: { select: { appVersion: true } },
+              id: true,
+            },
+          },
+        },
+      },
       sessionId: true,
     },
     where: {
@@ -271,9 +290,36 @@ export async function createObservationSessionForScannedFileReadResult(
   });
 
   if (scannedFile) {
+    const library = scannedFile.scanSession.connectedFolder;
+    const canReuse = observation.observerType === "OPENAI" &&
+      observation.aiUsage?.sourceComplete === true &&
+      observation.result.observations.length > 0 &&
+      readResult.preview.characterCount === readResult.preview.extractedText.length &&
+      readResult.preview.sourceChecksum?.toLowerCase() === scannedFile.checksum?.toLowerCase() &&
+      library.bridgeDeviceId && library.bridgeRootId && library.bridgeDevice;
+    const fingerprint = canReuse
+      ? observationFingerprint({
+          bridgeDeviceId: library.bridgeDeviceId!,
+          bridgeRootId: library.bridgeRootId!,
+          bridgeVersion: library.bridgeDevice!.appVersion,
+          checksum: scannedFile.checksum,
+          connectedLibraryId: library.id,
+          fileType: scannedFile.fileType,
+          relativePath: scannedFile.relativePath,
+        })
+      : null;
     await prisma.$transaction([
       prisma.scannedFile.update({
         data: {
+          aiHttpAttempts: observation.aiUsage?.httpAttempts ?? 0,
+          aiInputTokens: observation.aiUsage?.inputTokens ?? null,
+          aiModel: observation.aiUsage?.model ?? null,
+          aiOutputTokens: observation.aiUsage?.outputTokens ?? null,
+          aiRequestCount: observation.aiUsage?.requestCount ?? 0,
+          observationClaimedAt: null,
+          observationFingerprint: fingerprint,
+          observationVersion: observation.observerType === "OPENAI" ? observationProcessingVersion : null,
+          observationOrigin: observation.observerType === "OPENAI" ? "NEW_AI" : "BASIC",
           processedAt: new Date(),
           processingErrorCategory: null,
           processingStage: "EXAMINED",

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { open, readFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -14,6 +16,12 @@ import {
   extractVideoMetadata,
   supportedVideoFileTypeForPath,
 } from "../../../src/lib/bridge/video-metadata";
+import {
+  extractImageMetadata,
+  imageDimensionsText,
+  ImageMetadataError,
+  supportedImageFileTypeForPath,
+} from "../../../src/lib/bridge/image-metadata";
 
 const documentExtensions = new Set([
   ".txt",
@@ -26,11 +34,22 @@ const documentExtensions = new Set([
 ]);
 const audioExtensions = new Set([".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"]);
 const videoExtensions = new Set([".mp4", ".mov", ".m4v"]);
+const maxTemporaryTextCharacters = 2_000_000;
 const readableExtensions = new Set([
   ...documentExtensions,
   ...audioExtensions,
   ...videoExtensions,
 ]);
+
+async function sourceChecksum(filePath: string) {
+  const hash = createHash("sha256");
+
+  for await (const chunk of createReadStream(filePath)) {
+    hash.update(chunk);
+  }
+
+  return hash.digest("hex");
+}
 
 function htmlToText(value: string) {
   return value
@@ -413,13 +432,49 @@ export async function readBridgeRootFile(
 ): Promise<BridgeReadResult> {
   const safeFile = await resolveBridgeRootFile(rootId, relativePath);
   const extension = path.posix.extname(safeFile.relativePath).toLowerCase();
+  const imageFileType = supportedImageFileTypeForPath(safeFile.relativePath);
 
-  if (!readableExtensions.has(extension)) {
+  if (!readableExtensions.has(extension) && !imageFileType) {
     throw new BridgeAppError(
       "Unsupported for reading.",
       "UNSUPPORTED_FILE_TYPE",
       409,
     );
+  }
+
+  if (imageFileType) {
+    try {
+      const metadata = await extractImageMetadata(
+        safeFile.localPath,
+        safeFile.relativePath,
+      );
+      const extractedText = [
+        "Image technical metadata only; image contents were not interpreted.",
+        `Format: ${metadata.format}`,
+        `Dimensions: ${imageDimensionsText(metadata)}`,
+        "OCR text: unavailable.",
+        "Visual analysis: unavailable.",
+      ].join("\n");
+
+      return {
+        characterCount: extractedText.length,
+        extractedText,
+        fileName: safeFile.fileName,
+        fileType: imageFileType,
+        relativePath: safeFile.relativePath,
+        warnings: ["Only image metadata was examined; text and visual meaning were not extracted."],
+      };
+    } catch (error) {
+      if (error instanceof ImageMetadataError) {
+        throw new BridgeAppError(error.message, error.category, 422);
+      }
+
+      throw new BridgeAppError(
+        "This image could not be read safely.",
+        "IMAGE_METADATA_FAILED",
+        422,
+      );
+    }
   }
 
   if (audioExtensions.has(extension)) {
@@ -458,7 +513,17 @@ export async function readBridgeRootFile(
     );
   }
 
+  const checksumBefore = await sourceChecksum(safeFile.localPath);
   const result = await extractText(safeFile.localPath, extension);
+  const checksumAfter = await sourceChecksum(safeFile.localPath);
+
+  if (checksumBefore !== checksumAfter) {
+    throw new BridgeAppError(
+      "This file changed while it was being read. Scan it again before examining it.",
+      "FILE_CHANGED_DURING_READ",
+      409,
+    );
+  }
   const extractedText = result.text.trim();
 
   if (!extractedText) {
@@ -475,10 +540,13 @@ export async function readBridgeRootFile(
 
   return {
     characterCount: extractedText.length,
-    extractedText,
+    extractedText: extractedText.slice(0, maxTemporaryTextCharacters),
+    sourceChecksum: checksumAfter,
     fileName: safeFile.fileName,
     fileType: fileTypeForExtension(extension),
     relativePath: safeFile.relativePath,
-    warnings: result.warnings,
+    warnings: extractedText.length > maxTemporaryTextCharacters
+      ? [...result.warnings, "Only the first 2,000,000 characters were sent for analysis; later content was not examined."]
+      : result.warnings,
   };
 }
