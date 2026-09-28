@@ -4,7 +4,7 @@ import path from "node:path";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { documentSignalVersion } from "@/lib/bridge/document-signals";
 import { workingKnowledgeTerms, type ScanWorkingKnowledgeIndex } from "@/lib/bridge/scan-working-knowledge";
-import { humanIdentityCorrectionVersion, persistentFileKey } from "@/lib/bridge/persistent-knowledge";
+import { humanIdentityCorrectionVersion, persistentFileKey, usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
 import { loadScanWorkingKnowledge } from "@/lib/bridge/scan-working-knowledge";
 
 export const librarySearchIndexVersion = "library-search-v1";
@@ -52,8 +52,8 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
   if (!session || !session.connectedFolder.isEnabled || !session.connectedFolder.readPermission ||
       session.connectedFolder.status !== "CONNECTED") return 0;
   const latestSession = await prisma.scanSession.findFirst({
-    orderBy: { startedAt: "desc" }, select: { id: true },
-    where: { connectedFolderId: session.connectedFolderId },
+    orderBy: [{ startedAt: "desc" }, { id: "desc" }], select: { id: true },
+    where: { ...usableScanSnapshotWhere, connectedFolderId: session.connectedFolderId },
   });
   if (latestSession?.id !== index.scanSessionId) return 0;
 
@@ -63,6 +63,7 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
         select: { observationSessions: {
           orderBy: { createdAt: "desc" },
           select: { id: true, status: true, humanDecisions: {
+            where: { decisionType: "MODIFY" },
             orderBy: { createdAt: "desc" }, select: { decisionType: true, editedSuggestion: true }, take: 1,
           } }, take: 1,
         } },

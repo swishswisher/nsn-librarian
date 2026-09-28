@@ -444,10 +444,19 @@ export async function readBridgeRootFile(
 
   if (imageFileType) {
     try {
+      const checksumBefore = await sourceChecksum(safeFile.localPath);
       const metadata = await extractImageMetadata(
         safeFile.localPath,
         safeFile.relativePath,
       );
+      const checksumAfter = await sourceChecksum(safeFile.localPath);
+      if (checksumBefore !== checksumAfter) {
+        throw new BridgeAppError(
+          "This image changed while it was being read. Scan it again before examining it.",
+          "FILE_CHANGED_DURING_READ",
+          409,
+        );
+      }
       const extractedText = [
         "Image technical metadata only; image contents were not interpreted.",
         `Format: ${metadata.format}`,
@@ -457,6 +466,7 @@ export async function readBridgeRootFile(
       ].join("\n");
 
       return {
+        sourceChecksum: checksumAfter,
         characterCount: extractedText.length,
         extractedText,
         fileName: safeFile.fileName,
@@ -465,6 +475,7 @@ export async function readBridgeRootFile(
         warnings: ["Only image metadata was examined; text and visual meaning were not extracted."],
       };
     } catch (error) {
+      if (error instanceof BridgeAppError) throw error;
       if (error instanceof ImageMetadataError) {
         throw new BridgeAppError(error.message, error.category, 422);
       }

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import assert from "node:assert/strict";
@@ -974,6 +974,45 @@ test("a file changed after scanning cannot be observed under its stale checksum"
     assert.equal(requestCount(), 0);
     assert.equal((await getBridgeScanSessionProgress(root.session.id))?.progress.remainingFiles, 0);
   });
+});
+
+test("an image changed after scanning is isolated before a stale observation can be accepted", async () => {
+  const relativePath = "Images/changed.png";
+  const original = pngMetadataFixture();
+  const root = await createCloudBackedBridgeRoot("SCAN_ROOT_CHANGED_IMAGE", new Map([[relativePath, original]]));
+  const file = await scannedFile(root.session.id, relativePath);
+  const changedBytes = Buffer.from(original);
+  changedBytes.writeUInt32BE(800, 16);
+  await writeFile(path.join(root.rootPath, "Images", "changed.png"), changedBytes);
+  const result = await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId,
+    bridgeRootId: root.root.id, relativePath, scannedFileId: file.id });
+  assert.equal(result.sourceChecksum, createHash("sha256").update(changedBytes).digest("hex"));
+  assert.notEqual(result.sourceChecksum, file.checksum);
+  assert.equal(JSON.stringify(result).includes(changedBytes.toString("base64")), false);
+  assert.match(result.extractedText, /technical metadata only/);
+  const rejected = await scannedFile(root.session.id, relativePath);
+  assert.equal(rejected.processingStage, "FAILED");
+  assert.equal(rejected.processingErrorCategory, "FILE_CHANGED_SINCE_SCAN");
+  assert.equal(rejected.libraryDocumentId, null);
+  assert.equal(rejected.observationFingerprint, null);
+  assert.equal(rejected.organizationSuggestions.length, 0);
+  assert.equal(await prisma.bridgeCommand.count({ where: { commandType: { in: ["EXECUTE_PLAN", "EXECUTE_UNDO"] } } }), 0);
+});
+
+test("unchanged image reads return a verified checksum and keep metadata-only semantics", async () => {
+  const bytes = pngMetadataFixture();
+  const relativePath = "Images/unchanged.png";
+  const root = await createCloudBackedBridgeRoot("SCAN_ROOT_UNCHANGED_IMAGE", new Map([[relativePath, bytes]]));
+  const file = await scannedFile(root.session.id, relativePath);
+  const result = await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId,
+    bridgeRootId: root.root.id, relativePath, scannedFileId: file.id });
+  assert.equal(result.sourceChecksum, file.checksum);
+  assert.equal(result.sourceChecksum, createHash("sha256").update(bytes).digest("hex"));
+  assert.match(result.extractedText, /OCR text: unavailable/);
+  assert.match(result.extractedText, /Visual analysis: unavailable/);
+  const processed = await scannedFile(root.session.id, relativePath);
+  assert.ok(processed.libraryDocumentId);
+  assert.equal(await prisma.observationSession.count({ where: { libraryDocumentId: processed.libraryDocumentId } }), 1);
 });
 
 test("legacy temporary reads remain usable but cannot seed an unverified reuse entry", async () => {

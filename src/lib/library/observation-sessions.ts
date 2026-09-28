@@ -4,6 +4,7 @@ import { runOpenAIObservation } from "@/lib/ai/openai-observer";
 import { OpenAIProviderError } from "@/lib/ai/openai-client";
 import type { AIObservationResult } from "@/lib/ai/types";
 import { getPrismaClient } from "@/lib/db/prisma";
+import { reconcileObservationKnowledge } from "@/lib/bridge/persistent-knowledge";
 import {
   createKnowledgeConnectionsForSession,
   getRelatedKnowledgeForSession,
@@ -676,6 +677,7 @@ export async function saveHumanDecision(
       latestDecision.editedSuggestion === editedSuggestion &&
       (!intendedStatus || existingSession.status === intendedStatus)
     ) {
+      await reconcileObservationKnowledge(tx, sessionId);
       return {
         decisionId: latestDecision.id,
         status: existingSession.status as ObservationSessionStatus,
@@ -708,6 +710,7 @@ export async function saveHumanDecision(
       data: { status: nextStatus },
       select: { status: true },
     });
+    await reconcileObservationKnowledge(tx, sessionId);
 
     return {
       decisionId: decision.id,

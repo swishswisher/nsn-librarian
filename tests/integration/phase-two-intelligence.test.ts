@@ -135,7 +135,7 @@ function knowledgeIndex(sessionId: string, libraryId: string, left: { file: { id
 
 test("persistent relationships deduplicate repeated scans and archive changed evidence", async () => {
   const library = await createLibrary("Root A");
-  const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const left = await createObservedFile({ checksum: "a".repeat(64), libraryId: library.id, relativePath: "Operations/invoice.txt", sessionId: firstScan.id });
   const right = await createObservedFile({ checksum: "b".repeat(64), libraryId: library.id, relativePath: "Finance/payment.txt", sessionId: firstScan.id });
   const firstIndex = knowledgeIndex(firstScan.id, library.id, left, right);
@@ -149,7 +149,7 @@ test("persistent relationships deduplicate repeated scans and archive changed ev
   assert.match(references, /"start":40/);
   assert.equal(references.includes("invoice payment"), false);
 
-  const secondScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const secondScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const sameLeft = await createObservedFile({ checksum: "a".repeat(64), libraryId: library.id, relativePath: "Operations/invoice.txt", sessionId: secondScan.id });
   const sameRight = await createObservedFile({ checksum: "b".repeat(64), libraryId: library.id, relativePath: "Finance/payment.txt", sessionId: secondScan.id });
   await persistent.persistScanWorkingKnowledge(knowledgeIndex(secondScan.id, library.id, sameLeft, sameRight));
@@ -170,7 +170,7 @@ test("persistent relationships deduplicate repeated scans and archive changed ev
   }), []);
   await prisma.connectedLibrary.update({ data: { isEnabled: true, status: "CONNECTED" }, where: { id: library.id } });
 
-  const thirdScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const thirdScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const changedLeft = await createObservedFile({ checksum: "c".repeat(64), libraryId: library.id, relativePath: "Operations/invoice.txt", sessionId: thirdScan.id });
   const unchangedRight = await createObservedFile({ checksum: "b".repeat(64), libraryId: library.id, relativePath: "Finance/payment.txt", sessionId: thirdScan.id });
   await persistent.persistScanWorkingKnowledge(knowledgeIndex(thirdScan.id, library.id, changedLeft, unchangedRight));
@@ -186,14 +186,14 @@ test("persistent relationships deduplicate repeated scans and archive changed ev
 
 test("changed evidence preserves a confirmed relationship as historical", async () => {
   const library = await createLibrary("Confirmed history root");
-  const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const left = await createObservedFile({ checksum: "d".repeat(64), libraryId: library.id, relativePath: "Finance/invoice.txt", sessionId: firstScan.id });
   const right = await createObservedFile({ checksum: "e".repeat(64), libraryId: library.id, relativePath: "Finance/payment.txt", sessionId: firstScan.id });
   await persistent.persistScanWorkingKnowledge(knowledgeIndex(firstScan.id, library.id, left, right));
   const original = await prisma.knowledgeConnection.findFirstOrThrow({ where: { sourceFileKey: { not: null }, status: "NEW" } });
   await prisma.knowledgeConnection.update({ data: { status: "CONFIRMED" }, where: { id: original.id } });
 
-  const secondScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const secondScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const changed = await createObservedFile({ checksum: "f".repeat(64), libraryId: library.id, relativePath: "Finance/invoice.txt", sessionId: secondScan.id });
   const same = await createObservedFile({ checksum: "e".repeat(64), libraryId: library.id, relativePath: "Finance/payment.txt", sessionId: secondScan.id });
   await persistent.persistScanWorkingKnowledge(knowledgeIndex(secondScan.id, library.id, changed, same));
@@ -213,13 +213,13 @@ function withVerifiedFields(index: ReturnType<typeof knowledgeIndex>, fileId: st
 
 test("explicit client identity connects separate scans without multiplying repeated-file signals", async () => {
   const library = await createLibrary("Entity root");
-  const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const first = await createObservedFile({ checksum: "1".repeat(64), libraryId: library.id, relativePath: "Loose/intake.txt", sessionId: firstScan.id });
   const filler = await createObservedFile({ checksum: "2".repeat(64), libraryId: library.id, relativePath: "Other/notes.txt", sessionId: firstScan.id });
   await persistent.persistScanWorkingKnowledge(withVerifiedFields(knowledgeIndex(firstScan.id, library.id, first, filler), first.file.id, "Client: Alex Lee; Client ID: C-101; Project: Intake; Project ID: P-1"));
   assert.equal(await prisma.knowledgeDocumentSignal.count({ where: { connectedLibraryId: library.id, kind: "CLIENT" } }), 1);
 
-  const secondScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const secondScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const repeated = await createObservedFile({ checksum: "1".repeat(64), libraryId: library.id, relativePath: "Loose/intake.txt", sessionId: secondScan.id });
   const second = await createObservedFile({ checksum: "3".repeat(64), libraryId: library.id, relativePath: "Clients/followup.txt", sessionId: secondScan.id });
   const secondIndex = knowledgeIndex(secondScan.id, library.id, repeated, second);
@@ -236,7 +236,7 @@ test("explicit client identity connects separate scans without multiplying repea
 
 test("repeated name-only mentions remain separate unresolved files", async () => {
   const library = await createLibrary("Ambiguous client root");
-  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const first = await createObservedFile({ checksum: "a".repeat(64), libraryId: library.id, relativePath: "a.txt", sessionId: scan.id });
   const second = await createObservedFile({ checksum: "b".repeat(64), libraryId: library.id, relativePath: "b.txt", sessionId: scan.id });
   const index = knowledgeIndex(scan.id, library.id, first, second);
@@ -266,7 +266,7 @@ test("repeated name-only mentions remain separate unresolved files", async () =>
 
 test("read-revoked roots cannot expose or change current identity relationships", async () => {
   const library = await createLibrary("Permission-limited identity root");
-  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const first = await createObservedFile({ checksum: "7".repeat(64), libraryId: library.id,
     relativePath: "first.txt", sessionId: scan.id });
   const second = await createObservedFile({ checksum: "8".repeat(64), libraryId: library.id,
@@ -302,7 +302,7 @@ test("read-revoked roots cannot expose or change current identity relationships"
 
 test("changed client identity retires provisional links but preserves a human rejection", async () => {
   const library = await createLibrary("Corrected entity root");
-  const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const left = await createObservedFile({ checksum: "4".repeat(64), libraryId: library.id, relativePath: "a.txt", sessionId: firstScan.id });
   const right = await createObservedFile({ checksum: "5".repeat(64), libraryId: library.id, relativePath: "b.txt", sessionId: firstScan.id });
   const firstIndex = knowledgeIndex(firstScan.id, library.id, left, right);
@@ -323,7 +323,7 @@ test("changed client identity retires provisional links but preserves a human re
   await persistent.persistScanWorkingKnowledge(firstIndex);
   assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: link.id } })).status, "REJECTED");
 
-  const changedScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const changedScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const changed = await createObservedFile({ checksum: "6".repeat(64), libraryId: library.id, relativePath: "a.txt", sessionId: changedScan.id });
   const unchanged = await createObservedFile({ checksum: "5".repeat(64), libraryId: library.id, relativePath: "b.txt", sessionId: changedScan.id });
   const changedIndex = knowledgeIndex(changedScan.id, library.id, changed, unchanged);
@@ -345,7 +345,7 @@ test("changed client identity retires provisional links but preserves a human re
 
 test("a file absent from the latest scan makes its old identity link historical and unreviewable", async () => {
   const library = await createLibrary("Missing file root");
-  const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const first = await createObservedFile({ checksum: "3".repeat(64), libraryId: library.id, relativePath: "one.txt", sessionId: firstScan.id });
   const second = await createObservedFile({ checksum: "4".repeat(64), libraryId: library.id, relativePath: "two.txt", sessionId: firstScan.id });
   const index = knowledgeIndex(firstScan.id, library.id, first, second);
@@ -356,7 +356,7 @@ test("a file absent from the latest scan makes its old identity link historical 
     sourceFileKey: { in: [persistent.persistentFileKey(library.id, "one.txt"), persistent.persistentFileKey(library.id, "two.txt")] },
     targetFileKey: { in: [persistent.persistentFileKey(library.id, "one.txt"), persistent.persistentFileKey(library.id, "two.txt")] },
   } });
-  const latestScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const latestScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const repeated = await createObservedFile({ checksum: "3".repeat(64), libraryId: library.id, relativePath: "one.txt", sessionId: latestScan.id });
   const filler = await createObservedFile({ checksum: "5".repeat(64), libraryId: library.id, relativePath: "other.txt", sessionId: latestScan.id });
   const latestIndex = knowledgeIndex(latestScan.id, library.id, repeated, filler);
@@ -372,7 +372,7 @@ test("a file absent from the latest scan makes its old identity link historical 
 
 test("human corrections join distinct client labels and assign a document to a project without file actions", async () => {
   const library = await createLibrary("Human correction root");
-  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const first = await createObservedFile({ checksum: "b".repeat(64), libraryId: library.id, relativePath: "Clients/one.txt", sessionId: scan.id });
   const second = await createObservedFile({ checksum: "c".repeat(64), libraryId: library.id, relativePath: "Clients/two.txt", sessionId: scan.id });
   const peer = await createObservedFile({ checksum: "0".repeat(64), libraryId: library.id, relativePath: "Clients/peer.txt", sessionId: scan.id });
@@ -436,7 +436,7 @@ test("human corrections join distinct client labels and assign a document to a p
     group.members.some((member) => member.relativePath === first.file.relativePath) &&
     group.members.some((member) => member.relativePath === second.file.relativePath)));
   const otherLibrary = await createLibrary("Different root");
-  const otherScan = await prisma.scanSession.create({ data: { connectedFolderId: otherLibrary.id } });
+  const otherScan = await prisma.scanSession.create({ data: { connectedFolderId: otherLibrary.id, status: "COMPLETED" } });
   const other = await createObservedFile({ checksum: "e".repeat(64), libraryId: otherLibrary.id, relativePath: "outside.txt", sessionId: otherScan.id });
   const otherFiller = await createObservedFile({ checksum: "f".repeat(64), libraryId: otherLibrary.id, relativePath: "other.txt", sessionId: otherScan.id });
   const otherIndex = knowledgeIndex(otherScan.id, otherLibrary.id, other, otherFiller);
@@ -450,7 +450,7 @@ test("human corrections join distinct client labels and assign a document to a p
 
 test("explicit v1/v2 forms a revision link while identical copies and filenames do not", async () => {
   const library = await createLibrary("Version root");
-  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const first = await createObservedFile({ checksum: "7".repeat(64), libraryId: library.id, relativePath: "final.txt", sessionId: scan.id });
   const second = await createObservedFile({ checksum: "8".repeat(64), libraryId: library.id, relativePath: "final2.txt", sessionId: scan.id });
   const index = knowledgeIndex(scan.id, library.id, first, second);
@@ -467,7 +467,7 @@ test("explicit v1/v2 forms a revision link while identical copies and filenames 
   await persistent.persistScanWorkingKnowledge(index);
   assert.equal(await prisma.knowledgeConnection.count({ where: { relationshipKind: "PROBABLE_REVISION" } }), 1);
 
-  const sameScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const sameScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const copy = await createObservedFile({ checksum: "7".repeat(64), libraryId: library.id, relativePath: "copy.txt", sessionId: sameScan.id });
   const other = await createObservedFile({ checksum: "9".repeat(64), libraryId: library.id, relativePath: "unrelated-final2.txt", sessionId: sameScan.id });
   await createObservedFile({ checksum: "8".repeat(64), libraryId: library.id, relativePath: "final2.txt", sessionId: sameScan.id });
@@ -480,7 +480,7 @@ test("explicit v1/v2 forms a revision link while identical copies and filenames 
     { sourceFileKey: persistent.persistentFileKey(library.id, "copy.txt"), targetFileKey: persistent.persistentFileKey(library.id, "final.txt") },
   ] } }), 0);
 
-  const changedScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const changedScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const revised = await createObservedFile({ checksum: "a".repeat(64), libraryId: library.id, relativePath: "final.txt", sessionId: changedScan.id });
   const stillV2 = await createObservedFile({ checksum: "8".repeat(64), libraryId: library.id, relativePath: "final2.txt", sessionId: changedScan.id });
   const revisedIndex = knowledgeIndex(changedScan.id, library.id, revised, stillV2);
@@ -550,7 +550,7 @@ test("large scans keep rare grounded subjects connected without unbounded pairs"
 
 test("disconnected roots provide no new persistent relationships", async () => {
   const library = await createLibrary("Disconnected Root");
-  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const left = await createObservedFile({ checksum: "1".repeat(64), libraryId: library.id, relativePath: "a.txt", sessionId: scan.id });
   const right = await createObservedFile({ checksum: "2".repeat(64), libraryId: library.id, relativePath: "b.txt", sessionId: scan.id });
   await prisma.connectedLibrary.update({ data: { isEnabled: false, status: "DISCONNECTED" }, where: { id: library.id } });
@@ -558,7 +558,7 @@ test("disconnected roots provide no new persistent relationships", async () => {
 });
 
 async function createReviewedMove(libraryId: string, source: string) {
-  const scan = await prisma.scanSession.create({ data: { connectedFolderId: libraryId } });
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: libraryId, status: "COMPLETED" } });
   const file = await prisma.scannedFile.create({
     data: {
       checksum: crypto.randomUUID().replaceAll("-", ""),
@@ -605,7 +605,7 @@ test("two reviewed moves propose a local rule, but only explicit approval activa
   await prisma.connectedLibrary.update({ data: { isEnabled: false, status: "DISCONNECTED" }, where: { id: library.id } });
   assert.equal((await preferences.applicableApprovedPreferences({ connectedLibraryId: library.id, contentText: "invoice payment", destination: "finance" })).length, 0);
   await prisma.connectedLibrary.update({ data: { isEnabled: true, status: "CONNECTED" }, where: { id: library.id } });
-  const futureScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id } });
+  const futureScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const future = await createObservedFile({
     checksum: "f".repeat(64),
     libraryId: library.id,
@@ -706,4 +706,143 @@ test("simultaneous conflicting preference approvals leave at most one active des
   assert.equal(await prisma.organizationPreference.count({
     where: { connectedLibraryId: library.id, status: "APPROVED", disputedAt: null },
   }), 1);
+});
+
+async function reviewedIdentityFixture(name: string) {
+  const library = await createLibrary(name);
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id,
+    status: "COMPLETED", searchIndexStatus: "COMPLETED", startedAt: new Date("2026-09-01T00:00:00Z") } });
+  const left = await createObservedFile({ checksum: "a".repeat(64), libraryId: library.id,
+    relativePath: "Clients/intake.txt", sessionId: scan.id });
+  const right = await createObservedFile({ checksum: "b".repeat(64), libraryId: library.id,
+    relativePath: "Clients/followup.txt", sessionId: scan.id });
+  const index = knowledgeIndex(scan.id, library.id, left, right);
+  for (const item of [left, right]) {
+    withVerifiedFields(index, item.file.id, "Client ID: C-101; Project ID: P-101");
+    await prisma.observationSession.update({ data: { observerType: "OPENAI",
+      observations: [{ evidence: [index.files.find((file) => file.id === item.file.id)!.sourceEvidenceText] }] },
+      where: { id: item.observation.id } });
+  }
+  await persistent.persistScanWorkingKnowledge(index);
+  const indexer = await import("../../src/lib/library/search-index");
+  await indexer.indexScanKnowledge(index);
+  return { library, scan, left, right, index, indexer };
+}
+
+test("rejecting an observation retires its identities and links before search refresh, retaining reviewed history", async () => {
+  const fixture = await reviewedIdentityFixture("Rejected identity lifecycle");
+  const { library, left, right, indexer } = fixture;
+  const approvedHistory = await prisma.observationSession.create({ data: {
+    libraryDocumentId: left.observation.libraryDocumentId, observerType: "OPENAI", status: "APPROVED",
+    createdAt: new Date("2025-01-01T00:00:00Z"), confidence: 0.7,
+    observations: [{ evidence: ['Source characters 0-16: "Client ID: C-055"'] }],
+    explanation: [], interpretations: [], planSuggestions: [], warnings: [],
+  } });
+  const link = await prisma.knowledgeConnection.findFirstOrThrow({ where: {
+    relationshipKind: "SAME_CLIENT", sourceObservationSessionId: { in: [left.observation.id, right.observation.id] },
+  } });
+  await persistent.reviewPersistentRelationship(link.id, "CONFIRM", "Earlier human review.");
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  const decision = await saveHumanDecision(left.observation.id, { decisionType: "REJECT" });
+  const retired = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: {
+    observationSessionId: left.observation.id, kind: "CLIENT", status: "SUPERSEDED",
+  } });
+  const retry = await saveHumanDecision(left.observation.id, { decisionType: "REJECT" });
+  assert.equal(retry.decisionId, decision.decisionId);
+  assert.equal(await prisma.humanDecision.count({ where: { observationSessionId: left.observation.id } }), 1);
+  assert.equal((await prisma.knowledgeDocumentSignal.findUniqueOrThrow({ where: { id: retired.id } })).supersededAt?.getTime(), retired.supersededAt?.getTime());
+  const historical = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: link.id } });
+  assert.equal(historical.status, "CONFIRMED");
+  assert.ok(historical.supersededAt);
+  assert.equal(await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: link.id } }), 1);
+  assert.equal(await prisma.knowledgeConnection.count({ where: { supersededAt: null, status: "NEW",
+    OR: [{ sourceObservationSessionId: left.observation.id }, { targetObservationSessionId: left.observation.id }] } }), 0);
+  assert.ok(await prisma.knowledgeDocumentSignal.count({ where: { observationSessionId: right.observation.id, kind: "CLIENT", status: "ACTIVE" } }));
+  await indexer.refreshSearchForObservation(left.observation.id);
+  assert.deepEqual((await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: left.file.id } })).entityHashes, []);
+  assert.equal((await prisma.observationSession.findUniqueOrThrow({ where: { id: approvedHistory.id } })).status, "APPROVED");
+  const { loadScanWorkingKnowledge } = await import("../../src/lib/bridge/scan-working-knowledge");
+  const rejectedWorking = (await loadScanWorkingKnowledge(fixture.scan.id)).files.find((file) => file.id === left.file.id)!;
+  assert.equal(rejectedWorking.sourceEvidenceText, "");
+  assert.deepEqual(rejectedWorking.trustedObservationEvidence, []);
+  assert.equal((await persistent.getPersistentIdentityGroups()).some((group) => group.libraryName === library.displayName &&
+    group.kind === "CLIENT" && group.members.some((file) => file.relativePath === left.file.relativePath)), false);
+  const { retrieveQuestionContext } = await import("../../src/lib/library/qa/retrieve");
+  assert.deepEqual((await retrieveQuestionContext("Client C-101", [library.id])).relationships, []);
+  await persistent.persistScanWorkingKnowledge(fixture.index);
+  assert.equal(await prisma.knowledgeDocumentSignal.count({ where: {
+    observationSessionId: left.observation.id, kind: "CLIENT", status: "ACTIVE",
+  } }), 0);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("human observation corrections supersede provisional identity hashes and remain idempotent after a note or regeneration", async () => {
+  const { left, library, index, indexer, scan } = await reviewedIdentityFixture("Corrected identity lifecycle");
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  const correction = { decisionType: "MODIFY" as const, editedSuggestion: "Client ID: C-202; Project ID: P-202" };
+  const first = await saveHumanDecision(left.observation.id, correction);
+  const retry = await saveHumanDecision(left.observation.id, correction);
+  assert.equal(first.decisionId, retry.decisionId);
+  const signals = await prisma.knowledgeDocumentSignal.findMany({ where: {
+    observationSessionId: left.observation.id, status: "ACTIVE", kind: { not: "FILE_ANCHOR" },
+  } });
+  const { extractDocumentSignals } = await import("../../src/lib/bridge/document-signals");
+  assert.deepEqual(signals.map((signal) => signal.identityHash).sort(),
+    extractDocumentSignals(correction.editedSuggestion, library.id).map((signal) => signal.identityHash).sort());
+  assert.ok(signals.every((signal) => JSON.stringify(signal.sourceRanges) === "[]"));
+  assert.equal(await prisma.knowledgeDocumentSignal.count({ where: {
+    observationSessionId: left.observation.id, status: "SUPERSEDED", kind: { in: ["CLIENT", "PROJECT"] },
+  } }), 2);
+  await saveHumanDecision(left.observation.id, { decisionType: "NOTE", note: "Correction remains authoritative." });
+  await indexer.refreshSearchForObservation(left.observation.id);
+  const entry = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: left.file.id } });
+  assert.deepEqual(entry.entityHashes.sort(), signals.map((signal) => signal.identityHash).sort());
+  assert.equal(entry.knowledgeState, "APPROVED");
+  await persistent.persistScanWorkingKnowledge(index);
+  const { loadScanWorkingKnowledge } = await import("../../src/lib/bridge/scan-working-knowledge");
+  const working = (await loadScanWorkingKnowledge(scan.id)).files.find((file) => file.id === left.file.id)!;
+  assert.deepEqual(working.provisionalWorkingEvidence, []);
+  assert.deepEqual(working.trustedObservationEvidence, [correction.editedSuggestion]);
+  assert.equal(await prisma.knowledgeConnection.count({ where: { status: "NEW", supersededAt: null,
+    OR: [{ sourceObservationSessionId: left.observation.id }, { targetObservationSessionId: left.observation.id }],
+  } }), 0);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("incomplete and failed snapshots cannot replace completed identities, search or QA; a completed snapshot can", async () => {
+  const { library, left, right, scan, indexer } = await reviewedIdentityFixture("Stable completed snapshot");
+  const link = await prisma.knowledgeConnection.findFirstOrThrow({ where: {
+    relationshipKind: "SAME_CLIENT", sourceObservationSessionId: { in: [left.observation.id, right.observation.id] },
+  } });
+  const next = await prisma.scanSession.create({ data: { connectedFolderId: library.id,
+    startedAt: new Date("2026-09-02T00:00:00Z"), status: "PENDING" } });
+  const replacement = await createObservedFile({ checksum: "c".repeat(64), libraryId: library.id,
+    relativePath: left.file.relativePath, sessionId: next.id });
+  const nextIndex = withVerifiedFields(knowledgeIndex(next.id, library.id, replacement, replacement), replacement.file.id, "Client ID: C-202");
+  const { searchLibrary } = await import("../../src/lib/library/search");
+  const { retrieveQuestionContext } = await import("../../src/lib/library/qa/retrieve");
+  for (const status of ["PENDING", "SCANNING", "READING", "EXAMINING", "GENERATING_SUGGESTIONS", "FAILED"] as const) {
+    await prisma.scanSession.update({ data: { status }, where: { id: next.id } });
+    assert.equal(await persistent.persistScanWorkingKnowledge(nextIndex), 0);
+    assert.equal(await indexer.indexScanKnowledge(nextIndex), 0);
+    await indexer.refreshSearchForObservation(left.observation.id);
+    assert.ok((await persistent.getPersistentIdentityGroups()).some((group) => group.libraryName === library.displayName && group.members.length === 2));
+    const displayed = (await persistent.getRecentPersistentFileRelationships()).find((item) => item.id === link.id);
+    assert.equal(displayed?.status, "NEW");
+    assert.equal(displayed?.reviewable, true);
+    assert.ok((await searchLibrary("intake.txt", [library.id])).some((result) => result.href.includes(scan.id)));
+    const context = await retrieveQuestionContext("Client C-101", [library.id]);
+    assert.ok(context.sources.length > 0);
+    assert.ok(context.sources.every((source) => source.href.includes(scan.id)));
+    assert.equal(context.indexIncomplete, true);
+  }
+  await persistent.reviewPersistentRelationship(link.id, "CONFIRM", "The completed sources remain current.");
+  await prisma.scanSession.update({ data: { status: "COMPLETED_WITH_ERRORS" }, where: { id: next.id } });
+  await persistent.persistScanWorkingKnowledge(nextIndex);
+  await indexer.indexScanKnowledge(nextIndex);
+  assert.equal((await persistent.getRecentPersistentFileRelationships()).find((item) => item.id === link.id)?.status, "ARCHIVED");
+  assert.equal((await persistent.getPersistentIdentityGroups()).some((group) => group.libraryName === library.displayName &&
+    group.members.some((file) => file.relativePath === right.file.relativePath)), false);
+  assert.equal((await searchLibrary("followup.txt", [library.id])).length, 0);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
 });

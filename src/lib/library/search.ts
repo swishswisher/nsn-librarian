@@ -2,6 +2,7 @@ import path from "node:path";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/document-signals";
+import { usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
 import { mediaCategoryForFileType } from "@/lib/bridge/media-kind";
 import { searchTopicIds, workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
 import { getScannedFileExamineRoute, getScanSessionRoute } from "@/lib/library/routes";
@@ -127,8 +128,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   // database predicate; there is no per-user library ownership model to infer.
   const roots = await prisma.connectedLibrary.findMany({
     select: { id: true, displayName: true, scanSessions: {
-      orderBy: { startedAt: "desc" }, select: { id: true }, take: 1,
-      where: { status: { in: ["COMPLETED", "COMPLETED_WITH_ERRORS"] } },
+      orderBy: [{ startedAt: "desc" }, { id: "desc" }], select: { id: true }, take: 1,
+      where: usableScanSnapshotWhere,
     } },
     where: { isEnabled: true, readPermission: true, status: "CONNECTED",
       ...(permittedRootIds ? { id: { in: permittedRootIds } } : {}),

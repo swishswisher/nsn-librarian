@@ -77,6 +77,8 @@ export async function POST(
     revalidatePath("/admin/library/review");
     revalidatePath(`/admin/library/review/${sessionId}`);
     revalidatePath("/admin/library/memory");
+    revalidatePath("/admin/library/knowledge");
+    revalidatePath("/admin/library/documents");
     revalidatePath(getNotebookRoute());
     revalidatePath(getNotebookArchiveRoute());
 

@@ -1,15 +1,66 @@
 import { createHash } from "node:crypto";
+import type { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 
 import { compareDocumentVersions, documentSignalVersion, extractDocumentSignals } from "./document-signals";
 import { normalizePhysicalRelativePath } from "./physical-file-identity";
-import type { ScanWorkingKnowledgeIndex } from "./scan-working-knowledge";
+import { loadScanWorkingKnowledge, type ScanWorkingKnowledgeIndex } from "./scan-working-knowledge";
 
 export const relationshipGenerationVersion = "scan-relationships-v1";
 export const humanIdentityCorrectionVersion = "human-identity-correction-v1";
 const maxRelationshipsPerFile = 3;
 const resolvedSignalKinds = ["CLIENT", "PERSON", "ORGANIZATION", "PROJECT", "WORKSHOP", "DOCUMENT_FAMILY"];
+
+export const usableScanSnapshotWhere = {
+  status: { in: ["COMPLETED", "COMPLETED_WITH_ERRORS"] },
+} satisfies Prisma.ScanSessionWhereInput;
+
+export async function reconcileObservationKnowledge(tx: Prisma.TransactionClient, observationSessionId: string) {
+  const observation = await tx.observationSession.findUnique({
+    select: { status: true, humanDecisions: {
+      where: { decisionType: "MODIFY" }, orderBy: { createdAt: "desc" },
+      select: { editedSuggestion: true }, take: 1,
+    } },
+    where: { id: observationSessionId },
+  });
+  if (!observation || !["REJECTED", "MODIFIED"].includes(observation.status)) return;
+  const rows = await tx.knowledgeDocumentSignal.findMany({ where: { observationSessionId, status: "ACTIVE", supersededAt: null } });
+  const corrected = observation.status === "MODIFIED" ? observation.humanDecisions[0]?.editedSuggestion ?? "" : "";
+  const sources = [...new Map(rows.map((row) => [`${row.fileKey}:${row.checksum}`, row])).values()];
+  const replacements = sources.flatMap((row) => extractDocumentSignals(corrected, row.connectedLibraryId).map((signal) => ({
+    ...signal, sourceRanges: [], connectedLibraryId: row.connectedLibraryId,
+    fileKey: row.fileKey, checksum: row.checksum, relativePath: row.relativePath,
+    observationSessionId,
+    signalKey: digest([documentSignalVersion, row.fileKey, row.checksum, signal.kind, signal.identityHash].join("\0")),
+  })));
+  await tx.knowledgeDocumentSignal.updateMany({
+    data: { status: "SUPERSEDED", supersededAt: new Date() },
+    where: { observationSessionId, status: "ACTIVE", kind: { not: "FILE_ANCHOR" },
+      signalKey: { notIn: replacements.map((signal) => signal.signalKey) } },
+  });
+  for (const signal of replacements) {
+    await tx.knowledgeDocumentSignal.upsert({
+      create: { ...signal, generationVersion: documentSignalVersion },
+      update: { status: "ACTIVE", supersededAt: null, sourceRanges: [] },
+      where: { signalKey: signal.signalKey },
+    });
+  }
+  // Retain decisions and confirmed history; retire only claims derived from the reviewed observation.
+  const affected = {
+    supersededAt: null,
+    AND: [
+      { OR: [{ sourceObservationSessionId: observationSessionId }, { targetObservationSessionId: observationSessionId }] },
+      { OR: [{ generationVersion: null }, { generationVersion: { not: humanIdentityCorrectionVersion } }] },
+    ],
+  };
+  await tx.knowledgeConnection.updateMany({
+    data: { status: "ARCHIVED", supersededAt: new Date() }, where: { ...affected, status: "NEW" },
+  });
+  await tx.knowledgeConnection.updateMany({
+    data: { supersededAt: new Date() }, where: { ...affected, status: "CONFIRMED" },
+  });
+}
 
 function digest(value: string) {
   return createHash("sha256").update(value).digest("hex");
@@ -121,14 +172,21 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
   const session = await prisma.scanSession.findUnique({
     select: {
       connectedFolderId: true,
+      status: true,
       connectedFolder: { select: { isEnabled: true, status: true } },
     },
     where: { id: index.scanSessionId },
   });
 
-  if (!session || !session.connectedFolder.isEnabled || session.connectedFolder.status === "DISCONNECTED") {
+  if (!session || !["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(session.status) ||
+      !session.connectedFolder.isEnabled || session.connectedFolder.status === "DISCONNECTED") {
     return 0;
   }
+  const latestSnapshot = await prisma.scanSession.findFirst({
+    orderBy: [{ startedAt: "desc" }, { id: "desc" }], select: { id: true },
+    where: { ...usableScanSnapshotWhere, connectedFolderId: session.connectedFolderId },
+  });
+  if (latestSnapshot?.id !== index.scanSessionId) return 0;
 
   const files = await prisma.scannedFile.findMany({
     select: {
@@ -138,7 +196,10 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
         select: {
           observationSessions: {
             orderBy: { createdAt: "desc" },
-            select: { id: true },
+            select: { id: true, status: true, humanDecisions: {
+              where: { decisionType: "MODIFY" }, orderBy: { createdAt: "desc" },
+              select: { editedSuggestion: true }, take: 1,
+            } },
             take: 1,
           },
         },
@@ -148,7 +209,10 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
     where: { sessionId: index.scanSessionId },
   });
   const byId = new Map(files.map((file) => [file.id, file]));
-  const workingFileById = new Map(index.files.map((file) => [file.id, file]));
+  // A review can finish after a batch computed its index; do not republish superseded claims.
+  const currentIndex = files.some((file) => ["REJECTED", "MODIFIED"].includes(file.libraryDocument?.observationSessions[0]?.status ?? ""))
+    ? await loadScanWorkingKnowledge(index.scanSessionId) : index;
+  const workingFileById = new Map(currentIndex.files.map((file) => [file.id, file]));
   const moves = await knownExecutedMoves(session.connectedFolderId);
   const keyFor = (file: typeof files[number]) =>
     fileKeyAfterKnownMoves(session.connectedFolderId, file.relativePath, file.checksum, moves);
@@ -200,12 +264,14 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
 
   let persisted = 0;
   const currentRelationshipKeys = new Set<string>();
-  for (const relationship of selectPersistentRelationships(index)) {
+  for (const relationship of selectPersistentRelationships(currentIndex)) {
     const left = byId.get(relationship.leftFileId);
     const right = byId.get(relationship.rightFileId);
     const leftObservationId = left?.libraryDocument?.observationSessions[0]?.id;
     const rightObservationId = right?.libraryDocument?.observationSessions[0]?.id;
     if (!left || !right || !leftObservationId || !rightObservationId ||
+        left.libraryDocument?.observationSessions[0]?.status === "REJECTED" ||
+        right.libraryDocument?.observationSessions[0]?.status === "REJECTED" ||
         leftObservationId === rightObservationId || !left.checksum || !right.checksum) {
       continue;
     }
@@ -266,11 +332,15 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
     persisted += 1;
   }
   const signalRows = files.flatMap((file) => {
-    const observationId = file.libraryDocument?.observationSessions[0]?.id;
+    const observation = file.libraryDocument?.observationSessions[0];
+    const observationId = observation?.id;
     const workingFile = workingFileById.get(file.id);
     if (!observationId || !file.checksum || !workingFile) return [];
     const fileKey = keyFor(file);
-    const extracted = extractDocumentSignals(workingFile.sourceEvidenceText, session.connectedFolderId);
+    const extracted = observation?.status === "REJECTED" ? [] : extractDocumentSignals(
+      observation?.status === "MODIFIED" ? observation.humanDecisions[0]?.editedSuggestion ?? "" : workingFile.sourceEvidenceText,
+      session.connectedFolderId,
+    ).map((signal) => ({ ...signal, sourceRanges: observation?.status === "MODIFIED" ? [] : signal.sourceRanges }));
     return [...extracted, {
       kind: "FILE_ANCHOR",
       identityHash: digest(`${session.connectedFolderId}\0${fileKey}`),
@@ -585,14 +655,17 @@ async function currentSnapshotSignals<T extends { connectedLibraryId: string; ch
   const latestDates = await prisma.scanSession.groupBy({
     by: ["connectedFolderId"],
     _max: { startedAt: true },
-    where: { connectedFolderId: { in: libraries } },
+    where: { ...usableScanSnapshotWhere, connectedFolderId: { in: libraries } },
   });
   const sessions = await prisma.scanSession.findMany({
     orderBy: { id: "desc" },
     select: { connectedFolderId: true, id: true, startedAt: true },
-    where: { OR: latestDates.flatMap((item) => item._max.startedAt ? [{ connectedFolderId: item.connectedFolderId, startedAt: item._max.startedAt }] : []) },
+    where: { ...usableScanSnapshotWhere, OR: latestDates.flatMap((item) => item._max.startedAt ? [{ connectedFolderId: item.connectedFolderId, startedAt: item._max.startedAt }] : []) },
   });
-  const latestByLibrary = new Map(sessions.map((session) => [session.connectedFolderId, session.id]));
+  const latestByLibrary = new Map<string, string>();
+  for (const session of sessions) {
+    if (!latestByLibrary.has(session.connectedFolderId)) latestByLibrary.set(session.connectedFolderId, session.id);
+  }
   const files = await prisma.scannedFile.findMany({
     select: { checksum: true, relativePath: true, sessionId: true },
     where: { sessionId: { in: [...latestByLibrary.values()] }, relativePath: { in: [...new Set(signals.map((signal) => signal.relativePath))] } },
@@ -625,7 +698,7 @@ export async function reviewPersistentRelationship(id: string, action: "CONFIRM"
     if (!library) throw new RelationshipReviewError("This library is not available for relationship review.", 409);
     const sourcePath = typeof evidence.sourceRelativePath === "string" ? evidence.sourceRelativePath : null;
     const targetPath = typeof evidence.targetRelativePath === "string" ? evidence.targetRelativePath : null;
-    const latestScan = await tx.scanSession.findFirst({ orderBy: { startedAt: "desc" }, select: { id: true }, where: { connectedFolderId: libraryId } });
+    const latestScan = await tx.scanSession.findFirst({ orderBy: [{ startedAt: "desc" }, { id: "desc" }], select: { id: true }, where: { ...usableScanSnapshotWhere, connectedFolderId: libraryId } });
     const files = latestScan && sourcePath && targetPath ? await tx.scannedFile.findMany({
       select: { checksum: true, relativePath: true },
       where: { sessionId: latestScan.id, relativePath: { in: [sourcePath, targetPath] } },
@@ -730,9 +803,9 @@ export async function createIdentityCorrection(input: {
       throw new RelationshipReviewError("This library is not available for relationship correction.", 409);
     }
     const latestScan = await tx.scanSession.findFirst({
-      orderBy: { startedAt: "desc" },
+      orderBy: [{ startedAt: "desc" }, { id: "desc" }],
       select: { id: true },
-      where: { connectedFolderId: source.connectedLibraryId },
+      where: { ...usableScanSnapshotWhere, connectedFolderId: source.connectedLibraryId },
     });
     const currentFiles = latestScan ? await tx.scannedFile.findMany({
       select: { checksum: true, relativePath: true },

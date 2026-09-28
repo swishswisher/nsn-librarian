@@ -106,29 +106,6 @@ export async function generateScanRecommendationBatch(
 ) {
   const prisma = getPrismaClient();
   const workingKnowledge = await loadScanWorkingKnowledge(sessionId);
-  try {
-    await persistScanWorkingKnowledge(workingKnowledge);
-    await prisma.scanSession.update({
-      data: { knowledgePersistenceStatus: "COMPLETED" },
-      where: { id: sessionId },
-    });
-  } catch {
-    await prisma.scanSession.update({
-      data: { knowledgePersistenceStatus: "INCOMPLETE" },
-      where: { id: sessionId },
-    });
-    // Partial knowledge must not stop current-scan recommendations.
-  }
-  try {
-    await indexScanKnowledge(workingKnowledge);
-    await prisma.scanSession.update({
-      data: { searchIndexStatus: "COMPLETED" }, where: { id: sessionId },
-    });
-  } catch {
-    await prisma.scanSession.update({
-      data: { searchIndexStatus: "INCOMPLETE" }, where: { id: sessionId },
-    });
-  }
   const files = await prisma.scannedFile.findMany({
     orderBy: { relativePath: "asc" },
     select: {
@@ -171,6 +148,31 @@ export async function generateScanRecommendationBatch(
   }
 
   await completeSession(sessionId, options.recordNotebook ?? false);
+
+  // Publish current knowledge only after the new snapshot has finished processing.
+  try {
+    await persistScanWorkingKnowledge(workingKnowledge);
+    await prisma.scanSession.update({
+      data: { knowledgePersistenceStatus: "COMPLETED" },
+      where: { id: sessionId },
+    });
+  } catch {
+    await prisma.scanSession.update({
+      data: { knowledgePersistenceStatus: "INCOMPLETE" },
+      where: { id: sessionId },
+    });
+    // Partial knowledge must not stop current-scan recommendations.
+  }
+  try {
+    await indexScanKnowledge(workingKnowledge);
+    await prisma.scanSession.update({
+      data: { searchIndexStatus: "COMPLETED" }, where: { id: sessionId },
+    });
+  } catch {
+    await prisma.scanSession.update({
+      data: { searchIndexStatus: "INCOMPLETE" }, where: { id: sessionId },
+    });
+  }
 
   return {
     createdCount,

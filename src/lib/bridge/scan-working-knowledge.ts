@@ -1075,6 +1075,7 @@ export async function loadScanWorkingKnowledge(
           select: {
             observationSessions: {
               orderBy: { createdAt: "desc" },
+              take: 1,
               select: {
                 explanation: true,
                 humanDecisions: {
