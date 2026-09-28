@@ -489,6 +489,7 @@ export async function readBridgeRootFile(
   }
 
   if (audioExtensions.has(extension)) {
+    const checksumBefore = await sourceChecksum(safeFile.localPath);
     const header = await readHeader(safeFile.localPath, safeFile.sizeBytes);
 
     if (!isValidAudioHeader(extension, header)) {
@@ -499,14 +500,20 @@ export async function readBridgeRootFile(
       );
     }
 
-    return extractAudioReview(
+    const result = await extractAudioReview(
       safeFile.localPath,
       safeFile.relativePath,
       safeFile.fileName,
     );
+    const checksumAfter = await sourceChecksum(safeFile.localPath);
+    if (checksumBefore !== checksumAfter) {
+      throw new BridgeAppError("This audio file changed while it was being read. Scan it again before examining it.", "FILE_CHANGED_DURING_READ", 409);
+    }
+    return { ...result, sourceChecksum: checksumAfter };
   }
 
   if (videoExtensions.has(extension)) {
+    const checksumBefore = await sourceChecksum(safeFile.localPath);
     const header = await readHeader(safeFile.localPath, safeFile.sizeBytes);
 
     if (!isValidVideoHeader(extension, header)) {
@@ -517,11 +524,16 @@ export async function readBridgeRootFile(
       );
     }
 
-    return extractVideoReview(
+    const result = await extractVideoReview(
       safeFile.localPath,
       safeFile.relativePath,
       safeFile.fileName,
     );
+    const checksumAfter = await sourceChecksum(safeFile.localPath);
+    if (checksumBefore !== checksumAfter) {
+      throw new BridgeAppError("This video file changed while it was being read. Scan it again before examining it.", "FILE_CHANGED_DURING_READ", 409);
+    }
+    return { ...result, sourceChecksum: checksumAfter };
   }
 
   const checksumBefore = await sourceChecksum(safeFile.localPath);

@@ -261,6 +261,94 @@ test("same-name clients with distinct identity hashes trigger clarification", as
   assert.equal(result.state, "AMBIGUOUS_ENTITY");
 });
 
+async function identityCorrectionFixture(kind: "CLIENT" | "PROJECT") {
+  const r = await root(`Corrected ${kind} QA Root`); const s = await scan(r.id);
+  const a = await file({ rootId: r.id, sessionId: s.id, relativePath: "Alice/intake.txt",
+    quote: `${kind} Alice intake`, entityHashes: ["identity-a"] });
+  const b = await file({ rootId: r.id, sessionId: s.id, relativePath: "Alice/followup.txt",
+    quote: `${kind} Alice followup`, entityHashes: ["identity-b"] });
+  const signals = [];
+  for (const [i, item] of [a, b].entries()) {
+    signals.push(await prisma.knowledgeDocumentSignal.create({ data: {
+      signalKey: crypto.randomUUID(), connectedLibraryId: r.id,
+      fileKey: item.index.fileKey, relativePath: item.scanned.relativePath,
+      checksum: item.scanned.checksum!, kind, identityHash: i === 0 ? "identity-a" : "identity-b",
+      sourceRanges: [], observationSessionId: item.observation.id, generationVersion: documentSignalVersion,
+    } }));
+  }
+  return { r, s, a, b, signals, question: `What do we have about ${kind.toLowerCase()} Alice?` };
+}
+
+for (const kind of ["CLIENT", "PROJECT"] as const) {
+  test(`confirmed ${kind} correction resolves QA ambiguity; separation and reconsideration restore it`, async () => {
+    const { r, a, b, signals, question } = await identityCorrectionFixture(kind);
+    assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, true);
+    const correction = await identity.createIdentityCorrection({ sourceSignalId: signals[1].id,
+      targetSignalId: signals[0].id, kind: kind === "CLIENT" ? "SAME_CLIENT" : "BELONGS_TO_PROJECT",
+      note: "Verified identity correction for synthetic files" });
+    // QA must use effective current identities even before a derived search refresh.
+    assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, false);
+    const indexer = await import("../../src/lib/library/search-index");
+    await indexer.refreshSearchForIdentityRelationship(correction.id);
+    for (const item of [a, b]) assert.deepEqual((await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: item.index.id } })).entityHashes, ["identity-a"]);
+    await identity.reviewPersistentRelationship(correction.id, "SEPARATE");
+    assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, true);
+    await identity.reviewPersistentRelationship(correction.id, "CONFIRM");
+    assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, false);
+    await identity.reviewPersistentRelationship(correction.id, "RECONSIDER");
+    assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, true);
+    assert.equal(await prisma.executionRun.count(), 0);
+  });
+}
+
+test("confirmed joins never merge an unrelated same-name client", async () => {
+  const { r, s, signals, question } = await identityCorrectionFixture("CLIENT");
+  const unrelated = await file({ rootId: r.id, sessionId: s.id, relativePath: "Other/Alice.txt",
+    quote: "Client Alice separate case", entityHashes: ["unrelated-alice"] });
+  await prisma.knowledgeDocumentSignal.create({ data: {
+    signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: unrelated.index.fileKey,
+    relativePath: unrelated.scanned.relativePath, checksum: unrelated.scanned.checksum!,
+    kind: "CLIENT", identityHash: "unrelated-alice", sourceRanges: [],
+    observationSessionId: unrelated.observation.id, generationVersion: documentSignalVersion,
+  } });
+  await identity.createIdentityCorrection({ sourceSignalId: signals[1].id,
+    targetSignalId: signals[0].id, kind: "SAME_CLIENT", note: "Only these two files" });
+  assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, true);
+  assert.ok((await identity.getEffectiveDocumentSignals([r.id])).some((signal) => signal.identityHash === "unrelated-alice"));
+});
+
+test("unauthorized or changed correction targets cannot influence QA or search identities", async () => {
+  const { r, a, b, signals, question } = await identityCorrectionFixture("CLIENT");
+  const correction = await identity.createIdentityCorrection({ sourceSignalId: signals[1].id,
+    targetSignalId: signals[0].id, kind: "SAME_CLIENT", note: "Synthetic verified join" });
+  const other = await root("Unauthorized target root");
+  const otherScan = await scan(other.id);
+  const external = await file({ rootId: other.id, sessionId: otherScan.id,
+    relativePath: "Alice/external.txt", quote: "Client Alice external", entityHashes: ["identity-a"] });
+  await prisma.knowledgeDocumentSignal.create({ data: {
+    signalKey: crypto.randomUUID(), connectedLibraryId: other.id, fileKey: external.index.fileKey,
+    relativePath: external.scanned.relativePath, checksum: external.scanned.checksum!, kind: "CLIENT",
+    identityHash: "identity-a", sourceRanges: [], observationSessionId: external.observation.id,
+    generationVersion: documentSignalVersion,
+  } });
+  await prisma.connectedLibrary.update({ where: { id: other.id }, data: { readPermission: false } });
+  await prisma.knowledgeConnection.update({ where: { id: correction.id }, data: {
+    targetFileKey: external.index.fileKey, targetChecksum: external.scanned.checksum,
+  } });
+  assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, true);
+  assert.equal((await identity.getEffectiveDocumentSignals([r.id])).some((signal) => signal.connectedLibraryId === other.id), false);
+  const indexer = await import("../../src/lib/library/search-index");
+  await indexer.refreshSearchForIdentityRelationship(correction.id);
+  assert.deepEqual((await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: b.index.id } })).entityHashes, ["identity-b"]);
+  await prisma.knowledgeConnection.update({ where: { id: correction.id }, data: {
+    targetFileKey: a.index.fileKey, targetChecksum: a.scanned.checksum,
+  } });
+  await prisma.scannedFile.update({ where: { id: a.scanned.id }, data: { checksum: "changed-after-correction" } });
+  const effective = await identity.getEffectiveDocumentSignals([r.id]);
+  assert.ok(effective.some((signal) => signal.fileKey === b.index.fileKey && signal.identityHash === "identity-b"));
+  assert.ok(!effective.some((signal) => signal.fileKey === b.index.fileKey && signal.identityHash === "identity-a"));
+});
+
 test("project question does not pull another project into context", async () => {
   const r = await root("Project QA Root"); const s = await scan(r.id);
   await file({ rootId: r.id, sessionId: s.id, relativePath: "ProjectY/invoice.txt",

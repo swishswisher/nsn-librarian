@@ -1015,6 +1015,47 @@ test("unchanged image reads return a verified checksum and keep metadata-only se
   assert.equal(await prisma.observationSession.count({ where: { libraryDocumentId: processed.libraryDocumentId } }), 1);
 });
 
+for (const medium of ["audio", "video"] as const) {
+  const relativePath = medium === "audio" ? "Audio/verified.mp3" : "Video/verified.mp4";
+  const bytes = medium === "audio" ? mp3FrameBuffer(1) : mp4VideoBuffer({ hasAudioTrack: true });
+
+  test(`${medium} changed after scanning cannot seed a stale observation`, async () => {
+    const root = await createCloudBackedBridgeRoot(`SCAN_ROOT_CHANGED_${medium}`, new Map([[relativePath, bytes]]));
+    const file = await scannedFile(root.session.id, relativePath);
+    const changed = Buffer.from(bytes);
+    changed[changed.length - 1] ^= 1;
+    await writeFile(path.join(root.rootPath, ...relativePath.split("/")), changed);
+    const result = await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id, relativePath, scannedFileId: file.id });
+    assert.equal(result.sourceChecksum, createHash("sha256").update(changed).digest("hex"));
+    assert.notEqual(result.sourceChecksum, file.checksum);
+    assert.equal(JSON.stringify(result).includes(changed.toString("base64")), false);
+    const rejected = await scannedFile(root.session.id, relativePath);
+    assert.equal(rejected.processingStage, "FAILED");
+    assert.equal(rejected.processingErrorCategory, "FILE_CHANGED_SINCE_SCAN");
+    assert.equal(rejected.libraryDocumentId, null);
+    assert.equal(rejected.observationFingerprint, null);
+    assert.equal(rejected.organizationSuggestions.length, 0);
+    assert.deepEqual(await readFile(path.join(root.rootPath, ...relativePath.split("/"))), changed);
+    assert.equal(await prisma.bridgeCommand.count({ where: { commandType: { in: ["EXECUTE_PLAN", "EXECUTE_UNDO"] } } }), 0);
+  });
+
+  test(`unchanged ${medium} returns a verified checksum and processes metadata only`, async () => {
+    const root = await createCloudBackedBridgeRoot(`SCAN_ROOT_UNCHANGED_${medium}`, new Map([[relativePath, bytes]]));
+    const file = await scannedFile(root.session.id, relativePath);
+    const result = await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id, relativePath, scannedFileId: file.id });
+    assert.equal(result.sourceChecksum, file.checksum);
+    assert.equal(result.sourceChecksum, createHash("sha256").update(bytes).digest("hex"));
+    assert.match(result.extractedText, /Transcript: unavailable\. No transcript was invented/);
+    const processed = await scannedFile(root.session.id, relativePath);
+    assert.ok(processed.libraryDocumentId);
+    assert.equal(await prisma.observationSession.count({ where: { libraryDocumentId: processed.libraryDocumentId } }), 1);
+    assert.deepEqual(await readFile(path.join(root.rootPath, ...relativePath.split("/"))), bytes);
+    assert.equal(await prisma.bridgeCommand.count({ where: { commandType: { in: ["EXECUTE_PLAN", "EXECUTE_UNDO"] } } }), 0);
+  });
+}
+
 test("legacy temporary reads remain usable but cannot seed an unverified reuse entry", async () => {
   await withMockObserver(async (requestCount) => {
     const root = await createCloudBackedBridgeRoot(

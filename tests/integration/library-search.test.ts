@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { after, before, test } from "node:test";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { after, before, mock, test } from "node:test";
 
 import { PrismaClient } from "@prisma/client";
 import { documentSignalVersion } from "../../src/lib/bridge/document-signals";
@@ -646,6 +648,66 @@ test("supported synonym and source subject outrank a generic partial filename", 
   const results = await search.searchLibrary("seminar", [r.id]);
   assert.equal(results[0]?.relativePath, strong.file.relativePath);
   assert.ok(results.some((result) => result.relativePath === decoy.file.relativePath));
+});
+
+test("identity decision APIs immediately refresh affected search hashes and preserve idempotent history", async () => {
+  const r = await root("Correction API Root"); const s = await session(r.id);
+  const a = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/intake.txt", evidence: evidence("Client Alice intake") });
+  const b = await observedFile({ rootId: r.id, sessionId: s.id, path: "Notes/followup.txt", evidence: evidence("Followup appointments") });
+  const unrelated = await observedFile({ rootId: r.id, sessionId: s.id, path: "Other/client.txt", evidence: evidence("Client Alice unrelated") });
+  const signals = [];
+  for (const [i, item] of [a, b, unrelated].entries()) {
+    signals.push(await prisma.knowledgeDocumentSignal.create({ data: {
+      checksum: item.file.checksum!, connectedLibraryId: r.id,
+      fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
+      generationVersion: documentSignalVersion, identityHash: `client-${i}`, kind: "CLIENT",
+      observationSessionId: item.observation.id, relativePath: item.file.relativePath,
+      signalKey: crypto.randomUUID(), sourceRanges: [],
+    } }));
+  }
+  await indexFiles(s.id, [a, b, unrelated]);
+  const beforeUnrelated = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: unrelated.file.id } });
+  const cache = createRequire(path.resolve("package.json"))("next/cache") as typeof import("next/cache");
+  const revalidation = mock.method(cache, "revalidatePath", () => undefined);
+  try {
+    const correctionRoute = await import("../../src/app/api/library/knowledge/document-relationships/correction/route");
+    const decisionRoute = await import("../../src/app/api/library/knowledge/document-relationships/[relationshipId]/decision/route");
+    const correction = await correctionRoute.POST(new Request("http://localhost/api/library/knowledge/document-relationships/correction", {
+      method: "POST", body: JSON.stringify({ sourceSignalId: signals[1].id, targetSignalId: signals[0].id,
+        kind: "SAME_CLIENT", note: "These two documents refer to the same client." }),
+    }));
+    assert.equal(correction.status, 200);
+    const link = await prisma.knowledgeConnection.findFirstOrThrow({ where: {
+      generationVersion: fileKey.humanIdentityCorrectionVersion, sourceFileKey: signals[1].fileKey } });
+    const hashes = async () => (await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: b.file.id } })).entityHashes;
+    const decide = async (action: string) => {
+      const response = await decisionRoute.POST(new Request("http://localhost/decision", {
+        method: "POST", body: JSON.stringify({ action, note: "Synthetic relationship review" }),
+      }), { params: Promise.resolve({ relationshipId: link.id }) });
+      assert.equal(response.status, 200);
+    };
+    assert.deepEqual(await hashes(), ["client-0"]);
+    assert.ok((await search.searchLibrary("client alice", [r.id])).some((item) => item.relativePath === b.file.relativePath));
+    await decide("SEPARATE");
+    assert.deepEqual(await hashes(), ["client-1"]);
+    assert.ok(!(await search.searchLibrary("client alice", [r.id])).some((item) => item.relativePath === b.file.relativePath));
+    await decide("CONFIRM");
+    assert.deepEqual(await hashes(), ["client-0"]);
+    await decide("RECONSIDER");
+    assert.deepEqual(await hashes(), ["client-1"]);
+    await decide("CONFIRM");
+    const decisions = await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: link.id } });
+    await decide("CONFIRM");
+    assert.equal(await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: link.id } }), decisions);
+    assert.deepEqual(await hashes(), ["client-0"]);
+    const afterUnrelated = await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: beforeUnrelated.id } });
+    assert.equal(afterUnrelated.indexedAt.getTime(), beforeUnrelated.indexedAt.getTime());
+    assert.deepEqual(afterUnrelated.entityHashes, ["client-2"]);
+    assert.equal(await prisma.executionRun.count(), 0);
+    assert.equal(await prisma.bridgeCommand.count(), 0);
+  } finally {
+    revalidation.mock.restore();
+  }
 });
 
 test("metadata search remains available if the derived index is unavailable", async () => {

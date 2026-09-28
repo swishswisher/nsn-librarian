@@ -2,9 +2,8 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { getPrismaClient } from "@/lib/db/prisma";
-import { documentSignalVersion } from "@/lib/bridge/document-signals";
 import { workingKnowledgeTerms, type ScanWorkingKnowledgeIndex } from "@/lib/bridge/scan-working-knowledge";
-import { humanIdentityCorrectionVersion, persistentFileKey, usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
+import { getEffectiveDocumentSignals, humanIdentityCorrectionVersion, persistentFileKey, usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
 import { loadScanWorkingKnowledge } from "@/lib/bridge/scan-working-knowledge";
 
 export const librarySearchIndexVersion = "library-search-v1";
@@ -73,6 +72,7 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
     where: { sessionId: index.scanSessionId, ...(onlyFileIds ? { id: { in: onlyFileIds } } : {}) },
   });
   const workingById = new Map(index.files.map((file) => [file.id, file]));
+  const effectiveSignals = await getEffectiveDocumentSignals([session.connectedFolderId]);
   let indexed = 0;
   for (const file of files) {
     const working = workingById.get(file.id);
@@ -86,28 +86,9 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
       ? observation.humanDecisions.find((decision) => decision.decisionType === "MODIFY")?.editedSuggestion?.slice(0, searchExcerptLimit) ?? ""
       : "";
     const excerpts = boundedSourceExcerpts(working.sourceEvidenceText);
-    const signals = await prisma.knowledgeDocumentSignal.findMany({
-      select: { identityHash: true, kind: true }, take: 12,
-      where: { checksum: file.checksum, connectedLibraryId: session.connectedFolderId,
-        fileKey, status: "ACTIVE", supersededAt: null,
-        generationVersion: documentSignalVersion, kind: { not: "FILE_ANCHOR" } },
-    });
-    const corrections = await prisma.knowledgeConnection.findMany({
-      select: { relationshipKind: true, sourceEvidence: true }, take: 8,
-      where: { generationVersion: humanIdentityCorrectionVersion, sourceFileKey: fileKey,
-        sourceChecksum: file.checksum, status: "CONFIRMED", supersededAt: null },
-    });
-    const correctedKinds = new Set<string>(corrections.map((item) => item.relationshipKind === "SAME_CLIENT"
-      ? "CLIENT" : item.relationshipKind === "BELONGS_TO_PROJECT" ? "PROJECT" : ""));
-    const entityHashes = [...new Set([
-      ...signals.filter((signal) => !correctedKinds.has(signal.kind.replace("UNRESOLVED_", "")))
-        .map((signal) => signal.identityHash),
-      ...corrections.flatMap((item) => {
-        const evidence = item.sourceEvidence;
-        return evidence && typeof evidence === "object" && !Array.isArray(evidence) &&
-          typeof evidence.identityHash === "string" ? [evidence.identityHash] : [];
-      }),
-    ])];
+    const entityHashes = [...new Set(effectiveSignals.filter((signal) =>
+      signal.fileKey === fileKey && signal.checksum === file.checksum && signal.kind !== "FILE_ANCHOR")
+      .map((signal) => signal.identityHash))];
     const concepts = working.supportingTopics.slice(0, 8);
     const knowledgeState = observation?.status === "APPROVED" || observation?.status === "MODIFIED"
       ? "APPROVED" : "PROVISIONAL";
@@ -174,4 +155,29 @@ export async function refreshSearchForObservation(observationSessionId: string) 
   const file = observation?.libraryDocument.scannedFiles[0];
   if (!file) return;
   await indexScanKnowledge(await loadScanWorkingKnowledge(file.sessionId), [file.id]);
+}
+
+export async function refreshSearchForIdentityRelationship(relationshipId: string) {
+  const prisma = getPrismaClient();
+  const relationship = await prisma.knowledgeConnection.findUnique({ where: { id: relationshipId } });
+  if (!relationship) return;
+  // Superseding a join can also retract the identity assigned to its former target.
+  const relatedCorrections = relationship.sourceFileKey ? await prisma.knowledgeConnection.findMany({
+    select: { targetFileKey: true },
+    where: { generationVersion: humanIdentityCorrectionVersion, sourceFileKey: relationship.sourceFileKey },
+  }) : [];
+  const entries = await prisma.librarySearchEntry.findMany({
+    select: { id: true, connectedLibraryId: true, fileKey: true, checksum: true },
+    where: { isCurrent: true, fileKey: { in: [relationship.sourceFileKey, relationship.targetFileKey,
+      ...relatedCorrections.map((correction) => correction.targetFileKey)]
+      .filter((key): key is string => Boolean(key)) } },
+  });
+  const signals = await getEffectiveDocumentSignals([...new Set(entries.map((entry) => entry.connectedLibraryId))]);
+  for (const entry of entries) {
+    const entityHashes = [...new Set(signals.filter((signal) => signal.fileKey === entry.fileKey &&
+      signal.checksum === entry.checksum && signal.kind !== "FILE_ANCHOR").map((signal) => signal.identityHash))];
+    await prisma.librarySearchEntry.update({ where: { id: entry.id },
+      // Force normal indexing to recompute its fingerprint after this targeted derived-field refresh.
+      data: { entityHashes, fingerprint: "", indexedAt: new Date() } });
+  }
 }

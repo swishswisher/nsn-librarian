@@ -2,6 +2,7 @@ import { revalidatePath } from "next/cache";
 
 import { RelationshipReviewError, reviewPersistentRelationship } from "@/lib/bridge/persistent-knowledge";
 import { recordDocumentRelationshipNotebookEntry } from "@/lib/library/notebook";
+import { refreshSearchForIdentityRelationship } from "@/lib/library/search-index";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,6 +21,7 @@ export async function POST(request: Request, context: { params: Promise<{ relati
       input.action as "CONFIRM" | "SEPARATE" | "RECONSIDER",
       typeof input.note === "string" ? input.note : undefined,
     );
+    await refreshSearchForIdentityRelationship(relationship.id);
     try {
       await recordDocumentRelationshipNotebookEntry(relationship.id);
     } catch {
@@ -27,6 +29,7 @@ export async function POST(request: Request, context: { params: Promise<{ relati
     }
     revalidatePath("/admin/library/knowledge");
     revalidatePath("/admin/library/notebook");
+    revalidatePath("/admin/library/search");
     return Response.json({ ok: true, status: relationship.status });
   } catch (error) {
     if (error instanceof RelationshipReviewError) {

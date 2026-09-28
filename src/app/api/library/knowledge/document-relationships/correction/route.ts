@@ -2,7 +2,7 @@ import { revalidatePath } from "next/cache";
 
 import { createIdentityCorrection, RelationshipReviewError } from "@/lib/bridge/persistent-knowledge";
 import { recordDocumentRelationshipNotebookEntry } from "@/lib/library/notebook";
-import { refreshSearchForObservation } from "@/lib/library/search-index";
+import { refreshSearchForIdentityRelationship } from "@/lib/library/search-index";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,11 +21,7 @@ export async function POST(request: Request) {
       sourceSignalId: typeof input.sourceSignalId === "string" ? input.sourceSignalId : "",
       targetSignalId: typeof input.targetSignalId === "string" ? input.targetSignalId : "",
     });
-    try {
-      await refreshSearchForObservation(relationship.sourceObservationSessionId);
-    } catch {
-      // The correction remains saved if the derived search index needs a retry.
-    }
+    await refreshSearchForIdentityRelationship(relationship.id);
     try {
       await recordDocumentRelationshipNotebookEntry(relationship.id);
     } catch {
@@ -33,6 +29,7 @@ export async function POST(request: Request) {
     }
     revalidatePath("/admin/library/knowledge");
     revalidatePath("/admin/library/notebook");
+    revalidatePath("/admin/library/search");
     return Response.json({ ok: true });
   } catch (error) {
     if (error instanceof RelationshipReviewError) {

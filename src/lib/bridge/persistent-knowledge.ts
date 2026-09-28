@@ -710,7 +710,7 @@ export async function reviewPersistentRelationship(id: string, action: "CONFIRM"
       throw new RelationshipReviewError("The supporting files are no longer in the latest scan. This relationship is now historical.", 409);
     }
     const status = action === "CONFIRM" ? "CONFIRMED" : action === "SEPARATE" ? "REJECTED" : "NEW";
-    if (connection.status === status) throw new RelationshipReviewError("This decision is already saved.", 409);
+    if (connection.status === status) return connection;
     const changed = await tx.knowledgeConnection.updateMany({
       data: { status },
       where: { id, status: connection.status, supersededAt: null },
@@ -927,28 +927,27 @@ export async function createIdentityCorrection(input: {
   });
 }
 
-export async function getPersistentIdentityGroups() {
+export async function getEffectiveDocumentSignals(permittedRootIds?: string[]) {
   const prisma = getPrismaClient();
+  const libraries = await prisma.connectedLibrary.findMany({
+    select: { id: true },
+    where: { ...(permittedRootIds ? { id: { in: permittedRootIds } } : {}),
+      isEnabled: true, readPermission: true, status: "CONNECTED", disconnectedAt: null,
+      hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null },
+  });
+  const libraryIds = libraries.map((library) => library.id);
   const candidateRows = await prisma.knowledgeDocumentSignal.findMany({
     orderBy: { lastSeenAt: "desc" },
-    take: 500,
     where: { status: "ACTIVE", supersededAt: null, generationVersion: documentSignalVersion,
-      kind: { in: [...resolvedSignalKinds, "UNRESOLVED_CLIENT", "UNRESOLVED_PROJECT"] } },
+      connectedLibraryId: { in: libraryIds } },
   });
   const humanCorrections = await prisma.knowledgeConnection.findMany({
     orderBy: { createdAt: "desc" },
     select: { relationshipKind: true, sourceChecksum: true, sourceEvidence: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
-    take: 1000,
-    where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null },
+    where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null,
+      sourceFileKey: { in: candidateRows.map((row) => row.fileKey) } },
   });
-  const anchorKeys = humanCorrections.flatMap((correction) => correction.sourceFileKey ? [correction.sourceFileKey] : []);
-  const anchorRows = anchorKeys.length > 0 ? await prisma.knowledgeDocumentSignal.findMany({
-    orderBy: { lastSeenAt: "desc" },
-    take: 500,
-    where: { fileKey: { in: anchorKeys }, kind: "FILE_ANCHOR", status: "ACTIVE",
-      supersededAt: null, generationVersion: documentSignalVersion },
-  }) : [];
-  const rows = await currentSnapshotSignals([...candidateRows, ...anchorRows]);
+  const rows = await currentSnapshotSignals(candidateRows);
   const effectiveRows = [...rows];
   const correctedIdentities = new Map<string, string>();
   for (const correction of humanCorrections) {
@@ -962,7 +961,7 @@ export async function getPersistentIdentityGroups() {
     const target = rows.find((row) => row.fileKey === correction.targetFileKey && row.checksum === correction.targetChecksum &&
       (row.kind === kind || (kind === "CLIENT" && row.kind === "UNRESOLVED_CLIENT")) &&
       row.identityHash === evidence.identityHash && row.connectedLibraryId === source?.connectedLibraryId);
-    if (!source || !target) continue;
+    if (!source || !target || evidence.connectedLibraryId !== source.connectedLibraryId) continue;
     const key = `${source.fileKey}:${kind}`;
     if (correctedIdentities.has(key)) continue;
     correctedIdentities.set(key, target.identityHash);
@@ -972,6 +971,18 @@ export async function getPersistentIdentityGroups() {
       effectiveRows.push({ ...target, kind, generationVersion: humanIdentityCorrectionVersion });
     }
   }
+  return effectiveRows.filter((row) => {
+    const correction = correctedIdentities.get(`${row.fileKey}:${row.kind}`);
+    return (!correction || correction === row.identityHash) &&
+      !(row.kind === "UNRESOLVED_CLIENT" && correctedIdentities.has(`${row.fileKey}:CLIENT`)) &&
+      !(row.kind === "UNRESOLVED_PROJECT" && correctedIdentities.has(`${row.fileKey}:PROJECT`));
+  });
+}
+
+export async function getPersistentIdentityGroups() {
+  const prisma = getPrismaClient();
+  const rows = await getEffectiveDocumentSignals();
+  const effectiveRows = rows;
   const libraryIds = [...new Set(rows.map((row) => row.connectedLibraryId))];
   const libraries = await prisma.connectedLibrary.findMany({
     select: { displayName: true, id: true },
@@ -990,10 +1001,6 @@ export async function getPersistentIdentityGroups() {
     if (![...resolvedSignalKinds, "UNRESOLVED_CLIENT", "UNRESOLVED_PROJECT"].includes(row.kind)) continue;
     const library = byLibrary.get(row.connectedLibraryId);
     if (!library) continue;
-    const correction = correctedIdentities.get(`${row.fileKey}:${row.kind}`);
-    if (correction && correction !== row.identityHash) continue;
-    if (row.kind === "UNRESOLVED_CLIENT" && correctedIdentities.has(`${row.fileKey}:CLIENT`)) continue;
-    if (row.kind === "UNRESOLVED_PROJECT" && correctedIdentities.has(`${row.fileKey}:PROJECT`)) continue;
     const key = `${row.connectedLibraryId}:${row.kind}:${row.identityHash}${row.kind.startsWith("UNRESOLVED_") ? `:${row.fileKey}` : ""}`;
     const existing = groups.get(key) ?? [];
     if (!existing.some((member) => member.fileKey === row.fileKey)) existing.push(row);

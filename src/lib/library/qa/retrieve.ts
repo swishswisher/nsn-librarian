@@ -2,7 +2,7 @@ import path from "node:path";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/document-signals";
-import { humanIdentityCorrectionVersion, relationshipGenerationVersion } from "@/lib/bridge/persistent-knowledge";
+import { getEffectiveDocumentSignals, humanIdentityCorrectionVersion, relationshipGenerationVersion } from "@/lib/bridge/persistent-knowledge";
 import { workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
 import { searchLibrary } from "@/lib/library/search";
 import { librarySearchIndexVersion } from "@/lib/library/search-index";
@@ -235,7 +235,8 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
         explanation: connection.reasoning.slice(0, 240) }] : [];
   });
   const identityKind = route.kind === "CLIENT" ? "CLIENT" : route.kind === "PROJECT" ? "PROJECT" : null;
-  const entityHashes = identityKind ? new Set(signals.filter((signal) => signal.kind === identityKind &&
+  const effectiveSignals = identityKind ? await getEffectiveDocumentSignals(rootIds) : [];
+  const entityHashes = identityKind ? new Set(effectiveSignals.filter((signal) => signal.kind === identityKind &&
     fileEntries.some((entry) => entry.fileKey === signal.fileKey && entry.checksum === signal.checksum))
     .map((signal) => `${signal.connectedLibraryId}:${signal.identityHash}`)) : new Set<string>();
   return { route, sources, relationships, versions,
