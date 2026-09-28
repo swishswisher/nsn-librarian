@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { workingKnowledgeTerms, type ScanWorkingKnowledgeIndex } from "@/lib/bridge/scan-working-knowledge";
-import { getEffectiveDocumentSignals, humanIdentityCorrectionVersion, persistentFileKey, usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
+import { fileKeyAfterKnownMoves, getEffectiveDocumentSignals, humanIdentityCorrectionVersion, knownExecutedMoves, usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
 import { loadScanWorkingKnowledge } from "@/lib/bridge/scan-working-knowledge";
 
 export const librarySearchIndexVersion = "library-search-v1";
@@ -72,6 +72,7 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
     where: { sessionId: index.scanSessionId, ...(onlyFileIds ? { id: { in: onlyFileIds } } : {}) },
   });
   const workingById = new Map(index.files.map((file) => [file.id, file]));
+  const moves = await knownExecutedMoves(session.connectedFolderId);
   const effectiveSignals = await getEffectiveDocumentSignals([session.connectedFolderId]);
   let indexed = 0;
   for (const file of files) {
@@ -79,7 +80,7 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
     if (!file.checksum || file.extractionStatus !== "COMPLETED" ||
         file.readingStatus !== "READ" || !working) continue;
 
-    const fileKey = persistentFileKey(session.connectedFolderId, file.relativePath);
+    const fileKey = fileKeyAfterKnownMoves(session.connectedFolderId, file.relativePath, file.checksum, moves);
     const entryKey = digest([librarySearchIndexVersion, fileKey, file.checksum].join("\0"));
     const observation = file.libraryDocument?.observationSessions[0];
     const reviewedText = observation?.status === "MODIFIED"
@@ -88,7 +89,7 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
     const excerpts = boundedSourceExcerpts(working.sourceEvidenceText);
     const entityHashes = [...new Set(effectiveSignals.filter((signal) =>
       signal.fileKey === fileKey && signal.checksum === file.checksum && signal.kind !== "FILE_ANCHOR")
-      .map((signal) => signal.identityHash))];
+      .map((signal) => signal.identityHash))].sort();
     const concepts = working.supportingTopics.slice(0, 8);
     const knowledgeState = observation?.status === "APPROVED" || observation?.status === "MODIFIED"
       ? "APPROVED" : "PROVISIONAL";
@@ -99,7 +100,8 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
     });
     await prisma.librarySearchEntry.updateMany({
       data: { isCurrent: false },
-      where: { fileKey, isCurrent: true, entryKey: { not: entryKey } },
+      where: { isCurrent: true, entryKey: { not: entryKey },
+        OR: [{ fileKey }, { scannedFileId: file.id }] },
     });
     if (existing?.fingerprint === fingerprint) {
       if (stats) stats.reused += 1;
@@ -107,7 +109,8 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
           existing.scanSessionId !== index.scanSessionId) {
         await prisma.librarySearchEntry.update({
           data: { isCurrent: true, scannedFileId: file.id, scanSessionId: index.scanSessionId,
-            relativePath: file.relativePath }, where: { entryKey },
+            relativePath: file.relativePath,
+            fileName: path.posix.basename(file.relativePath.replaceAll("\\", "/")) }, where: { entryKey },
         });
       }
     } else {

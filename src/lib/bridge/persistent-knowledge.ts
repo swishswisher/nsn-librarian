@@ -97,7 +97,7 @@ export function fileKeyAfterKnownMoves(
   return persistentFileKey(libraryId, sourcePath);
 }
 
-async function knownExecutedMoves(connectedLibraryId: string): Promise<ExecutedMoveAlias[]> {
+export async function knownExecutedMoves(connectedLibraryId: string): Promise<ExecutedMoveAlias[]> {
   const actions = await getPrismaClient().executionAction.findMany({
     orderBy: { completedAt: "desc" },
     select: {

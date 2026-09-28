@@ -710,6 +710,178 @@ test("identity decision APIs immediately refresh affected search hashes and pres
   }
 });
 
+async function canonicalMoveFixture(actionType: "MOVE_FILE" | "RENAME_FILE") {
+  const r = await root(`Canonical ${actionType} Root`); const s = await session(r.id);
+  await prisma.scanSession.update({ where: { id: s.id }, data: { searchIndexStatus: "COMPLETED" } });
+  const originalPath = "Loose/intake-v1.txt";
+  const destination = actionType === "MOVE_FILE" ? "Clients/intake-v1.txt" : "Loose/renamed-v1.txt";
+  const descriptions = [
+    { path: originalPath, checksum: "a".repeat(64), text: "Client ID: C-111; Project ID: P-111; Document ID: D-42; Document Title: Annual Plan; Version: v1" },
+    { path: "Versions/annual-v2.txt", checksum: "b".repeat(64), text: "Client ID: C-111; Project ID: P-111; Document ID: D-42; Document Title: Annual Plan; Version: v2" },
+    { path: "Alice/profile.txt", checksum: "c".repeat(64), text: "Client: Alice; Client ID: C-222; Project ID: P-222" },
+  ];
+  const files = [];
+  for (const item of descriptions) files.push(await observedFile({ rootId: r.id, sessionId: s.id,
+    path: item.path, checksum: item.checksum, evidence: evidence(item.text) }));
+  const index = { clusters: [], files: files.map((item) => item.working), relationships: [], scanSessionId: s.id };
+  await fileKey.persistScanWorkingKnowledge(index);
+  await indexFiles(s.id, files);
+  for (const kind of ["CLIENT", "PROJECT"] as const) {
+    const source = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: {
+      connectedLibraryId: r.id, relativePath: originalPath, kind } });
+    const target = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: {
+      connectedLibraryId: r.id, relativePath: descriptions[2].path, kind } });
+    await fileKey.createIdentityCorrection({ sourceSignalId: source.id, targetSignalId: target.id,
+      kind: kind === "CLIENT" ? "SAME_CLIENT" : "BELONGS_TO_PROJECT", note: "Synthetic verified human correction" });
+  }
+  await indexFiles(s.id, files);
+  const initialEntry = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: files[0].file.id } });
+  const revision = await prisma.knowledgeConnection.findFirstOrThrow({ where: {
+    relationshipKind: "PROBABLE_REVISION", sourceFileKey: { in: [initialEntry.fileKey,
+      fileKey.persistentFileKey(r.id, descriptions[1].path)] },
+  } });
+  const plan = await prisma.organizationPlan.create({ data: {
+    connectedLibraryId: r.id, scanSessionId: s.id, createdBy: "isolated-test",
+    status: "EXECUTED", totalActions: 1, actions: [], warnings: [], skippedItems: [], history: [],
+  } });
+  const execution = await prisma.executionRun.create({ data: {
+    organizationPlanId: plan.id, connectedLibraryId: r.id, status: "COMPLETED",
+    completedAt: new Date(), totalActions: 1, completedActions: 1, successfulActions: 1,
+    actions: { create: { actionType, sourceRelativePath: originalPath, destinationRelativePath: destination,
+      sourceChecksumBefore: descriptions[0].checksum, destinationChecksumAfter: descriptions[0].checksum,
+      status: "COMPLETED", sequence: 1, completedAt: new Date() } },
+  }, include: { actions: true } });
+  return { r, s, files, descriptions, originalPath, destination, initialEntry, execution, revision };
+}
+
+async function indexMovedSnapshot(fixture: Awaited<ReturnType<typeof canonicalMoveFixture>>, currentPath: string, includeCopy = false) {
+  const s = await session(fixture.r.id);
+  await prisma.scanSession.update({ where: { id: s.id }, data: { searchIndexStatus: "COMPLETED" } });
+  const files = [];
+  const descriptions = fixture.descriptions.map((item, i) => ({ ...item, path: i === 0 ? currentPath : item.path }));
+  if (includeCopy) descriptions.push({ ...fixture.descriptions[0], path: "Copies/intake-copy.txt" });
+  for (const item of descriptions) files.push(await observedFile({ rootId: fixture.r.id, sessionId: s.id,
+    path: item.path, checksum: item.checksum, evidence: evidence(item.text) }));
+  const index = { clusters: [], files: files.map((item) => item.working), relationships: [], scanSessionId: s.id };
+  await fileKey.persistScanWorkingKnowledge(index);
+  const stats = { reused: 0 };
+  await indexer.indexScanKnowledge(index, files.map((item) => item.file.id), stats);
+  const entry = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: files[0].file.id } });
+  return { s, files, index, entry, stats };
+}
+
+for (const actionType of ["MOVE_FILE", "RENAME_FILE"] as const) {
+  test(`an executed ${actionType} keeps canonical search identity, human corrections, versions and QA context`, async () => {
+    const fixture = await canonicalMoveFixture(actionType);
+    assert.equal(fixture.initialEntry.fileKey, fileKey.persistentFileKey(fixture.r.id, fixture.originalPath));
+    const next = await indexMovedSnapshot(fixture, fixture.destination);
+    assert.equal(next.entry.fileKey, fixture.initialEntry.fileKey);
+    assert.equal(next.entry.id, fixture.initialEntry.id);
+    assert.equal(next.entry.relativePath, fixture.destination);
+    assert.equal(next.entry.fileName, path.posix.basename(fixture.destination));
+    assert.deepEqual(next.entry.entityHashes, fixture.initialEntry.entityHashes);
+    assert.equal(next.stats.reused, 3);
+    const signals = await fileKey.getEffectiveDocumentSignals([fixture.r.id]);
+    for (const kind of ["CLIENT", "PROJECT", "DOCUMENT_FAMILY"]) {
+      assert.ok(signals.some((signal) => signal.fileKey === next.entry.fileKey && signal.kind === kind));
+    }
+    assert.equal(await prisma.knowledgeConnection.count({ where: { id: fixture.revision.id, supersededAt: null } }), 1);
+    const expanded = await search.searchLibrary("client alice", [fixture.r.id]);
+    assert.ok(expanded.some((result) => result.relativePath === fixture.destination));
+    const qa = await import("../../src/lib/library/qa/retrieve");
+    const client = await qa.retrieveQuestionContext("What do we have about client Alice?", [fixture.r.id]);
+    assert.equal(client.ambiguousEntity, false);
+    assert.ok(client.sources.some((source) => source.relativePath === fixture.destination));
+    const versions = await qa.retrieveQuestionContext("What changed between Annual Plan versions?", [fixture.r.id]);
+    assert.equal(versions.versions[0]?.ordering, "ORDERED");
+    const latest = versions.sources.find((source) => source.id === versions.versions[0]?.newerSourceId);
+    assert.equal(latest?.relativePath, fixture.descriptions[1].path);
+    assert.equal(await prisma.bridgeCommand.count(), 0);
+  });
+}
+
+test("targeted reindexing retires a legacy path-key entry without a full-library rebuild", async () => {
+  const fixture = await canonicalMoveFixture("MOVE_FILE");
+  const moved = await indexMovedSnapshot(fixture, fixture.destination);
+  const legacy = await prisma.librarySearchEntry.create({ data: {
+    entryKey: crypto.randomUUID(), fileKey: fileKey.persistentFileKey(fixture.r.id, fixture.destination),
+    checksum: moved.entry.checksum, connectedLibraryId: fixture.r.id,
+    scannedFileId: moved.files[0].file.id, scanSessionId: moved.s.id,
+    relativePath: fixture.destination, fileName: path.posix.basename(fixture.destination),
+    fileType: "TEXT", indexVersion: indexer.librarySearchIndexVersion, fingerprint: "legacy-path-key",
+    knowledgeState: "PROVISIONAL",
+    entityHashes: [], concepts: [], reviewedTerms: [], sourceTerms: [], sourceExcerpts: [],
+  } });
+  const peerBefore = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: moved.files[1].file.id } });
+  assert.equal(await indexer.indexScanKnowledge(moved.index, [moved.files[0].file.id]), 1);
+  assert.equal((await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: legacy.id } })).isCurrent, false);
+  assert.equal(await prisma.librarySearchEntry.count({ where: { scannedFileId: moved.files[0].file.id, isCurrent: true } }), 1);
+  const current = await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: fixture.initialEntry.id } });
+  assert.equal(current.isCurrent, true);
+  assert.deepEqual(current.entityHashes, fixture.initialEntry.entityHashes);
+  assert.equal((await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: peerBefore.id } })).indexedAt.getTime(), peerBefore.indexedAt.getTime());
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("Undo restores the original canonical entry without creating a duplicate identity", async () => {
+  const fixture = await canonicalMoveFixture("RENAME_FILE");
+  await indexMovedSnapshot(fixture, fixture.destination);
+  await prisma.undoRun.create({ data: { executionRunId: fixture.execution.id, status: "COMPLETED",
+    completedAt: new Date(), totalActions: 1, completedActions: 1,
+    actions: { create: { originalExecutionActionId: fixture.execution.actions[0].id,
+      actionType: "RESTORE_FILE", sourceRelativePath: fixture.destination,
+      destinationRelativePath: fixture.originalPath, sequence: 1, status: "COMPLETED", completedAt: new Date() } },
+  } });
+  const restored = await indexMovedSnapshot(fixture, fixture.originalPath);
+  assert.equal(restored.entry.id, fixture.initialEntry.id);
+  assert.equal(restored.entry.fileKey, fixture.initialEntry.fileKey);
+  assert.equal(restored.entry.relativePath, fixture.originalPath);
+  assert.equal(restored.entry.fileName, path.posix.basename(fixture.originalPath));
+  assert.deepEqual(restored.entry.entityHashes, fixture.initialEntry.entityHashes);
+  assert.equal(await prisma.librarySearchEntry.count({ where: { fileKey: fixture.initialEntry.fileKey } }), 1);
+  assert.equal(fileKey.fileKeyAfterKnownMoves(fixture.r.id, fixture.destination,
+    fixture.descriptions[0].checksum, await fileKey.knownExecutedMoves(fixture.r.id)),
+    fileKey.persistentFileKey(fixture.r.id, fixture.destination));
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("exact copies stay distinct and untracked renames cannot inherit canonical human corrections", async () => {
+  const fixture = await canonicalMoveFixture("MOVE_FILE");
+  const moved = await indexMovedSnapshot(fixture, fixture.destination, true);
+  const copy = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: moved.files[3].file.id } });
+  assert.equal(copy.checksum, moved.entry.checksum);
+  assert.notEqual(copy.fileKey, moved.entry.fileKey);
+  assert.notEqual(copy.id, moved.entry.id);
+  assert.ok(!(copy.entityHashes as string[]).includes((await prisma.knowledgeDocumentSignal.findFirstOrThrow({
+    where: { connectedLibraryId: fixture.r.id, relativePath: fixture.descriptions[2].path, kind: "CLIENT" },
+  })).identityHash));
+  const external = await indexMovedSnapshot(fixture, "External/untracked-intake.txt");
+  assert.equal(external.entry.fileKey, fileKey.persistentFileKey(fixture.r.id, external.entry.relativePath));
+  assert.notEqual(external.entry.fileKey, fixture.initialEntry.fileKey);
+  const qa = await import("../../src/lib/library/qa/retrieve");
+  assert.ok(!(await qa.retrieveQuestionContext("What do we have about client Alice?", [fixture.r.id]))
+    .sources.some((source) => source.relativePath === external.entry.relativePath));
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("executed aliases are root-scoped and revoked or disconnected roots cannot index moved knowledge", async () => {
+  const fixture = await canonicalMoveFixture("MOVE_FILE");
+  const other = await root("Unrelated alias root"); const s = await session(other.id);
+  const sameBytes = await observedFile({ rootId: other.id, sessionId: s.id, path: fixture.destination,
+    checksum: fixture.descriptions[0].checksum, evidence: evidence("An independent file") });
+  await indexFiles(s.id, [sameBytes]);
+  assert.equal((await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: sameBytes.file.id } })).fileKey,
+    fileKey.persistentFileKey(other.id, fixture.destination));
+  const moved = await indexMovedSnapshot(fixture, fixture.destination);
+  for (const data of [{ readPermission: false }, { readPermission: true, status: "DISCONNECTED" as const }]) {
+    await prisma.connectedLibrary.update({ where: { id: fixture.r.id }, data });
+    assert.equal(await indexer.indexScanKnowledge(moved.index, [moved.files[0].file.id]), 0);
+    assert.deepEqual(await search.searchLibrary("client alice", [fixture.r.id]), []);
+    const qa = await import("../../src/lib/library/qa/retrieve");
+    assert.deepEqual((await qa.retrieveQuestionContext("client Alice", [fixture.r.id])).sources, []);
+  }
+});
+
 test("metadata search remains available if the derived index is unavailable", async () => {
   const r = await root("No Index Root"); const s = await session(r.id);
   await prisma.scannedFile.create({ data: {
