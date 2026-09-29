@@ -1677,6 +1677,122 @@ test("concurrent failed-row retries retain single-owner claims and recover stale
   assert.equal((await backfill.getSearchBackfillProgress(s.id)).reused, 1);
 });
 
+test("observation decisions refresh the latest completed snapshot through pending, failed and newer completed scans", async () => {
+  const r = await root("Targeted completed snapshot Root"); const a = await session(r.id);
+  await prisma.scanSession.update({ where: { id: a.id }, data: { searchIndexStatus: "COMPLETED" } });
+  const item = await observedFile({ rootId: r.id, sessionId: a.id, path: "Notes/outline.txt",
+    checksum: "a".repeat(64), evidence: evidence("Workshop outline for the new term") });
+  const peer = await observedFile({ rootId: r.id, sessionId: a.id, path: "Notes/peer.txt",
+    evidence: evidence("Unrelated peer evidence") });
+  await indexFiles(a.id, [item, peer]);
+  const original = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: item.file.id } });
+  const peerBefore = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: peer.file.id } });
+  const scannedCopy = async (sessionId: string, checksum: string) => prisma.scannedFile.create({ data: {
+    sessionId, libraryDocumentId: item.observation.libraryDocumentId,
+    localPath: `bridge://${r.id}/Notes/outline.txt`, relativePath: item.file.relativePath,
+    checksum, fileType: "TEXT", readStatus: "SUPPORTED", readingStatus: "READ",
+    extractionStatus: "COMPLETED",
+  } });
+  const b = await prisma.scanSession.create({ data: { connectedFolderId: r.id, status: "PENDING",
+    startedAt: new Date(a.startedAt.getTime() + 60_000) } });
+  const pending = await scannedCopy(b.id, item.file.checksum!);
+  const cache = createRequire(path.resolve("package.json"))("next/cache") as typeof import("next/cache");
+  const revalidation = mock.method(cache, "revalidatePath", () => undefined);
+  try {
+    const route = await import("../../src/app/api/library/observation-sessions/[sessionId]/decision/route");
+    const decide = async (decisionType: string, editedSuggestion?: string) => {
+      const response = await route.POST(new Request("http://localhost/decision", { method: "POST",
+        body: JSON.stringify({ decisionType, editedSuggestion }) }),
+      { params: Promise.resolve({ sessionId: item.observation.id }) });
+      assert.equal(response.status, 200);
+    };
+    await decide("MODIFY", "Becoming belongs in the workshop outline");
+    let current = await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: original.id } });
+    assert.equal(current.scannedFileId, item.file.id);
+    assert.equal(current.scanSessionId, a.id);
+    assert.equal(current.knowledgeState, "APPROVED");
+    assert.ok(current.reviewedTerms.includes("becom"));
+    assert.ok((await search.searchLibrary("becoming", [r.id])).some((row) => row.id === original.id));
+    assert.equal(await prisma.librarySearchEntry.count({ where: { scannedFileId: pending.id } }), 0);
+    await prisma.scanSession.update({ where: { id: b.id }, data: { status: "SCANNING" } });
+    await decide("NOTE");
+    assert.equal((await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: original.id } })).scannedFileId, item.file.id);
+    await prisma.scanSession.update({ where: { id: b.id }, data: { status: "FAILED" } });
+    await decide("REJECT");
+    current = await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: original.id } });
+    assert.equal(current.scannedFileId, item.file.id);
+    assert.equal(current.knowledgeState, "PROVISIONAL");
+    assert.deepEqual(current.reviewedTerms, []);
+    const qa = await import("../../src/lib/library/qa/retrieve");
+    assert.ok((await qa.retrieveQuestionContext("outline", [r.id])).sources.some((row) => row.href.includes(a.id)));
+
+    const c = await prisma.scanSession.create({ data: { connectedFolderId: r.id,
+      startedAt: new Date(b.startedAt.getTime() + 60_000), status: "COMPLETED_WITH_ERRORS",
+      searchIndexStatus: "COMPLETED" } });
+    const completed = await scannedCopy(c.id, item.file.checksum!);
+    await decide("ACCEPT");
+    current = await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: original.id } });
+    assert.equal(current.scannedFileId, completed.id);
+    assert.equal(current.scanSessionId, c.id);
+    assert.equal(current.knowledgeState, "APPROVED");
+    assert.deepEqual(current.reviewedTerms, []);
+    assert.equal(await prisma.librarySearchEntry.count({ where: { fileKey: original.fileKey } }), 1);
+    assert.ok((await search.searchLibrary("outline", [r.id])).some((row) => row.href.includes(c.id)));
+    assert.ok((await qa.retrieveQuestionContext("outline", [r.id])).sources.some((row) => row.href.includes(c.id)));
+
+    const d = await prisma.scanSession.create({ data: { connectedFolderId: r.id,
+      startedAt: new Date(c.startedAt.getTime() + 60_000), status: "PENDING" } });
+    await scannedCopy(d.id, "d".repeat(64));
+    await decide("MODIFY", "Updated outline for Becoming");
+    assert.equal((await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: original.id } })).scannedFileId, completed.id);
+    await prisma.scanSession.update({ where: { id: d.id }, data: { status: "COMPLETED",
+      searchIndexStatus: "COMPLETED" } });
+    await decide("ACCEPT");
+    const latest = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: {
+      in: (await prisma.scannedFile.findMany({ where: { sessionId: d.id }, select: { id: true } })).map((row) => row.id),
+    } } });
+    assert.equal(latest.isCurrent, true);
+    assert.equal(latest.scanSessionId, d.id);
+    assert.equal((await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: original.id } })).isCurrent, false);
+    assert.equal(await prisma.librarySearchEntry.count({ where: { fileKey: original.fileKey, isCurrent: true } }), 1);
+    assert.equal(await prisma.librarySearchEntry.count({ where: { fileKey: original.fileKey } }), 2);
+    assert.ok((await search.searchLibrary("older outline", [r.id])).some((row) => row.state === "Historical scan"));
+    assert.equal((await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: peerBefore.id } })).indexedAt.getTime(),
+      peerBefore.indexedAt.getTime(), "Targeted refresh must not rebuild unrelated files");
+    assert.equal(await prisma.bridgeCommand.count(), 0);
+  } finally {
+    revalidation.mock.restore();
+  }
+});
+
+for (const actionType of ["MOVE_FILE", "RENAME_FILE"] as const) {
+  test(`targeted observation refresh preserves canonical ${actionType} identity while a newer scan is incomplete`, async () => {
+    const fixture = await canonicalMoveFixture(actionType);
+    const moved = await indexMovedSnapshot(fixture, fixture.destination);
+    const pending = await prisma.scanSession.create({ data: { connectedFolderId: fixture.r.id,
+      status: "SCANNING", startedAt: new Date(moved.s.startedAt.getTime() + 60_000) } });
+    const newer = await prisma.scannedFile.create({ data: { sessionId: pending.id,
+      libraryDocumentId: moved.files[0].observation.libraryDocumentId,
+      localPath: `bridge://${fixture.r.id}/${fixture.destination}`, relativePath: fixture.destination,
+      fileType: "TEXT", checksum: moved.files[0].file.checksum, readStatus: "SUPPORTED",
+      readingStatus: "READ", extractionStatus: "COMPLETED",
+    } });
+    const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+    await saveHumanDecision(moved.files[0].observation.id, { decisionType: "ACCEPT" });
+    await indexer.refreshSearchForObservation(moved.files[0].observation.id);
+    const current = await prisma.librarySearchEntry.findUniqueOrThrow({ where: { id: fixture.initialEntry.id } });
+    assert.equal(current.id, moved.entry.id);
+    assert.equal(current.fileKey, fixture.initialEntry.fileKey);
+    assert.equal(current.relativePath, fixture.destination);
+    assert.equal(current.scannedFileId, moved.files[0].file.id);
+    assert.equal(current.knowledgeState, "APPROVED");
+    assert.deepEqual(current.entityHashes, moved.entry.entityHashes);
+    assert.equal(await prisma.librarySearchEntry.count({ where: { scannedFileId: newer.id } }), 0);
+    assert.equal(await prisma.librarySearchEntry.count({ where: { fileKey: current.fileKey } }), 1);
+    assert.equal(await prisma.bridgeCommand.count(), 0);
+  });
+}
+
 test("metadata search remains available if the derived index is unavailable", async () => {
   const r = await root("No Index Root"); const s = await session(r.id);
   await prisma.scannedFile.create({ data: {

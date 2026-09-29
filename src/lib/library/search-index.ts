@@ -146,14 +146,27 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
 export async function refreshSearchForObservation(observationSessionId: string) {
   const prisma = getPrismaClient();
   const observation = await prisma.observationSession.findUnique({
-    select: { libraryDocument: { select: { scannedFiles: {
-      orderBy: { createdAt: "desc" }, select: { id: true, sessionId: true }, take: 1,
-    } } } },
+    select: { libraryDocumentId: true },
     where: { id: observationSessionId },
   });
-  const file = observation?.libraryDocument.scannedFiles[0];
-  if (!file) return;
-  await indexScanKnowledge(await loadScanWorkingKnowledge(file.sessionId), [file.id]);
+  if (!observation) return;
+  const files = await prisma.scannedFile.findMany({
+    select: { id: true, sessionId: true, scanSession: { select: { connectedFolderId: true } } },
+    where: { libraryDocumentId: observation.libraryDocumentId,
+      scanSession: { ...usableScanSnapshotWhere,
+        connectedFolder: { isEnabled: true, readPermission: true, status: "CONNECTED" } } },
+    orderBy: [{ scanSession: { startedAt: "desc" } }, { scanSession: { id: "desc" } },
+      { createdAt: "desc" }, { id: "desc" }],
+  });
+  for (const file of files) {
+    const latest = await prisma.scanSession.findFirst({
+      select: { id: true }, orderBy: [{ startedAt: "desc" }, { id: "desc" }],
+      where: { ...usableScanSnapshotWhere, connectedFolderId: file.scanSession.connectedFolderId },
+    });
+    if (latest?.id !== file.sessionId) continue;
+    await indexScanKnowledge(await loadScanWorkingKnowledge(file.sessionId), [file.id]);
+    return;
+  }
 }
 
 export async function refreshSearchForIdentityRelationship(relationshipId: string) {
