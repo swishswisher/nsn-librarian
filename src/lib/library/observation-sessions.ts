@@ -5,7 +5,7 @@ import { OpenAIProviderError } from "@/lib/ai/openai-client";
 import type { AIObservationResult } from "@/lib/ai/types";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { reconcileObservationKnowledge } from "@/lib/bridge/persistent-knowledge";
-import { invalidateCorrectedMemorySources } from "@/lib/library/memory";
+import { buildMemoryFromApprovedSession, invalidateCorrectedMemorySources } from "@/lib/library/memory";
 import {
   createKnowledgeConnectionsForSession,
   getRelatedKnowledgeForSession,
@@ -650,7 +650,7 @@ export async function saveHumanDecision(
     throw new ObservationSessionError("Write the corrected observation before saving it.", 400);
   }
 
-  return prisma.$transaction(async (tx) => {
+  const result = await prisma.$transaction(async (tx) => {
     const existingSession = await tx.observationSession.findUnique({
       where: { id: sessionId },
       select: {
@@ -713,11 +713,13 @@ export async function saveHumanDecision(
     });
     await reconcileObservationKnowledge(tx, sessionId);
 
-    if (nextStatus === "MODIFIED") await invalidateCorrectedMemorySources(tx, sessionId);
+    if (nextStatus === "MODIFIED" || nextStatus === "REJECTED") await invalidateCorrectedMemorySources(tx, sessionId);
 
     return {
       decisionId: decision.id,
       status: updatedSession.status as ObservationSessionStatus,
     };
   });
+  if (result.status === "REJECTED") await buildMemoryFromApprovedSession(sessionId);
+  return result;
 }

@@ -1,8 +1,8 @@
 import path from "node:path";
 
 import { getPrismaClient } from "@/lib/db/prisma";
-import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/document-signals";
-import { usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
+import { compareDocumentVersions } from "@/lib/bridge/document-signals";
+import { getDocumentVersionSignals, usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
 import { mediaCategoryForFileType } from "@/lib/bridge/media-kind";
 import { searchTopicIds, workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
 import { getScannedFileExamineRoute, getScanSessionRoute } from "@/lib/library/routes";
@@ -205,14 +205,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
     select: { id: true }, where: { id: { in: [...candidateById.values()].map((entry) => entry.scannedFileId) },
       sourceUnavailableAt: null },
   })).map((file) => file.id));
-  const candidateHashes = [...new Set([...candidateById.values()].flatMap((entry) => entry.entityHashes))];
-  const versions = candidateHashes.length ? await prisma.knowledgeDocumentSignal.findMany({
-    select: { checksum: true, fileKey: true, identityHash: true, revisionNumber: true, revisionDate: true },
-    take: 240,
-    where: { connectedLibraryId: { in: rootIds }, kind: "DOCUMENT_FAMILY", status: "ACTIVE",
-      supersededAt: null, generationVersion: documentSignalVersion,
-      identityHash: { in: candidateHashes } },
-  }) : [];
+  const versions = await getDocumentVersionSignals([...candidateById.values()], intent.wantsHistory);
   const results: LibrarySearchResult[] = [];
   for (const entry of candidateById.values()) {
     const root = rootById.get(entry.connectedLibraryId);
@@ -225,8 +218,10 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
     const ranked = rankSearchEntry(entry, intent, new Set(seedHashes));
     if (!ranked) continue;
     const category = mediaCategoryForFileType(entry.fileType);
-    const member = versions.find((signal) => signal.fileKey === entry.fileKey && signal.checksum === entry.checksum);
+    const member = versions.find((signal) => signal.connectedLibraryId === entry.connectedLibraryId &&
+      signal.fileKey === entry.fileKey && signal.checksum === entry.checksum);
     const supersededVersion = member && versions.some((other) =>
+      other.connectedLibraryId === member.connectedLibraryId &&
       other.identityHash === member.identityHash &&
       (other.fileKey !== member.fileKey || other.checksum !== member.checksum) &&
       compareDocumentVersions(other, member) === 1,

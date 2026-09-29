@@ -1418,6 +1418,265 @@ test("encoded source quotations reach Search, QA, document signals and persisten
   assert.equal(await prisma.bridgeCommand.count(), 0);
 });
 
+async function inPlaceRevisions(withOrder = true) {
+  const r = await root("Historical lineage Root");
+  const items = [];
+  for (const i of [1, 2]) {
+    const s = await session(r.id);
+    await prisma.scanSession.update({ where: { id: s.id }, data: {
+      searchIndexStatus: "COMPLETED", startedAt: new Date(2026, 0, i),
+    } });
+    const text = `Project ID: P-lineage; Document ID: D-lineage; Document Title: Orchid Review${withOrder ? `; Version: v${i}` : ""}`;
+    const item = await observedFile({ rootId: r.id, sessionId: s.id, path: "Reports/orchid.txt",
+      checksum: String(i).repeat(64), evidence: evidence(text) });
+    await fileKey.persistScanWorkingKnowledge({ clusters: [], files: [item.working], relationships: [], scanSessionId: s.id });
+    await indexFiles(s.id, [item]);
+    items.push(item);
+  }
+  const signals = await prisma.knowledgeDocumentSignal.findMany({ where: {
+    connectedLibraryId: r.id, kind: "DOCUMENT_FAMILY",
+  }, orderBy: { checksum: "asc" } });
+  return { r, items, signals };
+}
+
+test("historical same-path revisions retain checksum-bound lineage in Search and QA", async () => {
+  const { r, items, signals } = await inPlaceRevisions();
+  assert.deepEqual(signals.map((row) => row.status), ["SUPERSEDED", "ACTIVE"]);
+  assert.ok(signals[0].supersededAt);
+  const entries = await prisma.librarySearchEntry.findMany({ where: { connectedLibraryId: r.id } });
+  assert.equal(entries.length, 2);
+  assert.equal(entries.find((row) => row.checksum === items[0].file.checksum)?.isCurrent, false);
+  assert.equal(entries.find((row) => row.checksum === items[1].file.checksum)?.isCurrent, true);
+  const found = await search.searchLibrary("older Orchid Review versions", [r.id]);
+  assert.equal(found.filter((row) => row.kind === "FILE").length, 2);
+  assert.equal(found.filter((row) => row.state === "Historical scan").length, 1);
+  const qa = await import("../../src/lib/library/qa/retrieve");
+  const context = await qa.retrieveQuestionContext("What changed between Orchid Review versions?", [r.id]);
+  assert.equal(context.sources.length, 2);
+  assert.equal(context.versions.length, 1);
+  assert.equal(context.versions[0].ordering, "ORDERED");
+  assert.equal(context.sources.find((source) => source.id === context.versions[0].newerSourceId)?.timeState, "Current scan");
+  const current = await qa.retrieveQuestionContext("Orchid Review", [r.id]);
+  assert.equal(current.sources.length, 1);
+  assert.equal(current.versions.length, 0);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("historical lineage excludes wrong checksums, unrelated superseded signals and unauthorized roots", async () => {
+  const { r, items, signals } = await inPlaceRevisions();
+  const qa = await import("../../src/lib/library/qa/retrieve");
+  await prisma.knowledgeDocumentSignal.update({ where: { id: signals[0].id }, data: { checksum: "wrong-revision" } });
+  const other = await root("Unauthorized lineage Root"); const scan = await session(other.id);
+  const unrelated = await observedFile({ rootId: other.id, sessionId: scan.id, path: "unrelated.txt" });
+  await prisma.knowledgeDocumentSignal.create({ data: {
+    checksum: items[0].file.checksum!, connectedLibraryId: other.id,
+    fileKey: signals[0].fileKey, generationVersion: documentSignalVersion,
+    identityHash: signals[1].identityHash, kind: "DOCUMENT_FAMILY", status: "SUPERSEDED",
+    supersededAt: new Date(), observationSessionId: unrelated.observation.id,
+    relativePath: unrelated.file.relativePath, signalKey: crypto.randomUUID(), sourceRanges: [], revisionNumber: "1",
+  } });
+  let context = await qa.retrieveQuestionContext("Orchid Review versions", [r.id]);
+  assert.equal(context.sources.length, 2);
+  assert.equal(context.versions.length, 0);
+  assert.ok(context.sources.every((source) => source.rootName === r.displayName));
+  const entries = await prisma.librarySearchEntry.findMany({ where: { connectedLibraryId: r.id } });
+  assert.deepEqual((await fileKey.getDocumentVersionSignals(entries, true)).map((row) => row.id), [signals[1].id]);
+  await prisma.knowledgeDocumentSignal.update({ where: { id: signals[0].id }, data: { checksum: items[0].file.checksum! } });
+  context = await qa.retrieveQuestionContext("Orchid Review versions", [r.id]);
+  assert.equal(context.versions.length, 1);
+  await prisma.connectedLibrary.update({ where: { id: r.id }, data: { readPermission: false } });
+  assert.equal((await qa.retrieveQuestionContext("Orchid Review versions", [r.id])).sources.length, 0);
+});
+
+test("historical revisions with no ordering stay ambiguous and exact copies are not revisions", async () => {
+  const { r, items } = await inPlaceRevisions(false);
+  const qa = await import("../../src/lib/library/qa/retrieve");
+  const context = await qa.retrieveQuestionContext("Orchid Review versions", [r.id]);
+  assert.equal(context.versions[0]?.ordering, "AMBIGUOUS");
+  assert.equal(context.versions[0]?.newerSourceId, null);
+  const copy = await observedFile({ rootId: r.id, sessionId: items[1].file.sessionId,
+    path: "Reports/orchid-copy.txt", checksum: items[1].file.checksum!,
+    evidence: items[1].working.sourceEvidenceText });
+  await indexFiles(items[1].file.sessionId, [copy]);
+  assert.equal((await qa.retrieveQuestionContext("Orchid Review versions", [r.id])).sources.length, 2);
+});
+
+test("historical version retrieval cannot revive rejected or superseded human-corrected family claims", async () => {
+  for (const decisionType of ["REJECT", "MODIFY"] as const) {
+    const { r, items } = await inPlaceRevisions();
+    const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+    await saveHumanDecision(items[0].observation.id, { decisionType,
+      ...(decisionType === "MODIFY" ? { editedSuggestion: "This is an unrelated reminder, not an Orchid Review revision." } : {}) });
+    const qa = await import("../../src/lib/library/qa/retrieve");
+    assert.equal((await qa.retrieveQuestionContext("Orchid Review versions", [r.id])).versions.length, 0);
+  }
+});
+
+test("rejection immediately retires sole-source Memory through the decision API and preserves audit, unrelated Memory and reapproval", async () => {
+  const beforeRuns = await prisma.executionRun.count();
+  const r = await root("Rejected Memory Root"); const s = await session(r.id);
+  const item = await observedFile({ rootId: r.id, sessionId: s.id, path: "rejected-memory.txt" });
+  const unrelated = await observedFile({ rootId: r.id, sessionId: s.id, path: "untouched-memory.txt", status: "APPROVED" });
+  for (const [source, word] of [[item, "rejectionquartz"], [unrelated, "untouchedquartz"]] as const) {
+    await prisma.libraryDocument.update({ where: { id: source.file.libraryDocumentId! }, data: { previewText: `${word} ${word}` } });
+  }
+  await memory.buildMemoryFromApprovedSession(unrelated.observation.id);
+  const untouched = await prisma.memoryEntry.findUniqueOrThrow({ where: { memoryKey: "TERM:untouchedquartz" } });
+  const cache = createRequire(path.resolve("package.json"))("next/cache") as typeof import("next/cache");
+  const revalidation = mock.method(cache, "revalidatePath", () => undefined);
+  try {
+    const route = await import("../../src/app/api/library/observation-sessions/[sessionId]/decision/route");
+    const decide = async (decisionType: string) => {
+      const response = await route.POST(new Request("http://localhost/decision", { method: "POST",
+        body: JSON.stringify({ decisionType }) }), { params: Promise.resolve({ sessionId: item.observation.id }) });
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    await decide("ACCEPT");
+    const entry = await prisma.memoryEntry.findUniqueOrThrow({ where: { memoryKey: "TERM:rejectionquartz" } });
+    const qa = await import("../../src/lib/library/qa/retrieve");
+    assert.ok((await search.searchLibrary("rejectionquartz", [r.id])).some((row) => row.id === entry.id));
+    assert.ok((await qa.retrieveQuestionContext("rejectionquartz", [r.id])).sources.some((row) => row.sourceType === "APPROVED_MEMORY"));
+    const rejected = await decide("REJECT");
+    const archived = await prisma.memoryEntry.findUniqueOrThrow({ where: { id: entry.id } });
+    assert.equal(archived.status, "ARCHIVED");
+    assert.equal(archived.searchProvenanceComplete, false);
+    assert.ok(JSON.stringify(archived.evidence).includes("HUMAN_CORRECTION_ARCHIVE"));
+    assert.equal(await prisma.memorySearchSource.count({ where: { memoryEntryId: entry.id } }), 1);
+    assert.ok(!(await search.searchLibrary("rejectionquartz", [r.id])).some((row) => row.kind === "MEMORY"));
+    assert.ok(!(await qa.retrieveQuestionContext("rejectionquartz", [r.id])).sources.some((row) => row.sourceType === "APPROVED_MEMORY"));
+    assert.deepEqual(await prisma.memoryEntry.findUniqueOrThrow({ where: { id: untouched.id } }), untouched);
+    assert.equal((await decide("REJECT")).decisionId, rejected.decisionId);
+    assert.deepEqual(await prisma.memoryEntry.findUniqueOrThrow({ where: { id: entry.id } }), archived);
+    assert.equal(await prisma.humanDecision.count({ where: { observationSessionId: item.observation.id } }), 2);
+    await decide("ACCEPT");
+    const restored = await prisma.memoryEntry.findUniqueOrThrow({ where: { id: entry.id } });
+    assert.equal(restored.status, "ACTIVE");
+    assert.equal(restored.searchProvenanceComplete, true);
+    assert.ok(JSON.stringify(restored.evidence).includes("HUMAN_CORRECTION_ARCHIVE"));
+    assert.ok((await search.searchLibrary("rejectionquartz", [r.id])).some((row) => row.id === entry.id));
+    assert.equal(await prisma.bridgeCommand.count(), 0);
+    assert.equal(await prisma.executionRun.count(), beforeRuns);
+  } finally {
+    revalidation.mock.restore();
+  }
+});
+
+test("rejection retains independently approved shared Memory and removes only the rejected contribution", async () => {
+  const r = await root("Shared rejection Root"); const s = await session(r.id);
+  const items = [];
+  for (const name of ["shared-reject-a.txt", "shared-reject-b.txt"]) {
+    const item = await observedFile({ rootId: r.id, sessionId: s.id, path: name, status: "APPROVED" });
+    await prisma.libraryDocument.update({ where: { id: item.file.libraryDocumentId! }, data: { previewText: "sharedquartz sharedquartz" } });
+    await memory.buildMemoryFromApprovedSession(item.observation.id);
+    items.push(item);
+  }
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  await saveHumanDecision(items[0].observation.id, { decisionType: "REJECT" });
+  const entry = await prisma.memoryEntry.findUniqueOrThrow({ where: { memoryKey: "TERM:sharedquartz" }, include: { searchSources: true } });
+  assert.equal(entry.status, "ACTIVE");
+  assert.equal(entry.searchProvenanceComplete, true);
+  assert.equal(entry.searchSourceCount, 1);
+  assert.deepEqual(entry.searchSources.map((row) => row.observationSessionId), [items[1].observation.id]);
+  assert.ok(!JSON.stringify(entry.evidence).includes(items[0].file.relativePath));
+  assert.ok((await search.searchLibrary("sharedquartz", [r.id])).some((row) => row.id === entry.id));
+  const qa = await import("../../src/lib/library/qa/retrieve");
+  assert.ok((await qa.retrieveQuestionContext("sharedquartz", [r.id])).sources.some((row) => row.sourceType === "APPROVED_MEMORY"));
+  await saveHumanDecision(items[0].observation.id, { decisionType: "REJECT" });
+  assert.deepEqual(await prisma.memoryEntry.findUniqueOrThrow({ where: { id: entry.id }, include: { searchSources: true } }), entry);
+});
+
+test("rejecting a modified source reconciles its learned terminology preference", async () => {
+  const r = await root("Rejected preference Root"); const s = await session(r.id);
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  const items = [];
+  for (const name of ["rejected-pref-a.txt", "rejected-pref-b.txt"]) {
+    const item = await observedFile({ rootId: r.id, sessionId: s.id, path: name });
+    await saveHumanDecision(item.observation.id, { decisionType: "MODIFY", editedSuggestion: "oldquartz -> newquartz" });
+    await memory.buildMemoryFromApprovedSession(item.observation.id);
+    items.push(item);
+  }
+  const entry = await prisma.memoryEntry.findUniqueOrThrow({ where: { memoryKey: "PREFERENCE:prefer-newquartz-over-oldquartz" } });
+  assert.equal(entry.status, "ACTIVE");
+  await saveHumanDecision(items[0].observation.id, { decisionType: "REJECT" });
+  assert.equal((await prisma.memoryEntry.findUniqueOrThrow({ where: { id: entry.id } })).status, "ARCHIVED");
+  assert.equal(await prisma.humanDecision.count({ where: { observationSessionId: items[0].observation.id } }), 2);
+});
+
+test("failed retry passes rotate across 45 files despite 20 persistent failures without retrying successes", async () => {
+  const r = await root("Fair retry Root"); const s = await session(r.id);
+  const ids = Array.from({ length: 45 }, (_, i) => `${s.id}-${i.toString().padStart(2, "0")}`);
+  await prisma.scannedFile.createMany({ data: ids.map((id, i) => ({ id, sessionId: s.id,
+    localPath: `bridge://${r.id}/retry-${i}.txt`, relativePath: `retry-${i}.txt`, fileType: "TEXT",
+    checksum: `synthetic-${i}`, extractionStatus: "COMPLETED", readingStatus: "READ", readStatus: "SUPPORTED",
+  })) });
+  await prisma.librarySearchBackfillFile.createMany({ data: ids.map((id) => ({
+    scannedFileId: id, scanSessionId: s.id, indexVersion: indexer.librarySearchIndexVersion,
+    status: "FAILED", updatedAt: new Date(2020, 0, 1),
+  })) });
+  const passes: string[][] = [];
+  const retry = async () => {
+    const attempted: string[] = []; passes.push(attempted);
+    const progress = await runSearchPreparationBatches((retryFailed) => backfill.prepareSearchBatch(s.id, retryFailed,
+      async (_scan, id) => {
+        attempted.push(id);
+        if (ids.indexOf(id) < 20) throw new Error("Persistent synthetic failure");
+        return "INDEXED";
+      }), () => undefined);
+    assert.ok(attempted.length <= 20);
+    assert.equal(progress.remaining, 0);
+    assert.equal(progress.completed, false);
+    return progress;
+  };
+  assert.equal((await retry()).failed, 45);
+  assert.deepEqual(passes[0], ids.slice(0, 20));
+  const second = await retry();
+  assert.deepEqual(passes[1], ids.slice(20, 40));
+  assert.equal(second.indexed, 20);
+  assert.equal(second.failed, 25);
+  const third = await retry();
+  assert.deepEqual(passes[2].slice(0, 5), ids.slice(40));
+  assert.equal(third.indexed, 25);
+  assert.equal(third.failed, 20);
+  assert.equal(new Set(passes.flat()).size, 45);
+  await retry();
+  assert.ok(passes[3].every((id) => ids.indexOf(id) < 20));
+  assert.equal((await backfill.prepareSearchBatch(s.id, false, async () => assert.fail("Failed files require explicit retry"))).processedFiles, 0);
+  const recovered = await backfill.prepareSearchBatch(s.id, true, async () => "REUSED");
+  assert.equal(recovered.completed, true);
+  assert.equal(recovered.reused, 20);
+  assert.equal(recovered.indexed, 25);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("concurrent failed-row retries retain single-owner claims and recover stale attempts", async () => {
+  const r = await root("Concurrent retry Root"); const s = await session(r.id);
+  const item = await observedFile({ rootId: r.id, sessionId: s.id, path: "retry-claim.txt" });
+  await backfill.prepareSearchBatch(s.id, false, async () => { throw new Error("Synthetic failure"); });
+  let release!: () => void; let started!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  let attempts = 0;
+  const first = backfill.prepareSearchBatch(s.id, true, async () => {
+    attempts += 1; started(); await held; return "INDEXED";
+  });
+  await ready;
+  const second = await backfill.prepareSearchBatch(s.id, true, async () => {
+    attempts += 1; return "INDEXED";
+  });
+  assert.equal(second.claimedFiles, 0);
+  assert.equal(second.waitingForClaims, true);
+  assert.equal(attempts, 1);
+  await prisma.librarySearchBackfillFile.updateMany({ where: { scannedFileId: item.file.id }, data: {
+    updatedAt: new Date(Date.now() - 6 * 60_000),
+  } });
+  const resumed = await backfill.prepareSearchBatch(s.id, true, async () => "REUSED");
+  assert.equal(resumed.reused, 1);
+  release();
+  assert.equal((await first).processedFiles, 0, "Expired claim must not overwrite the new owner");
+  assert.equal((await backfill.getSearchBackfillProgress(s.id)).reused, 1);
+});
+
 test("metadata search remains available if the derived index is unavailable", async () => {
   const r = await root("No Index Root"); const s = await session(r.id);
   await prisma.scannedFile.create({ data: {

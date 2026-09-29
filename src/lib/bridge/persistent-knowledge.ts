@@ -18,6 +18,43 @@ export const usableScanSnapshotWhere = {
   status: { in: ["COMPLETED", "COMPLETED_WITH_ERRORS"] },
 } satisfies Prisma.ScanSessionWhereInput;
 
+export async function getDocumentVersionSignals(entries: Array<{
+  connectedLibraryId: string; fileKey: string; checksum: string; isCurrent: boolean;
+}>, includeHistory: boolean) {
+  if (!entries.length) return [];
+  const prisma = getPrismaClient();
+  const signals = await prisma.knowledgeDocumentSignal.findMany({
+    take: 240, orderBy: { status: "asc" },
+    where: { kind: "DOCUMENT_FAMILY", generationVersion: documentSignalVersion,
+      OR: entries.map((entry) => ({
+        connectedLibraryId: entry.connectedLibraryId, fileKey: entry.fileKey, checksum: entry.checksum,
+        OR: [{ status: "ACTIVE", supersededAt: null },
+          ...(includeHistory && !entry.isCurrent ? [{ status: "SUPERSEDED" }] : [])],
+      })),
+    },
+  });
+  const observations = await prisma.observationSession.findMany({
+    where: { id: { in: signals.map((signal) => signal.observationSessionId) } },
+    select: { id: true, status: true, humanDecisions: {
+      where: { decisionType: "MODIFY" }, orderBy: { createdAt: "desc" }, take: 1,
+      select: { editedSuggestion: true },
+    } },
+  });
+  const byObservation = new Map(observations.map((observation) => [observation.id, observation]));
+  return signals.filter((signal) => {
+    const observation = byObservation.get(signal.observationSessionId);
+    if (!observation || observation.status === "REJECTED") return false;
+    if (signal.status === "ACTIVE") return true;
+    // Historical revisions are useful; superseded human-corrected claims are not.
+    if (signals.some((current) => current.status === "ACTIVE" &&
+        current.connectedLibraryId === signal.connectedLibraryId &&
+        current.fileKey === signal.fileKey && current.checksum === signal.checksum)) return false;
+    return observation.status !== "MODIFIED" || extractDocumentSignals(
+      observation.humanDecisions[0]?.editedSuggestion ?? "", signal.connectedLibraryId,
+    ).some((corrected) => corrected.kind === "DOCUMENT_FAMILY" && corrected.identityHash === signal.identityHash);
+  });
+}
+
 export async function reconcileObservationKnowledge(tx: Prisma.TransactionClient, observationSessionId: string) {
   const observation = await tx.observationSession.findUnique({
     select: { status: true, humanDecisions: {

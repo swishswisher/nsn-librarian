@@ -904,7 +904,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
 
   if (
     !session ||
-    (session.status !== "APPROVED" && session.status !== "MODIFIED") ||
+    (session.status !== "APPROVED" && session.status !== "MODIFIED" && session.status !== "REJECTED") ||
     (session.status === "MODIFIED" &&
       !session.humanDecisions.some(
         (decision) => decision.decisionType === "MODIFY" && decision.editedSuggestion?.trim(),
@@ -913,7 +913,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
     return 0;
   }
 
-  const contributionSources = session.status === "MODIFIED"
+  const contributionSources = session.status === "MODIFIED" || session.status === "REJECTED"
     ? await prisma.memorySearchSource.findMany({
       select: { observationSessionId: true },
       where: { memoryEntry: { status: "ACTIVE", searchSources: {
@@ -947,18 +947,20 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
   const preparedApprovedSessions = approvedSessions.map((approvedSession) =>
     prepareSession(approvedSession),
   );
-  const currentPreparedSession = prepareSession(session);
   const candidates = new Map<string, MemoryCandidate>();
 
-  for (const candidate of termCandidatesForSession(
-    currentPreparedSession,
-    aggregateApprovedTerms(preparedApprovedSessions),
-  )) {
-    addCandidate(candidates, candidate);
-  }
+  if (session.status !== "REJECTED") {
+    const currentPreparedSession = prepareSession(session);
+    for (const candidate of termCandidatesForSession(
+      currentPreparedSession,
+      aggregateApprovedTerms(preparedApprovedSessions),
+    )) {
+      addCandidate(candidates, candidate);
+    }
 
-  for (const candidate of themeCandidatesForSession(currentPreparedSession)) {
-    addCandidate(candidates, candidate);
+    for (const candidate of themeCandidatesForSession(currentPreparedSession)) {
+      addCandidate(candidates, candidate);
+    }
   }
 
   if (session.status === "APPROVED") {
@@ -1007,9 +1009,10 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
     addCandidate(candidates, candidate);
   }
 
-  if (session.status === "MODIFIED") {
+  if (session.status === "MODIFIED" || session.status === "REJECTED") {
     await reconcileCorrectedMemory(sessionId, approvedSessions, candidates);
   }
+  if (session.status === "REJECTED") return 0;
 
   let changedCount = 0;
 

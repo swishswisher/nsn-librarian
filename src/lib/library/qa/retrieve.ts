@@ -2,7 +2,7 @@ import path from "node:path";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/document-signals";
-import { getEffectiveDocumentSignals, humanIdentityCorrectionVersion, relationshipGenerationVersion } from "@/lib/bridge/persistent-knowledge";
+import { getDocumentVersionSignals, getEffectiveDocumentSignals, humanIdentityCorrectionVersion, relationshipGenerationVersion } from "@/lib/bridge/persistent-knowledge";
 import { workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
 import { searchLibrary } from "@/lib/library/search";
 import { librarySearchIndexVersion } from "@/lib/library/search-index";
@@ -156,15 +156,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   }
 
   const fileEntries = [...sourceEntryById.values()];
-  const signals = fileEntries.length ? await prisma.knowledgeDocumentSignal.findMany({
-    take: 80,
-    where: { status: "ACTIVE", supersededAt: null, generationVersion: documentSignalVersion,
-      connectedLibraryId: { in: rootIds },
-      fileKey: { in: fileEntries.map((entry) => entry.fileKey) },
-      kind: { in: ["DOCUMENT_FAMILY", "CLIENT", "PROJECT"] } },
-    select: { fileKey: true, checksum: true, connectedLibraryId: true,
-      identityHash: true, kind: true, revisionNumber: true, revisionDate: true },
-  }) : [];
+  const signals = await getDocumentVersionSignals(fileEntries, route.wantsHistory);
   const byEntry = new Map([...sourceEntryById.entries()]);
   const versions: AnswerVersion[] = [];
   const sourceIds = [...byEntry.keys()];
@@ -173,8 +165,10 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
       const leftId = sourceIds[i], rightId = sourceIds[j];
       const left = byEntry.get(leftId)!; const right = byEntry.get(rightId)!;
       const leftSignal = signals.find((signal) => signal.kind === "DOCUMENT_FAMILY" &&
+        signal.connectedLibraryId === left.connectedLibraryId &&
         signal.fileKey === left.fileKey && signal.checksum === left.checksum);
       const rightSignal = signals.find((signal) => signal.kind === "DOCUMENT_FAMILY" &&
+        signal.connectedLibraryId === right.connectedLibraryId &&
         signal.fileKey === right.fileKey && signal.checksum === right.checksum &&
         signal.connectedLibraryId === leftSignal?.connectedLibraryId &&
         signal.identityHash === leftSignal?.identityHash);

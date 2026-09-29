@@ -81,14 +81,21 @@ export async function prepareSearchBatch(
     take: searchBackfillBatchSize * 3, orderBy: { id: "asc" }, select: { id: true },
     where: { sessionId, ...eligible, searchBackfillFiles: { none: {
       indexVersion: librarySearchIndexVersion, OR: [
-        { status: { in: retryFailed ? ["INDEXED", "REUSED"] : ["INDEXED", "REUSED", "FAILED"] } },
+        { status: { in: ["INDEXED", "REUSED", "FAILED"] } },
         { status: "PROCESSING", updatedAt: { gt: new Date(Date.now() - searchClaimLeaseMs) } },
       ],
     } } },
   });
+  const retries = retryFailed ? await prisma.librarySearchBackfillFile.findMany({
+    take: searchBackfillBatchSize * 3,
+    orderBy: [{ updatedAt: "asc" }, { scannedFileId: "asc" }],
+    select: { scannedFileId: true },
+    where: { scanSessionId: sessionId, indexVersion: librarySearchIndexVersion, status: "FAILED",
+      scannedFile: { sessionId, ...eligible } },
+  }) : [];
   let claimedCount = 0;
   let processedCount = 0;
-  for (const file of files) {
+  for (const file of [...files, ...retries.map((row) => ({ id: row.scannedFileId }))]) {
     if (claimedCount >= searchBackfillBatchSize) break;
     const claimUpdatedAt = await claimSearchFile(sessionId, file.id, retryFailed);
     if (!claimUpdatedAt) continue;
