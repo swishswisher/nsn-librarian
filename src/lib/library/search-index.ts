@@ -90,7 +90,8 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
     const fingerprint = searchEntryFingerprint({ checksum: file.checksum,
       concepts, entityHashes, excerpts, reviewedText, knowledgeState });
     const existing = await prisma.librarySearchEntry.findUnique({
-      select: { fingerprint: true, isCurrent: true, scannedFileId: true, scanSessionId: true }, where: { entryKey },
+      select: { fingerprint: true, isCurrent: true, scannedFileId: true, scanSessionId: true,
+        fileType: true, relativePath: true, fileName: true }, where: { entryKey },
     });
     await prisma.librarySearchEntry.updateMany({
       data: { isCurrent: false },
@@ -100,10 +101,11 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
     if (existing?.fingerprint === fingerprint) {
       if (stats) stats.reused += 1;
       if (!existing.isCurrent || existing.scannedFileId !== file.id ||
-          existing.scanSessionId !== index.scanSessionId) {
+          existing.scanSessionId !== index.scanSessionId || existing.fileType !== file.fileType ||
+          existing.relativePath !== file.relativePath || existing.fileName !== path.posix.basename(file.relativePath.replaceAll("\\", "/"))) {
         await prisma.librarySearchEntry.update({
           data: { isCurrent: true, scannedFileId: file.id, scanSessionId: index.scanSessionId,
-            relativePath: file.relativePath,
+            relativePath: file.relativePath, fileType: file.fileType,
             fileName: path.posix.basename(file.relativePath.replaceAll("\\", "/")) }, where: { entryKey },
         });
       }
@@ -120,7 +122,7 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
           sourceExcerpts: excerpts, sourceTerms: workingKnowledgeTerms(excerpts.map((excerpt) => excerpt.text).join(" ")).slice(0, 80),
         },
         update: {
-          concepts, entityHashes, fingerprint, indexedAt: new Date(), isCurrent: true,
+          concepts, entityHashes, fingerprint, indexedAt: new Date(), isCurrent: true, fileType: file.fileType,
           knowledgeState,
           fileName: path.posix.basename(file.relativePath.replaceAll("\\", "/")),
           relativePath: file.relativePath, reviewedTerms: workingKnowledgeTerms(reviewedText).slice(0, 40),

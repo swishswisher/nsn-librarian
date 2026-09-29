@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { after, before, test } from "node:test";
 
 import { PrismaClient } from "@prisma/client";
+import { formatOrganizationConcepts, organizationConceptsFromEvidence } from "../../src/lib/bridge/organization-concepts";
 
 const schema = `phase_two_${process.pid}_${Date.now()}`;
 const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -132,6 +133,51 @@ function knowledgeIndex(sessionId: string, libraryId: string, left: { file: { id
     scanSessionId: sessionId,
   };
 }
+
+test("system-archived subject evidence reactivates the same relationship with current references and archive history", async (t) => {
+  const library = await createLibrary("Returning subject evidence");
+  t.after(async () => {
+    await prisma.knowledgeConnection.deleteMany({ where: { sourceEvidence: { path: ["connectedLibraryId"], equals: library.id } } });
+    await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: library.id } });
+    await prisma.connectedLibrary.delete({ where: { id: library.id } });
+  });
+  const snapshot = async (supported: boolean) => {
+    const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
+    const left = await createObservedFile({ checksum: "a".repeat(64), libraryId: library.id, relativePath: "Finance/invoice.txt", sessionId: scan.id });
+    const right = await createObservedFile({ checksum: "b".repeat(64), libraryId: library.id, relativePath: "Finance/payment.txt", sessionId: scan.id });
+    const index = knowledgeIndex(scan.id, library.id, left, right);
+    if (!supported) index.relationships = [];
+    await persistent.persistScanWorkingKnowledge(index);
+    return { index, left, right };
+  };
+  await snapshot(true);
+  const original = await prisma.knowledgeConnection.findFirstOrThrow({ where: {
+    sourceEvidence: { path: ["connectedLibraryId"], equals: library.id }, relationshipKind: "RELATED_SUBJECT",
+  } });
+  assert.equal(original.status, "NEW");
+  await snapshot(false);
+  const archived = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: original.id } });
+  assert.equal(archived.status, "ARCHIVED");
+  assert.ok(archived.supersededAt);
+  const restored = await snapshot(true);
+  const current = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: original.id } });
+  assert.equal(current.status, "NEW");
+  assert.equal(current.supersededAt, null);
+  assert.equal(current.relationshipKey, original.relationshipKey);
+  assert.deepEqual(new Set([current.sourceObservationSessionId, current.targetObservationSessionId]),
+    new Set([restored.left.observation.id, restored.right.observation.id]));
+  const evidence = current.sourceEvidence as Record<string, unknown>;
+  assert.deepEqual(new Set([evidence.sourceScannedFileId, evidence.targetScannedFileId]),
+    new Set([restored.left.file.id, restored.right.file.id]));
+  const history = evidence.previousSnapshots as Array<Record<string, unknown>>;
+  assert.ok(history.some((entry) => entry.status === "ARCHIVED" && entry.supersededAt === archived.supersededAt?.toISOString()));
+  assert.equal(await prisma.knowledgeConnection.count({ where: { relationshipKey: original.relationshipKey } }), 1);
+  assert.equal((await persistent.getRecentPersistentFileRelationships()).find((row) => row.id === original.id)?.status, "NEW");
+  await persistent.persistScanWorkingKnowledge(restored.index);
+  const repeated = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: original.id } });
+  assert.deepEqual(repeated.sourceEvidence, current.sourceEvidence);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
 
 test("persistent relationships deduplicate repeated scans and archive changed evidence", async () => {
   const library = await createLibrary("Root A");
@@ -623,7 +669,10 @@ test("disconnected roots provide no new persistent relationships", async () => {
   assert.equal(await persistent.persistScanWorkingKnowledge(knowledgeIndex(scan.id, library.id, left, right)), 0);
 });
 
-async function createReviewedMove(libraryId: string, source: string) {
+async function createReviewedMove(libraryId: string, source: string, options: {
+  suggestionType?: "MOVE_FILE" | "GROUP_WITH_FILES";
+  conceptEvidence?: string[];
+} = {}) {
   const scan = await prisma.scanSession.create({ data: { connectedFolderId: libraryId, status: "COMPLETED" } });
   const file = await prisma.scannedFile.create({
     data: {
@@ -646,13 +695,70 @@ async function createReviewedMove(libraryId: string, source: string) {
       scannedFileId: file.id,
       status: "APPROVED",
       suggestionKey: crypto.randomUUID(),
-      suggestionType: "MOVE_FILE",
+      suggestionType: options.suggestionType ?? "MOVE_FILE",
       supportingInformation: ["Source location: characters 0-50 of extracted text."],
       title: "Move to Finance",
-      whySuggested: ["Content concepts: invoice, payment"],
+      whySuggested: options.conceptEvidence ?? ["Content concepts: invoice, payment"],
     },
   });
 }
+
+test("MOVE and GROUP evidence use one normalized concept contract, including both historical labels", () => {
+  const concepts = [" Invoice ", "PAYMENT", "invoice", "a"];
+  const expected = ["invoice", "payment"];
+  assert.deepEqual(organizationConceptsFromEvidence([formatOrganizationConcepts(concepts)]), expected);
+  for (const label of ["Content concepts: ", "Specific shared concepts: "]) {
+    assert.deepEqual(organizationConceptsFromEvidence([123, `${label}${concepts.join(", ")}`]), expected);
+  }
+  assert.deepEqual(organizationConceptsFromEvidence(["File type: invoice, payment"]), []);
+  assert.deepEqual(organizationConceptsFromEvidence(null), []);
+});
+
+for (const labels of [
+  ["Specific shared concepts: ", "Specific shared concepts: "],
+  ["Content concepts: ", "Content concepts: "],
+  ["Specific shared concepts: ", "Content concepts: "],
+]) {
+  test(`two distinct GROUP approvals propose a preference using ${labels.join("and ")}`, async () => {
+    const library = await createLibrary(`GROUP preference ${labels.join("/")}`);
+    const options = { suggestionType: "GROUP_WITH_FILES" as const, conceptEvidence: [`${labels[0]}Invoice, PAYMENT, invoice`] };
+    const first = await createReviewedMove(library.id, "Loose/group-one.txt", options);
+    assert.equal(await preferences.proposeOrganizationPreferences(library.id), 0);
+    await createReviewedMove(library.id, "Loose/group-one.txt", options);
+    assert.equal(await preferences.proposeOrganizationPreferences(library.id), 0);
+    const second = await createReviewedMove(library.id, "Loose/group-two.txt", {
+      suggestionType: "GROUP_WITH_FILES", conceptEvidence: [`${labels[1]}payment, invoice`],
+    });
+    assert.equal(await preferences.proposeOrganizationPreferences(library.id), 1);
+    const proposal = await prisma.organizationPreference.findFirstOrThrow({ where: { connectedLibraryId: library.id } });
+    assert.equal(proposal.status, "PROPOSED");
+    assert.equal(proposal.destinationRelativePath, "Finance");
+    assert.deepEqual(proposal.scopeTerms, ["invoice", "payment"]);
+    assert.equal((proposal.sourceDecisionIds as string[]).length, 2);
+    assert.ok((proposal.sourceDecisionIds as string[]).includes(second.id));
+    assert.equal(await preferences.proposeOrganizationPreferences(library.id), 0);
+    assert.deepEqual(await preferences.applicableApprovedPreferences({ connectedLibraryId: library.id, contentText: "invoice payment" }), []);
+    assert.equal((await prisma.organizationSuggestion.findUniqueOrThrow({ where: { id: first.id } })).status, "APPROVED");
+    assert.equal(await prisma.executionRun.count(), 0);
+    assert.equal(await prisma.bridgeCommand.count(), 0);
+  });
+}
+
+test("unrelated GROUP approvals cannot combine, while mixed MOVE and GROUP shared concepts can", async () => {
+  const library = await createLibrary("Unrelated GROUP concepts");
+  await createReviewedMove(library.id, "Loose/finance.txt", {
+    suggestionType: "GROUP_WITH_FILES", conceptEvidence: ["Specific shared concepts: invoice, payment"],
+  });
+  await createReviewedMove(library.id, "Loose/workshop.txt", {
+    suggestionType: "GROUP_WITH_FILES", conceptEvidence: ["Specific shared concepts: workshop, training"],
+  });
+  assert.equal(await preferences.proposeOrganizationPreferences(library.id), 0);
+  await createReviewedMove(library.id, "Loose/finance-move.txt");
+  assert.equal(await preferences.proposeOrganizationPreferences(library.id), 1);
+  const proposal = await prisma.organizationPreference.findFirstOrThrow({ where: { connectedLibraryId: library.id } });
+  assert.deepEqual(proposal.scopeTerms, ["invoice", "payment"]);
+  assert.equal(proposal.status, "PROPOSED");
+});
 
 test("two reviewed moves propose a local rule, but only explicit approval activates it", async () => {
   const library = await createLibrary("Preference Root");

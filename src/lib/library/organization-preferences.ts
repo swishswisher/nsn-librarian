@@ -5,6 +5,7 @@ import type { Prisma } from "@prisma/client";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { normalizePhysicalRelativePath } from "@/lib/bridge/physical-file-identity";
 import { currentRecommendationGenerationVersion } from "@/lib/bridge/recommendation-generation";
+import { organizationConceptsFromEvidence } from "@/lib/bridge/organization-concepts";
 
 const maxReviewedDecisions = 200;
 const maxProposalsPerReview = 4;
@@ -17,13 +18,6 @@ export class OrganizationPreferenceError extends Error {
 
 function jsonStrings(value: Prisma.JsonValue): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-}
-
-function contentConcepts(value: Prisma.JsonValue) {
-  const entry = jsonStrings(value).find((item) => item.startsWith("Content concepts: "));
-  return entry
-    ? [...new Set(entry.slice(18).split(",").map((term) => term.trim().toLowerCase()).filter((term) => term.length >= 4))].slice(0, 8)
-    : [];
 }
 
 function normalizedFolder(value: string) {
@@ -95,8 +89,8 @@ export async function proposeOrganizationPreferences(connectedLibraryId: string)
     for (let left = 0; left < group.length; left += 1) {
       for (let right = left + 1; right < group.length; right += 1) {
         if (proposedCount >= maxProposalsPerReview) break;
-        const leftTerms = contentConcepts(group[left].whySuggested);
-        const rightTerms = new Set(contentConcepts(group[right].whySuggested));
+        const leftTerms = organizationConceptsFromEvidence(group[left].whySuggested);
+        const rightTerms = new Set(organizationConceptsFromEvidence(group[right].whySuggested));
         const scopeTerms = leftTerms.filter((term) => rightTerms.has(term)).sort();
         if (scopeTerms.length < 2) continue;
         const key = proposalKey(connectedLibraryId, destination, scopeTerms);

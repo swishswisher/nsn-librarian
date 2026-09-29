@@ -172,13 +172,19 @@ function verifiedRanges(sourceEvidenceText: string, sharedTerms: string[]) {
 async function upsertCurrentRelationship(data: Prisma.KnowledgeConnectionUncheckedCreateInput & { relationshipKey: string }) {
   const prisma = getPrismaClient();
   return prisma.$transaction(async (tx) => {
-    const existing = await tx.knowledgeConnection.findUnique({ where: { relationshipKey: data.relationshipKey } });
+    const existing = await tx.knowledgeConnection.findUnique({
+      include: { decisions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { nextStatus: true }, take: 1 } },
+      where: { relationshipKey: data.relationshipKey },
+    });
+    const reactivate = existing?.status === "ARCHIVED" &&
+      [relationshipGenerationVersion, documentSignalVersion].includes(existing.generationVersion ?? "") &&
+      existing.decisions[0]?.nextStatus !== "REJECTED" && existing.decisions[0]?.nextStatus !== "CONFIRMED";
     let sourceEvidence = data.sourceEvidence;
     const previous = existing?.sourceEvidence;
     if (existing && previous && !Array.isArray(previous) && typeof previous === "object" &&
         sourceEvidence && !Array.isArray(sourceEvidence) && typeof sourceEvidence === "object") {
       const { previousSnapshots, ...previousEvidence } = previous;
-      const changed = existing.sourceObservationSessionId !== data.sourceObservationSessionId ||
+      const changed = reactivate || existing.sourceObservationSessionId !== data.sourceObservationSessionId ||
         existing.targetObservationSessionId !== data.targetObservationSessionId ||
         !isDeepStrictEqual(previousEvidence, sourceEvidence);
       sourceEvidence = {
@@ -186,6 +192,7 @@ async function upsertCurrentRelationship(data: Prisma.KnowledgeConnectionUncheck
         ...(previousSnapshots || changed ? { previousSnapshots: [
           ...(Array.isArray(previousSnapshots) ? previousSnapshots : []),
           ...(changed ? [{ evidence: previousEvidence, observedAt: (existing.lastSeenAt ?? existing.createdAt).toISOString(),
+            ...(reactivate ? { status: existing.status, supersededAt: existing.supersededAt?.toISOString() ?? null } : {}),
             sourceObservationSessionId: existing.sourceObservationSessionId,
             targetObservationSessionId: existing.targetObservationSessionId }] : []),
         ] } : {}),
@@ -194,6 +201,7 @@ async function upsertCurrentRelationship(data: Prisma.KnowledgeConnectionUncheck
     return tx.knowledgeConnection.upsert({
       create: data,
       update: { lastSeenAt: data.lastSeenAt, sourceEvidence,
+        ...(reactivate ? { status: "NEW", supersededAt: null } : {}),
         sourceObservationSessionId: data.sourceObservationSessionId,
         targetObservationSessionId: data.targetObservationSessionId },
       where: { relationshipKey: data.relationshipKey },

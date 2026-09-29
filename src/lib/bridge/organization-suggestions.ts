@@ -21,6 +21,7 @@ import {
   recordChecksumDuplicateSuggestionsForSession,
 } from "./checksum-duplicates";
 import { jsonImageHumanLabels } from "./image-metadata";
+import { formatOrganizationConcepts } from "./organization-concepts";
 import { readScannedFile } from "./reader";
 import { earlierRelationshipContext } from "./persistent-knowledge";
 import {
@@ -1668,7 +1669,7 @@ function moveAndFolderDrafts(context: SuggestionContext) {
         title: `Consider a ${best.rule.folder} folder`,
         whySuggested: [
           best.rule.explanation,
-          `Content concepts: ${matchedConcepts}`,
+          formatOrganizationConcepts(best.directMatches),
         ],
         supportingInformation: [
           folderEvidence,
@@ -1702,7 +1703,7 @@ function moveAndFolderDrafts(context: SuggestionContext) {
         title: `Consider placing this with ${best.rule.folder}`,
         whySuggested: [
           best.rule.explanation,
-          `Content concepts: ${matchedConcepts}`,
+          formatOrganizationConcepts(best.directMatches),
         ],
         supportingInformation: [
           folderEvidence,
@@ -1904,7 +1905,7 @@ function groupWithFilesDraft(context: SuggestionContext, topTerms: string[]) {
     title: `Review this with related files in ${candidate.folder}`,
     whySuggested: [
       "The proposed folder is supported by content meaning and an existing file pattern.",
-      `Specific shared concepts: ${sharedTerms.join(", ")}`,
+      formatOrganizationConcepts(sharedTerms),
     ],
     supportingInformation: [
       patternDescription,
