@@ -6,6 +6,7 @@ import { after, before, mock, test } from "node:test";
 
 import { PrismaClient, type KnowledgeDocumentSignal } from "@prisma/client";
 import { documentSignalVersion } from "../../src/lib/bridge/document-signals";
+import { runSearchPreparationBatches } from "../../src/lib/library/search-preparation";
 
 const schema = `phase_three_${process.pid}_${Date.now()}`;
 const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -557,6 +558,9 @@ test("bounded backfill resumes, reuses current rows and has no filesystem comman
   })) });
   const beforeCommands = await prisma.bridgeCommand.count();
   const first = await backfill.prepareSearchBatch(s.id);
+  assert.equal(first.claimedFiles, 20);
+  assert.equal(first.processedFiles, 20);
+  assert.equal(first.waitingForClaims, false);
   assert.equal(first.indexed + first.reused, 20);
   assert.equal(first.completedFiles, 20);
   assert.equal(first.remaining, 23);
@@ -570,6 +574,26 @@ test("bounded backfill resumes, reuses current rows and has no filesystem comman
   assert.equal((await backfill.prepareSearchBatch(s.id)).indexed + last.reused, 43);
   assert.equal(await prisma.librarySearchBackfillFile.count({ where: { scanSessionId: s.id } }), 43);
   assert.equal(await prisma.bridgeCommand.count(), beforeCommands);
+});
+
+test("Prepare Search continues on processed batches and stops normally when complete", async () => {
+  const r = await root("Client continuation Root"); const s = await session(r.id);
+  await prisma.scannedFile.createMany({ data: Array.from({ length: 43 }, (_, i) => ({
+    sessionId: s.id, localPath: `bridge://${r.id}/client-${i}.txt`, relativePath: `client-${i}.txt`,
+    fileType: "TEXT", checksum: `synthetic-${i}`, extractionStatus: "COMPLETED", readingStatus: "READ",
+  })) });
+  const retryFlags: boolean[] = [];
+  const remaining: number[] = [];
+  const result = await runSearchPreparationBatches(async (retryFailed) => {
+    retryFlags.push(retryFailed);
+    assert.ok(retryFlags.length <= 3, "Preparation must stop after completion");
+    return backfill.prepareSearchBatch(s.id, retryFailed, async () => "INDEXED");
+  }, (progress) => remaining.push(progress.remaining));
+  assert.deepEqual(retryFlags, [true, false, false]);
+  assert.deepEqual(remaining, [23, 3, 0]);
+  assert.equal(result.completed, true);
+  assert.equal(result.processedFiles, 3);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
 });
 
 test("failed backfill file is isolated, reported and retryable", async () => {
@@ -609,11 +633,22 @@ test("concurrent search preparation claims a file once and recovers an interrupt
     return "INDEXED";
   });
   await started;
-  const concurrent = await backfill.prepareSearchBatch(s.id, false, async () => {
-    processCount += 1;
-    return "INDEXED";
-  });
+  let requests = 0;
+  const tab = () => runSearchPreparationBatches(async (retryFailed) => {
+    requests += 1;
+    assert.ok(requests <= 2, "Waiting tabs must not hot-loop");
+    return backfill.prepareSearchBatch(s.id, retryFailed, async () => {
+      processCount += 1;
+      return "INDEXED";
+    });
+  }, () => undefined);
+  const [concurrent, otherTab] = await Promise.all([tab(), tab()]);
+  assert.equal(requests, 2);
   assert.equal(concurrent.remaining, 1);
+  assert.equal(concurrent.claimedFiles, 0);
+  assert.equal(concurrent.processedFiles, 0);
+  assert.equal(concurrent.waitingForClaims, true);
+  assert.equal(otherTab.waitingForClaims, true);
   assert.equal(processCount, 1);
   release();
   assert.equal((await first).completed, true);
@@ -629,8 +664,44 @@ test("concurrent search preparation claims a file once and recovers an interrupt
     return "REUSED";
   });
   assert.equal(resumed.completed, true);
+  assert.equal(resumed.claimedFiles, 1);
+  assert.equal(resumed.processedFiles, 1);
+  assert.equal(resumed.waitingForClaims, false);
   assert.equal(resumed.reused, 1);
   assert.equal(processCount, 2);
+});
+
+test("live search claims do not hide available work past the bounded candidate window", async () => {
+  const r = await root("Claim window Root"); const s = await session(r.id);
+  await prisma.scannedFile.createMany({ data: Array.from({ length: 61 }, (_, i) => ({
+    id: `claim-window-${i.toString().padStart(3, "0")}`, sessionId: s.id,
+    localPath: `bridge://${r.id}/file-${i}.txt`, relativePath: `file-${i}.txt`, fileType: "TEXT",
+    checksum: `synthetic-${i}`, extractionStatus: "COMPLETED", readingStatus: "READ",
+  })) });
+  await prisma.librarySearchBackfillFile.createMany({ data: Array.from({ length: 60 }, (_, i) => ({
+    scannedFileId: `claim-window-${i.toString().padStart(3, "0")}`, scanSessionId: s.id,
+    indexVersion: indexer.librarySearchIndexVersion, status: "PROCESSING",
+  })) });
+  const result = await backfill.prepareSearchBatch(s.id, false, async () => "INDEXED");
+  assert.equal(result.claimedFiles, 1);
+  assert.equal(result.processedFiles, 1);
+  assert.equal(result.remaining, 60);
+  const waiting = await backfill.prepareSearchBatch(s.id);
+  assert.equal(waiting.claimedFiles, 0);
+  assert.equal(waiting.processedFiles, 0);
+  assert.equal(waiting.waitingForClaims, true);
+});
+
+test("Prepare Search stops on zero saved progress even if a claim was acquired", async () => {
+  let requests = 0;
+  const result = await runSearchPreparationBatches(async () => {
+    requests += 1;
+    assert.equal(requests, 1);
+    return { indexed: 0, reused: 0, failed: 0, remaining: 1, completed: false,
+      claimedFiles: 1, processedFiles: 0, waitingForClaims: false };
+  }, () => undefined);
+  assert.equal(result.remaining, 1);
+  assert.equal(requests, 1);
 });
 
 test("supported synonym and source subject outrank a generic partial filename", async () => {

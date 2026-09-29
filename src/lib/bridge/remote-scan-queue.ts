@@ -460,13 +460,12 @@ async function storeMediaMetadata(
   }
 }
 
-async function queueRemoteReads(input: {
+async function queueRemoteReadBatch(input: {
   bridgeDeviceId: string;
   bridgeRootId: string;
   connectedLibraryId: string;
   scanSessionId: string;
-}) {
-  const prisma = getPrismaClient();
+}, prisma: Prisma.TransactionClient) {
   const files = await prisma.scannedFile.findMany({
     orderBy: { relativePath: "asc" },
     select: { checksum: true, id: true, relativePath: true },
@@ -489,7 +488,7 @@ async function queueRemoteReads(input: {
         relativePath: file.relativePath,
         scanSessionId: input.scanSessionId,
         scannedFileId: file.id,
-      });
+      }, prisma);
     } catch (error) {
       if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002")) {
         throw error;
@@ -502,6 +501,20 @@ async function queueRemoteReads(input: {
   }
 
   return files.length;
+}
+
+async function queueRemoteReads(input: Parameters<typeof queueRemoteReadBatch>[0]) {
+  const prisma = getPrismaClient();
+  return prisma.$transaction(async (tx) => {
+    // Serialize admission across fetches and roots on the same sequential Bridge worker.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`remote-read-batch:${input.bridgeDeviceId}`}))`;
+    const active = await tx.bridgeCommand.count({ where: {
+      bridgeDeviceId: input.bridgeDeviceId, commandType: "READ_FILE_TEMPORARILY",
+      expiresAt: { gt: new Date() }, status: { in: ["PENDING", "ACKNOWLEDGED", "RUNNING"] },
+    } });
+    if (active > 0) return 0;
+    return queueRemoteReadBatch(input, tx);
+  }, { timeout: 60_000 });
 }
 
 export async function queueNextRemoteReadBatchForDevice(bridgeDeviceId: string) {

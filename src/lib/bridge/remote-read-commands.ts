@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
+import type { Prisma } from "@prisma/client";
+
 import { getPrismaClient } from "@/lib/db/prisma";
 import {
   BridgeCloudError,
@@ -318,7 +320,7 @@ export async function markRemoteReadFailure(input: {
   return updated;
 }
 
-export async function queueRemoteReadCommand(input: RemoteReadCommandInput) {
+export async function queueRemoteReadCommand(input: RemoteReadCommandInput, prisma?: Prisma.TransactionClient) {
   return createBridgeCloudCommand({
     authorizationContext: {
       purpose:
@@ -345,7 +347,7 @@ export async function queueRemoteReadCommand(input: RemoteReadCommandInput) {
       scanSessionId: input.scanSessionId,
       scannedFileId: input.scannedFileId,
     },
-  });
+  }, prisma);
 }
 
 async function activeReadCommandForScannedFile(input: {

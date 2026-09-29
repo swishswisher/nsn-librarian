@@ -452,12 +452,11 @@ async function assertCommandTarget(input: {
   bridgeDeviceId: string;
   bridgeRootId?: string | null;
   connectedLibraryId?: string | null;
-}) {
+}, prisma: Prisma.TransactionClient = getPrismaClient()) {
   if (!input.connectedLibraryId) {
     return;
   }
 
-  const prisma = getPrismaClient();
   const library = await prisma.connectedLibrary.findUnique({
     where: {
       id: input.connectedLibraryId,
@@ -499,8 +498,7 @@ export async function createBridgeCloudCommand(input: {
   expiresAt?: Date;
   idempotencyKey?: string;
   payload?: BridgeJson;
-}) {
-  const prisma = getPrismaClient();
+}, prisma: Prisma.TransactionClient = getPrismaClient()) {
   const device = await prisma.bridgeDevice.findUnique({
     where: {
       bridgeDeviceId: input.bridgeDeviceId,
@@ -511,7 +509,7 @@ export async function createBridgeCloudCommand(input: {
     throw new BridgeCloudError("This Bridge device is not available.", 403);
   }
 
-  await assertCommandTarget(input);
+  await assertCommandTarget(input, prisma);
 
   const envelope = createBridgeCommandEnvelope({
     authorizationContext: input.authorizationContext ?? {},

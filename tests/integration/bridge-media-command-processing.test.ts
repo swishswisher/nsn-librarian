@@ -810,6 +810,10 @@ test("an unchanged cloud document reuses its grounded observation but receives f
     assert.deepEqual(progress?.progress.aiUsage?.models, ["gpt-4o-mini"]);
     assert.deepEqual(progress?.progress.aiUsage?.processingVersions, ["phase1-grounded-observer-v2"]);
     assert.equal(progress?.progress.remainingFiles, 0);
+    const commandsBefore = await prisma.bridgeCommand.count();
+    assert.deepEqual(await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId), []);
+    assert.equal(await prisma.bridgeCommand.count(), commandsBefore);
+    assert.equal(await readCommandFor(secondFile.id), undefined);
 
     await writeFile(path.join(root.rootPath, "Loose", "notes.txt"), "Workshop facilitation notes. Changed content.");
     const changed = await repeatCloudScan(root);
@@ -868,7 +872,7 @@ test("partial observations are not reused and simultaneous reports claim paid wo
   }, 150);
 });
 
-test("large authorized scans queue every supported file without a batch approval step", async () => {
+test("75 unread files advance in bounded batches only after active reads are consumed", async () => {
   const files = new Map(Array.from({ length: 75 }, (_, index) => [
     `Documents/note-${index}.txt`, Buffer.from(`Document ${index} remains on the Mac.`),
   ]));
@@ -876,11 +880,54 @@ test("large authorized scans queue every supported file without a batch approval
 
   assert.equal((root.importResult as Record<string, unknown>)?.queuedReads, 50);
   assert.equal(await prisma.bridgeCommand.count({ where: { commandType: "READ_FILE_TEMPORARILY" } }), 50);
-  await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId);
-  assert.equal(await prisma.bridgeCommand.count({ where: { commandType: "READ_FILE_TEMPORARILY" } }), 75);
-  await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId);
-  assert.equal(await prisma.bridgeCommand.count({ where: { commandType: "READ_FILE_TEMPORARILY" } }), 75);
+  const firstBatch = await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId);
+  assert.equal(firstBatch.length, 50);
+  await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, firstBatch[0].commandId);
+  await prisma.bridgeCommand.update({ where: { commandId: firstBatch[1].commandId }, data: { status: "RUNNING" } });
+  for (const retry of await Promise.all([
+    fetchRecoverableBridgeCommands(root.device.bridgeDeviceId), fetchRecoverableBridgeCommands(root.device.bridgeDeviceId),
+  ])) assert.deepEqual(new Set(retry.map((command) => command.commandId)), new Set(firstBatch.map((command) => command.commandId)));
+  assert.equal(await prisma.bridgeCommand.count({ where: { commandType: "READ_FILE_TEMPORARILY" } }), 50);
   assert.equal((await getBridgeScanSessionProgress(root.session.id))?.progress.remainingFiles, 75);
+  for (const command of firstBatch) {
+    const payload = command.payload as { scannedFileId: string; relativePath: string };
+    await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId, bridgeRootId: root.root.id, ...payload });
+  }
+  const [secondBatch, concurrentBatch] = await Promise.all([
+    fetchRecoverableBridgeCommands(root.device.bridgeDeviceId), fetchRecoverableBridgeCommands(root.device.bridgeDeviceId),
+  ]);
+  assert.equal(secondBatch.length, 25);
+  assert.deepEqual(new Set(secondBatch.map((row) => row.commandId)), new Set(concurrentBatch.map((row) => row.commandId)));
+  assert.equal(await prisma.bridgeCommand.count({ where: { commandType: "READ_FILE_TEMPORARILY" } }), 75);
+  assert.equal(new Set([...firstBatch, ...secondBatch].map((row) => (row.payload as { scannedFileId: string }).scannedFileId)).size, 75);
+  for (const command of secondBatch) {
+    const payload = command.payload as { scannedFileId: string; relativePath: string };
+    await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId, bridgeRootId: root.root.id, ...payload });
+  }
+  const progress = await getBridgeScanSessionProgress(root.session.id);
+  assert.equal(progress?.progress.remainingFiles, 0);
+  assert.equal(progress?.progress.filesWithSuggestions, 75);
+  assert.equal(progress?.session.status, "COMPLETED");
+  assert.deepEqual(await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId), []);
+  assert.equal(await prisma.bridgeCommand.count(), 75);
+});
+
+test("expired read batches are isolated before recovery admits remaining files", async () => {
+  const root = await createCloudBackedBridgeRoot("SCAN_ROOT_EXPIRED_BATCH", new Map(Array.from({ length: 75 }, (_, i) => [
+    `Documents/expired-${i}.txt`, Buffer.from(`Synthetic document ${i}.`),
+  ])));
+  const first = await prisma.bridgeCommand.findMany({ where: { commandType: "READ_FILE_TEMPORARILY" } });
+  assert.equal(first.length, 50);
+  assert.ok(first.every((row) => row.expiresAt.getTime() - row.issuedAt.getTime() <= 10 * 60_000));
+  await prisma.bridgeCommand.updateMany({ where: { commandId: { in: first.map((row) => row.commandId) } },
+    data: { expiresAt: new Date(Date.now() - 1_000) } });
+  const next = await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId);
+  assert.equal(next.length, 25);
+  assert.equal(await prisma.bridgeCommand.count({ where: { status: "EXPIRED" } }), 50);
+  assert.equal(await prisma.scannedFile.count({ where: { sessionId: root.session.id, processingErrorCategory: "READ_COMMAND_TIMEOUT" } }), 50);
+  assert.equal((await getBridgeScanSessionProgress(root.session.id))?.progress.remainingFiles, 25);
+  assert.equal((await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId)).length, 25);
+  assert.equal(await prisma.bridgeCommand.count(), 75);
 });
 
 test("reused observations join new files in the next scan's working knowledge", async () => {

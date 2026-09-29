@@ -31,6 +31,7 @@ import {
   getScannedFileExamineRoute,
 } from "@/lib/library/routes";
 import type { LibrarySearchResult } from "@/lib/library/search";
+import { runSearchPreparationBatches, type SearchPreparationProgress } from "@/lib/library/search-preparation";
 
 type LibraryExplorerProps = {
   data: LibraryExplorerData;
@@ -532,25 +533,26 @@ function RootSection({
     setIndexing(true);
     setIndexMessage(null);
     try {
-      let retryFailed = true;
-      for (;;) {
+      const progress = await runSearchPreparationBatches(async (retryFailed) => {
         const response = await fetch("/api/library/search/index", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ sessionId, retryFailed }),
         });
-        const payload: { ok?: boolean; error?: string; progress?: {
-          indexed: number; reused: number; failed: number; remaining: number; completed: boolean;
-        } } = await response.json();
+        const payload: { ok?: boolean; error?: string; progress?: SearchPreparationProgress } = await response.json();
         if (!response.ok || !payload.ok || !payload.progress) {
           throw new Error(payload.error ?? "Search preparation could not finish.");
         }
-        const progress = payload.progress;
+        return payload.progress;
+      }, (progress) => {
         setIndexMessage(`${progress.indexed} indexed, ${progress.reused} reused, ${progress.failed} need retry, ${progress.remaining} remaining.`);
-        if (progress.remaining === 0) {
-          if (progress.completed) setIndexMessage(`Search is ready. ${progress.indexed} indexed, ${progress.reused} reused.`);
-          break;
-        }
-        retryFailed = false;
+        if (progress.completed) setIndexMessage(`Search is ready. ${progress.indexed} indexed, ${progress.reused} reused.`);
+      });
+      if (progress.remaining > 0) {
+        setIndexMessage(progress.waitingForClaims
+          ? "Search preparation is already running elsewhere. Try Prepare Search again shortly to check or resume."
+          : "Search preparation paused without further progress. Try Prepare Search again to resume.");
+        router.refresh();
+        return;
       }
       for (;;) {
         const response = await fetch("/api/library/search/index", {

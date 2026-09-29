@@ -80,11 +80,14 @@ export async function prepareSearchBatch(
   const files = await prisma.scannedFile.findMany({
     take: searchBackfillBatchSize * 3, orderBy: { id: "asc" }, select: { id: true },
     where: { sessionId, ...eligible, searchBackfillFiles: { none: {
-      indexVersion: librarySearchIndexVersion, status: { in: retryFailed
-        ? ["INDEXED", "REUSED"] : ["INDEXED", "REUSED", "FAILED"] },
+      indexVersion: librarySearchIndexVersion, OR: [
+        { status: { in: retryFailed ? ["INDEXED", "REUSED"] : ["INDEXED", "REUSED", "FAILED"] } },
+        { status: "PROCESSING", updatedAt: { gt: new Date(Date.now() - searchClaimLeaseMs) } },
+      ],
     } } },
   });
   let claimedCount = 0;
+  let processedCount = 0;
   for (const file of files) {
     if (claimedCount >= searchBackfillBatchSize) break;
     const claimUpdatedAt = await claimSearchFile(sessionId, file.id, retryFailed);
@@ -96,12 +99,13 @@ export async function prepareSearchBatch(
     } catch {
       // A single unreadable or malformed file must not discard completed work.
     }
-    await prisma.librarySearchBackfillFile.updateMany({
+    const saved = await prisma.librarySearchBackfillFile.updateMany({
       data: { status },
       where: { scanSessionId: sessionId, scannedFileId: file.id,
         indexVersion: librarySearchIndexVersion, status: "PROCESSING",
         updatedAt: claimUpdatedAt },
     });
+    processedCount += saved.count;
   }
   const progress = await getSearchBackfillProgress(sessionId);
   if (progress.remaining === 0) {
@@ -115,5 +119,11 @@ export async function prepareSearchBatch(
       searchIndexStatus: progress.completed ? "COMPLETED" : "INCOMPLETE",
     }, where: { id: sessionId } });
   }
-  return progress;
+  const activeClaims = progress.remaining > 0 && processedCount === 0
+    ? await prisma.librarySearchBackfillFile.count({ where: {
+        scanSessionId: sessionId, indexVersion: librarySearchIndexVersion, status: "PROCESSING",
+        updatedAt: { gt: new Date(Date.now() - searchClaimLeaseMs) },
+      } }) : 0;
+  return { ...progress, claimedFiles: claimedCount, processedFiles: processedCount,
+    waitingForClaims: activeClaims > 0 };
 }
