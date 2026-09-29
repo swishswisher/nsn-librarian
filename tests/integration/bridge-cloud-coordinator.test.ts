@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
 
@@ -252,7 +252,7 @@ async function createCloudScannedFile(
   });
   const scannedFile = await prisma.scannedFile.create({
     data: {
-      checksum: `checksum-${randomUUID()}`,
+      checksum: createHash("sha256").update(`synthetic:${input.relativePath}`).digest("hex"),
       extractionErrorCategory:
         input.readStatus === "UNSUPPORTED" ? "UNSUPPORTED_FILE_TYPE" : "READ_FAILED",
       extractionStatus:
@@ -333,6 +333,10 @@ async function completeTemporaryRead(input: {
   relativePath: string;
   text: string;
 }) {
+  const command = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: input.commandId } });
+  const file = await prisma.scannedFile.findUniqueOrThrow({ where: {
+    id: (command.payload as { scannedFileId: string }).scannedFileId,
+  } });
   await acknowledgeBridgeCloudCommand(input.bridgeDeviceId, input.commandId);
   const prepared = await prepareBridgeCommandReportForPersistence(
     input.bridgeDeviceId,
@@ -340,6 +344,7 @@ async function completeTemporaryRead(input: {
       commandId: input.commandId,
       result: {
         extractedText: input.text,
+        sourceChecksum: file.checksum,
         fileName: input.relativePath.split("/").at(-1) ?? "note.txt",
         fileType: "DOCUMENT",
         relativePath: input.relativePath,
@@ -461,7 +466,7 @@ test("an existing cloud scan regenerates recommendations while preserving review
   });
   const secondFile = await prisma.scannedFile.create({
     data: {
-      checksum: `checksum-${randomUUID()}`,
+      checksum: createHash("sha256").update(randomUUID()).digest("hex"),
       extractionErrorCategory: "READ_FAILED",
       extractionStatus: "FAILED",
       fileType: "txt",
@@ -479,7 +484,7 @@ test("an existing cloud scan regenerates recommendations while preserving review
   await prisma.scannedFile.createMany({
     data: [
       {
-        checksum: `checksum-${randomUUID()}`,
+        checksum: createHash("sha256").update(randomUUID()).digest("hex"),
         extractionErrorCategory: "FILE_CORRUPT",
         extractionStatus: "FAILED",
         fileType: "pdf",
@@ -1779,5 +1784,4 @@ test("production cloud monitoring dashboard does not drain localhost events", as
   assert.equal(afterDashboard.monitoringState, "WATCHING");
   assert.equal(afterDashboard.monitoringErrorCategory, null);
 });
-
 

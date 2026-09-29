@@ -1056,7 +1056,7 @@ for (const medium of ["audio", "video"] as const) {
   });
 }
 
-test("legacy temporary reads remain usable but cannot seed an unverified reuse entry", async () => {
+test("legacy checksum-less temporary reads are rejected before observation or reuse", async () => {
   await withMockObserver(async (requestCount) => {
     const root = await createCloudBackedBridgeRoot(
       "SCAN_ROOT_LEGACY_READ",
@@ -1074,14 +1074,72 @@ test("legacy temporary reads remain usable but cannot seed an unverified reuse e
       safeErrorCategory: null,
       status: "COMPLETED",
     });
+    assert.equal(prepared.status, "FAILED");
+    assert.equal(prepared.safeErrorCategory, "SOURCE_CHECKSUM_MISSING");
     await completeBridgeCloudCommand(root.device.bridgeDeviceId, prepared);
     const observed = await scannedFile(root.session.id, file.relativePath);
-    assert.equal(observed.observationOrigin, "NEW_AI");
+    assert.equal(observed.processingStage, "FAILED");
+    assert.equal(observed.processingErrorCategory, "SOURCE_CHECKSUM_MISSING");
+    assert.equal(observed.libraryDocumentId, null);
+    assert.equal(observed.previewText, null);
+    assert.equal(observed.organizationSuggestions.length, 0);
     assert.equal(observed.observationFingerprint, null);
-    assert.equal(requestCount(), 1);
+    assert.equal(requestCount(), 0);
     const nextScan = await repeatCloudScan(root);
     assert.equal((nextScan.result as Record<string, unknown>)?.queuedReads, 1);
   });
+});
+
+for (const medium of ["document", "image", "audio", "video"] as const) {
+  for (const checksumCase of ["missing", "malformed", "overlong", "non-string"] as const) {
+    test(`${medium} completed reads reject ${checksumCase} source checksums before accepting content`, async () => {
+      const relativePath = { document: "notes.txt", image: "image.png", audio: "audio.mp3", video: "video.mp4" }[medium];
+      const bytes = { document: Buffer.from("Synthetic workshop notes."), image: pngMetadataFixture(),
+        audio: mp3FrameBuffer(1), video: mp4VideoBuffer({ hasAudioTrack: true }) }[medium];
+      const root = await createCloudBackedBridgeRoot(`Integrity_${medium}_${checksumCase}`, new Map([[relativePath, bytes]]));
+      const file = await scannedFile(root.session.id, relativePath);
+      const command = await readCommandFor(file.id);
+      assert.ok(command);
+      await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, command.commandId);
+      const result = bridgeJson(await readBridgeRootFile(root.root.id, relativePath)) as Record<string, unknown>;
+      if (checksumCase === "missing") delete result.sourceChecksum;
+      else result.sourceChecksum = checksumCase === "malformed" ? "not-a-sha256" :
+        checksumCase === "non-string" ? 123 : `${file.checksum}0`;
+      const prepared = await prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, {
+        commandId: command.commandId, result: result as BridgeJson, safeErrorCategory: null, status: "COMPLETED",
+      });
+      const category = checksumCase === "missing" ? "SOURCE_CHECKSUM_MISSING" : "SOURCE_CHECKSUM_INVALID";
+      assert.equal(prepared.status, "FAILED");
+      assert.equal(prepared.safeErrorCategory, category);
+      await completeBridgeCloudCommand(root.device.bridgeDeviceId, prepared);
+      const rejected = await scannedFile(root.session.id, relativePath);
+      assert.equal(rejected.processingStage, "FAILED");
+      assert.equal(rejected.processingErrorCategory, category);
+      assert.equal(rejected.libraryDocumentId, null);
+      assert.equal(rejected.previewText, null);
+      assert.equal(rejected.organizationSuggestions.length, 0);
+      assert.equal(await prisma.observationSession.count(), 0);
+      assert.equal((await prisma.bridgeCommand.findUniqueOrThrow({ where: { id: command.id } })).status, "FAILED");
+      assert.deepEqual(await readFile(path.join(root.rootPath, relativePath)), bytes);
+      assert.equal(await prisma.bridgeCommand.count({ where: { commandType: { in: ["EXECUTE_PLAN", "EXECUTE_UNDO"] } } }), 0);
+    });
+  }
+}
+
+test("a completed read cannot establish integrity against an unverified scan checksum", async () => {
+  const root = await createCloudBackedBridgeRoot("Integrity_unverified_scan", new Map([["notes.txt", Buffer.from("Synthetic notes.")]]));
+  const file = await scannedFile(root.session.id, "notes.txt");
+  await prisma.scannedFile.update({ where: { id: file.id }, data: { checksum: null } });
+  await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId, bridgeRootId: root.root.id,
+    relativePath: file.relativePath, scannedFileId: file.id });
+  const rejected = await scannedFile(root.session.id, file.relativePath);
+  assert.equal(rejected.processingErrorCategory, "SCAN_CHECKSUM_UNVERIFIED");
+  assert.equal(rejected.libraryDocumentId, null);
+  assert.equal(await prisma.observationSession.count(), 0);
+  const errors = await import("../../src/lib/bridge/remote-read-commands");
+  assert.match(errors.remoteReadFailureMessageFor("SOURCE_CHECKSUM_MISSING", file.relativePath), /Update NSN Bridge/);
+  assert.match(errors.remoteReadFailureMessageFor("SOURCE_CHECKSUM_INVALID", file.relativePath), /verify/);
+  assert.match(errors.remoteReadFailureMessageFor(rejected.processingErrorCategory, file.relativePath), /Scan the folder again/);
 });
 
 test("an incomplete provider response is reviewable but never reused as complete", async () => {

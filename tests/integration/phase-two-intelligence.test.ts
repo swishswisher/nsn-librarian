@@ -184,6 +184,72 @@ test("persistent relationships deduplicate repeated scans and archive changed ev
   assert.equal(await prisma.knowledgeConnection.count({ where: { relationshipKey: { not: null }, status: "ARCHIVED" } }), 2);
 });
 
+test("known moves and Undo refresh subject relationship references without losing evidence history", async (t) => {
+  const library = await createLibrary("Moved subject root");
+  t.after(async () => {
+    await prisma.knowledgeConnection.deleteMany({ where: { sourceEvidence: { path: ["connectedLibraryId"], equals: library.id } } });
+    await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: library.id } });
+    await prisma.connectedLibrary.delete({ where: { id: library.id } });
+  });
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
+  const left = await createObservedFile({ checksum: "a".repeat(64), libraryId: library.id, relativePath: "Loose/invoice.txt", sessionId: scan.id });
+  const right = await createObservedFile({ checksum: "b".repeat(64), libraryId: library.id, relativePath: "Finance/payment.txt", sessionId: scan.id });
+  await persistent.persistScanWorkingKnowledge(knowledgeIndex(scan.id, library.id, left, right));
+  const leftKey = persistent.persistentFileKey(library.id, left.file.relativePath);
+  const original = await prisma.knowledgeConnection.findFirstOrThrow({ where: {
+    OR: [{ sourceFileKey: leftKey }, { targetFileKey: leftKey }],
+  } });
+  const movedSide = original.sourceFileKey === leftKey ? "source" : "target";
+  await prisma.knowledgeConnection.update({ where: { id: original.id }, data: { status: "CONFIRMED" } });
+  const plan = await prisma.organizationPlan.create({ data: {
+    connectedLibraryId: library.id, scanSessionId: scan.id, createdBy: "isolated-test", status: "EXECUTED",
+    totalActions: 1, actions: [], warnings: [], skippedItems: [], history: [],
+  } });
+  const run = await prisma.executionRun.create({ data: {
+    organizationPlanId: plan.id, connectedLibraryId: library.id, status: "COMPLETED", completedAt: new Date(), totalActions: 1,
+    actions: { create: { actionType: "MOVE_FILE", sourceRelativePath: left.file.relativePath, destinationRelativePath: "Finance/invoice.txt",
+      sourceChecksumBefore: left.file.checksum, destinationChecksumAfter: left.file.checksum, sequence: 1, status: "COMPLETED" } },
+  }, include: { actions: true } });
+  const nextSnapshot = async (relativePath: string) => {
+    const nextScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
+    const source = await createObservedFile({ checksum: left.file.checksum!, libraryId: library.id, relativePath, sessionId: nextScan.id });
+    const target = await createObservedFile({ checksum: right.file.checksum!, libraryId: library.id, relativePath: right.file.relativePath, sessionId: nextScan.id });
+    const index = knowledgeIndex(nextScan.id, library.id, source, target);
+    await persistent.persistScanWorkingKnowledge(index);
+    return { source, target, index };
+  };
+  const moved = await nextSnapshot("Finance/invoice.txt");
+  const refreshed = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: original.id } });
+  assert.equal(refreshed.relationshipKey, original.relationshipKey);
+  assert.equal(refreshed.status, "CONFIRMED");
+  assert.equal(refreshed.sourceObservationSessionId, (movedSide === "source" ? moved.source : moved.target).observation.id);
+  assert.equal(refreshed.targetObservationSessionId, (movedSide === "target" ? moved.source : moved.target).observation.id);
+  const refs = refreshed.sourceEvidence as Record<string, unknown>;
+  assert.equal(refs[`${movedSide}RelativePath`], "Finance/invoice.txt");
+  assert.deepEqual(new Set([refs.sourceRelativePath, refs.targetRelativePath]), new Set(["Finance/invoice.txt", right.file.relativePath]));
+  assert.deepEqual((refs.previousSnapshots as Array<{ evidence: unknown }>)[0].evidence, original.sourceEvidence);
+  assert.equal((await persistent.getRecentPersistentFileRelationships()).find((row) => row.id === original.id)?.status, "CONFIRMED");
+  await persistent.persistScanWorkingKnowledge(moved.index);
+  assert.equal(((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: original.id } })).sourceEvidence as Record<string, unknown>)
+    .previousSnapshots instanceof Array, true);
+  assert.equal(await prisma.knowledgeConnection.count({ where: { relationshipKey: original.relationshipKey } }), 1);
+  await prisma.undoRun.create({ data: {
+    executionRunId: run.id, status: "COMPLETED", completedAt: new Date(), totalActions: 1,
+    actions: { create: { originalExecutionActionId: run.actions[0].id, actionType: "RESTORE_FILE",
+      sourceRelativePath: "Finance/invoice.txt", destinationRelativePath: left.file.relativePath, sequence: 1, status: "COMPLETED" } },
+  } });
+  await nextSnapshot(left.file.relativePath);
+  const restored = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: original.id } });
+  assert.equal((restored.sourceEvidence as Record<string, unknown>)[`${movedSide}RelativePath`], left.file.relativePath);
+  assert.equal(((restored.sourceEvidence as Record<string, unknown>).previousSnapshots as unknown[]).length, 2);
+  assert.equal(restored.status, "CONFIRMED");
+  assert.equal(await prisma.knowledgeConnection.count({ where: { relationshipKey: original.relationshipKey } }), 1);
+  await nextSnapshot("External/untracked-invoice.txt");
+  assert.equal((await persistent.getRecentPersistentFileRelationships()).find((row) => row.id === original.id)?.status, "ARCHIVED");
+  assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: original.id } })).status, "CONFIRMED");
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
 test("changed evidence preserves a confirmed relationship as historical", async () => {
   const library = await createLibrary("Confirmed history root");
   const firstScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });

@@ -164,6 +164,10 @@ export function remoteReadFailureCategoryFor(
     return "FILE_CHANGED_SINCE_SCAN";
   }
 
+  if (["SOURCE_CHECKSUM_MISSING", "SOURCE_CHECKSUM_INVALID", "SCAN_CHECKSUM_UNVERIFIED"].includes(normalized)) {
+    return normalized;
+  }
+
   return "READ_COMMAND_FAILED";
 }
 
@@ -185,6 +189,18 @@ export function remoteReadFailureMessageFor(
 
   if (category === "FILE_CHANGED_SINCE_SCAN") {
     return "This file changed after the scan. Scan the folder again before examining it.";
+  }
+
+  if (category === "SOURCE_CHECKSUM_MISSING") {
+    return "This Bridge did not verify the file's contents. Update NSN Bridge and retry reading.";
+  }
+
+  if (category === "SOURCE_CHECKSUM_INVALID") {
+    return "The Bridge could not verify the file's contents. Retry reading with an up-to-date NSN Bridge.";
+  }
+
+  if (category === "SCAN_CHECKSUM_UNVERIFIED") {
+    return "This scan does not have a verified file checksum. Scan the folder again before examining it.";
   }
 
   if (category === "FILE_NOT_FOUND") {

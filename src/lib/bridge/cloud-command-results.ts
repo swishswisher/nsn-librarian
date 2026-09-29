@@ -516,7 +516,7 @@ function remoteReadResult(value: unknown) {
 
   return {
     audioMetadata: remoteAudioReadMetadata(result.audioMetadata),
-    sourceChecksum: stringValue(result.sourceChecksum, 64),
+    sourceChecksum: typeof result.sourceChecksum === "string" ? result.sourceChecksum : null,
     characterCount: reportedCharacterCount && reportedCharacterCount >= extractedText.length
       ? reportedCharacterCount
       : extractedText.length,
@@ -665,7 +665,7 @@ async function storeRemoteReadMediaMetadata(
   }
 }
 
-async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
+async function applyCompletedRead(commandPayload: unknown, rawResult: unknown): Promise<BridgeJson> {
   const payload = objectValue(commandPayload);
   const scannedFileId = stringValue(payload?.scannedFileId, 100);
   const scanSessionId = stringValue(payload?.scanSessionId, 100);
@@ -693,9 +693,17 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
     );
   }
 
-  if (result.sourceChecksum && stored.checksum?.toLowerCase() !== result.sourceChecksum.toLowerCase()) {
+  const checksumError = objectValue(rawResult)?.sourceChecksum == null
+    ? "SOURCE_CHECKSUM_MISSING"
+    : !result.sourceChecksum || !/^[a-f0-9]{64}$/i.test(result.sourceChecksum)
+      ? "SOURCE_CHECKSUM_INVALID"
+      : !stored.checksum || !/^[a-f0-9]{64}$/i.test(stored.checksum)
+        ? "SCAN_CHECKSUM_UNVERIFIED"
+        : stored.checksum.toLowerCase() !== result.sourceChecksum.toLowerCase()
+          ? "FILE_CHANGED_SINCE_SCAN" : null;
+  if (checksumError) {
     await markRemoteReadFailure({
-      safeErrorCategory: "FILE_CHANGED_SINCE_SCAN",
+      safeErrorCategory: checksumError,
       scanSessionId,
       scannedFileId,
     });
@@ -705,6 +713,7 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
       characterCount: result.characterCount,
       observationPrepared: false,
       observationReused: false,
+      safeErrorCategory: checksumError,
       scannedFileId,
       suggestionsCreated: 0,
       suggestionsReused: 0,
@@ -1092,9 +1101,12 @@ export async function prepareBridgeCommandReportForPersistence(
 
   if (command.commandType === "READ_FILE_TEMPORARILY") {
     if (report.status === "COMPLETED") {
+      const result = await applyCompletedRead(command.payload, report.result);
+      const safeErrorCategory = objectValue(result)?.safeErrorCategory;
       return {
         ...report,
-        result: await applyCompletedRead(command.payload, report.result),
+        ...(typeof safeErrorCategory === "string" ? { status: "FAILED" as const, safeErrorCategory } : {}),
+        result,
       };
     }
 

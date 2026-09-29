@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { after, before, mock, test } from "node:test";
 
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, type KnowledgeDocumentSignal } from "@prisma/client";
 import { documentSignalVersion } from "../../src/lib/bridge/document-signals";
 
 const schema = `phase_three_${process.pid}_${Date.now()}`;
@@ -710,6 +710,107 @@ test("identity decision APIs immediately refresh affected search hashes and pres
   }
 });
 
+for (const kind of ["CLIENT", "PROJECT"] as const) {
+  test(`reconfirming an older ${kind} correction makes Search, QA and Knowledge use that sole correction`, async () => {
+    const r = await root(`Reconfirmed ${kind} Root`); const s = await session(r.id);
+    const names = kind === "CLIENT" ? ["Alice", "Beatrice"] : ["North Star", "South Moon"];
+    const items: Array<Awaited<ReturnType<typeof observedFile>>> = [];
+    const signals: KnowledgeDocumentSignal[] = [];
+    for (const [i, text] of ["Followup appointments", ...names.map((name) => `${kind}: ${name}`)].entries()) {
+      const item = await observedFile({ rootId: r.id, sessionId: s.id, path: `Records/neutral-${i}.txt`, evidence: evidence(text) });
+      items.push(item);
+      signals.push(await prisma.knowledgeDocumentSignal.create({ data: {
+        checksum: item.file.checksum!, connectedLibraryId: r.id,
+        fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
+        generationVersion: documentSignalVersion, identityHash: `reconfirm-${kind}-${i}`, kind,
+        observationSessionId: item.observation.id, relativePath: item.file.relativePath,
+        signalKey: crypto.randomUUID(), sourceRanges: [],
+      } }));
+    }
+    await indexFiles(s.id, items);
+    const cache = createRequire(path.resolve("package.json"))("next/cache") as typeof import("next/cache");
+    const revalidation = mock.method(cache, "revalidatePath", () => undefined);
+    try {
+      const correctionRoute = await import("../../src/app/api/library/knowledge/document-relationships/correction/route");
+      const decisionRoute = await import("../../src/app/api/library/knowledge/document-relationships/[relationshipId]/decision/route");
+      const createCorrection = async (target: number) => {
+        const response = await correctionRoute.POST(new Request("http://localhost/correction", {
+          method: "POST", body: JSON.stringify({ sourceSignalId: signals[0].id, targetSignalId: signals[target].id,
+            kind: kind === "CLIENT" ? "SAME_CLIENT" : "BELONGS_TO_PROJECT", note: "Synthetic human identity correction" }),
+        }));
+        assert.equal(response.status, 200);
+        return prisma.knowledgeConnection.findFirstOrThrow({ where: {
+          generationVersion: fileKey.humanIdentityCorrectionVersion,
+          sourceFileKey: signals[0].fileKey, targetFileKey: signals[target].fileKey,
+        } });
+      };
+      const decide = async (id: string, action: string) => {
+        const response = await decisionRoute.POST(new Request("http://localhost/decision", {
+          method: "POST", body: JSON.stringify({ action, note: "Synthetic reconfirmation" }),
+        }), { params: Promise.resolve({ relationshipId: id }) });
+        assert.equal(response.status, 200);
+      };
+      const a = await createCorrection(1);
+      const b = await createCorrection(2);
+      assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: a.id } })).status, "REJECTED");
+      assert.equal(b.status, "CONFIRMED");
+      await decide(a.id, "CONFIRM");
+      const confirmed = await prisma.knowledgeConnection.findMany({ where: {
+        generationVersion: fileKey.humanIdentityCorrectionVersion, sourceFileKey: signals[0].fileKey,
+        status: "CONFIRMED", supersededAt: null,
+      } });
+      assert.deepEqual(confirmed.map((row) => row.id), [a.id]);
+      assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: b.id } })).status, "REJECTED");
+      const hashes = async () => (await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: items[0].file.id } })).entityHashes;
+      assert.deepEqual(await hashes(), [signals[1].identityHash]);
+      const sourcePath = items[0].file.relativePath;
+      assert.ok((await search.searchLibrary(`${kind} ${names[0]}`, [r.id])).some((row) => row.relativePath === sourcePath));
+      assert.ok(!(await search.searchLibrary(`${kind} ${names[1]}`, [r.id])).some((row) => row.relativePath === sourcePath));
+      const qa = await import("../../src/lib/library/qa/retrieve");
+      const context = await qa.retrieveQuestionContext(`What do we have about ${kind.toLowerCase()} ${names[0]}?`, [r.id]);
+      assert.equal(context.ambiguousEntity, false);
+      assert.ok(context.sources.some((source) => source.relativePath === sourcePath));
+      assert.ok(!(await qa.retrieveQuestionContext(`What do we have about ${kind.toLowerCase()} ${names[1]}?`, [r.id]))
+        .sources.some((source) => source.relativePath === sourcePath));
+      const group = (await fileKey.getPersistentIdentityGroups()).find((row) => row.libraryName === r.displayName && row.kind === kind &&
+        row.members.some((member) => member.fileKey === signals[0].fileKey));
+      assert.ok(group?.humanConfirmed);
+      assert.deepEqual(new Set(group.members.map((member) => member.fileKey)), new Set([signals[0].fileKey, signals[1].fileKey]));
+      const ui = await fileKey.getRecentPersistentFileRelationships();
+      assert.equal(ui.find((row) => row.id === a.id)?.status, "CONFIRMED");
+      assert.equal(ui.find((row) => row.id === b.id)?.status, "REJECTED");
+      const decisions = await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: { in: [a.id, b.id] } } });
+      await decide(a.id, "CONFIRM");
+      assert.equal(await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: { in: [a.id, b.id] } } }), decisions);
+      assert.deepEqual(await hashes(), [signals[1].identityHash]);
+      await createCorrection(2);
+      await createCorrection(1);
+      assert.deepEqual(await hashes(), [signals[1].identityHash]);
+      assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: b.id } })).status, "REJECTED");
+      await decide(a.id, "SEPARATE");
+      assert.deepEqual(await hashes(), [signals[0].identityHash]);
+      await decide(a.id, "CONFIRM");
+      await decide(a.id, "RECONSIDER");
+      assert.deepEqual(await hashes(), [signals[0].identityHash]);
+      const results = await Promise.all([a.id, b.id].map((id) => decisionRoute.POST(new Request("http://localhost/decision", {
+        method: "POST", body: JSON.stringify({ action: "CONFIRM" }),
+      }), { params: Promise.resolve({ relationshipId: id }) })));
+      assert.ok(results.every((response) => [200, 409].includes(response.status)));
+      assert.ok(results.some((response) => response.status === 200));
+      const winner = await prisma.knowledgeConnection.findMany({ where: {
+        generationVersion: fileKey.humanIdentityCorrectionVersion, sourceFileKey: signals[0].fileKey,
+        status: "CONFIRMED", supersededAt: null,
+      } });
+      assert.equal(winner.length, 1);
+      assert.deepEqual(await hashes(), [winner[0].id === a.id ? signals[1].identityHash : signals[2].identityHash]);
+      assert.equal(await prisma.executionRun.count(), 0);
+      assert.equal(await prisma.bridgeCommand.count(), 0);
+    } finally {
+      revalidation.mock.restore();
+    }
+  });
+}
+
 async function canonicalMoveFixture(actionType: "MOVE_FILE" | "RENAME_FILE") {
   const r = await root(`Canonical ${actionType} Root`); const s = await session(r.id);
   await prisma.scanSession.update({ where: { id: s.id }, data: { searchIndexStatus: "COMPLETED" } });
@@ -771,6 +872,48 @@ async function indexMovedSnapshot(fixture: Awaited<ReturnType<typeof canonicalMo
 }
 
 for (const actionType of ["MOVE_FILE", "RENAME_FILE"] as const) {
+  test(`an executed ${actionType} refreshes canonical relationship evidence and keeps review history`, async () => {
+    const fixture = await canonicalMoveFixture(actionType);
+    await fileKey.reviewPersistentRelationship(fixture.revision.id, "CONFIRM", "Keep this version relationship.");
+    const before = await prisma.knowledgeConnection.findMany({ where: {
+      OR: [{ sourceFileKey: fixture.initialEntry.fileKey }, { targetFileKey: fixture.initialEntry.fileKey }], supersededAt: null,
+    } });
+    const next = await indexMovedSnapshot(fixture, fixture.destination);
+    const ui = await fileKey.getRecentPersistentFileRelationships();
+    for (const old of before) {
+      const current = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: old.id } });
+      assert.equal(current.relationshipKey, old.relationshipKey);
+      assert.equal(current.status, old.status);
+      assert.equal(current.supersededAt, null);
+      const refs = current.sourceEvidence as Record<string, unknown>;
+      const source = next.files.find((item) => fileKey.persistentFileKey(fixture.r.id,
+        item.file.relativePath === fixture.destination ? fixture.originalPath : item.file.relativePath) === current.sourceFileKey);
+      const target = next.files.find((item) => fileKey.persistentFileKey(fixture.r.id,
+        item.file.relativePath === fixture.destination ? fixture.originalPath : item.file.relativePath) === current.targetFileKey);
+      assert.ok(source); assert.ok(target);
+      assert.equal(refs.sourceRelativePath, source.file.relativePath);
+      assert.equal(refs.targetRelativePath, target.file.relativePath);
+      assert.equal(current.sourceObservationSessionId, source.observation.id);
+      assert.equal(current.targetObservationSessionId, target.observation.id);
+      const history = refs.previousSnapshots as Array<Record<string, unknown>>;
+      assert.equal(history.length, 1);
+      assert.deepEqual(history[0].evidence, old.sourceEvidence);
+      assert.equal(history[0].sourceObservationSessionId, old.sourceObservationSessionId);
+      assert.equal(history[0].targetObservationSessionId, old.targetObservationSessionId);
+      assert.equal(ui.find((row) => row.id === old.id)?.reviewable, true);
+      await fileKey.reviewPersistentRelationship(old.id, "CONFIRM");
+      assert.equal(await prisma.knowledgeConnection.count({ where: { relationshipKey: old.relationshipKey } }), 1);
+    }
+    const decisions = await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: fixture.revision.id } });
+    assert.equal(decisions, 1);
+    await fileKey.persistScanWorkingKnowledge(next.index);
+    assert.equal(((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: fixture.revision.id } })).sourceEvidence as Record<string, unknown>)
+      .previousSnapshots instanceof Array, true);
+    assert.equal((((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: fixture.revision.id } })).sourceEvidence as Record<string, unknown>)
+      .previousSnapshots as unknown[]).length, 1);
+    assert.equal(await prisma.bridgeCommand.count(), 0);
+  });
+
   test(`an executed ${actionType} keeps canonical search identity, human corrections, versions and QA context`, async () => {
     const fixture = await canonicalMoveFixture(actionType);
     assert.equal(fixture.initialEntry.fileKey, fileKey.persistentFileKey(fixture.r.id, fixture.originalPath));
@@ -839,6 +982,15 @@ test("Undo restores the original canonical entry without creating a duplicate id
   assert.equal(restored.entry.fileName, path.posix.basename(fixture.originalPath));
   assert.deepEqual(restored.entry.entityHashes, fixture.initialEntry.entityHashes);
   assert.equal(await prisma.librarySearchEntry.count({ where: { fileKey: fixture.initialEntry.fileKey } }), 1);
+  const relationships = await fileKey.getRecentPersistentFileRelationships();
+  const revision = relationships.find((row) => row.id === fixture.revision.id);
+  assert.equal(revision?.reviewable, true);
+  assert.ok([revision.sourceRelativePath, revision.targetRelativePath].includes(fixture.originalPath));
+  assert.ok(![revision.sourceRelativePath, revision.targetRelativePath].includes(fixture.destination));
+  const row = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: fixture.revision.id } });
+  const snapshots = (row.sourceEvidence as Record<string, unknown>).previousSnapshots as Array<{ evidence: Record<string, unknown> }>;
+  assert.equal(snapshots.length, 2);
+  assert.ok(snapshots.some((snapshot) => [snapshot.evidence.sourceRelativePath, snapshot.evidence.targetRelativePath].includes(fixture.destination)));
   assert.equal(fileKey.fileKeyAfterKnownMoves(fixture.r.id, fixture.destination,
     fixture.descriptions[0].checksum, await fileKey.knownExecutedMoves(fixture.r.id)),
     fileKey.persistentFileKey(fixture.r.id, fixture.destination));
@@ -861,6 +1013,9 @@ test("exact copies stay distinct and untracked renames cannot inherit canonical 
   const qa = await import("../../src/lib/library/qa/retrieve");
   assert.ok(!(await qa.retrieveQuestionContext("What do we have about client Alice?", [fixture.r.id]))
     .sources.some((source) => source.relativePath === external.entry.relativePath));
+  const oldRelationship = (await fileKey.getRecentPersistentFileRelationships()).find((row) => row.id === fixture.revision.id);
+  assert.equal(oldRelationship?.reviewable, false);
+  assert.equal(oldRelationship?.status, "ARCHIVED");
   assert.equal(await prisma.bridgeCommand.count(), 0);
 });
 
