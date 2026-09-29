@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
 import type { Prisma } from "@prisma/client";
+import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import {
@@ -1597,10 +1598,10 @@ function imageWebsiteCandidateDraft(context: SuggestionContext) {
 }
 
 export function sourceLocationsForRecommendation(contentText: string, concepts: string[]) {
-  return [...contentText.matchAll(/Source characters (\d+)-(\d+): "([^"\n]{1,240})"/g)]
-    .filter((match) => textContainsAnyTerm(match[3] ?? "", concepts))
+  return verifiedSourceExcerpts(contentText)
+    .filter((excerpt) => textContainsAnyTerm(excerpt.text, concepts))
     .slice(0, 3)
-    .map((match) => `Source location: characters ${match[1]}-${match[2]} of extracted text.`);
+    .map((excerpt) => `Source location: characters ${excerpt.start}-${excerpt.end} of extracted text.`);
 }
 
 function moveAndFolderDrafts(context: SuggestionContext) {

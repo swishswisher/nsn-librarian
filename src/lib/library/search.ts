@@ -38,7 +38,8 @@ export function parseSearchIntent(value: string): SearchIntent {
   const query = value.trim().slice(0, 120);
   const normalized = query.toLowerCase();
   const fileType = /\b(pdf|docx?|html?|markdown|images?|audio|video)\b/i.exec(query)?.[1]?.toLowerCase() ?? null;
-  const entityName = /\b(?:client|project)\s+(?:named\s+)?([\p{L}\p{N}-]{1,50})/iu.exec(query)?.[1]?.toLowerCase() ?? null;
+  const entityPhrase = /\b(?:client|project)\s+(?:named\s+)?([\p{L}\p{N}][\p{L}\p{N} .'-]{0,70})/iu.exec(query)?.[1];
+  const entityName = entityPhrase?.split(/\b(?:and|with|about|have|in|on|for|from|documents?|files?|invoices?|versions?|pdf|docx?|html?|markdown|images?|audio|video|older|earlier|previous|history)\b/iu)[0]?.trim().toLowerCase() || null;
   return {
     query,
     terms: workingKnowledgeTerms(query).slice(0, 12),
@@ -59,6 +60,18 @@ function validExcerpts(value: unknown): SearchExcerpt[] {
       ? [{ start: item.start, end: item.end, text: item.text }]
       : [],
   ).slice(0, 8);
+}
+
+function matchesEntityPhrase(value: string, phrase: string) {
+  const text = value.normalize("NFKC").toLowerCase();
+  const name = phrase.normalize("NFKC").toLowerCase();
+  let offset = text.indexOf(name);
+  while (offset >= 0) {
+    if (!/[\p{L}\p{N}]/u.test(text[offset - 1] ?? "") &&
+        !/[\p{L}\p{N}]/u.test(text[offset + name.length] ?? "")) return true;
+    offset = text.indexOf(name, offset + 1);
+  }
+  return false;
 }
 
 export function rankSearchEntry(entry: {
@@ -172,8 +185,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   // Resolved identity expansion uses only identities from already scoped matches.
   const seedHashes = [...new Set(initial.filter((entry) =>
     intent.entityName
-      ? entry.sourceTerms.includes(workingKnowledgeTerms(intent.entityName)[0] ?? "") ||
-        workingKnowledgeTerms(entry.relativePath).includes(workingKnowledgeTerms(intent.entityName)[0] ?? "")
+      ? validExcerpts(entry.sourceExcerpts).some((excerpt) => matchesEntityPhrase(excerpt.text, intent.entityName!)) ||
+        matchesEntityPhrase(entry.relativePath, intent.entityName)
       : intent.terms.filter((term) => entry.sourceTerms.includes(term) ||
           workingKnowledgeTerms(entry.relativePath).includes(term)).length >= 2,
   ).flatMap((entry) => entry.entityHashes))].slice(0, 24);
@@ -206,8 +219,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
     if (!root || !currentSourceIds.has(entry.scannedFileId) ||
         (!intent.wantsHistory && !root.scanSessions.some((session) => session.id === entry.scanSessionId))) continue;
     if (intent.entityName && !entry.entityHashes.some((hash) => seedHashes.includes(hash)) &&
-        !entry.relativePath.toLowerCase().includes(intent.entityName) &&
-        !validExcerpts(entry.sourceExcerpts).some((excerpt) => excerpt.text.toLowerCase().includes(intent.entityName!))) continue;
+        !matchesEntityPhrase(entry.relativePath, intent.entityName) &&
+        !validExcerpts(entry.sourceExcerpts).some((excerpt) => matchesEntityPhrase(excerpt.text, intent.entityName!))) continue;
     if (intent.fileType && !entry.fileType.toLowerCase().includes(intent.fileType.replace(/s$/, ""))) continue;
     const ranked = rankSearchEntry(entry, intent, new Set(seedHashes));
     if (!ranked) continue;
@@ -258,7 +271,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   for (const file of fallback) {
     const root = rootById.get(file.scanSession.connectedFolderId);
     if (!root) continue;
-    if (intent.entityName && !file.relativePath.toLowerCase().includes(intent.entityName)) continue;
+    if (intent.entityName && !matchesEntityPhrase(file.relativePath, intent.entityName)) continue;
     const href = getScannedFileExamineRoute(file.sessionId, file.id);
     if (indexedFileIds.has(file.id)) continue;
     if (intent.fileType && !file.fileType.toLowerCase().includes(intent.fileType.replace(/s$/, ""))) continue;

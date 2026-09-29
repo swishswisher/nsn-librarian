@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { workingKnowledgeTerms, type ScanWorkingKnowledgeIndex } from "@/lib/bridge/scan-working-knowledge";
@@ -17,14 +18,7 @@ function digest(value: string) {
 }
 
 export function boundedSourceExcerpts(value: string): SearchExcerpt[] {
-  return [...value.matchAll(/Source characters (\d+)-(\d+): "([^"\n]{1,240})"/g)]
-    .flatMap((match) => {
-      const start = Number(match[1]);
-      const end = Number(match[2]);
-      const text = match[3];
-      return end - start === text.length ? [{ end, start, text }] : [];
-    })
-    .slice(0, searchEvidenceLimit);
+  return verifiedSourceExcerpts(value).slice(0, searchEvidenceLimit);
 }
 
 export function searchEntryFingerprint(input: {

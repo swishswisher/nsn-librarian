@@ -6,9 +6,48 @@ import {
   groundedEvidence,
   sampleDocumentText,
   verifiedSourceText,
+  verifiedSourceExcerpts,
 } from "../../src/lib/ai/source-evidence";
+import { boundedSourceExcerpts } from "../../src/lib/library/search-index";
+import { extractDocumentSignals } from "../../src/lib/bridge/document-signals";
 import { buildScanWorkingKnowledge } from "../../src/lib/bridge/scan-working-knowledge";
 import { sourceLocationsForRecommendation } from "../../src/lib/bridge/organization-suggestions";
+
+for (const quote of ["Invoice payment records", "Invoice payment\nOffice expense", 'Invoice "payment" records', 'Invoice "payment"\nOffice expense']) {
+  test(`verified evidence round-trips exact text: ${JSON.stringify(quote)}`, () => {
+    const source = `Preamble. ${quote} End.`;
+    const stored = groundedEvidence(quote, source)!;
+    const excerpts = [{ start: 10, end: 10 + quote.length, text: quote }];
+    assert.equal(verifiedSourceText(stored), quote);
+    assert.deepEqual(verifiedSourceExcerpts(stored), excerpts);
+    assert.deepEqual(boundedSourceExcerpts(stored), excerpts);
+    assert.equal(source.slice(excerpts[0].start, excerpts[0].end), quote);
+    assert.equal(sourceLocationsForRecommendation(stored, ["payment"]).length, 1);
+    const legacy = `Source characters 10-${10 + quote.length}: "${quote}"`;
+    assert.deepEqual(verifiedSourceExcerpts(legacy), excerpts);
+    assert.equal(verifiedSourceText(legacy), quote);
+  });
+}
+
+test("encoded multiline identity evidence retains document signals and exact source ranges", () => {
+  const quote = 'Client: Alice Smith\nClient ID: C-001\nProject: North "Star"\nProject ID: P-001';
+  const source = `   ${quote}`;
+  const stored = groundedEvidence(quote, source)!;
+  const signals = extractDocumentSignals(stored, "synthetic-root");
+  assert.ok(signals.some((signal) => signal.kind === "CLIENT"));
+  assert.ok(signals.some((signal) => signal.kind === "PROJECT"));
+  for (const signal of signals) {
+    assert.ok(signal.sourceRanges.every((range) => source.slice(range.start, range.end) === quote));
+  }
+  assert.deepEqual(extractDocumentSignals(`Source characters 3-${3 + quote.length}: "${quote}"`, "synthetic-root"), signals);
+});
+
+test("invalid ranges and unverified trailing claims cannot become verified evidence", () => {
+  assert.deepEqual(verifiedSourceExcerpts('Source characters 10-12: "invoice payment"'), []);
+  assert.deepEqual(verifiedSourceExcerpts('Source characters 99-4: "invoice payment"'), []);
+  assert.equal(verifiedSourceText('Source characters 0-15: "invoice payment" extra claim'), null);
+  assert.deepEqual(verifiedSourceExcerpts(`Source characters 0-241: "${"x".repeat(241)}"`), []);
+});
 
 test("bounded observation samples reach beyond the old prefix limit", () => {
   const source = `${"Routine introduction. ".repeat(7_000)}Workshop facilitation schedule and seminar materials.`;
@@ -64,11 +103,11 @@ test("source locations preserve leading whitespace offsets in extracted text", (
 
 test("recommendation provenance names only matching source locations without copying excerpts", () => {
   const locations = sourceLocationsForRecommendation(
-    'Source characters 10-24: "invoice payment" Source characters 80-99: "workshop planning"',
+    'Source characters 10-25: "invoice payment" Source characters 80-97: "workshop planning"',
     ["invoice", "payment"],
   );
 
-  assert.deepEqual(locations, ["Source location: characters 10-24 of extracted text."]);
+  assert.deepEqual(locations, ["Source location: characters 10-25 of extracted text."]);
   assert.ok(!locations[0].includes("invoice payment"));
 });
 

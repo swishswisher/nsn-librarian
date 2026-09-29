@@ -882,6 +882,184 @@ test("executed aliases are root-scoped and revoked or disconnected roots cannot 
   }
 });
 
+test("multiword client and project parsing preserves phrases and stops at filters", () => {
+  for (const [query, expected] of [
+    ["client Alice Smith", "alice smith"], ["project North Star", "north star"],
+    ["client named Alice Smith with invoices", "alice smith"],
+    ["project North Star pdf files", "north star"], ["client Alice", "alice"],
+  ]) assert.equal(search.parseSearchIntent(query).entityName, expected);
+});
+
+for (const [kind, wanted, other] of [["client", "Alice Smith", "Alice Jones"], ["project", "North Star", "North Wind"]]) {
+  test(`full ${kind} phrase does not expand a same-prefix identity`, async () => {
+    const r = await root(`Multiword ${kind}`); const s = await session(r.id);
+    const items: Array<Awaited<ReturnType<typeof observedFile>>> = [];
+    for (const [index, name] of [wanted, other, `${wanted}son`].entries()) {
+      const item = await observedFile({ rootId: r.id, sessionId: s.id, path: `neutral-${index}.txt`,
+        evidence: evidence(`${kind}: ${name}; ${kind} ID: ID-${index}`) });
+      await prisma.knowledgeDocumentSignal.create({ data: {
+        checksum: item.file.checksum!, connectedLibraryId: r.id,
+        fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
+        generationVersion: documentSignalVersion, identityHash: `multiword-${kind}-${index}`,
+        kind: kind.toUpperCase(), observationSessionId: item.observation.id,
+        relativePath: item.file.relativePath, signalKey: crypto.randomUUID(), sourceRanges: [],
+      } });
+      items.push(item);
+    }
+    await indexFiles(s.id, items);
+    const results = await search.searchLibrary(`${kind} ${wanted}`, [r.id]);
+    assert.ok(results.some((result) => result.relativePath === items[0].file.relativePath));
+    assert.ok(!results.some((result) => result.relativePath === items[1].file.relativePath));
+    assert.ok(!results.some((result) => result.relativePath === items[2].file.relativePath));
+  });
+}
+
+test("Prepare Search keeps the completed snapshot during incomplete scans and advances only on completion", async () => {
+  const headers = createRequire(path.resolve("package.json"))("next/headers");
+  const { createHumanSessionToken } = await import("../../src/lib/auth/token");
+  const oldSecret = process.env.AUTH_SECRET; const oldUsers = process.env.NSN_AUTH_ALLOWED_USERS_JSON;
+  process.env.AUTH_SECRET = "synthetic-search-authorization-secret-12345678";
+  const user = { email: "test@example.invalid", name: "Synthetic tester", role: "OWNER" as const, googleSubject: "test-subject" };
+  process.env.NSN_AUTH_ALLOWED_USERS_JSON = JSON.stringify([user]);
+  const token = createHumanSessionToken(user, { ...user, picture: null });
+  const cookieMock = mock.method(headers, "cookies", async () => ({ get: () => ({ value: token }) }));
+  try {
+    const route = await import("../../src/app/api/library/search/index/route");
+    const r = await root("Search preparation snapshots"); const old = await session(r.id);
+    const newer = await prisma.scanSession.create({ data: { connectedFolderId: r.id, status: "PENDING",
+      startedAt: new Date(old.startedAt.getTime() + 10_000) } });
+    const get = (id: string) => route.GET(new Request(`https://example.invalid/api/library/search/index?sessionId=${id}`));
+    const post = (id: string) => route.POST(new Request("https://example.invalid/api/library/search/index", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: id }),
+    }));
+    for (const status of ["PENDING", "SCANNING", "READING", "EXAMINING", "GENERATING_SUGGESTIONS", "FAILED"] as const) {
+      await prisma.scanSession.update({ where: { id: newer.id }, data: { status } });
+      assert.equal((await get(old.id)).status, 200);
+      assert.equal((await post(old.id)).status, 200);
+      assert.equal((await post(newer.id)).status, 404);
+    }
+    await prisma.scanSession.update({ where: { id: newer.id }, data: { status: "COMPLETED_WITH_ERRORS" } });
+    assert.equal((await post(newer.id)).status, 200);
+    assert.equal((await get(old.id)).status, 404);
+    await prisma.connectedLibrary.update({ where: { id: r.id }, data: { readPermission: false } });
+    assert.equal((await post(newer.id)).status, 404);
+    assert.equal(await prisma.bridgeCommand.count({ where: { payload: { path: ["scanSessionId"], equals: newer.id } } }), 0);
+  } finally {
+    cookieMock.mock.restore();
+    if (oldSecret === undefined) delete process.env.AUTH_SECRET; else process.env.AUTH_SECRET = oldSecret;
+    if (oldUsers === undefined) delete process.env.NSN_AUTH_ALLOWED_USERS_JSON; else process.env.NSN_AUTH_ALLOWED_USERS_JSON = oldUsers;
+  }
+});
+
+test("corrected Memory retires obsolete contributions immediately while preserving audit and unrelated Memory", async () => {
+  const r = await root("Corrected Memory"); const s = await session(r.id);
+  const item = await observedFile({ rootId: r.id, sessionId: s.id, path: "corrected.txt", status: "APPROVED" });
+  const unrelated = await observedFile({ rootId: r.id, sessionId: s.id, path: "unrelated.txt", status: "APPROVED" });
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  const qa = await import("../../src/lib/library/qa/retrieve");
+  await prisma.libraryDocument.update({ where: { id: item.file.libraryDocumentId! },
+    data: { previewText: "attachment attachment regulation regulation" } });
+  await prisma.libraryDocument.update({ where: { id: unrelated.file.libraryDocumentId! },
+    data: { previewText: "clinical clinical therapy therapy" } });
+  await saveHumanDecision(item.observation.id, { decisionType: "ACCEPT" });
+  await memory.buildMemoryFromApprovedSession(item.observation.id);
+  await memory.buildMemoryFromApprovedSession(unrelated.observation.id);
+  const old = await prisma.memoryEntry.findUniqueOrThrow({ where: { memoryKey: "THEME:attachment-regulation" } });
+  const untouched = await prisma.memoryEntry.findUniqueOrThrow({ where: { memoryKey: "THEME:clinical-practice" } });
+  assert.ok((await search.searchLibrary("attachment", [r.id])).some((row) => row.kind === "MEMORY"));
+  const input = { decisionType: "MODIFY" as const, editedSuggestion: "workshop workshop teaching teaching" };
+  const correction = await saveHumanDecision(item.observation.id, input);
+  assert.ok(!(await search.searchLibrary("attachment", [r.id])).some((row) => row.kind === "MEMORY"));
+  assert.ok(!(await qa.retrieveQuestionContext("attachment", [r.id])).sources.some((source) => source.sourceType === "APPROVED_MEMORY"));
+  await memory.buildMemoryFromApprovedSession(item.observation.id);
+  const archived = await prisma.memoryEntry.findUniqueOrThrow({ where: { id: old.id } });
+  assert.equal(archived.status, "ARCHIVED");
+  assert.deepEqual((archived.evidence as unknown[]).filter((value) => typeof value === "string"), old.evidence);
+  assert.equal((await prisma.memoryEntry.findUniqueOrThrow({ where: { memoryKey: "THEME:teaching-material" } })).status, "ACTIVE");
+  assert.deepEqual(await prisma.memoryEntry.findUniqueOrThrow({ where: { id: untouched.id } }), untouched);
+  assert.ok((await search.searchLibrary("teaching", [r.id])).some((row) => row.kind === "MEMORY"));
+  const count = await prisma.memoryEntry.count();
+  assert.equal((await saveHumanDecision(item.observation.id, input)).decisionId, correction.decisionId);
+  await memory.buildMemoryFromApprovedSession(item.observation.id);
+  assert.deepEqual(await prisma.memoryEntry.findUniqueOrThrow({ where: { id: old.id } }), archived);
+  assert.equal(await prisma.memoryEntry.count(), count);
+  assert.equal(await prisma.humanDecision.count({ where: { observationSessionId: item.observation.id } }), 2);
+  await saveHumanDecision(item.observation.id, { decisionType: "MODIFY", editedSuggestion: "attachment regulation" });
+  await memory.buildMemoryFromApprovedSession(item.observation.id);
+  const restored = await prisma.memoryEntry.findUniqueOrThrow({ where: { id: old.id } });
+  assert.equal(restored.status, "ACTIVE");
+  assert.ok(restored.searchProvenanceComplete);
+  assert.ok((restored.evidence as unknown[]).some((value) => typeof value === "object"));
+  assert.ok((await search.searchLibrary("attachment", [r.id])).some((row) => row.kind === "MEMORY"));
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("a correction removes only its contribution to shared Memory supported by another session", async () => {
+  const r = await root("Shared Memory"); const s = await session(r.id);
+  const items = [];
+  for (const name of ["shared-a.txt", "shared-b.txt"]) {
+    const item = await observedFile({ rootId: r.id, sessionId: s.id, path: name, status: "APPROVED" });
+    await prisma.libraryDocument.update({ where: { id: item.file.libraryDocumentId! },
+      data: { previewText: "clinical clinical therapy therapy" } });
+    await memory.buildMemoryFromApprovedSession(item.observation.id);
+    items.push(item);
+  }
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  await saveHumanDecision(items[0].observation.id, { decisionType: "MODIFY", editedSuggestion: "workshop teaching" });
+  await memory.buildMemoryFromApprovedSession(items[0].observation.id);
+  const entry = await prisma.memoryEntry.findUniqueOrThrow({ where: { memoryKey: "THEME:clinical-practice" }, include: { searchSources: true } });
+  assert.equal(entry.status, "ACTIVE");
+  assert.equal(entry.searchProvenanceComplete, true);
+  assert.equal(entry.searchSources.filter((row) => row.connectedLibraryId === r.id).length, 1);
+  assert.equal(entry.searchSources.find((row) => row.connectedLibraryId === r.id)?.observationSessionId, items[1].observation.id);
+  assert.ok(!JSON.stringify(entry.evidence).includes(items[0].file.relativePath));
+});
+
+test("obsolete MODIFY decisions cannot keep an old terminology preference active", async () => {
+  const r = await root("Corrected preference"); const s = await session(r.id);
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  const items: Array<Awaited<ReturnType<typeof observedFile>>> = [];
+  for (const name of ["preference-a.txt", "preference-b.txt"]) {
+    const item = await observedFile({ rootId: r.id, sessionId: s.id, path: name });
+    await saveHumanDecision(item.observation.id, { decisionType: "MODIFY", editedSuggestion: "Recovery -> Becoming" });
+    await memory.buildMemoryFromApprovedSession(item.observation.id);
+    items.push(item);
+  }
+  const old = await prisma.memoryEntry.findUniqueOrThrow({ where: { memoryKey: "PREFERENCE:prefer-becoming-over-recovery" } });
+  assert.equal(old.status, "ACTIVE");
+  const input = { decisionType: "MODIFY" as const, editedSuggestion: "Recovery -> Flourishing" };
+  await saveHumanDecision(items[0].observation.id, input);
+  await memory.buildMemoryFromApprovedSession(items[0].observation.id);
+  assert.equal((await prisma.memoryEntry.findUniqueOrThrow({ where: { id: old.id } })).status, "ARCHIVED");
+  assert.equal(await prisma.humanDecision.count({ where: { observationSessionId: items[0].observation.id } }), 2);
+  assert.ok(!(await search.searchLibrary("becoming", [r.id])).some((row) => row.kind === "MEMORY"));
+});
+
+test("encoded source quotations reach Search, QA, document signals and persistent ranges without changing the quotation", async () => {
+  const r = await root("Quoted evidence"); const s = await session(r.id);
+  const { groundedEvidence } = await import("../../src/lib/ai/source-evidence");
+  const quote = 'Client: Alice Smith\nClient ID: C-quoted\nWorkshop: "Orchid" training';
+  const source = `Introduction. ${quote}`;
+  const item = await observedFile({ rootId: r.id, sessionId: s.id, path: "quoted.txt", evidence: groundedEvidence(quote, source)! });
+  const other = await observedFile({ rootId: r.id, sessionId: s.id, path: "support.txt", evidence: groundedEvidence(quote, source)! });
+  await fileKey.persistScanWorkingKnowledge({ clusters: [], files: [item.working, other.working], scanSessionId: s.id,
+    relationships: [{ leftFileId: item.file.id, rightFileId: other.file.id, confidence: 0.8,
+      sharedTerms: ["orchid", "training"], supportingTopics: ["workshops"], sharedTopics: ["workshops"],
+      supportingTopicConfidence: { workshops: 0.8 }, evidenceKinds: ["CONTENT"] }] });
+  await indexFiles(s.id, [item, other]);
+  const result = (await search.searchLibrary("orchid", [r.id])).find((row) => row.relativePath === item.file.relativePath)!;
+  assert.equal(result.excerpt, quote);
+  assert.deepEqual(result.sourceRange, { start: 14, end: 14 + quote.length });
+  assert.equal(source.slice(result.sourceRange!.start, result.sourceRange!.end), quote);
+  assert.ok((await fileKey.getEffectiveDocumentSignals([r.id])).some((signal) => signal.kind === "CLIENT"));
+  const qa = await import("../../src/lib/library/qa/retrieve");
+  const context = await qa.retrieveQuestionContext("orchid", [r.id]);
+  assert.ok(context.sources.some((row) => row.text === quote && row.sourceRange?.start === 14));
+  const connection = await prisma.knowledgeConnection.findFirstOrThrow({ where: { sourceFileKey: fileKey.persistentFileKey(r.id, item.file.relativePath) } });
+  assert.deepEqual((connection.sourceEvidence as { sourceRanges: unknown }).sourceRanges, [{ start: 14, end: 14 + quote.length }]);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
 test("metadata search remains available if the derived index is unavailable", async () => {
   const r = await root("No Index Root"); const s = await session(r.id);
   await prisma.scannedFile.create({ data: {

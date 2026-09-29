@@ -263,6 +263,10 @@ function evidenceFromJson(value: Prisma.JsonValue) {
   return asStringArray(value).slice(0, 12);
 }
 
+function correctionArchives(value: Prisma.JsonValue) {
+  return asArray(value).filter((item) => isRecord(item) && item.kind === "HUMAN_CORRECTION_ARCHIVE");
+}
+
 function collectSessionText(session: StoredSessionForMemory) {
   if (session.status === "MODIFIED") {
     const corrected = session.humanDecisions.find(
@@ -563,7 +567,10 @@ function preferenceCandidatesFromDecisions(
     }
   }
 
+  const currentDecisions = new Set<string>();
   for (const decision of decisions) {
+    if (currentDecisions.has(decision.observationSessionId)) continue;
+    currentDecisions.add(decision.observationSessionId);
     if (decision.decisionType !== "MODIFY" || !decision.editedSuggestion) {
       continue;
     }
@@ -621,6 +628,9 @@ async function relationshipCandidatesForSession(sessionId: string, seenAt: Date)
   const connections = await prisma.knowledgeConnection.findMany({
     where: {
       status: { in: [...visibleConnectionStatuses] },
+      supersededAt: null,
+      sourceObservationSession: { status: "APPROVED" },
+      targetObservationSession: { status: "APPROVED" },
       OR: [
         { sourceObservationSessionId: sessionId },
         { targetObservationSessionId: sessionId },
@@ -729,6 +739,18 @@ async function upsertMemoryCandidate(candidate: MemoryCandidate) {
   }
 
   if (existing.status !== activeMemoryStatus) {
+    if (existing.status === "ARCHIVED" && correctionArchives(existing.evidence).length > 0) {
+      await prisma.$transaction(async (tx) => {
+        await tx.memoryEntry.update({ where: { id: existing.id }, data: {
+          status: activeMemoryStatus, description: candidate.description,
+          evidence: toJsonInput([...candidate.evidence, ...correctionArchives(existing.evidence)]),
+          confidence: candidate.confidence, occurrenceCount: candidate.occurrenceCount,
+          lastSeen: candidate.seenAt, searchProvenanceComplete: false,
+        } });
+        await tx.memorySearchSource.deleteMany({ where: { memoryEntryId: existing.id } });
+      });
+      return "RESTORED" as const;
+    }
     return "UNCHANGED" as const;
   }
 
@@ -747,7 +769,7 @@ async function upsertMemoryCandidate(candidate: MemoryCandidate) {
       confidence: clampConfidence(
         Math.max(existing.confidence, candidate.confidence) + 0.03,
       ),
-      evidence: toJsonInput(mergedEvidence),
+      evidence: toJsonInput([...mergedEvidence, ...correctionArchives(existing.evidence)]),
       lastSeen: candidate.seenAt > existing.lastSeen ? candidate.seenAt : existing.lastSeen,
       occurrenceCount: Math.max(
         existing.occurrenceCount + (hasNewEvidence ? 1 : 0),
@@ -794,6 +816,74 @@ async function attachMemorySources(candidate: MemoryCandidate, created: boolean)
   return true;
 }
 
+export async function invalidateCorrectedMemorySources(tx: Prisma.TransactionClient, sessionId: string) {
+  await tx.memoryEntry.updateMany({
+    where: { status: "ACTIVE", searchProvenanceComplete: true,
+      searchSources: { some: { observationSessionId: sessionId } } },
+    data: { searchProvenanceComplete: false, searchProvenanceCheckedAt: new Date() },
+  });
+}
+
+async function reconcileCorrectedMemory(
+  sessionId: string,
+  sessions: StoredSessionForMemory[],
+  candidates: Map<string, MemoryCandidate>,
+) {
+  const prisma = getPrismaClient();
+  const entries = await prisma.memoryEntry.findMany({
+    where: { status: "ACTIVE", searchSources: { some: { observationSessionId: sessionId } } },
+    include: { searchSources: true },
+  });
+  const prepared = sessions.map(prepareSession);
+  const aggregate = aggregateApprovedTerms(prepared);
+  for (const entry of entries) {
+    const support = new Map<string, MemoryCandidate>();
+    const sourceIds = new Set(entry.searchSources.map((source) => source.observationSessionId));
+    const current = candidates.get(entry.memoryKey);
+    if (current) addCandidate(support, current);
+    for (const source of prepared.filter((item) => sourceIds.has(item.id) && item.id !== sessionId)) {
+      for (const candidate of [...termCandidatesForSession(source, aggregate), ...themeCandidatesForSession(source)]) {
+        if (candidate.memoryKey === entry.memoryKey) addCandidate(support, candidate);
+      }
+      const stored = sessions.find((item) => item.id === source.id);
+      if (stored?.status === "APPROVED" && entry.memoryType === "RELATIONSHIP") {
+        for (const candidate of await relationshipCandidatesForSession(source.id, source.seenAt)) {
+          if (candidate.memoryKey === entry.memoryKey) addCandidate(support, candidate);
+        }
+      }
+    }
+    const replacement = support.get(entry.memoryKey);
+    if (!replacement) {
+      // Keep the original evidence and provenance as archived history.
+      await prisma.memoryEntry.update({ where: { id: entry.id }, data: {
+        status: "ARCHIVED", searchProvenanceComplete: false, searchProvenanceCheckedAt: new Date(),
+        evidence: toJsonInput([...evidenceFromJson(entry.evidence), ...correctionArchives(entry.evidence), {
+          kind: "HUMAN_CORRECTION_ARCHIVE", observationSessionId: sessionId, archivedAt: new Date().toISOString(),
+          previousEvidence: evidenceFromJson(entry.evidence), sourceSessionIds: [...sourceIds],
+        }]),
+      } });
+      continue;
+    }
+    const retainedIds = [...new Set(replacement.sourceSessionIds)].sort();
+    const oldIds = [...sourceIds].sort();
+    if (entry.searchProvenanceComplete && JSON.stringify(oldIds) === JSON.stringify(retainedIds) &&
+        JSON.stringify(evidenceFromJson(entry.evidence)) === JSON.stringify(replacement.evidence)) continue;
+    await prisma.$transaction(async (tx) => {
+      await tx.memoryEntry.update({ where: { id: entry.id }, data: {
+        description: replacement.description,
+        evidence: toJsonInput([...replacement.evidence, ...correctionArchives(entry.evidence)]),
+        confidence: replacement.confidence, occurrenceCount: replacement.memoryType === "THEME"
+          ? retainedIds.length : replacement.occurrenceCount,
+        lastSeen: replacement.seenAt, searchProvenanceComplete: false,
+      } });
+      await tx.memorySearchSource.deleteMany({ where: {
+        memoryEntryId: entry.id, observationSessionId: { notIn: retainedIds },
+      } });
+    });
+    await attachMemorySources(replacement, true);
+  }
+}
+
 export async function buildMemoryFromApprovedSession(sessionId: string) {
   const prisma = getPrismaClient();
   const session = await prisma.observationSession.findUnique({
@@ -823,6 +913,13 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
     return 0;
   }
 
+  const contributionSources = session.status === "MODIFIED"
+    ? await prisma.memorySearchSource.findMany({
+      select: { observationSessionId: true },
+      where: { memoryEntry: { status: "ACTIVE", searchSources: {
+        some: { observationSessionId: sessionId },
+      } } },
+    }) : [];
   const approvedSessions = await prisma.observationSession.findMany({
     where: { status: { in: ["APPROVED", "MODIFIED"] } },
     orderBy: { createdAt: "desc" },
@@ -840,6 +937,13 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
       },
     },
   });
+  const missingSources = contributionSources.map((source) => source.observationSessionId)
+    .filter((id) => !approvedSessions.some((source) => source.id === id));
+  if (missingSources.length) approvedSessions.push(...await prisma.observationSession.findMany({
+    where: { id: { in: missingSources }, status: { in: ["APPROVED", "MODIFIED"] } },
+    include: { libraryDocument: { select: { originalFileName: true, previewText: true, rawText: true } },
+      humanDecisions: { orderBy: { createdAt: "desc" } } },
+  }));
   const preparedApprovedSessions = approvedSessions.map((approvedSession) =>
     prepareSession(approvedSession),
   );
@@ -890,8 +994,21 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
     },
   });
 
+  const missingPreferenceSources = contributionSources.map((source) => source.observationSessionId)
+    .filter((id) => !humanDecisions.some((decision) => decision.observationSessionId === id));
+  if (missingPreferenceSources.length) humanDecisions.push(...await prisma.humanDecision.findMany({
+    where: { observationSessionId: { in: missingPreferenceSources }, decisionType: "MODIFY",
+      observationSession: { status: { in: ["APPROVED", "MODIFIED"] } } },
+    orderBy: { createdAt: "desc" }, distinct: ["observationSessionId"],
+    include: { observationSession: { select: { status: true,
+      libraryDocument: { select: { originalFileName: true } } } } },
+  }));
   for (const candidate of preferenceCandidatesFromDecisions(humanDecisions)) {
     addCandidate(candidates, candidate);
+  }
+
+  if (session.status === "MODIFIED") {
+    await reconcileCorrectedMemory(sessionId, approvedSessions, candidates);
   }
 
   let changedCount = 0;
@@ -906,7 +1023,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
       });
     }
     const result = await upsertMemoryCandidate(candidate);
-    if (result === "CREATED") await attachMemorySources(candidate, true);
+    if (result === "CREATED" || result === "RESTORED") await attachMemorySources(candidate, true);
     if (result !== "UNCHANGED") {
       changedCount += 1;
     }

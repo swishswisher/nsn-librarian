@@ -2,7 +2,6 @@ import type { AIObservationResult } from "./types";
 
 const maxSourceCharacters = 2_000_000;
 const maxEvidenceCharacters = 240;
-const sourceEvidencePattern = /^Source characters (\d+)-(\d+): "([\s\S]+)"$/;
 
 export function sampleDocumentText(text: string, budget: number) {
   const source = text.slice(0, maxSourceCharacters);
@@ -96,13 +95,53 @@ export function groundedEvidence(value: string, source: string) {
   }
 
   const excerpt = source.slice(offset, offset + quote.length);
-  return `Source characters ${offset}-${offset + excerpt.length}: "${excerpt}"`;
+  return `Source characters ${offset}-${offset + excerpt.length}: ${JSON.stringify(excerpt)}`;
+}
+
+export function verifiedSourceExcerpts(value: string) {
+  const excerpts: Array<{ start: number; end: number; text: string }> = [];
+  const markers = /Source characters (\d+)-(\d+): /g;
+  let match: RegExpExecArray | null;
+  while ((match = markers.exec(value))) {
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    const length = end - start;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 ||
+        length < 1 || length > maxEvidenceCharacters) continue;
+    const tail = value.slice(markers.lastIndex);
+    if (!tail.startsWith('"')) continue;
+    let text: string | null = null;
+    let consumed = 0;
+    const encoded = /^"(?:\\.|[^"\\])*"/.exec(tail)?.[0];
+    if (encoded) {
+      try {
+        const decoded: unknown = JSON.parse(encoded);
+        if (typeof decoded === "string" && decoded.length === length) {
+          text = decoded;
+          consumed = encoded.length;
+        }
+      } catch { /* Older excerpts stored literal newlines rather than JSON escapes. */ }
+    }
+    // Legacy quotations are bounded by their verified source length, not a quote regex.
+    if (text === null && tail[length + 1] === '"') {
+      text = tail.slice(1, length + 1);
+      consumed = length + 2;
+    }
+    if (text === null) continue;
+    excerpts.push({ start, end, text });
+    markers.lastIndex += consumed;
+  }
+  return excerpts;
 }
 
 export function verifiedSourceText(value: string) {
-  const match = value.match(sourceEvidencePattern);
-
-  return match ? match[3] : null;
+  if (!/^Source characters \d+-\d+: "/.test(value) || !value.endsWith('"')) return null;
+  const excerpts = verifiedSourceExcerpts(value);
+  if (excerpts.length !== 1) return null;
+  const excerpt = excerpts[0];
+  const prefix = `Source characters ${excerpt.start}-${excerpt.end}: `;
+  return value === prefix + JSON.stringify(excerpt.text) || value === `${prefix}"${excerpt.text}"`
+    ? excerpt.text : null;
 }
 
 export function groundObservationResult(

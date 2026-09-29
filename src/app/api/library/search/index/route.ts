@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { getHumanSession } from "@/lib/auth/session";
 import { getPrismaClient } from "@/lib/db/prisma";
+import { usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
 import { getSearchBackfillProgress, prepareSearchBatch } from "@/lib/library/search-backfill";
 import { backfillHistoricalMemorySearchSources } from "@/lib/library/memory";
 
@@ -17,8 +18,8 @@ async function authorizedSession(sessionId: string) {
   });
   if (!session) return null;
   const latest = await prisma.scanSession.findFirst({
-    select: { id: true }, orderBy: { startedAt: "desc" },
-    where: { connectedFolderId: session.connectedFolderId },
+    select: { id: true }, orderBy: [{ startedAt: "desc" }, { id: "desc" }],
+    where: { connectedFolderId: session.connectedFolderId, ...usableScanSnapshotWhere },
   });
   return latest?.id === session.id ? session : null;
 }

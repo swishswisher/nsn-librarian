@@ -5,6 +5,7 @@ import { OpenAIProviderError } from "@/lib/ai/openai-client";
 import type { AIObservationResult } from "@/lib/ai/types";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { reconcileObservationKnowledge } from "@/lib/bridge/persistent-knowledge";
+import { invalidateCorrectedMemorySources } from "@/lib/library/memory";
 import {
   createKnowledgeConnectionsForSession,
   getRelatedKnowledgeForSession,
@@ -711,6 +712,8 @@ export async function saveHumanDecision(
       select: { status: true },
     });
     await reconcileObservationKnowledge(tx, sessionId);
+
+    if (nextStatus === "MODIFIED") await invalidateCorrectedMemorySources(tx, sessionId);
 
     return {
       decisionId: decision.id,

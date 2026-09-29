@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 
 export const documentSignalVersion = "document-signals-v1";
 
@@ -48,11 +49,10 @@ function validDate(value: string) {
 function extractFields(sourceEvidenceText: string) {
   const fields = new Map<string, Field>();
   const conflicts = new Map<string, SourceRange[]>();
-  const excerpts = [...sourceEvidenceText.matchAll(/Source characters (\d+)-(\d+): "([^"\n]{1,240})"/g)].slice(0, 24);
+  const excerpts = verifiedSourceExcerpts(sourceEvidenceText).slice(0, 24);
   for (const excerpt of excerpts) {
-    const range = { start: Number(excerpt[1]), end: Number(excerpt[2]) };
-    if (range.end - range.start !== excerpt[3].length) continue;
-    for (const segment of excerpt[3].split(/[;\n]/)) {
+    const range = { start: excerpt.start, end: excerpt.end };
+    for (const segment of excerpt.text.split(/[;\n]/)) {
       const match = segment.trim().match(/^(client id|client|person|email|organization|company|domain|project id|project|year|workshop|event|date|document id|document title|title|version|revision)\s*:\s*(.{2,100})$/i);
       if (!match) continue;
       const value = normalized(match[2]);

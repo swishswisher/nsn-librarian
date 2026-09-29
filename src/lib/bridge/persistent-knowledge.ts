@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Prisma } from "@prisma/client";
+import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 
@@ -161,10 +162,10 @@ export function selectPersistentRelationships(index: ScanWorkingKnowledgeIndex) 
 }
 
 function verifiedRanges(sourceEvidenceText: string, sharedTerms: string[]) {
-  return [...sourceEvidenceText.matchAll(/Source characters (\d+)-(\d+): "([^"\n]{1,240})"/g)]
-    .filter((match) => sharedTerms.some((term) => match[3].toLowerCase().includes(term.toLowerCase())))
+  return verifiedSourceExcerpts(sourceEvidenceText)
+    .filter((excerpt) => sharedTerms.some((term) => excerpt.text.toLowerCase().includes(term.toLowerCase())))
     .slice(0, 2)
-    .map((match) => ({ start: Number(match[1]), end: Number(match[2]) }));
+    .map((excerpt) => ({ start: excerpt.start, end: excerpt.end }));
 }
 
 export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeIndex) {
