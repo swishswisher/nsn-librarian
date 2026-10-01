@@ -55,6 +55,68 @@ export async function getDocumentVersionSignals(entries: Array<{
   });
 }
 
+export type KnowledgeRelationshipPairEntry = {
+  fileKey: string;
+  checksum: string;
+};
+
+export function knowledgeRelationshipPairKey(
+  left: KnowledgeRelationshipPairEntry,
+  right: KnowledgeRelationshipPairEntry,
+) {
+  return [`${left.fileKey}\0${left.checksum}`, `${right.fileKey}\0${right.checksum}`]
+    .sort()
+    .join("\0");
+}
+
+export async function getSeparatedRelationshipPairIdentities(
+  entries: KnowledgeRelationshipPairEntry[],
+  relationshipKinds: string[],
+) {
+  const separated = new Map<string, Set<string>>();
+  if (!entries.length || !relationshipKinds.length) return separated;
+
+  const prisma = getPrismaClient();
+  const endpointKeys = new Set(entries.map((entry) => `${entry.fileKey}\0${entry.checksum}`));
+  const fileKeys = [...new Set(entries.map((entry) => entry.fileKey))];
+  const rows = await prisma.knowledgeConnection.findMany({
+    select: {
+      sourceChecksum: true,
+      sourceEvidence: true,
+      sourceFileKey: true,
+      targetChecksum: true,
+      targetFileKey: true,
+    },
+    where: {
+      decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
+      generationVersion: documentSignalVersion,
+      relationshipKind: { in: relationshipKinds },
+      sourceFileKey: { in: fileKeys },
+      status: "REJECTED",
+      supersededAt: null,
+      targetFileKey: { in: fileKeys },
+    },
+  });
+
+  for (const row of rows) {
+    if (!row.sourceFileKey || !row.sourceChecksum || !row.targetFileKey || !row.targetChecksum ||
+        !endpointKeys.has(`${row.sourceFileKey}\0${row.sourceChecksum}`) ||
+        !endpointKeys.has(`${row.targetFileKey}\0${row.targetChecksum}`)) continue;
+    const pairKey = knowledgeRelationshipPairKey(
+      { fileKey: row.sourceFileKey, checksum: row.sourceChecksum },
+      { fileKey: row.targetFileKey, checksum: row.targetChecksum },
+    );
+    const evidence = row.sourceEvidence;
+    const identityHash = evidence && !Array.isArray(evidence) && typeof evidence === "object" &&
+      typeof evidence.identityHash === "string" ? evidence.identityHash : null;
+    const identities = separated.get(pairKey) ?? new Set<string>();
+    if (identityHash) identities.add(identityHash);
+    separated.set(pairKey, identities);
+  }
+
+  return separated;
+}
+
 export async function reconcileObservationKnowledge(tx: Prisma.TransactionClient, observationSessionId: string) {
   const observation = await tx.observationSession.findUnique({
     select: { status: true, observerType: true, observations: true, humanDecisions: {
