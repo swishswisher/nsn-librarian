@@ -981,6 +981,139 @@ test("human observation corrections supersede provisional identity hashes and re
   assert.equal(await prisma.bridgeCommand.count(), 0);
 });
 
+test("reject then re-approve restores original identity, search and QA without reviving human-rejected links", async () => {
+  const { library, left, right, indexer } = await reviewedIdentityFixture("Re-approved identity lifecycle");
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  const { retrieveQuestionContext } = await import("../../src/lib/library/qa/retrieve");
+  const original = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: {
+    observationSessionId: left.observation.id, kind: "CLIENT", status: "ACTIVE",
+  } });
+  const clientLink = await prisma.knowledgeConnection.findFirstOrThrow({ where: {
+    relationshipKind: "SAME_CLIENT", sourceObservationSessionId: { in: [left.observation.id, right.observation.id] },
+  } });
+  const rejectedLink = await prisma.knowledgeConnection.findFirstOrThrow({ where: {
+    relationshipKind: "SAME_PROJECT", sourceObservationSessionId: { in: [left.observation.id, right.observation.id] },
+  } });
+  await persistent.reviewPersistentRelationship(rejectedLink.id, "SEPARATE", "This project link is not valid.");
+  await saveHumanDecision(left.observation.id, { decisionType: "ACCEPT" });
+  await saveHumanDecision(left.observation.id, { decisionType: "REJECT" });
+  await indexer.refreshSearchForObservation(left.observation.id);
+  assert.equal((await prisma.knowledgeDocumentSignal.findUniqueOrThrow({ where: { id: original.id } })).status, "SUPERSEDED");
+  assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: clientLink.id } })).status, "ARCHIVED");
+  assert.deepEqual((await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: left.file.id } })).entityHashes, []);
+
+  await saveHumanDecision(left.observation.id, { decisionType: "ACCEPT" });
+  await indexer.refreshSearchForObservation(left.observation.id);
+  const restored = await prisma.knowledgeDocumentSignal.findUniqueOrThrow({ where: { id: original.id } });
+  assert.equal(restored.status, "ACTIVE");
+  assert.equal(restored.supersededAt, null);
+  assert.equal((await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: left.file.id } })).entityHashes.includes(original.identityHash), true);
+  assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: clientLink.id } })).status, "NEW");
+  assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: rejectedLink.id } })).status, "REJECTED");
+  assert.ok((await retrieveQuestionContext("Client C-101", [library.id])).sources.some((source) => source.href.includes(left.file.id) || source.href.includes(left.file.sessionId)));
+  const signalCount = await prisma.knowledgeDocumentSignal.count({ where: { signalKey: original.signalKey } });
+  const linkCount = await prisma.knowledgeConnection.count({ where: { relationshipKey: clientLink.relationshipKey } });
+  await saveHumanDecision(left.observation.id, { decisionType: "ACCEPT" });
+  assert.equal(await prisma.knowledgeDocumentSignal.count({ where: { signalKey: original.signalKey } }), signalCount);
+  assert.equal(await prisma.knowledgeConnection.count({ where: { relationshipKey: clientLink.relationshipKey } }), linkCount);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("modify then re-approve replaces corrected identity with original approved evidence", async () => {
+  const { left, library, indexer } = await reviewedIdentityFixture("Re-approved correction lifecycle");
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  const original = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: {
+    observationSessionId: left.observation.id, kind: "CLIENT", status: "ACTIVE",
+  } });
+  await saveHumanDecision(left.observation.id, { decisionType: "ACCEPT" });
+  const correctedEvidence = "Client ID: C-202; Project ID: P-202";
+  await saveHumanDecision(left.observation.id, { decisionType: "MODIFY",
+    editedSuggestion: `Source characters 40-${40 + correctedEvidence.length}: "${correctedEvidence}"` });
+  const corrected = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: {
+    observationSessionId: left.observation.id, kind: "CLIENT", status: "ACTIVE",
+  } });
+  assert.notEqual(corrected.identityHash, original.identityHash);
+  const correctedMemory = await prisma.memoryEntry.create({ data: {
+    memoryKey: `old-correction-${crypto.randomUUID()}`, memoryType: "TERM", title: "Superseded correction",
+    description: "This correction is no longer current.", evidence: ["Corrected only"],
+    searchProvenanceComplete: true, searchSourceCount: 1,
+    searchSources: { create: { connectedLibraryId: library.id, observationSessionId: left.observation.id } },
+  } });
+  await saveHumanDecision(left.observation.id, { decisionType: "ACCEPT" });
+  const { buildMemoryFromApprovedSession } = await import("../../src/lib/library/memory");
+  await buildMemoryFromApprovedSession(left.observation.id);
+  await indexer.refreshSearchForObservation(left.observation.id);
+  assert.equal((await prisma.knowledgeDocumentSignal.findUniqueOrThrow({ where: { id: original.id } })).status, "ACTIVE");
+  assert.equal((await prisma.knowledgeDocumentSignal.findUniqueOrThrow({ where: { id: corrected.id } })).status, "SUPERSEDED");
+  const current = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: left.file.id } });
+  assert.equal(current.entityHashes.includes(original.identityHash), true);
+  assert.equal(current.entityHashes.includes(corrected.identityHash), false);
+  assert.equal((await prisma.memoryEntry.findUniqueOrThrow({ where: { id: correctedMemory.id } })).status, "ARCHIVED");
+  assert.equal((await persistent.getPersistentIdentityGroups()).some((group) => group.libraryName === library.displayName &&
+    group.kind === "CLIENT" && group.members.some((member) => member.relativePath === left.file.relativePath)), true);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("re-approval does not refresh or expose a root whose read permission was revoked", async () => {
+  const { library, left } = await reviewedIdentityFixture("Unreadable re-approval root");
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  await saveHumanDecision(left.observation.id, { decisionType: "REJECT" });
+  await prisma.connectedLibrary.update({ data: { readPermission: false }, where: { id: library.id } });
+  await saveHumanDecision(left.observation.id, { decisionType: "ACCEPT" });
+  assert.equal((await prisma.observationSession.findUniqueOrThrow({ where: { id: left.observation.id } })).status, "APPROVED");
+  assert.equal((await persistent.getPersistentIdentityGroups()).some((group) => group.libraryName === library.displayName), false);
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
+test("explicit shared identities enforce the three-link cap on both endpoints deterministically", async () => {
+  const library = await createLibrary("Bounded explicit identity root");
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
+  const entries = await Promise.all(Array.from({ length: 9 }, (_, i) => createObservedFile({
+    checksum: String(i + 1).repeat(64), libraryId: library.id, relativePath: `Clients/client-${i}.txt`, sessionId: scan.id,
+  })));
+  const index = knowledgeIndex(scan.id, library.id, entries[0], entries[1]);
+  index.relationships = [];
+  index.files = entries.map((entry) => ({ ...index.files[0],
+    id: entry.file.id, fileName: entry.file.relativePath, normalizedIdentity: `${library.id}/${entry.file.relativePath}`,
+    relativePath: entry.file.relativePath,
+  }));
+  for (const entry of entries) withVerifiedFields(index, entry.file.id, "Client ID: C-101");
+  await persistent.persistScanWorkingKnowledge(index);
+  const links = await prisma.knowledgeConnection.findMany({ where: {
+    relationshipKind: "SAME_CLIENT", status: "NEW", supersededAt: null,
+    sourceObservationSessionId: { in: entries.map((entry) => entry.observation.id) },
+  } });
+  const degree = new Map<string, number>();
+  for (const link of links) {
+    for (const key of [link.sourceFileKey!, link.targetFileKey!]) degree.set(key, (degree.get(key) ?? 0) + 1);
+  }
+  assert.ok(links.length > 3);
+  assert.ok([...degree.values()].every((count) => count <= 3));
+  assert.equal(new Set(links.map((link) => link.relationshipKey)).size, links.length);
+  const firstKeys = links.map((link) => link.relationshipKey).sort();
+  const hubKey = [...degree.entries()].find(([, count]) => count === 3)?.[0];
+  const otherKey = [...entries.map((entry) => persistent.persistentFileKey(library.id, entry.file.relativePath))]
+    .find((key) => key !== hubKey && !links.some((link) => [link.sourceFileKey, link.targetFileKey].includes(key) &&
+      [link.sourceFileKey, link.targetFileKey].includes(hubKey ?? "")));
+  assert.ok(hubKey && otherKey);
+  const hub = entries.find((entry) => persistent.persistentFileKey(library.id, entry.file.relativePath) === hubKey)!;
+  const other = entries.find((entry) => persistent.persistentFileKey(library.id, entry.file.relativePath) === otherKey)!;
+  const obsolete = await prisma.knowledgeConnection.create({ data: {
+    confidence: 0.75, generationVersion: "document-signals-v1", relationshipKey: crypto.randomUUID(),
+    relationshipKind: "SAME_CLIENT", reasoning: "Old unbounded link", sharedTerms: [], similarityScore: 0.75,
+    sourceChecksum: hub.file.checksum, sourceFileKey: hubKey, sourceObservationSessionId: hub.observation.id,
+    targetChecksum: other.file.checksum, targetFileKey: otherKey, targetObservationSessionId: other.observation.id,
+  } });
+  await persistent.persistScanWorkingKnowledge({ ...index, files: [...index.files].reverse() });
+  const repeated = await prisma.knowledgeConnection.findMany({ where: {
+    relationshipKind: "SAME_CLIENT", status: "NEW", supersededAt: null,
+    sourceObservationSessionId: { in: entries.map((entry) => entry.observation.id) },
+  } });
+  assert.deepEqual(repeated.map((link) => link.relationshipKey).sort(), firstKeys);
+  assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: obsolete.id } })).status, "ARCHIVED");
+  assert.equal(await prisma.bridgeCommand.count(), 0);
+});
+
 test("incomplete and failed snapshots cannot replace completed identities, search or QA; a completed snapshot can", async () => {
   const { library, left, right, scan, indexer } = await reviewedIdentityFixture("Stable completed snapshot");
   const link = await prisma.knowledgeConnection.findFirstOrThrow({ where: {

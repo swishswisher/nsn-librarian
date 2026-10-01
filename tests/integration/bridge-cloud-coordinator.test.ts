@@ -43,6 +43,7 @@ let previousOpenAIKey: string | undefined;
 let previousPairingSecret: string | undefined;
 let testDatabaseUrl: string;
 let testDirectDatabaseUrl: string;
+let safeTestDatabase = false;
 
 const testSchemaName = `bridge_cloud_coordinator_${process.pid}_${Date.now()}`;
 
@@ -55,6 +56,9 @@ function databaseUrlForSchema(
   }
 
   const url = new URL(databaseUrl);
+  if (url.hostname !== "127.0.0.1" || url.pathname !== "/nsn_library_machine_test") {
+    throw new Error("Bridge cloud coordinator tests require the isolated local test database.");
+  }
   url.searchParams.set("schema", schemaName);
 
   return url.toString();
@@ -88,6 +92,7 @@ before(async () => {
     testSchemaName,
     process.env.DIRECT_URL ?? process.env.DATABASE_URL,
   );
+  safeTestDatabase = true;
   process.env.DATABASE_URL = testDatabaseUrl;
   process.env.DIRECT_URL = testDirectDatabaseUrl;
   process.env.NSN_BRIDGE_COMMAND_SIGNING_SECRET =
@@ -153,12 +158,13 @@ beforeEach(async () => {
 after(async () => {
   await prisma?.$disconnect();
 
-  const cleanupPrisma = new PrismaClient();
-
-  await cleanupPrisma.$executeRawUnsafe(
-    `DROP SCHEMA IF EXISTS "${testSchemaName}" CASCADE`,
-  );
-  await cleanupPrisma.$disconnect();
+  if (safeTestDatabase) {
+    const cleanupPrisma = new PrismaClient();
+    await cleanupPrisma.$executeRawUnsafe(
+      `DROP SCHEMA IF EXISTS "${testSchemaName}" CASCADE`,
+    );
+    await cleanupPrisma.$disconnect();
+  }
 
   if (previousDatabaseUrl === undefined) {
     delete process.env.DATABASE_URL;
@@ -1784,4 +1790,3 @@ test("production cloud monitoring dashboard does not drain localhost events", as
   assert.equal(afterDashboard.monitoringState, "WATCHING");
   assert.equal(afterDashboard.monitoringErrorCategory, null);
 });
-

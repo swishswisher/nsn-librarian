@@ -579,6 +579,14 @@ function deterministicPurposeTerms(observations: unknown) {
   });
 }
 
+export function observationSourceEvidenceText(observation: { observerType: string; observations: unknown }) {
+  const excerpts = observation.observerType === "OPENAI"
+    ? verifiedObservationExcerpts(observation.observations).slice(0, 8) : [];
+  const terms = observation.observerType === "DETERMINISTIC"
+    ? deterministicPurposeTerms(observation.observations).slice(0, 8) : [];
+  return [...excerpts, ...terms].join(" ");
+}
+
 function addWeightedTerms(
   target: WeightedTerms,
   values: string[],

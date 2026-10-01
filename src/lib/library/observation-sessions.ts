@@ -4,7 +4,7 @@ import { runOpenAIObservation } from "@/lib/ai/openai-observer";
 import { OpenAIProviderError } from "@/lib/ai/openai-client";
 import type { AIObservationResult } from "@/lib/ai/types";
 import { getPrismaClient } from "@/lib/db/prisma";
-import { reconcileObservationKnowledge } from "@/lib/bridge/persistent-knowledge";
+import { reconcileObservationKnowledge, refreshApprovedObservationRelationships } from "@/lib/bridge/persistent-knowledge";
 import { buildMemoryFromApprovedSession, invalidateCorrectedMemorySources } from "@/lib/library/memory";
 import {
   createKnowledgeConnectionsForSession,
@@ -682,6 +682,9 @@ export async function saveHumanDecision(
       return {
         decisionId: latestDecision.id,
         status: existingSession.status as ObservationSessionStatus,
+        reapproved: intendedStatus === "APPROVED" && await tx.humanDecision.count({
+          where: { observationSessionId: sessionId, decisionType: { in: ["REJECT", "MODIFY"] } },
+        }) > 0,
       };
     }
 
@@ -703,6 +706,7 @@ export async function saveHumanDecision(
       return {
         decisionId: decision.id,
         status: existingSession.status as ObservationSessionStatus,
+        reapproved: false,
       };
     }
 
@@ -714,12 +718,17 @@ export async function saveHumanDecision(
     await reconcileObservationKnowledge(tx, sessionId);
 
     if (nextStatus === "MODIFIED" || nextStatus === "REJECTED") await invalidateCorrectedMemorySources(tx, sessionId);
+    if (nextStatus === "APPROVED" && ["MODIFIED", "REJECTED"].includes(existingSession.status)) {
+      await invalidateCorrectedMemorySources(tx, sessionId);
+    }
 
     return {
       decisionId: decision.id,
       status: updatedSession.status as ObservationSessionStatus,
+      reapproved: nextStatus === "APPROVED" && ["MODIFIED", "REJECTED"].includes(existingSession.status),
     };
   });
+  if (result.reapproved) await refreshApprovedObservationRelationships(sessionId);
   if (result.status === "REJECTED") await buildMemoryFromApprovedSession(sessionId);
   return result;
 }

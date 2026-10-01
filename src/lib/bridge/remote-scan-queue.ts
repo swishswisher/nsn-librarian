@@ -36,7 +36,8 @@ const activeScanStatuses = [
   "GENERATING_SUGGESTIONS",
 ] as const;
 const maxScanFiles = 20_000;
-const remoteReadBatchSize = 50;
+// Four sequential reads leave roughly two minutes each within the ten-minute command lifetime.
+const remoteReadBatchSize = 4;
 function objectValue(value: unknown) {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)

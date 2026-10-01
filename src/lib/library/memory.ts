@@ -913,7 +913,10 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
     return 0;
   }
 
-  const contributionSources = session.status === "MODIFIED" || session.status === "REJECTED"
+  const reapprovedAfterCorrection = session.status === "APPROVED" && session.humanDecisions.some(
+    (decision) => decision.decisionType === "MODIFY" || decision.decisionType === "REJECT",
+  );
+  const contributionSources = session.status === "MODIFIED" || session.status === "REJECTED" || reapprovedAfterCorrection
     ? await prisma.memorySearchSource.findMany({
       select: { observationSessionId: true },
       where: { memoryEntry: { status: "ACTIVE", searchSources: {
@@ -974,8 +977,6 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
 
   const humanDecisions = await prisma.humanDecision.findMany({
     where: {
-      decisionType: "MODIFY",
-      editedSuggestion: { not: null },
       observationSession: {
         status: { in: ["APPROVED", "MODIFIED"] },
       },
@@ -999,7 +1000,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
   const missingPreferenceSources = contributionSources.map((source) => source.observationSessionId)
     .filter((id) => !humanDecisions.some((decision) => decision.observationSessionId === id));
   if (missingPreferenceSources.length) humanDecisions.push(...await prisma.humanDecision.findMany({
-    where: { observationSessionId: { in: missingPreferenceSources }, decisionType: "MODIFY",
+    where: { observationSessionId: { in: missingPreferenceSources },
       observationSession: { status: { in: ["APPROVED", "MODIFIED"] } } },
     orderBy: { createdAt: "desc" }, distinct: ["observationSessionId"],
     include: { observationSession: { select: { status: true,
@@ -1009,7 +1010,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
     addCandidate(candidates, candidate);
   }
 
-  if (session.status === "MODIFIED" || session.status === "REJECTED") {
+  if (session.status === "MODIFIED" || session.status === "REJECTED" || reapprovedAfterCorrection) {
     await reconcileCorrectedMemory(sessionId, approvedSessions, candidates);
   }
   if (session.status === "REJECTED") return 0;
