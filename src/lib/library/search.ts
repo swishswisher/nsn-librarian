@@ -2,7 +2,12 @@ import path from "node:path";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { compareDocumentVersions } from "@/lib/bridge/document-signals";
-import { getDocumentVersionSignals, usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
+import {
+  getDocumentVersionSignals,
+  getSeparatedRelationshipPairIdentities,
+  knowledgeRelationshipPairKey,
+  usableScanSnapshotWhere,
+} from "@/lib/bridge/persistent-knowledge";
 import { mediaCategoryForFileType } from "@/lib/bridge/media-kind";
 import { searchTopicIds, workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
 import { getScannedFileExamineRoute, getScanSessionRoute } from "@/lib/library/routes";
@@ -183,14 +188,17 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   const initial = [...new Map([...exact, ...broader].map((entry) => [entry.id, entry])).values()];
 
   // Resolved identity expansion uses only identities from already scoped matches.
-  const seedHashes = [...new Set(initial.filter((entry) =>
+  // Human SEPARATE decisions suppress only the rejected identity hash for that
+  // exact file/checksum pair; independent matches and other identities remain valid.
+  const seedEntries = initial.filter((entry) =>
     intent.entityName
       ? validExcerpts(entry.sourceExcerpts).some((excerpt) => matchesEntityPhrase(excerpt.text, intent.entityName!)) ||
         matchesEntityPhrase(entry.relativePath, intent.entityName)
       : intent.terms.filter((term) => entry.sourceTerms.includes(term) ||
           workingKnowledgeTerms(entry.relativePath).includes(term)).length >= 2,
-  ).flatMap((entry) => entry.entityHashes))].slice(0, 24);
-  const related = seedHashes.length ? await prisma.librarySearchEntry.findMany({
+  );
+  const seedHashes = [...new Set(seedEntries.flatMap((entry) => entry.entityHashes))].slice(0, 24);
+  const relatedCandidates = seedHashes.length ? await prisma.librarySearchEntry.findMany({
     take: Math.min(40, searchCandidateLimit - initial.length),
     where: {
       connectedLibraryId: { in: rootIds },
@@ -200,12 +208,28 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
       entityHashes: { hasSome: seedHashes },
     },
   }) : [];
+  const separatedIdentityPairs = relatedCandidates.length && seedEntries.length
+    ? await getSeparatedRelationshipPairIdentities(
+      [...seedEntries, ...relatedCandidates],
+      ["SAME_CLIENT", "SAME_PROJECT"],
+    )
+    : new Map<string, Set<string>>();
+  const related = relatedCandidates.filter((entry) => !seedEntries.some((seed) => {
+    if (seed.id === entry.id) return false;
+    const separatedHashes = separatedIdentityPairs.get(knowledgeRelationshipPairKey(seed, entry));
+    return Boolean(separatedHashes && [...separatedHashes].some((hash) =>
+      seedHashes.includes(hash) && seed.entityHashes.includes(hash) && entry.entityHashes.includes(hash),
+    ));
+  }));
   const candidateById = new Map([...initial, ...related].map((entry) => [entry.id, entry]));
   const currentSourceIds = new Set((await prisma.scannedFile.findMany({
     select: { id: true }, where: { id: { in: [...candidateById.values()].map((entry) => entry.scannedFileId) },
       sourceUnavailableAt: null },
   })).map((file) => file.id));
-  const versions = await getDocumentVersionSignals([...candidateById.values()], intent.wantsHistory);
+  const [versions, separatedVersionPairs] = await Promise.all([
+    getDocumentVersionSignals([...candidateById.values()], intent.wantsHistory),
+    getSeparatedRelationshipPairIdentities([...candidateById.values()], ["PROBABLE_REVISION"]),
+  ]);
   const results: LibrarySearchResult[] = [];
   for (const entry of candidateById.values()) {
     const root = rootById.get(entry.connectedLibraryId);
@@ -224,6 +248,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
       other.connectedLibraryId === member.connectedLibraryId &&
       other.identityHash === member.identityHash &&
       (other.fileKey !== member.fileKey || other.checksum !== member.checksum) &&
+      !separatedVersionPairs.has(knowledgeRelationshipPairKey(member, other)) &&
       compareDocumentVersions(other, member) === 1,
     );
     const state = !entry.isCurrent ? "Historical scan" : supersededVersion ? "Earlier document version" :
