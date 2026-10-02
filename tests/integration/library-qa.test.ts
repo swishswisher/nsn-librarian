@@ -332,6 +332,51 @@ test("same-name clients with distinct identity hashes trigger clarification", as
   assert.equal(versionResult.state, "AMBIGUOUS_ENTITY");
 });
 
+for (const [kind, name] of [["CLIENT", "Alice"], ["PROJECT", "Atlas"]] as const) {
+  test(`${kind.toLowerCase()} Ask context excludes files sharing only mixed identity kinds`, async () => {
+    const r = await root(`${kind} Typed Ask Root`); const s = await scan(r.id);
+    const label = kind === "CLIENT" ? "Client" : "Project";
+    const requestedHash = `ask-${kind.toLowerCase()}-${crypto.randomUUID()}`;
+    const mixed = [
+      ["ORGANIZATION", `org-${crypto.randomUUID()}`],
+      ["PERSON", `person-${crypto.randomUUID()}`],
+      ["DOCUMENT_FAMILY", `family-${crypto.randomUUID()}`],
+      [kind === "CLIENT" ? "PROJECT" : "CLIENT", `other-${crypto.randomUUID()}`],
+    ] as const;
+    const seed = await file({ rootId: r.id, sessionId: s.id, relativePath: "seed.txt",
+      quote: `${label} ${name}; Organization Acme`, entityHashes: [requestedHash, ...mixed.map(([, hash]) => hash)] });
+    const related = await file({ rootId: r.id, sessionId: s.id, relativePath: "related.txt",
+      quote: "Legitimate identity-linked details", entityHashes: [requestedHash] });
+    const unrelated = await file({ rootId: r.id, sessionId: s.id, relativePath: "unrelated.txt",
+      quote: `${label} scheduling for Acme without the named identity`,
+      entityHashes: mixed.map(([, hash]) => hash) });
+    const signal = (item: typeof seed, signalKind: string, identityHash: string) => ({
+      signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+      relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!, kind: signalKind,
+      identityHash, sourceRanges: [], observationSessionId: item.observation.id,
+      generationVersion: documentSignalVersion,
+    });
+    await prisma.knowledgeDocumentSignal.createMany({ data: [
+      signal(seed, kind, requestedHash), signal(related, kind, requestedHash),
+      ...mixed.flatMap(([mixedKind, hash]) => [signal(seed, mixedKind, hash), signal(unrelated, mixedKind, hash)]),
+    ] });
+    const question = `What do we have about ${label.toLowerCase()} ${name}?`;
+    const context = await retrieve.retrieveQuestionContext(question, [r.id]);
+    assert.deepEqual(new Set(context.sources.map((source) => source.relativePath)),
+      new Set([seed.scanned.relativePath, related.scanned.relativePath]));
+    assert.equal(context.ambiguousEntity, false);
+
+    let modelCalled = false;
+    const result = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id], model: async () => {
+      modelCalled = true;
+      return model([claim("Legitimate identity-linked details", ["S2"])])();
+    } });
+    assert.equal(modelCalled, true);
+    assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+    assert.ok(!result.sources.some((source) => source.relativePath === unrelated.scanned.relativePath));
+  });
+}
+
 async function identityCorrectionFixture(kind: "CLIENT" | "PROJECT") {
   const r = await root(`Corrected ${kind} QA Root`); const s = await scan(r.id);
   const a = await file({ rootId: r.id, sessionId: s.id, relativePath: "Alice/intake.txt",

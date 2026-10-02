@@ -4,6 +4,7 @@ import { getPrismaClient } from "@/lib/db/prisma";
 import { compareDocumentVersions } from "@/lib/bridge/document-signals";
 import {
   getDocumentVersionSignals,
+  getEffectiveDocumentSignals,
   getSeparatedRelationshipPairIdentities,
   knowledgeRelationshipPairKey,
   usableScanSnapshotWhere,
@@ -37,6 +38,7 @@ export type SearchIntent = {
   wantsHistory: boolean;
   fileType: string | null;
   entityName: string | null;
+  entityKind: "CLIENT" | "PROJECT" | null;
 };
 
 export function compareSearchResults(a: LibrarySearchResult, b: LibrarySearchResult) {
@@ -49,7 +51,8 @@ export function parseSearchIntent(value: string): SearchIntent {
   const query = value.trim().slice(0, 120);
   const normalized = query.toLowerCase();
   const fileType = /\b(pdf|docx?|html?|markdown|images?|audio|video)\b/i.exec(query)?.[1]?.toLowerCase() ?? null;
-  const entityPhrase = /\b(?:client|project)\s+(?:named\s+)?([\p{L}\p{N}][\p{L}\p{N} .'-]{0,70})/iu.exec(query)?.[1];
+  const entityMatch = /\b(client|project)\s+(?:named\s+)?([\p{L}\p{N}][\p{L}\p{N} .'-]{0,70})/iu.exec(query);
+  const entityPhrase = entityMatch?.[2];
   const entityName = entityPhrase?.split(/\b(?:and|with|about|have|in|on|for|from|documents?|files?|invoices?|versions?|pdf|docx?|html?|markdown|images?|audio|video|older|earlier|previous|history)\b/iu)[0]?.trim().toLowerCase() || null;
   return {
     query,
@@ -58,6 +61,8 @@ export function parseSearchIntent(value: string): SearchIntent {
     wantsHistory: /\b(older|earlier|previous|versions?|history|historical)\b/.test(normalized),
     fileType,
     entityName,
+    entityKind: entityMatch?.[1]?.toLowerCase() === "client" ? "CLIENT" :
+      entityMatch?.[1]?.toLowerCase() === "project" ? "PROJECT" : null,
   };
 }
 
@@ -205,10 +210,28 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
       : intent.terms.filter((term) => entry.sourceTerms.includes(term) ||
           workingKnowledgeTerms(entry.relativePath).includes(term)).length >= 2,
   );
+  // Search entries intentionally retain every identity kind for general discovery.
+  // Explicit entity searches must instead seed from the active, checksum-bound
+  // effective signals of the requested kind; otherwise an organization or person
+  // mentioned by a client file can pull unrelated material into the result set.
+  const effectiveEntitySignals = intent.entityKind
+    ? await getEffectiveDocumentSignals(rootIds)
+    : [];
+  const effectiveHashesByEndpoint = new Map<string, Set<string>>();
+  for (const signal of effectiveEntitySignals) {
+    if (signal.kind !== intent.entityKind) continue;
+    const endpoint = `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`;
+    const hashes = effectiveHashesByEndpoint.get(endpoint) ?? new Set<string>();
+    hashes.add(signal.identityHash);
+    effectiveHashesByEndpoint.set(endpoint, hashes);
+  }
   const seedHashesByRoot = new Map<string, Set<string>>();
   for (const entry of seedEntries) {
     const hashes = seedHashesByRoot.get(entry.connectedLibraryId) ?? new Set<string>();
-    for (const hash of entry.entityHashes) hashes.add(hash);
+    const eligibleHashes = intent.entityKind
+      ? effectiveHashesByEndpoint.get(`${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`) ?? []
+      : entry.entityHashes;
+    for (const hash of eligibleHashes) hashes.add(hash);
     seedHashesByRoot.set(entry.connectedLibraryId, hashes);
   }
   const seedPairs = [...seedHashesByRoot].flatMap(([connectedLibraryId, hashes]) =>

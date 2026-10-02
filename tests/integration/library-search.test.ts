@@ -164,6 +164,45 @@ test("client identity search expands only shared resolved hashes", async () => {
   assert.ok(results.some((result) => result.relativePath === b.file.relativePath));
 });
 
+for (const [kind, query, name] of [
+  ["CLIENT", "client Alice", "Alice"],
+  ["PROJECT", "project Atlas", "Atlas"],
+] as const) {
+  test(`${kind.toLowerCase()} expansion ignores mixed non-requested identity hashes`, async () => {
+    const r = await root(`${kind} Typed Identity Root`); const s = await session(r.id);
+    const seed = await observedFile({ rootId: r.id, sessionId: s.id, path: "seed.txt",
+      evidence: evidence(`${kind === "CLIENT" ? "Client" : "Project"}: ${name}; Organization: Acme`) });
+    const related = await observedFile({ rootId: r.id, sessionId: s.id, path: "related.txt",
+      evidence: evidence("Legitimate same-identity material without query words") });
+    const unrelated = await observedFile({ rootId: r.id, sessionId: s.id, path: "unrelated.txt",
+      evidence: evidence("Organization-only material without the requested identity") });
+    const requestedHash = `typed-${kind.toLowerCase()}-${crypto.randomUUID()}`;
+    const mixedKinds = ["ORGANIZATION", "PERSON", "DOCUMENT_FAMILY",
+      kind === "CLIENT" ? "PROJECT" : "CLIENT"] as const;
+    const mixedHashes = mixedKinds.map((mixedKind) => `${mixedKind.toLowerCase()}-${crypto.randomUUID()}`);
+    const signal = (item: Awaited<ReturnType<typeof observedFile>>, signalKind: typeof kind | typeof mixedKinds[number], identityHash: string) => ({
+      checksum: item.file.checksum!, connectedLibraryId: r.id,
+      fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
+      generationVersion: documentSignalVersion, identityHash, kind: signalKind,
+      observationSessionId: item.observation.id, relativePath: item.file.relativePath,
+      signalKey: crypto.randomUUID(), sourceRanges: [],
+    });
+    await prisma.knowledgeDocumentSignal.createMany({ data: [
+      signal(seed, kind, requestedHash), signal(related, kind, requestedHash),
+      ...mixedKinds.flatMap((mixedKind, index) => [
+        signal(seed, mixedKind, mixedHashes[index]),
+        signal(unrelated, mixedKind, mixedHashes[index]),
+      ]),
+    ] });
+    await indexFiles(s.id, [seed, related, unrelated]);
+
+    const results = await search.searchLibrary(query);
+    assert.ok(results.some((result) => result.relativePath === seed.file.relativePath));
+    assert.ok(results.some((result) => result.relativePath === related.file.relativePath));
+    assert.ok(!results.some((result) => result.relativePath === unrelated.file.relativePath));
+  });
+}
+
 for (const [kind, query] of [["CLIENT", "client alice"], ["PROJECT", "project atlas"]] as const) {
   test(`${kind.toLowerCase()} identity expansion is scoped to each independently matching root`, async () => {
     const firstRoot = await root(`${kind} Seed Root`); const firstSession = await session(firstRoot.id);
