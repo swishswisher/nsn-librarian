@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -112,33 +113,30 @@ function pngMetadataFixture() {
   return buffer;
 }
 
-function atom(type: string, payload: Buffer) {
-  const buffer = Buffer.alloc(8 + payload.length);
-
-  buffer.writeUInt32BE(buffer.length, 0);
-  buffer.write(type, 4, 4, "ascii");
-  payload.copy(buffer, 8);
-
-  return buffer;
-}
-
 function mp4VideoBuffer(options: { hasAudioTrack?: boolean } = {}) {
-  const mvhdPayload = Buffer.alloc(100);
+  const fixtureDirectory = mkdtempSync(path.join(os.tmpdir(), "nsn-video-fixture-"));
+  const fixturePath = path.join(fixtureDirectory, "fixture.mp4");
+  const inputs = ["-f", "lavfi", "-i", "color=c=blue:s=64x48:r=2:d=1"];
+  if (options.hasAudioTrack) {
+    inputs.push("-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000:duration=1");
+  }
 
-  mvhdPayload.writeUInt32BE(1000, 12);
-  mvhdPayload.writeUInt32BE(4000, 16);
-
-  return Buffer.concat([
-    atom("ftyp", Buffer.from("isom0000isommp42", "ascii")),
-    atom(
-      "moov",
-      Buffer.concat([
-        atom("mvhd", mvhdPayload),
-        Buffer.from(options.hasAudioTrack ? "vide soun" : "vide", "ascii"),
-      ]),
-    ),
-    Buffer.alloc(128),
-  ]);
+  try {
+    execFileSync(process.env.FFMPEG_PATH ?? "ffmpeg", [
+      "-hide_banner", "-loglevel", "error", "-y", ...inputs,
+      "-c:v", "mpeg4", "-pix_fmt", "yuv420p",
+      ...(options.hasAudioTrack ? ["-c:a", "aac", "-shortest"] : ["-an"]),
+      "-movflags", "+faststart", fixturePath,
+    ], { stdio: "pipe" });
+    return readFileSync(fixturePath);
+  } catch (error) {
+    const stderr = error && typeof error === "object" && "stderr" in error
+      ? String((error as { stderr?: Buffer | string }).stderr ?? "")
+      : String(error);
+    throw new Error(`FFmpeg could not create the synthetic MP4 fixture: ${stderr}`);
+  } finally {
+    rmSync(fixtureDirectory, { force: true, recursive: true });
+  }
 }
 
 async function resetTestData() {

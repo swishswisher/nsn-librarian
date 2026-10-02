@@ -142,12 +142,26 @@ async function fileDraft(rootId: string, rootPath: string, filePath: string) {
 
     await access(filePath, fsConstants.R_OK);
 
+    const checksumBefore = await checksumFile(filePath);
+    const imageMetadata = fileType.startsWith("IMAGE_")
+      ? await extractImageMetadata(filePath, relativePath, stats).catch(() => null)
+      : null;
+    const checksumAfter = fileType.startsWith("IMAGE_")
+      ? await checksumFile(filePath)
+      : checksumBefore;
+
+    if (checksumBefore !== checksumAfter) {
+      throw new BridgeAppError(
+        "This image changed while its metadata was being inspected.",
+        "FILE_CHANGED_DURING_SCAN",
+        409,
+      );
+    }
+
     return {
-      checksum: await checksumFile(filePath),
+      checksum: checksumAfter,
       fileType,
-      imageMetadata: fileType.startsWith("IMAGE_")
-        ? await extractImageMetadata(filePath, relativePath, stats).catch(() => null)
-        : null,
+      imageMetadata,
       lastModified: stats.mtime,
       localPath: bridgeRootUri(rootId, relativePath),
       readStatus: "SUPPORTED",

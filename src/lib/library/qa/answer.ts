@@ -32,8 +32,46 @@ function emptyAnswer(context: AnswerContext, state: LibraryAnswer["state"], answ
     indexIncomplete: context.indexIncomplete, notice, usage };
 }
 
+function compareKeys(left: string, right: string) {
+  return left.localeCompare(right);
+}
+
+function canonicalAnswerContext(context: AnswerContext): AnswerContext {
+  return {
+    ...context,
+    sources: context.sources.map((source) => ({
+      ...source,
+      corroborationKeys: [...source.corroborationKeys].sort(compareKeys),
+    })).sort((left, right) => compareKeys(
+      `${left.sourceType}\u0000${left.physicalIdentity}\u0000${left.id}`,
+      `${right.sourceType}\u0000${right.physicalIdentity}\u0000${right.id}`,
+    )),
+    relationships: context.relationships.map((relationship) => {
+      const [leftSourceId, rightSourceId] = [
+        relationship.leftSourceId,
+        relationship.rightSourceId,
+      ].sort(compareKeys);
+      return { ...relationship, leftSourceId, rightSourceId };
+    }).sort((left, right) => compareKeys(
+      `${left.leftSourceId}\u0000${left.rightSourceId}\u0000${left.status}\u0000${left.explanation}`,
+      `${right.leftSourceId}\u0000${right.rightSourceId}\u0000${right.status}\u0000${right.explanation}`,
+    )),
+    versions: context.versions.map((version) => {
+      const [leftSourceId, rightSourceId] = [
+        version.leftSourceId,
+        version.rightSourceId,
+      ].sort(compareKeys);
+      return { ...version, leftSourceId, rightSourceId };
+    }).sort((left, right) => compareKeys(
+      `${left.leftSourceId}\u0000${left.rightSourceId}\u0000${left.newerSourceId ?? ""}\u0000${left.ordering}`,
+      `${right.leftSourceId}\u0000${right.rightSourceId}\u0000${right.newerSourceId ?? ""}\u0000${right.ordering}`,
+    )),
+  };
+}
+
 function contextStillCurrent(before: AnswerContext, after: AnswerContext) {
-  return JSON.stringify(before) === JSON.stringify(after);
+  return JSON.stringify(canonicalAnswerContext(before)) ===
+    JSON.stringify(canonicalAnswerContext(after));
 }
 
 function independentSupport(sourceIds: string[], context: AnswerContext) {
