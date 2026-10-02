@@ -54,10 +54,10 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
     select: {
       checksum: true, extractionStatus: true, fileType: true, id: true, libraryDocument: {
         select: { observationSessions: {
-          orderBy: { createdAt: "desc" },
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
           select: { id: true, status: true, humanDecisions: {
             where: { decisionType: "MODIFY" },
-            orderBy: { createdAt: "desc" }, select: { decisionType: true, editedSuggestion: true }, take: 1,
+            orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { decisionType: true, editedSuggestion: true }, take: 1,
           } }, take: 1,
         } },
       },
@@ -80,11 +80,11 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
     const reviewedText = observation?.status === "MODIFIED"
       ? observation.humanDecisions.find((decision) => decision.decisionType === "MODIFY")?.editedSuggestion?.slice(0, searchExcerptLimit) ?? ""
       : "";
-    const excerpts = boundedSourceExcerpts(working.sourceEvidenceText);
+    const excerpts = observation?.status === "REJECTED" ? [] : boundedSourceExcerpts(working.sourceEvidenceText);
     const entityHashes = [...new Set(effectiveSignals.filter((signal) =>
       signal.fileKey === fileKey && signal.checksum === file.checksum && signal.kind !== "FILE_ANCHOR")
       .map((signal) => signal.identityHash))].sort();
-    const concepts = working.supportingTopics.slice(0, 8);
+    const concepts = observation?.status === "REJECTED" ? [] : working.supportingTopics.slice(0, 8);
     const knowledgeState = observation?.status === "APPROVED" || observation?.status === "MODIFIED"
       ? "APPROVED" : "PROVISIONAL";
     const fingerprint = searchEntryFingerprint({ checksum: file.checksum,

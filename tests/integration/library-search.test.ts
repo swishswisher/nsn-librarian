@@ -300,6 +300,42 @@ test("human correction changes fingerprint and reviewed terms", async () => {
   assert.equal(after.knowledgeState, "APPROVED");
 });
 
+test("search indexing deterministically selects same-millisecond observation reviews", async () => {
+  const r = await root("Timestamp tie review root"); const s = await session(r.id);
+  const rejected = await observedFile({ rootId: r.id, sessionId: s.id, path: "rejected.txt",
+    checksum: "tie-rejected", evidence: evidence("Evidence that must not remain approved"), status: "APPROVED" });
+  const tiedAt = new Date("2026-01-02T03:04:05.678Z");
+  await prisma.observationSession.update({ where: { id: rejected.observation.id },
+    data: { id: "tie-observation-a", createdAt: tiedAt } });
+  await prisma.observationSession.create({ data: {
+    id: "tie-observation-z", createdAt: tiedAt, libraryDocumentId: rejected.observation.libraryDocumentId,
+    confidence: 1, explanation: [], interpretations: [], observations: [], observerType: "DETERMINISTIC",
+    planSuggestions: [], status: "REJECTED", warnings: [],
+  } });
+  await indexFiles(s.id, [rejected]);
+  const rejectedEntry = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: rejected.file.id } });
+  assert.equal(rejectedEntry.knowledgeState, "PROVISIONAL");
+  assert.deepEqual(rejectedEntry.sourceExcerpts, []);
+  assert.deepEqual(rejectedEntry.sourceTerms, []);
+
+  const modified = await observedFile({ rootId: r.id, sessionId: s.id, path: "modified.txt",
+    checksum: "tie-modified", evidence: evidence("Original review wording"), status: "MODIFIED" });
+  await prisma.humanDecision.createMany({ data: [
+    { id: "tie-decision-a", observationSessionId: modified.observation.id, decisionType: "MODIFY",
+      editedSuggestion: "obsolete correction", createdAt: tiedAt },
+    { id: "tie-decision-z", observationSessionId: modified.observation.id, decisionType: "MODIFY",
+      editedSuggestion: "deterministic latest correction", createdAt: tiedAt },
+  ] });
+  await indexFiles(s.id, [rejected, modified]);
+  const first = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: modified.file.id } });
+  assert.ok(first.reviewedTerms.includes("latest"));
+  assert.ok(!first.reviewedTerms.includes("obsolete"));
+  await indexFiles(s.id, [rejected, modified]);
+  const second = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: modified.file.id } });
+  assert.equal(second.fingerprint, first.fingerprint);
+  assert.deepEqual(second.reviewedTerms, first.reviewedTerms);
+});
+
 test("provisional evidence is labeled provisional", async () => {
   const r = await root("Provisional Root"); const s = await session(r.id);
   await indexFiles(s.id, [await observedFile({ rootId: r.id, sessionId: s.id, path: "provisional.txt", evidence: evidence("An unusual provisional term") })]);

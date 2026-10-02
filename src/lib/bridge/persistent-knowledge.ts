@@ -18,6 +18,87 @@ export const usableScanSnapshotWhere = {
   status: { in: ["COMPLETED", "COMPLETED_WITH_ERRORS"] },
 } satisfies Prisma.ScanSessionWhereInput;
 
+type EffectiveIdentitySignal = {
+  checksum: string;
+  connectedLibraryId: string;
+  fileKey: string;
+  identityHash: string;
+  kind: string;
+};
+
+type EffectiveIdentityCorrection = {
+  id: string;
+  relationshipKind: string | null;
+  sourceChecksum: string | null;
+  sourceEvidence: Prisma.JsonValue | null;
+  sourceFileKey: string | null;
+  targetChecksum: string | null;
+  targetFileKey: string | null;
+};
+
+/** Resolve human identity joins as ordered equivalence classes, not one-hop aliases. */
+function correctedClientIdentities(
+  rows: EffectiveIdentitySignal[],
+  corrections: EffectiveIdentityCorrection[],
+  separatedPairs: Set<string> = new Set(),
+) {
+  const clientRows = rows.filter((row) => ["CLIENT", "UNRESOLVED_CLIENT"].includes(row.kind));
+  const byEndpoint = new Map(clientRows.map((row) => [`${row.fileKey}\0${row.checksum}`, row]));
+  const byFile = new Map(clientRows.map((row) => [row.fileKey, row]));
+  const parent = new Map(clientRows.map((row) => [row.fileKey, row.fileKey]));
+  const members = new Map(clientRows.map((row) => [row.fileKey, new Set([row.fileKey])]));
+  const canonical = new Map(clientRows.map((row) => [row.fileKey, row.identityHash]));
+  const find = (key: string): string => {
+    const next = parent.get(key);
+    if (!next || next === key) return key;
+    const root = find(next);
+    parent.set(key, root);
+    return root;
+  };
+
+  for (const correction of corrections) {
+    if (correction.relationshipKind !== "SAME_CLIENT" || !correction.sourceFileKey || !correction.sourceChecksum ||
+        !correction.targetFileKey || !correction.targetChecksum) continue;
+    const source = byEndpoint.get(`${correction.sourceFileKey}\0${correction.sourceChecksum}`);
+    const target = byEndpoint.get(`${correction.targetFileKey}\0${correction.targetChecksum}`);
+    const evidence = correction.sourceEvidence;
+    if (!source || !target || source.connectedLibraryId !== target.connectedLibraryId ||
+        !evidence || Array.isArray(evidence) || typeof evidence !== "object" ||
+        evidence.connectedLibraryId !== source.connectedLibraryId || typeof evidence.identityHash !== "string") continue;
+    const sourceRoot = find(source.fileKey);
+    const targetRoot = find(target.fileKey);
+    const targetIdentity = canonical.get(targetRoot) ?? target.identityHash;
+    // Older rows stored the target's raw hash; newer rows store its effective canonical hash.
+    if (evidence.identityHash !== target.identityHash && evidence.identityHash !== targetIdentity) continue;
+    if (sourceRoot === targetRoot) continue;
+    const sourceMembers = members.get(sourceRoot) ?? new Set([source.fileKey]);
+    const targetMembers = members.get(targetRoot) ?? new Set([target.fileKey]);
+    const directPair = knowledgeRelationshipPairKey(source, target);
+    if ([...sourceMembers].some((sourceKey) => [...targetMembers].some((targetKey) => {
+      const sourceRow = byFile.get(sourceKey);
+      const targetRow = byFile.get(targetKey);
+      return sourceRow && targetRow && separatedPairs.has(knowledgeRelationshipPairKey(sourceRow, targetRow)) &&
+        knowledgeRelationshipPairKey(sourceRow, targetRow) !== directPair;
+    }))) continue;
+    for (const key of sourceMembers) {
+      parent.set(key, targetRoot);
+      targetMembers.add(key);
+    }
+    members.set(targetRoot, targetMembers);
+    members.delete(sourceRoot);
+    canonical.set(targetRoot, targetIdentity);
+    canonical.delete(sourceRoot);
+  }
+
+  const result = new Map<string, string>();
+  for (const [root, group] of members) {
+    if (group.size < 2) continue;
+    const identity = canonical.get(find(root));
+    if (identity) for (const fileKey of group) result.set(fileKey, identity);
+  }
+  return result;
+}
+
 export async function getDocumentVersionSignals(entries: Array<{
   connectedLibraryId: string; fileKey: string; checksum: string; isCurrent: boolean;
 }>, includeHistory: boolean) {
@@ -120,7 +201,7 @@ export async function getSeparatedRelationshipPairIdentities(
 export async function reconcileObservationKnowledge(tx: Prisma.TransactionClient, observationSessionId: string) {
   const observation = await tx.observationSession.findUnique({
     select: { status: true, observerType: true, observations: true, humanDecisions: {
-      orderBy: { createdAt: "desc" },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       select: { decisionType: true, editedSuggestion: true },
     } },
     where: { id: observationSessionId },
@@ -378,9 +459,9 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
       libraryDocument: {
         select: {
           observationSessions: {
-            orderBy: { createdAt: "desc" },
+            orderBy: [{ createdAt: "desc" }, { id: "desc" }],
             select: { id: true, status: true, humanDecisions: {
-              where: { decisionType: "MODIFY" }, orderBy: { createdAt: "desc" },
+              where: { decisionType: "MODIFY" }, orderBy: [{ createdAt: "desc" }, { id: "desc" }],
               select: { editedSuggestion: true }, take: 1,
             } },
             take: 1,
@@ -738,7 +819,7 @@ export async function earlierRelationshipContext(input: {
   const moves = moveCandidate ? await knownExecutedMoves(input.connectedLibraryId) : [];
   const fileKey = fileKeyAfterKnownMoves(input.connectedLibraryId, input.relativePath, input.checksum, moves);
   const connections = await prisma.knowledgeConnection.findMany({
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: 8,
     where: {
       createdAt: { lt: input.scanStartedAt },
@@ -780,7 +861,7 @@ export async function getRecentPersistentFileRelationships() {
       targetChecksum: true,
       status: true,
       supersededAt: true,
-      decisions: { orderBy: { createdAt: "desc" }, select: { action: true, createdAt: true, note: true }, take: 8 },
+      decisions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { action: true, createdAt: true, note: true }, take: 8 },
     },
     take: 30,
     where: { generationVersion: { in: [relationshipGenerationVersion, documentSignalVersion, humanIdentityCorrectionVersion] } },
@@ -1055,8 +1136,38 @@ export async function createIdentityCorrection(input: {
     ))) {
       throw new RelationshipReviewError("One of these files is no longer in the latest scan. Scan again before correcting it.", 409);
     }
+    let targetIdentityHash = target.identityHash;
+    if (input.kind === "SAME_CLIENT") {
+      const [clientSignals, activeCorrections, separated] = await Promise.all([
+        tx.knowledgeDocumentSignal.findMany({
+          select: { checksum: true, connectedLibraryId: true, fileKey: true, identityHash: true, kind: true },
+          where: { connectedLibraryId: source.connectedLibraryId, generationVersion: documentSignalVersion,
+            kind: { in: ["CLIENT", "UNRESOLVED_CLIENT"] }, status: "ACTIVE", supersededAt: null },
+        }),
+        tx.knowledgeConnection.findMany({
+          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+          select: { id: true, relationshipKind: true, sourceChecksum: true, sourceEvidence: true,
+            sourceFileKey: true, targetChecksum: true, targetFileKey: true },
+          where: { generationVersion: humanIdentityCorrectionVersion, relationshipKind: "SAME_CLIENT",
+            status: "CONFIRMED", supersededAt: null },
+        }),
+        tx.knowledgeConnection.findMany({
+          select: { sourceChecksum: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
+          where: { decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
+            generationVersion: documentSignalVersion, relationshipKind: "SAME_CLIENT",
+            status: "REJECTED", supersededAt: null },
+        }),
+      ]);
+      const separatedPairs = new Set(separated.flatMap((row) => row.sourceFileKey && row.sourceChecksum &&
+        row.targetFileKey && row.targetChecksum ? [knowledgeRelationshipPairKey(
+          { fileKey: row.sourceFileKey, checksum: row.sourceChecksum },
+          { fileKey: row.targetFileKey, checksum: row.targetChecksum },
+        )] : []));
+      targetIdentityHash = correctedClientIdentities(clientSignals, activeCorrections, separatedPairs)
+        .get(target.fileKey) ?? target.identityHash;
+    }
     const relationshipKey = digest([humanIdentityCorrectionVersion, input.kind, source.fileKey, source.checksum,
-      target.fileKey, target.checksum, target.identityHash].join("\0"));
+      target.fileKey, target.checksum, targetIdentityHash].join("\0"));
     const existing = await tx.knowledgeConnection.findUnique({
       select: { id: true, status: true, supersededAt: true },
       where: { relationshipKey },
@@ -1066,7 +1177,7 @@ export async function createIdentityCorrection(input: {
     const evidence = {
       connectedLibraryId: source.connectedLibraryId,
       evidenceKinds: ["HUMAN_REVIEW"],
-      identityHash: target.identityHash,
+      identityHash: targetIdentityHash,
       sourceRanges: source.sourceRanges,
       sourceRelativePath: source.relativePath,
       supportingTopics: [input.kind === "SAME_CLIENT" ? "client identity" : "project membership"],
@@ -1100,7 +1211,7 @@ export async function createIdentityCorrection(input: {
     for (const proposal of conflictingProposals) {
       const proposalEvidence = proposal.sourceEvidence;
       if (!proposalEvidence || Array.isArray(proposalEvidence) || typeof proposalEvidence !== "object" ||
-          proposalEvidence.identityHash === target.identityHash) continue;
+          proposalEvidence.identityHash === targetIdentityHash) continue;
       const changed = await tx.knowledgeConnection.updateMany({ data: { status: "REJECTED" }, where: { id: proposal.id, status: "NEW" } });
       if (changed.count === 1) await tx.knowledgeConnectionDecision.create({
         data: {
@@ -1172,24 +1283,44 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[]) {
       connectedLibraryId: { in: libraryIds } },
   });
   const humanCorrections = await prisma.knowledgeConnection.findMany({
-    orderBy: { createdAt: "desc" },
-    select: { relationshipKind: true, sourceChecksum: true, sourceEvidence: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    select: { id: true, relationshipKind: true, sourceChecksum: true, sourceEvidence: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
     where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null,
       sourceFileKey: { in: candidateRows.map((row) => row.fileKey) } },
+  });
+  const separatedClientRows = await prisma.knowledgeConnection.findMany({
+    select: { sourceChecksum: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
+    where: { decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
+      generationVersion: documentSignalVersion, relationshipKind: "SAME_CLIENT",
+      status: "REJECTED", supersededAt: null,
+      sourceFileKey: { in: candidateRows.map((row) => row.fileKey) },
+      targetFileKey: { in: candidateRows.map((row) => row.fileKey) } },
   });
   const rows = await currentSnapshotSignals(candidateRows);
   const effectiveRows = [...rows];
   const correctedIdentities = new Map<string, string>();
+  const separatedClientPairs = new Set(separatedClientRows.flatMap((row) => row.sourceFileKey && row.sourceChecksum &&
+    row.targetFileKey && row.targetChecksum ? [knowledgeRelationshipPairKey(
+      { fileKey: row.sourceFileKey, checksum: row.sourceChecksum },
+      { fileKey: row.targetFileKey, checksum: row.targetChecksum },
+    )] : []));
+  const correctedClients = correctedClientIdentities(rows, humanCorrections, separatedClientPairs);
+  for (const row of rows) {
+    const identityHash = correctedClients.get(row.fileKey);
+    if (!identityHash || !["CLIENT", "UNRESOLVED_CLIENT"].includes(row.kind)) continue;
+    correctedIdentities.set(`${row.fileKey}:CLIENT`, identityHash);
+    effectiveRows.push({ ...row, kind: "CLIENT", identityHash, sourceRanges: [],
+      generationVersion: humanIdentityCorrectionVersion });
+  }
   for (const correction of humanCorrections) {
-    const kind = correction.relationshipKind === "SAME_CLIENT" ? "CLIENT" :
-      correction.relationshipKind === "BELONGS_TO_PROJECT" ? "PROJECT" : null;
+    const kind = correction.relationshipKind === "BELONGS_TO_PROJECT" ? "PROJECT" : null;
     const evidence = correction.sourceEvidence;
     if (!kind || !correction.sourceFileKey || !correction.targetFileKey ||
         !evidence || Array.isArray(evidence) || typeof evidence !== "object" ||
         typeof evidence.identityHash !== "string") continue;
     const source = rows.find((row) => row.fileKey === correction.sourceFileKey && row.checksum === correction.sourceChecksum);
     const target = rows.find((row) => row.fileKey === correction.targetFileKey && row.checksum === correction.targetChecksum &&
-      (row.kind === kind || (kind === "CLIENT" && row.kind === "UNRESOLVED_CLIENT")) &&
+      (row.kind === kind || row.kind === "UNRESOLVED_PROJECT") &&
       row.identityHash === evidence.identityHash && row.connectedLibraryId === source?.connectedLibraryId);
     if (!source || !target || evidence.connectedLibraryId !== source.connectedLibraryId) continue;
     const key = `${source.fileKey}:${kind}`;

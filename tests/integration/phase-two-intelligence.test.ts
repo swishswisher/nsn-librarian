@@ -4,6 +4,7 @@ import { after, before, test } from "node:test";
 
 import { PrismaClient } from "@prisma/client";
 import { formatOrganizationConcepts, organizationConceptsFromEvidence } from "../../src/lib/bridge/organization-concepts";
+import { documentSignalVersion } from "../../src/lib/bridge/document-signals";
 
 const schema = `phase_two_${process.pid}_${Date.now()}`;
 const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -595,6 +596,52 @@ test("human corrections join distinct client labels and assign a document to a p
   await assert.rejects(persistent.createIdentityCorrection({ sourceSignalId: source.id, targetSignalId: outside.id, kind: "SAME_CLIENT", note: "Cannot cross roots." }));
   assert.equal(await prisma.bridgeCommand.count(), 0);
   assert.equal(await prisma.executionRun.count(), 0);
+});
+
+test("same-client corrections form a canonical transitive equivalence regardless of submission order", async () => {
+  const library = await createLibrary("Transitive correction root");
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
+  const files = await Promise.all(["A", "B", "C", "D"].map((name, index) => createObservedFile({
+    checksum: String(index + 3).repeat(64), libraryId: library.id,
+    relativePath: `Clients/${name}.txt`, sessionId: scan.id,
+  })));
+  const signals = await Promise.all(files.map((item, index) => prisma.knowledgeDocumentSignal.create({ data: {
+    checksum: item.file.checksum!, connectedLibraryId: library.id,
+    fileKey: persistent.persistentFileKey(library.id, item.file.relativePath),
+    generationVersion: documentSignalVersion,
+    identityHash: `client-${index}`, kind: "CLIENT", observationSessionId: item.observation.id,
+    relativePath: item.file.relativePath, signalKey: crypto.randomUUID(), sourceRanges: [],
+  } })));
+
+  await persistent.createIdentityCorrection({ sourceSignalId: signals[0].id, targetSignalId: signals[1].id,
+    kind: "SAME_CLIENT", note: "A and B are the same client." });
+  const chained = await persistent.createIdentityCorrection({ sourceSignalId: signals[2].id, targetSignalId: signals[0].id,
+    kind: "SAME_CLIENT", note: "C belongs with the already corrected A identity." });
+  assert.equal((chained.sourceEvidence as { identityHash?: string }).identityHash, signals[1].identityHash);
+  await persistent.createIdentityCorrection({ sourceSignalId: signals[1].id, targetSignalId: signals[0].id,
+    kind: "SAME_CLIENT", note: "Reversing A and B must not reverse their canonical identity." });
+
+  const separated = await prisma.knowledgeConnection.create({ data: {
+    sourceObservationSessionId: signals[1].observationSessionId,
+    targetObservationSessionId: signals[3].observationSessionId,
+    sourceChecksum: signals[1].checksum, targetChecksum: signals[3].checksum,
+    sourceFileKey: signals[1].fileKey, targetFileKey: signals[3].fileKey,
+    generationVersion: documentSignalVersion, relationshipKind: "SAME_CLIENT",
+    sharedTerms: [], reasoning: "These generated identities were explicitly separated.", status: "REJECTED",
+    sourceEvidence: { connectedLibraryId: library.id, identityHash: signals[1].identityHash },
+  } });
+  await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: separated.id,
+    action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+  await persistent.createIdentityCorrection({ sourceSignalId: signals[3].id, targetSignalId: signals[2].id,
+    kind: "SAME_CLIENT", note: "A transitive join must not bypass the separated B and D pair." });
+
+  const effective = await persistent.getEffectiveDocumentSignals([library.id]);
+  for (const signal of signals.slice(0, 3)) {
+    assert.ok(effective.some((row) => row.fileKey === signal.fileKey && row.kind === "CLIENT" &&
+      row.identityHash === signals[1].identityHash));
+  }
+  assert.ok(effective.some((row) => row.fileKey === signals[3].fileKey && row.identityHash === signals[3].identityHash));
+  assert.ok(!effective.some((row) => row.fileKey === signals[2].fileKey && row.identityHash === signals[0].identityHash));
 });
 
 test("explicit v1/v2 forms a revision link while identical copies and filenames do not", async () => {

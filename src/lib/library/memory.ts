@@ -897,7 +897,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
         },
       },
       humanDecisions: {
-        orderBy: { createdAt: "desc" },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       },
     },
   });
@@ -925,7 +925,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
     }) : [];
   const approvedSessions = await prisma.observationSession.findMany({
     where: { status: { in: ["APPROVED", "MODIFIED"] } },
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: 100,
     include: {
       libraryDocument: {
@@ -936,7 +936,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
         },
       },
       humanDecisions: {
-        orderBy: { createdAt: "desc" },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       },
     },
   });
@@ -945,7 +945,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
   if (missingSources.length) approvedSessions.push(...await prisma.observationSession.findMany({
     where: { id: { in: missingSources }, status: { in: ["APPROVED", "MODIFIED"] } },
     include: { libraryDocument: { select: { originalFileName: true, previewText: true, rawText: true } },
-      humanDecisions: { orderBy: { createdAt: "desc" } } },
+      humanDecisions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }] } },
   }));
   const preparedApprovedSessions = approvedSessions.map((approvedSession) =>
     prepareSession(approvedSession),
@@ -981,7 +981,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
         status: { in: ["APPROVED", "MODIFIED"] },
       },
     },
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: 150,
     include: {
       observationSession: {
@@ -1002,7 +1002,7 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
   if (missingPreferenceSources.length) humanDecisions.push(...await prisma.humanDecision.findMany({
     where: { observationSessionId: { in: missingPreferenceSources },
       observationSession: { status: { in: ["APPROVED", "MODIFIED"] } } },
-    orderBy: { createdAt: "desc" }, distinct: ["observationSessionId"],
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }], distinct: ["observationSessionId"],
     include: { observationSession: { select: { status: true,
       libraryDocument: { select: { originalFileName: true } } } } },
   }));
@@ -1061,7 +1061,7 @@ export async function backfillHistoricalMemorySearchSources(limit = 20) {
           scannedFiles: { select: { relativePath: true, scanSession: {
             select: { connectedFolderId: true },
           } } },
-        } }, humanDecisions: { orderBy: { createdAt: "desc" } } },
+        } }, humanDecisions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }] } },
       });
       if (sessions.length === 1) {
         const source = sessions[0];
