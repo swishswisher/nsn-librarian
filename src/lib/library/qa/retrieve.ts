@@ -68,7 +68,12 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     root.scanSessions[0].searchIndexStatus !== "COMPLETED" ||
     Boolean(newerActiveSessions[index]));
 
-  const results = await searchLibrary(route.searchQuery, rootIds, { includeEntityMatches: true });
+  const results = await searchLibrary(route.searchQuery, rootIds, {
+    includeEntityMatches: true,
+    // Search remains display-bounded, but Ask must see every candidate from the
+    // bounded retrieval window before deciding whether an entity is ambiguous.
+    includeAllEntityMatches: true,
+  });
   const requestedHashesByResultId = new Map(results.flatMap((result) =>
     result.matchedEntityHashes?.length ? [[result.id, result.matchedEntityHashes] as const] : []));
   const indexIds = results.filter((result) => result.kind === "FILE").map((result) => result.id);
@@ -114,6 +119,14 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
       (route.wantsHistory || entry.isCurrent && latestIds.has(entry.scanSessionId))
       ? [entry] : [];
   });
+  // Answer sources already collapse byte-identical copies by checksum. Apply
+  // the same physical-source identity before counting request-bound hashes or
+  // evaluating separations, choosing the first stable ranked authorized copy.
+  // Distinct bytes remain distinct even when their typed entity names match.
+  const ambiguityEntries = [...new Map(eligibleMatchedEntries.map((entry) => [
+    entry.checksum ? `sha256:${entry.checksum}` : `${entry.connectedLibraryId}:${entry.fileKey}`,
+    entry,
+  ])).values()];
   const sources: AnswerContextSource[] = [];
   const sourceEntryById = new Map<string, (typeof entries)[number]>();
   const physicalSeen = new Set<string>();
@@ -263,22 +276,22 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   const identityKind = route.entityKind;
   const [effectiveSignals, separatedIdentityPairs] = identityKind ? await Promise.all([
     getEffectiveDocumentSignals(rootIds, route.wantsHistory ? {
-      historicalEntries: eligibleMatchedEntries.map((entry) => ({
+      historicalEntries: ambiguityEntries.map((entry) => ({
         checksum: entry.checksum, connectedLibraryId: entry.connectedLibraryId,
         fileKey: entry.fileKey, isCurrent: entry.isCurrent,
       })),
     } : undefined),
-    getSeparatedRelationshipPairIdentities(eligibleMatchedEntries, [`SAME_${identityKind}`]),
+    getSeparatedRelationshipPairIdentities(ambiguityEntries, [`SAME_${identityKind}`]),
   ]) : [[], new Map<string, Set<string>>()];
   // Search has already bound the requested name to exact typed evidence. Use
   // those admitted identities rather than every same-kind signal on a selected
   // multi-signal document (for example, a file mentioning both Alice and Bob).
-  const entityHashes = identityKind ? new Set(eligibleMatchedEntries.flatMap((entry) =>
+  const entityHashes = identityKind ? new Set(ambiguityEntries.flatMap((entry) =>
     (requestedHashesByResultId.get(entry.id) ?? []).map((hash) =>
       `${entry.connectedLibraryId}:${hash}`))) : new Set<string>();
   const effectiveIdentitiesByEndpoint = new Map<string, Set<string>>();
   for (const signal of effectiveSignals) {
-    if (signal.kind !== identityKind || !eligibleMatchedEntries.some((entry) =>
+    if (signal.kind !== identityKind || !ambiguityEntries.some((entry) =>
       entry.connectedLibraryId === signal.connectedLibraryId &&
       entry.fileKey === signal.fileKey && entry.checksum === signal.checksum)) continue;
     const endpoint = `${signal.fileKey}\0${signal.checksum}`;
@@ -286,8 +299,8 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
       ...(effectiveIdentitiesByEndpoint.get(endpoint) ?? []), signal.identityHash,
     ]));
   }
-  const hasSeparatedMatchingIdentity = eligibleMatchedEntries.some((left, leftIndex) =>
-    eligibleMatchedEntries.slice(leftIndex + 1).some((right) => {
+  const hasSeparatedMatchingIdentity = ambiguityEntries.some((left, leftIndex) =>
+    ambiguityEntries.slice(leftIndex + 1).some((right) => {
       const separated = separatedIdentityPairs.get(knowledgeRelationshipPairKey(left, right));
       const leftIdentities = effectiveIdentitiesByEndpoint.get(`${left.fileKey}\0${left.checksum}`);
       const rightIdentities = effectiveIdentitiesByEndpoint.get(`${right.fileKey}\0${right.checksum}`);

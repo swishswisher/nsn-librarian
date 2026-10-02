@@ -178,6 +178,8 @@ export function rankSearchEntry(entry: {
 
 export async function searchLibrary(value: string, permittedRootIds?: string[], options?: {
   includeEntityMatches?: boolean;
+  /** Keep the bounded ranked file set so Ask can check identity ambiguity before UI truncation. */
+  includeAllEntityMatches?: boolean;
 }): Promise<LibrarySearchResult[]> {
   const intent = parseSearchIntent(value);
   if (intent.query.length < 2) return [];
@@ -513,6 +515,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
       state: "Human-approved Memory", reason: "Matches a human-approved library memory, not a quotation from a file",
       excerpt: null, sourceRange: null, score: Math.min(45, 28 + matchingTerms.length * 6) });
   }
-  return results.sort(compareSearchResults)
-    .slice(0, searchResultLimit);
+  const rankedResults = results.sort(compareSearchResults);
+  return options?.includeAllEntityMatches && intent.entityKind
+    ? rankedResults
+    : rankedResults.slice(0, searchResultLimit);
 }

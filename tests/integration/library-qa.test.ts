@@ -332,12 +332,47 @@ test("same-name clients with distinct identity hashes trigger clarification", as
   assert.equal(versionResult.state, "AMBIGUOUS_ENTITY");
 });
 
+test("Ask treats authorized byte-identical cross-root copies as one physical identity", async () => {
+  const leftRoot = await root("Duplicate identity left root");
+  const rightRoot = await root("Duplicate identity right root");
+  const leftScan = await scan(leftRoot.id); const rightScan = await scan(rightRoot.id);
+  const checksum = "duplicate-dana-checksum";
+  const left = await file({ rootId: leftRoot.id, sessionId: leftScan.id,
+    relativePath: "Dana/profile.txt", quote: "Client Dana physical-copy evidence",
+    checksum, entityHashes: ["dana-left-root"] });
+  const right = await file({ rootId: rightRoot.id, sessionId: rightScan.id,
+    relativePath: "Dana/profile-copy.txt", quote: "Client Dana physical-copy evidence",
+    checksum, entityHashes: ["dana-right-root"] });
+  await prisma.knowledgeDocumentSignal.createMany({ data: [
+    { item: left, rootId: leftRoot.id, hash: "dana-left-root" },
+    { item: right, rootId: rightRoot.id, hash: "dana-right-root" },
+  ].map(({ item, rootId, hash }) => ({
+    signalKey: crypto.randomUUID(), connectedLibraryId: rootId, fileKey: item.index.fileKey,
+    relativePath: item.scanned.relativePath, checksum, kind: "CLIENT", identityHash: hash,
+    sourceRanges: [], observationSessionId: item.observation.id,
+    generationVersion: documentSignalVersion,
+  })) });
+
+  for (const question of ["What do we have about client Dana?", "Show older files for client Dana"]) {
+    let modelCalled = false;
+    const result = await answer.answerLibraryQuestion(question, {
+      permittedRootIds: [leftRoot.id, rightRoot.id], model: async () => {
+        modelCalled = true;
+        return model([claim("Client Dana physical-copy evidence", ["S1"])])();
+      },
+    });
+    assert.equal(modelCalled, true);
+    assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+    assert.equal(result.sources.length, 1);
+  }
+});
+
 test("Ask checks entity ambiguity beyond the eight-source answer cap", async () => {
   const primaryRoot = await root("Capped Alice Primary Root");
   const laterRoot = await root("Capped Alice Distinct Root");
   const primaryScan = await scan(primaryRoot.id);
   const laterScan = await scan(laterRoot.id);
-  const primary = await Promise.all(Array.from({ length: 8 }, (_, index) => file({
+  const primary = await Promise.all(Array.from({ length: 20 }, (_, index) => file({
     rootId: primaryRoot.id, sessionId: primaryScan.id,
     relativePath: `00-primary/alice-${index}.txt`, quote: `Client Alice priority evidence ${index}`,
     entityHashes: ["capped-alice-primary"],
@@ -363,10 +398,15 @@ test("Ask checks entity ambiguity beyond the eight-source answer cap", async () 
 
   const question = "What do we have about client Alice?";
   const search = await import("../../src/lib/library/search");
+  const displayedMatches = (await search.searchLibrary(question, [primaryRoot.id, laterRoot.id]))
+    .filter((result) => result.kind === "FILE");
+  assert.equal(displayedMatches.length, 20);
+  assert.ok(displayedMatches.every((result) => result.rootName === primaryRoot.displayName));
   const matches = (await search.searchLibrary(question, [primaryRoot.id, laterRoot.id], {
     includeEntityMatches: true,
+    includeAllEntityMatches: true,
   })).filter((result) => result.kind === "FILE");
-  assert.equal(matches.length, 10);
+  assert.equal(matches.length, 22);
   assert.equal(matches.at(-2)?.relativePath, distinct.scanned.relativePath);
 
   const context = await retrieve.retrieveQuestionContext(question, [primaryRoot.id, laterRoot.id]);
