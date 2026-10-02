@@ -679,7 +679,8 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
       left.identityHash.localeCompare(right.identityHash) ||
       left.fileKey.localeCompare(right.fileKey));
   const activeCorrections = await prisma.knowledgeConnection.findMany({
-    select: { relationshipKind: true, sourceChecksum: true, sourceEvidence: true, sourceFileKey: true },
+    select: { relationshipKind: true, sourceChecksum: true, sourceEvidence: true, sourceFileKey: true,
+      targetChecksum: true, targetFileKey: true },
     where: {
       generationVersion: humanIdentityCorrectionVersion,
       sourceFileKey: { in: fileKeys },
@@ -687,13 +688,32 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
       supersededAt: null,
     },
   });
+  const correctionEndpointSignals = await prisma.knowledgeDocumentSignal.findMany({
+    select: { checksum: true, fileKey: true, identityHash: true, kind: true },
+    where: { connectedLibraryId: session.connectedFolderId, generationVersion: documentSignalVersion,
+      fileKey: { in: fileKeys }, status: "ACTIVE", supersededAt: null,
+      kind: { in: ["CLIENT", "UNRESOLVED_CLIENT", "PROJECT", "UNRESOLVED_PROJECT"] } },
+  });
+  const correctionIdentityKinds = (kind: string) => kind === "CLIENT"
+    ? ["CLIENT", "UNRESOLVED_CLIENT"] : ["PROJECT", "UNRESOLVED_PROJECT"];
+  const identitiesAtEndpoint = (fileKey: string, checksum: string, kind: string) => new Set(correctionEndpointSignals
+    .filter((signal) => signal.fileKey === fileKey && signal.checksum === checksum &&
+      correctionIdentityKinds(kind).includes(signal.kind))
+    .map((signal) => signal.identityHash));
   const correctedIdentityByFile = new Map<string, string>();
   for (const correction of activeCorrections) {
     const kind = correction.relationshipKind === "SAME_CLIENT" ? "CLIENT" :
       correction.relationshipKind === "BELONGS_TO_PROJECT" ? "PROJECT" : null;
     const evidence = correction.sourceEvidence;
+    const sourceIdentities = kind && correction.sourceFileKey && correction.sourceChecksum
+      ? identitiesAtEndpoint(correction.sourceFileKey, correction.sourceChecksum, kind) : new Set<string>();
+    const targetIdentities = kind && correction.targetFileKey && correction.targetChecksum
+      ? identitiesAtEndpoint(correction.targetFileKey, correction.targetChecksum, kind) : new Set<string>();
     if (kind && correction.sourceFileKey && correction.sourceChecksum === checksumByKey.get(correction.sourceFileKey) &&
-        evidence && !Array.isArray(evidence) && typeof evidence === "object" && typeof evidence.identityHash === "string") {
+        correction.targetFileKey && correction.targetChecksum === checksumByKey.get(correction.targetFileKey) &&
+        sourceIdentities.size <= 1 && targetIdentities.size <= 1 &&
+        evidence && !Array.isArray(evidence) && typeof evidence === "object" &&
+        typeof evidence.identityHash === "string" && targetIdentities.has(evidence.identityHash)) {
       correctedIdentityByFile.set(`${correction.sourceFileKey}:${kind}`, evidence.identityHash);
     }
   }
