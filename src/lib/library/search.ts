@@ -206,7 +206,6 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   const seedPairs = [...seedHashesByRoot].flatMap(([connectedLibraryId, hashes]) =>
     [...hashes].map((hash) => ({ connectedLibraryId, hash })),
   ).slice(0, 24);
-  const seedHashes = [...new Set(seedPairs.map(({ hash }) => hash))];
   const expansionHashesByRoot = new Map<string, string[]>();
   for (const { connectedLibraryId, hash } of seedPairs) {
     const hashes = expansionHashesByRoot.get(connectedLibraryId) ?? [];
@@ -232,8 +231,9 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   const related = relatedCandidates.filter((entry) => !seedEntries.some((seed) => {
     if (seed.id === entry.id) return false;
     const separatedHashes = separatedIdentityPairs.get(knowledgeRelationshipPairKey(seed, entry));
+    const seedHashes = seedHashesByRoot.get(seed.connectedLibraryId) ?? new Set<string>();
     return Boolean(separatedHashes && [...separatedHashes].some((hash) =>
-      seedHashes.includes(hash) && seed.entityHashes.includes(hash) && entry.entityHashes.includes(hash),
+      seedHashes.has(hash) && seed.entityHashes.includes(hash) && entry.entityHashes.includes(hash),
     ));
   }));
   const candidateById = new Map([...initial, ...related].map((entry) => [entry.id, entry]));
@@ -248,13 +248,14 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   const results: LibrarySearchResult[] = [];
   for (const entry of candidateById.values()) {
     const root = rootById.get(entry.connectedLibraryId);
+    const rootSeedHashes = seedHashesByRoot.get(entry.connectedLibraryId) ?? new Set<string>();
     if (!root || !currentSourceIds.has(entry.scannedFileId) ||
         (!intent.wantsHistory && !root.scanSessions.some((session) => session.id === entry.scanSessionId))) continue;
-    if (intent.entityName && !entry.entityHashes.some((hash) => seedHashes.includes(hash)) &&
+    if (intent.entityName && !entry.entityHashes.some((hash) => rootSeedHashes.has(hash)) &&
         !matchesEntityPhrase(entry.relativePath, intent.entityName) &&
         !validExcerpts(entry.sourceExcerpts).some((excerpt) => matchesEntityPhrase(excerpt.text, intent.entityName!))) continue;
     if (intent.fileType && !entry.fileType.toLowerCase().includes(intent.fileType.replace(/s$/, ""))) continue;
-    const ranked = rankSearchEntry(entry, intent, new Set(seedHashes));
+    const ranked = rankSearchEntry(entry, intent, rootSeedHashes);
     if (!ranked) continue;
     const category = mediaCategoryForFileType(entry.fileType);
     const member = versions.find((signal) => signal.connectedLibraryId === entry.connectedLibraryId &&

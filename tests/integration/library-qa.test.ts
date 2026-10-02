@@ -747,6 +747,28 @@ test("an active newer scan leaves the completed snapshot usable but marks answer
   assert.equal(result.indexIncomplete, true);
 });
 
+test("failed scans do not invalidate a completed indexed answer snapshot", async () => {
+  const r = await root("Failed Scan QA Root"); const completed = await scan(r.id);
+  await file({ rootId: r.id, sessionId: completed.id, relativePath: "cedar.txt",
+    quote: "Cedar workshop starts Tuesday" });
+  const failed = await prisma.scanSession.create({ data: { connectedFolderId: r.id, status: "FAILED",
+    startedAt: new Date(Date.now() + 1000) } });
+  const result = await answer.answerLibraryQuestion("cedar", { permittedRootIds: [r.id],
+    model: model([claim("Cedar workshop starts Tuesday", ["S1"])]) });
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  assert.equal(result.indexIncomplete, false);
+
+  await prisma.scanSession.update({ where: { id: failed.id }, data: { status: "READING" } });
+  const active = await retrieve.retrieveQuestionContext("cedar", [r.id]);
+  assert.equal(active.indexIncomplete, true);
+
+  await prisma.scanSession.update({ where: { id: failed.id }, data: {
+    status: "COMPLETED", searchIndexStatus: "COMPLETED",
+  } });
+  const replacement = await retrieve.retrieveQuestionContext("cedar", [r.id]);
+  assert.equal(replacement.indexIncomplete, false);
+});
+
 test("usage audit stores tokens and status but no question or answer", async () => {
   const r = await root("Usage QA Root"); const s = await scan(r.id);
   await file({ rootId: r.id, sessionId: s.id, relativePath: "usage.txt", quote: "Usage notes are bounded" });

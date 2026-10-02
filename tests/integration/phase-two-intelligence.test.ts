@@ -994,12 +994,15 @@ test("reject then re-approve restores original identity, search and QA without r
   const rejectedLink = await prisma.knowledgeConnection.findFirstOrThrow({ where: {
     relationshipKind: "SAME_PROJECT", sourceObservationSessionId: { in: [left.observation.id, right.observation.id] },
   } });
+  await persistent.reviewPersistentRelationship(clientLink.id, "CONFIRM", "Human-confirmed client identity.");
   await persistent.reviewPersistentRelationship(rejectedLink.id, "SEPARATE", "This project link is not valid.");
   await saveHumanDecision(left.observation.id, { decisionType: "ACCEPT" });
   await saveHumanDecision(left.observation.id, { decisionType: "REJECT" });
   await indexer.refreshSearchForObservation(left.observation.id);
   assert.equal((await prisma.knowledgeDocumentSignal.findUniqueOrThrow({ where: { id: original.id } })).status, "SUPERSEDED");
-  assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: clientLink.id } })).status, "ARCHIVED");
+  const supersededConfirmed = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: clientLink.id } });
+  assert.equal(supersededConfirmed.status, "CONFIRMED");
+  assert.ok(supersededConfirmed.supersededAt);
   assert.deepEqual((await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: left.file.id } })).entityHashes, []);
 
   await saveHumanDecision(left.observation.id, { decisionType: "ACCEPT" });
@@ -1008,7 +1011,9 @@ test("reject then re-approve restores original identity, search and QA without r
   assert.equal(restored.status, "ACTIVE");
   assert.equal(restored.supersededAt, null);
   assert.equal((await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: left.file.id } })).entityHashes.includes(original.identityHash), true);
-  assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: clientLink.id } })).status, "NEW");
+  const restoredConfirmed = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: clientLink.id } });
+  assert.equal(restoredConfirmed.status, "CONFIRMED");
+  assert.equal(restoredConfirmed.supersededAt, null);
   assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: rejectedLink.id } })).status, "REJECTED");
   assert.ok((await retrieveQuestionContext("Client C-101", [library.id])).sources.some((source) => source.href.includes(left.file.id) || source.href.includes(left.file.sessionId)));
   const signalCount = await prisma.knowledgeDocumentSignal.count({ where: { signalKey: original.signalKey } });
@@ -1139,7 +1144,7 @@ test("incomplete and failed snapshots cannot replace completed identities, searc
     const context = await retrieveQuestionContext("Client C-101", [library.id]);
     assert.ok(context.sources.length > 0);
     assert.ok(context.sources.every((source) => source.href.includes(scan.id)));
-    assert.equal(context.indexIncomplete, true);
+    assert.equal(context.indexIncomplete, status !== "FAILED");
   }
   await persistent.reviewPersistentRelationship(link.id, "CONFIRM", "The completed sources remain current.");
   await prisma.scanSession.update({ data: { status: "COMPLETED_WITH_ERRORS" }, where: { id: next.id } });

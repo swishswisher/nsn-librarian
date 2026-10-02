@@ -35,6 +35,10 @@ const readableRoot = {
   canonicalConnectedLibraryId: null,
 };
 
+const activeScanStatuses = [
+  "PENDING", "SCANNING", "READING", "EXAMINING", "GENERATING_SUGGESTIONS",
+] as const;
+
 export async function retrieveQuestionContext(question: string, permittedRootIds?: string[]): Promise<AnswerContext> {
   const route = routeLibraryQuestion(question);
   const prisma = getPrismaClient();
@@ -51,13 +55,15 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   const latestIds = new Set(roots.flatMap((root) => root.scanSessions.map((session) => session.id)));
   if (!rootIds.length) return { route, sources: [], relationships: [], versions: [],
     indexIncomplete: false, ambiguousEntity: false };
-  const newestSessions = await Promise.all(roots.map((root) => prisma.scanSession.findFirst({
-    where: { connectedFolderId: root.id }, orderBy: { startedAt: "desc" },
+  const newerActiveSessions = await Promise.all(roots.map((root) => prisma.scanSession.findFirst({
+    where: { connectedFolderId: root.id, status: { in: [...activeScanStatuses] },
+      ...(root.scanSessions[0] ? { startedAt: { gt: root.scanSessions[0].startedAt } } : {}) },
+    orderBy: [{ startedAt: "desc" }, { id: "desc" }],
     select: { id: true },
   })));
   const indexIncomplete = roots.some((root, index) => !root.scanSessions.length ||
     root.scanSessions[0].searchIndexStatus !== "COMPLETED" ||
-    newestSessions[index]?.id !== root.scanSessions[0].id);
+    Boolean(newerActiveSessions[index]));
 
   const results = await searchLibrary(route.searchQuery, rootIds);
   const indexIds = results.filter((result) => result.kind === "FILE").map((result) => result.id);

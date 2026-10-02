@@ -162,7 +162,7 @@ for (const [kind, query] of [["CLIENT", "client alice"], ["PROJECT", "project at
     const firstRelated = await observedFile({ rootId: firstRoot.id, sessionId: firstSession.id,
       path: `${kind.toLowerCase()}/related.txt`, evidence: evidence("Identity-linked notes without query words") });
     const secondUnrelated = await observedFile({ rootId: secondRoot.id, sessionId: secondSession.id,
-      path: "unrelated/notes.txt", evidence: evidence("Unrelated notes without query words") });
+      path: "unrelated/notes.txt", evidence: evidence(`${kind === "CLIENT" ? "Client" : "Project"} scheduling notes without a name`) });
     const sharedHash = `raw-shared-${kind.toLowerCase()}-${crypto.randomUUID()}`;
     await prisma.knowledgeDocumentSignal.createMany({ data: [
       [firstRoot.id, firstSeed], [firstRoot.id, firstRelated], [secondRoot.id, secondUnrelated],

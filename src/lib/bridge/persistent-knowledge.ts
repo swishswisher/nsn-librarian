@@ -313,9 +313,13 @@ async function upsertCurrentRelationship(data: Prisma.KnowledgeConnectionUncheck
       include: { decisions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { nextStatus: true }, take: 1 } },
       where: { relationshipKey: data.relationshipKey },
     });
-    const reactivate = existing?.status === "ARCHIVED" &&
-      [relationshipGenerationVersion, documentSignalVersion].includes(existing.generationVersion ?? "") &&
+    const generated = [relationshipGenerationVersion, documentSignalVersion]
+      .includes(existing?.generationVersion ?? "");
+    const reactivateArchived = existing?.status === "ARCHIVED" && generated &&
       existing.decisions[0]?.nextStatus !== "REJECTED" && existing.decisions[0]?.nextStatus !== "CONFIRMED";
+    const reactivateConfirmed = existing?.status === "CONFIRMED" && Boolean(existing.supersededAt) && generated &&
+      existing.decisions[0]?.nextStatus !== "REJECTED";
+    const reactivate = reactivateArchived || reactivateConfirmed;
     let sourceEvidence = data.sourceEvidence;
     const previous = existing?.sourceEvidence;
     if (existing && previous && !Array.isArray(previous) && typeof previous === "object" &&
@@ -338,7 +342,7 @@ async function upsertCurrentRelationship(data: Prisma.KnowledgeConnectionUncheck
     return tx.knowledgeConnection.upsert({
       create: data,
       update: { lastSeenAt: data.lastSeenAt, sourceEvidence,
-        ...(reactivate ? { status: "NEW", supersededAt: null } : {}),
+        ...(reactivate ? { status: reactivateConfirmed ? "CONFIRMED" : "NEW", supersededAt: null } : {}),
         sourceObservationSessionId: data.sourceObservationSessionId,
         targetObservationSessionId: data.targetObservationSessionId },
       where: { relationshipKey: data.relationshipKey },
