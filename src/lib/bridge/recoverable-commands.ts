@@ -6,6 +6,8 @@ import type {
 import { getPrismaClient } from "@/lib/db/prisma";
 
 import { recordBridgeHeartbeat } from "./cloud-coordinator";
+import { queueNextRemoteReadBatchForDevice } from "./remote-scan-queue";
+import { expireRemoteReadCommandsForSession } from "./remote-read-commands";
 
 function bridgeJson(value: unknown): BridgeJson {
   return JSON.parse(JSON.stringify(value)) as BridgeJson;
@@ -46,6 +48,31 @@ export async function fetchRecoverableBridgeCommands(bridgeDeviceId: string) {
   const now = new Date();
 
   await recordBridgeHeartbeat(bridgeDeviceId).catch(() => undefined);
+  const expiredReads = await prisma.bridgeCommand.findMany({
+    select: { payload: true },
+    where: {
+      bridgeDeviceId,
+      commandType: "READ_FILE_TEMPORARILY",
+      expiresAt: { lte: now },
+      status: { in: ["PENDING", "ACKNOWLEDGED", "RUNNING"] },
+    },
+  });
+  const expiredSessions = new Set<string>();
+
+  for (const command of expiredReads) {
+    const payload = command.payload;
+
+    if (typeof payload === "object" && payload !== null && !Array.isArray(payload) &&
+        typeof (payload as Record<string, unknown>).scanSessionId === "string") {
+      expiredSessions.add((payload as Record<string, string>).scanSessionId);
+    }
+  }
+
+  for (const sessionId of expiredSessions) {
+    await expireRemoteReadCommandsForSession(sessionId);
+  }
+
+  await queueNextRemoteReadBatchForDevice(bridgeDeviceId).catch(() => undefined);
   await prisma.bridgeCommand.updateMany({
     data: { status: "EXPIRED" },
     where: {

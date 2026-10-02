@@ -9,7 +9,7 @@ import { RetryAutomaticProcessingButton } from "@/components/library/RetryAutoma
 import { ScanSessionAutoRefresh } from "@/components/library/ScanSessionAutoRefresh";
 import { ScannedFilesPanel } from "@/components/library/ScannedFilesPanel";
 import { scannedFileCategoryCounts } from "@/lib/bridge/scanned-file-filters";
-import { getBridgeScanSessionDetail } from "@/lib/bridge/scan-sessions";
+import { getBridgeScanSessionDetail, summarizeScanAIUsage } from "@/lib/bridge/scan-sessions";
 import { getNotebookEntryForScanSession } from "@/lib/library/notebook";
 import {
   getNotebookEntryRoute,
@@ -116,6 +116,7 @@ export default async function ScanSessionDetailPage({
   const filesRead = session.scannedFiles.filter(
     (file) => file.readingStatus === "READ",
   ).length;
+  const aiUsage = summarizeScanAIUsage(session.scannedFiles);
   const filesWithSuggestions = session.scannedFiles.filter(
     (file) => file.organizationSuggestionCounts.total > 0,
   ).length;
@@ -181,6 +182,12 @@ export default async function ScanSessionDetailPage({
           </div>
         </NsnPageHeader>
 
+        {session.knowledgePersistenceStatus === "INCOMPLETE" ? (
+          <p className="border-l-4 border-[var(--nsn-gold)] pl-3 text-sm leading-6 text-[var(--nsn-slate)]" role="status">
+            Some related-knowledge notes could not be saved during this scan. File recommendations may still be available for review.
+          </p>
+        ) : null}
+
         <section
           aria-label="Scan session summary"
           className="grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-9"
@@ -208,6 +215,22 @@ export default async function ScanSessionDetailPage({
           <SummaryTile label="Unsupported" value={session.unsupportedFiles} />
           <SummaryTile label="Needs Attention" value={needsAttention} />
           <SummaryTile label="Remaining" value={remainingFiles} />
+        </section>
+
+        <section className="min-w-0 space-y-2 text-sm text-[var(--nsn-slate)]">
+          <h2 className="font-semibold text-[var(--nsn-navy)]">AI observation usage</h2>
+          <p className="break-words [overflow-wrap:anywhere]">
+            {aiUsage.newlyObserved} new, {aiUsage.reusedObservations} reused, {aiUsage.pendingDocuments} waiting, {aiUsage.failedObservations} used basic mode. Reuse avoided {aiUsage.avoidedRequests} observation requests.
+          </p>
+          <p className="break-words [overflow-wrap:anywhere]">
+            {aiUsage.requests} requests, {aiUsage.httpAttempts} HTTP attempts. Provider-reported tokens: {aiUsage.inputTokens} input, {aiUsage.outputTokens} output{aiUsage.unreportedTokenRequests ? `; ${aiUsage.unreportedTokenRequests} requests without token totals` : ""}. Cost estimate unavailable without maintained pricing.
+          </p>
+          {aiUsage.models.length || aiUsage.processingVersions.length ? (
+            <p className="break-words [overflow-wrap:anywhere]">
+              {aiUsage.models.length ? `Models: ${aiUsage.models.join(", ")}. ` : ""}
+              {aiUsage.processingVersions.length ? `Processing versions: ${aiUsage.processingVersions.join(", ")}.` : ""}
+            </p>
+          ) : null}
         </section>
 
         <ScanSessionAutoRefresh

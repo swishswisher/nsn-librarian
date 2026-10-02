@@ -36,7 +36,7 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_DB: nsn_test
+          POSTGRES_DB: nsn_library_machine_test
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres
         ports:
@@ -47,8 +47,8 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_test?schema=public
-      DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_test?schema=public
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_library_machine_test?schema=public
+      DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5432/nsn_library_machine_test?schema=public
       NEXT_PUBLIC_APP_URL: https://nsn-librarian.vercel.app
       NSN_LIBRARIAN_APP_URL: https://nsn-librarian.vercel.app
       AUTH_SECRET: ci-auth-secret-with-at-least-thirty-two-characters
@@ -57,6 +57,7 @@ jobs:
       NSN_AUTH_ALLOWED_USERS_JSON: '[{"email":"ci@example.com","googleSubject":"ci-google-subject","name":"CI User","role":"OWNER"}]'
       NSN_BRIDGE_COMMAND_SIGNING_SECRET: ci-command-signing-secret-with-at-least-32-characters
       NSN_BRIDGE_PAIRING_SECRET: ci-pairing-secret-with-at-least-32-characters
+      OPENAI_API_KEY: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -70,14 +71,31 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install FFmpeg media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
+      - name: Verify FFmpeg media tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -version
+          ffprobe -version
+
       - name: Generate Prisma client
         run: npm run db:generate
 
-      - name: Prepare test database
-        run: |
-          npx prisma db push --skip-generate
-          psql postgresql://postgres:postgres@127.0.0.1:5432/nsn_test \
-            -f prisma/migrations/20260730170000_bridge_request_nonce/migration.sql
+      - name: Validate Prisma schema
+        run: npm run db:validate
+
+      - name: Apply test database migrations
+        run: npm run db:deploy
+
+      - name: Verify migration status
+        run: npm run db:status
 
       - name: Lint
         run: npm run lint
@@ -90,6 +108,21 @@ jobs:
 
       - name: Test Bridge
         run: npm run test:bridge
+
+      - name: Test Memory
+        run: npm run test:memory
+
+      - name: Test Phase 1-3 intelligence and remaining plan regressions
+        run: >-
+          node --env-file-if-exists=.env --test --test-concurrency=1 --import tsx
+          tests/integration/phase-one-evidence.test.ts
+          tests/integration/phase-two-intelligence.test.ts
+          tests/integration/document-signals.test.ts
+          tests/integration/library-search.test.ts
+          tests/integration/library-qa.test.ts
+          tests/integration/organization-plan-state.test.ts
+          tests/integration/organization-suggestion-approval.test.ts
+          tests/integration/scan-availability.test.ts
 
       - name: Build web
         run: npm run build:web

@@ -8,6 +8,7 @@ import {
 import { buildMemoryFromApprovedSession } from "@/lib/library/memory";
 import { recordObservationDecisionNotebookEntry } from "@/lib/library/notebook";
 import { getNotebookArchiveRoute, getNotebookRoute } from "@/lib/library/routes";
+import { refreshSearchForObservation } from "@/lib/library/search-index";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -52,9 +53,15 @@ export async function POST(
       editedSuggestion: optionalText(body.editedSuggestion),
     });
     const memoryUpdatedCount =
-      result.status === "APPROVED"
+      result.status === "APPROVED" || result.status === "MODIFIED"
         ? await buildMemoryFromApprovedSession(sessionId)
         : 0;
+
+    try {
+      await refreshSearchForObservation(sessionId);
+    } catch {
+      // The human decision remains authoritative if search indexing is unavailable.
+    }
 
     try {
       await recordObservationDecisionNotebookEntry(
@@ -70,6 +77,8 @@ export async function POST(
     revalidatePath("/admin/library/review");
     revalidatePath(`/admin/library/review/${sessionId}`);
     revalidatePath("/admin/library/memory");
+    revalidatePath("/admin/library/knowledge");
+    revalidatePath("/admin/library/documents");
     revalidatePath(getNotebookRoute());
     revalidatePath(getNotebookArchiveRoute());
 

@@ -2,8 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
 import type { Prisma } from "@prisma/client";
+import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 
 import { getPrismaClient } from "@/lib/db/prisma";
+import {
+  applicableApprovedPreferences,
+  disputePreferencesFromDecisions,
+  proposeOrganizationPreferences,
+} from "@/lib/library/organization-preferences";
 
 import {
   ConnectedLibraryError,
@@ -15,7 +21,9 @@ import {
   recordChecksumDuplicateSuggestionsForSession,
 } from "./checksum-duplicates";
 import { jsonImageHumanLabels } from "./image-metadata";
+import { formatOrganizationConcepts } from "./organization-concepts";
 import { readScannedFile } from "./reader";
+import { earlierRelationshipContext } from "./persistent-knowledge";
 import {
   recommendationSupportForStorage,
   recommendationSupportFromJson,
@@ -133,6 +141,12 @@ type SuggestionContext = {
   semanticFiles: ScanWorkingKnowledgeFile[];
   semanticRelationships: ScanWorkingKnowledgeRelationship[];
   memoryMatches: MemoryMatch[];
+  earlierRelationships: Array<{ relationshipKind: string | null; relativePath: string; supportingTopics: string[] }>;
+  approvedPreferences: Array<{
+    destinationRelativePath: string;
+    id: string;
+    scopeTerms: string[];
+  }>;
   preferredTerms: string[];
   audioMetadata: {
     audioFingerprint: string | null;
@@ -682,6 +696,7 @@ function textFromJson(value: Prisma.JsonValue) {
 
 function reviewedObservationText(
   sessions: Array<{
+    humanDecisions?: Array<{ decisionType: string; editedSuggestion: string | null }>;
     status: string;
     observations: Prisma.JsonValue;
     interpretations: Prisma.JsonValue;
@@ -691,12 +706,16 @@ function reviewedObservationText(
 ) {
   return sessions
     .filter((session) => trustedObservationStatuses.has(session.status))
-    .flatMap((session) => [
-      ...textFromJson(session.observations),
-      ...textFromJson(session.interpretations),
-      ...textFromJson(session.explanation),
-      ...textFromJson(session.planSuggestions),
-    ])
+    .flatMap((session) => session.status === "MODIFIED"
+      ? session.humanDecisions?.find(
+          (decision) => decision.decisionType === "MODIFY" && decision.editedSuggestion?.trim(),
+        )?.editedSuggestion ?? []
+      : [
+          ...textFromJson(session.observations),
+          ...textFromJson(session.interpretations),
+          ...textFromJson(session.explanation),
+          ...textFromJson(session.planSuggestions),
+        ])
     .filter((item) => item.trim().length > 0);
 }
 
@@ -1429,12 +1448,12 @@ function audioWebsiteCandidateDraft(context: SuggestionContext) {
   return makeDraft(context, {
     confidence: 0.55,
     explanation:
-      "The Librarian noticed this recording may contain material worth reviewing for public use. Approval is required before it can influence any publishing plan.",
+      "The recording's file path or reviewed labels suggest a possible public-use candidate. Its spoken content may not have been transcribed, so Deanne must review it.",
     proposedRelativePath: joinRelativePath("Website Candidates/Audio", context.fileName),
     suggestionType: "WEBSITE_CANDIDATE",
     title: "Review this recording as a possible website candidate",
     whySuggested: [
-      "The recording includes public-facing or website-oriented signals.",
+      "The file path or reviewed labels include public-facing wording.",
       "Private recordings are excluded from publishing recommendations.",
     ],
   });
@@ -1543,12 +1562,12 @@ function videoWebsiteCandidateDraft(context: SuggestionContext) {
   return makeDraft(context, {
     confidence: 0.56,
     explanation:
-      "The Librarian noticed this video may contain material worth reviewing for public use. Approval is required before it can influence any publishing plan.",
+      "The video's file path or reviewed labels suggest a possible public-use candidate. Its speech and scenes may not have been analyzed, so Deanne must review it.",
     proposedRelativePath: joinRelativePath("Website Candidates/Video", context.fileName),
     suggestionType: "WEBSITE_CANDIDATE",
     title: "Review this video as a possible website candidate",
     whySuggested: [
-      "The video includes public-facing, webinar, or branding signals.",
+      "The file path or reviewed labels include public-facing, webinar, or branding wording.",
       "Private videos are excluded from publishing recommendations.",
     ],
   });
@@ -1579,6 +1598,13 @@ function imageWebsiteCandidateDraft(context: SuggestionContext) {
   });
 }
 
+export function sourceLocationsForRecommendation(contentText: string, concepts: string[]) {
+  return verifiedSourceExcerpts(contentText)
+    .filter((excerpt) => textContainsAnyTerm(excerpt.text, concepts))
+    .slice(0, 3)
+    .map((excerpt) => `Source location: characters ${excerpt.start}-${excerpt.end} of extracted text.`);
+}
+
 function moveAndFolderDrafts(context: SuggestionContext) {
   const best = bestRuleFor(context);
 
@@ -1605,10 +1631,21 @@ function moveAndFolderDrafts(context: SuggestionContext) {
   }
 
   const destinationFolder = establishedFolder?.folder ?? best.rule.folder;
+  const approvedPreference = context.approvedPreferences.find((preference) =>
+    normalizeText(preference.destinationRelativePath) === normalizeText(destinationFolder),
+  );
+  const earlierRelated = context.earlierRelationships
+    .filter((relationship) => relationship.supportingTopics.includes(best.rule.id) ||
+      (best.rule.id === "workshops" && relationship.relationshipKind === "SAME_WORKSHOP"))
+    .slice(0, 2);
   const currentFolder = folderFromRelativePath(context.currentRelativePath);
   const proposedRelativePath = joinRelativePath(destinationFolder, context.fileName);
   const drafts: SuggestionDraft[] = [];
   const matchedConcepts = best.directMatches.join(", ");
+  const sourceLocations = sourceLocationsForRecommendation(
+    context.contentText,
+    best.directMatches,
+  );
   const folderEvidence = establishedFolder
     ? `${establishedFolder.fileCount} existing files are already stored under ${establishedFolder.folder}.`
     : clusterSupport
@@ -1632,10 +1669,11 @@ function moveAndFolderDrafts(context: SuggestionContext) {
         title: `Consider a ${best.rule.folder} folder`,
         whySuggested: [
           best.rule.explanation,
-          `Content concepts: ${matchedConcepts}`,
+          formatOrganizationConcepts(best.directMatches),
         ],
         supportingInformation: [
           folderEvidence,
+          ...sourceLocations,
           ...(clusterSupport
             ? clusterSupport.relatedPaths
                 .slice(0, 3)
@@ -1665,10 +1703,11 @@ function moveAndFolderDrafts(context: SuggestionContext) {
         title: `Consider placing this with ${best.rule.folder}`,
         whySuggested: [
           best.rule.explanation,
-          `Content concepts: ${matchedConcepts}`,
+          formatOrganizationConcepts(best.directMatches),
         ],
         supportingInformation: [
           folderEvidence,
+          ...sourceLocations,
           ...(clusterSupport
             ? clusterSupport.relatedPaths
                 .slice(0, 3)
@@ -1680,6 +1719,12 @@ function moveAndFolderDrafts(context: SuggestionContext) {
           ...(best.memoryScore > 0
             ? ["Approved Memory corroborates this topic classification."]
             : []),
+          ...(approvedPreference
+            ? [`A separately approved organization preference for ${approvedPreference.scopeTerms.join(" and ")} supports this destination within this connected library.`]
+            : []),
+          ...earlierRelated.map((relationship) =>
+            `Earlier scan context: ${relationship.relativePath} ${relationship.relationshipKind === "SAME_WORKSHOP" ? "shared an explicit workshop marker" : "appeared related"}. This history did not count as current destination evidence.`
+          ),
         ],
       }),
     );
@@ -1860,7 +1905,7 @@ function groupWithFilesDraft(context: SuggestionContext, topTerms: string[]) {
     title: `Review this with related files in ${candidate.folder}`,
     whySuggested: [
       "The proposed folder is supported by content meaning and an existing file pattern.",
-      `Specific shared concepts: ${sharedTerms.join(", ")}`,
+      formatOrganizationConcepts(sharedTerms),
     ],
     supportingInformation: [
       patternDescription,
@@ -2253,6 +2298,9 @@ async function scannedFileContext(
   contentText: string,
   workingKnowledge?: ScanWorkingKnowledgeIndex,
 ) {
+  if (/^(?:Image technical metadata only|Audio review material|Video review material)/.test(contentText)) {
+    contentText = "";
+  }
   const prisma = getPrismaClient();
   const scannedFile = await prisma.scannedFile.findUnique({
     include: {
@@ -2308,6 +2356,10 @@ async function scannedFileContext(
           observationSessions: {
             select: {
               explanation: true,
+              humanDecisions: {
+                orderBy: { createdAt: "desc" },
+                select: { decisionType: true, editedSuggestion: true },
+              },
               interpretations: true,
               observations: true,
               planSuggestions: true,
@@ -2416,6 +2468,16 @@ async function scannedFileContext(
     },
   });
   const memoryMatches = activeMemoryMatches(memoryEntries, analysisTerms);
+  const approvedPreferences = await applicableApprovedPreferences({
+    connectedLibraryId: scannedFile.scanSession.connectedFolder.id,
+    contentText,
+  });
+  const earlierRelationships = await earlierRelationshipContext({
+    checksum: scannedFile.checksum,
+    connectedLibraryId: scannedFile.scanSession.connectedFolder.id,
+    relativePath: scannedFile.relativePath,
+    scanStartedAt: scannedFile.scanSession.startedAt,
+  });
   const preferredTerms = preferredTermsFromMemory(memoryEntries, analysisText);
   const exactDuplicate = await findExactChecksumDuplicateForScannedFile(
     scannedFile.id,
@@ -2563,6 +2625,14 @@ async function scannedFileContext(
       scannedFile.scanSession.scannedFiles.map((file) => file.relativePath),
     ),
     memoryMatches,
+    earlierRelationships,
+    approvedPreferences: approvedPreferences.map((preference) => ({
+      destinationRelativePath: preference.destinationRelativePath,
+      id: preference.id,
+      scopeTerms: Array.isArray(preference.scopeTerms)
+        ? preference.scopeTerms.filter((term): term is string => typeof term === "string")
+        : [],
+    })),
     preferredTerms,
     provisionalWorkingEvidence: provisionalText,
     reviewedObservationText: reviewedText,
@@ -3184,6 +3254,12 @@ export async function prepareOrganizationRecommendationRegeneration(
     },
   });
 
+  await disputePreferencesFromDecisions(
+    session.organizationSuggestions
+      .filter((suggestion) => suggestion.status !== "PENDING")
+      .map((suggestion) => suggestion.id),
+  );
+
   return {
     reviewedRecommendationCount,
     supersededRecommendationCount: superseded.count,
@@ -3493,26 +3569,62 @@ export async function reviewOrganizationSuggestion(
           suggestionId,
         },
       });
+      await transaction.organizationSuggestionDecisionEvent.create({
+        data: {
+          action: input.action,
+          context,
+          destination: revision.revisedRelativePath,
+          nextStatus,
+          previousStatus: currentStatus,
+          scanSessionId,
+          suggestionId,
+        },
+      });
     });
   } else {
     assertPendingReviewStatus(currentStatus);
 
-    const updated = await prisma.organizationSuggestion.updateMany({
-      data: {
-        reviewedAt: new Date(),
-        status: nextStatus,
-      },
-      where: {
-        id: suggestionId,
-        invalidatedAt: null,
-        recommendationGenerationId: existing.recommendationGenerationId,
-        recommendationGenerationVersion: currentRecommendationGenerationVersion,
-        scanSessionId,
-        status: "PENDING",
-      },
+    await prisma.$transaction(async (transaction) => {
+      const updated = await transaction.organizationSuggestion.updateMany({
+        data: {
+          reviewedAt: new Date(),
+          status: nextStatus,
+        },
+        where: {
+          id: suggestionId,
+          invalidatedAt: null,
+          recommendationGenerationId: existing.recommendationGenerationId,
+          recommendationGenerationVersion: currentRecommendationGenerationVersion,
+          scanSessionId,
+          status: "PENDING",
+        },
+      });
+      await assertReviewUpdateSucceeded(suggestionId, scanSessionId, updated.count);
+      await transaction.organizationSuggestionDecisionEvent.create({
+        data: {
+          action: input.action,
+          context,
+          destination: existing.proposedRelativePath,
+          nextStatus,
+          previousStatus: currentStatus,
+          scanSessionId,
+          suggestionId,
+        },
+      });
     });
+  }
 
-    await assertReviewUpdateSucceeded(suggestionId, scanSessionId, updated.count);
+  if ((nextStatus === "APPROVED" || nextStatus === "MODIFIED") &&
+      (existing.suggestionType === "MOVE_FILE" || existing.suggestionType === "GROUP_WITH_FILES")) {
+    try {
+      const session = await prisma.scanSession.findUnique({
+        select: { connectedFolderId: true },
+        where: { id: scanSessionId },
+      });
+      if (session) await proposeOrganizationPreferences(session.connectedFolderId);
+    } catch {
+      // A preference proposal is advisory and must not reverse a saved human decision.
+    }
   }
 
   const updated = await storedSuggestionById(suggestionId);
@@ -3579,7 +3691,17 @@ export async function resetOrganizationSuggestionDecision(
           },
         },
       }),
+      prisma.organizationSuggestionDecisionEvent.create({
+        data: {
+          action: "RESET",
+          nextStatus: "PENDING",
+          previousStatus: existing.status,
+          scanSessionId: normalizedScanSessionId,
+          suggestionId,
+        },
+      }),
     ]);
+    await disputePreferencesFromDecisions([suggestionId]);
   }
 
   await recordChecksumDuplicateSuggestionsForSession(normalizedScanSessionId);
@@ -3625,6 +3747,10 @@ export async function resetOrganizationSuggestionDecisionsForScanSession(
     );
   }
 
+  const reviewed = await prisma.organizationSuggestion.findMany({
+    select: { id: true, status: true },
+    where: { scanSessionId: normalizedScanSessionId, status: { not: "PENDING" } },
+  });
   const [cancelledPlans, result] = await prisma.$transaction([
     prisma.organizationPlan.updateMany({
       data: {
@@ -3649,7 +3775,18 @@ export async function resetOrganizationSuggestionDecisionsForScanSession(
         },
       },
     }),
+    prisma.organizationSuggestionDecisionEvent.createMany({
+      data: reviewed.map((item) => ({
+        action: "RESET",
+        nextStatus: "PENDING",
+        previousStatus: item.status,
+        scanSessionId: normalizedScanSessionId,
+        suggestionId: item.id,
+      })),
+    }),
   ]);
+
+  await disputePreferencesFromDecisions(reviewed.map((item) => item.id));
 
   await recordChecksumDuplicateSuggestionsForSession(normalizedScanSessionId);
 

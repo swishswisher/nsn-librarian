@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 
 import type {
   BridgeCommandReport,
@@ -15,6 +15,8 @@ import {
 import { getBridgeScanSessionProgress } from "./scan-sessions";
 import { bridgeDeviceIsOnline } from "./effective-health";
 import { queueRemoteReadCommand } from "./remote-read-commands";
+import { reuseCompletedObservationsForScan } from "./observation-reuse";
+import { generateScanRecommendationBatchIfReady } from "./scan-recommendation-batch";
 import { ingestBridgeWatchEvents } from "./monitor";
 import { recordChecksumDuplicateSuggestionsForSession } from "./checksum-duplicates";
 import type {
@@ -34,6 +36,8 @@ const activeScanStatuses = [
   "GENERATING_SUGGESTIONS",
 ] as const;
 const maxScanFiles = 20_000;
+// Four sequential reads leave roughly two minutes each within the ten-minute command lifetime.
+const remoteReadBatchSize = 4;
 function objectValue(value: unknown) {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -457,16 +461,18 @@ async function storeMediaMetadata(
   }
 }
 
-async function queueRemoteReads(input: {
+async function queueRemoteReadBatch(input: {
   bridgeDeviceId: string;
   bridgeRootId: string;
   connectedLibraryId: string;
   scanSessionId: string;
-}) {
-  const prisma = getPrismaClient();
+}, prisma: Prisma.TransactionClient) {
   const files = await prisma.scannedFile.findMany({
+    orderBy: { relativePath: "asc" },
     select: { checksum: true, id: true, relativePath: true },
+    take: remoteReadBatchSize,
     where: {
+      processingStage: "DISCOVERED",
       readStatus: "SUPPORTED",
       readingStatus: "NOT_READ",
       sessionId: input.scanSessionId,
@@ -474,18 +480,74 @@ async function queueRemoteReads(input: {
   });
 
   for (const file of files) {
-    await queueRemoteReadCommand({
-      bridgeDeviceId: input.bridgeDeviceId,
-      bridgeRootId: input.bridgeRootId,
-      connectedLibraryId: input.connectedLibraryId,
-      idempotencyKey: `read-file:${input.scanSessionId}:${file.id}:${file.checksum ?? "no-checksum"}`,
-      relativePath: file.relativePath,
-      scanSessionId: input.scanSessionId,
-      scannedFileId: file.id,
+    try {
+      await queueRemoteReadCommand({
+        bridgeDeviceId: input.bridgeDeviceId,
+        bridgeRootId: input.bridgeRootId,
+        connectedLibraryId: input.connectedLibraryId,
+        idempotencyKey: `read-file:${input.scanSessionId}:${file.id}:${file.checksum ?? "no-checksum"}`,
+        relativePath: file.relativePath,
+        scanSessionId: input.scanSessionId,
+        scannedFileId: file.id,
+      }, prisma);
+    } catch (error) {
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002")) {
+        throw error;
+      }
+    }
+    await prisma.scannedFile.updateMany({
+      data: { processingStage: "READING" },
+      where: { id: file.id, processingStage: "DISCOVERED" },
     });
   }
 
   return files.length;
+}
+
+async function queueRemoteReads(input: Parameters<typeof queueRemoteReadBatch>[0]) {
+  const prisma = getPrismaClient();
+  return prisma.$transaction(async (tx) => {
+    // Serialize admission across fetches and roots on the same sequential Bridge worker.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`remote-read-batch:${input.bridgeDeviceId}`}))`;
+    const active = await tx.bridgeCommand.count({ where: {
+      bridgeDeviceId: input.bridgeDeviceId, commandType: "READ_FILE_TEMPORARILY",
+      expiresAt: { gt: new Date() }, status: { in: ["PENDING", "ACKNOWLEDGED", "RUNNING"] },
+    } });
+    if (active > 0) return 0;
+    return queueRemoteReadBatch(input, tx);
+  }, { timeout: 60_000 });
+}
+
+export async function queueNextRemoteReadBatchForDevice(bridgeDeviceId: string) {
+  const prisma = getPrismaClient();
+  const session = await prisma.scanSession.findFirst({
+    include: { connectedFolder: true },
+    orderBy: { startedAt: "asc" },
+    where: {
+      connectedFolder: {
+        bridgeDeviceId,
+        isEnabled: true,
+        readPermission: true,
+        status: "CONNECTED",
+      },
+      scannedFiles: {
+        some: { processingStage: "DISCOVERED", readStatus: "SUPPORTED" },
+      },
+      status: "READING",
+    },
+  });
+  const library = session?.connectedFolder;
+
+  if (!session || !library?.bridgeRootId) {
+    return 0;
+  }
+
+  return queueRemoteReads({
+    bridgeDeviceId,
+    bridgeRootId: library.bridgeRootId,
+    connectedLibraryId: library.id,
+    scanSessionId: session.id,
+  });
 }
 
 export async function queueRemoteBridgeScan(connectedLibraryId: string) {
@@ -691,17 +753,27 @@ export async function importRemoteBridgeScanReport(input: {
       where: { id: input.connectedLibraryId },
     }),
   ]);
+  const reusedObservations = await reuseCompletedObservationsForScan({
+    bridgeDeviceId: input.bridgeDeviceId,
+    bridgeRootId: input.bridgeRootId,
+    connectedLibraryId: input.connectedLibraryId,
+    scanSessionId,
+  });
   const queuedReads = await queueRemoteReads({
     bridgeDeviceId: input.bridgeDeviceId,
     bridgeRootId: input.bridgeRootId,
     connectedLibraryId: input.connectedLibraryId,
     scanSessionId,
   });
+  if (queuedReads === 0) {
+    await generateScanRecommendationBatchIfReady(scanSessionId);
+  }
 
   return {
     cloudScanSessionId: scanSessionId,
     failedFiles: scan.failedFiles,
     queuedReads,
+    reusedObservations,
     supportedFiles: scan.supportedFiles,
     totalFiles: scan.totalFiles,
     unsupportedFiles: scan.unsupportedFiles,

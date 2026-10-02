@@ -3,6 +3,7 @@ import path from "node:path";
 import type { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
+import { verifiedSourceText } from "@/lib/ai/source-evidence";
 
 export type WorkingEvidenceKind =
   | "PROVISIONAL_OBSERVATION"
@@ -16,6 +17,7 @@ export type ScanWorkingKnowledgeInputFile = {
   id: string;
   observationSessions: Array<{
     explanation: unknown;
+    humanDecisions?: Array<{ decisionType: string; editedSuggestion: string | null }>;
     interpretations: unknown;
     observations: unknown;
     observerType: string;
@@ -60,6 +62,7 @@ export type ScanWorkingKnowledgeFile = {
   connectedLibraryId: string;
   fileName: string;
   fileType: string;
+  sourceEvidenceText: string;
   id: string;
   normalizedIdentity: string;
   provisionalWorkingEvidence: string[];
@@ -284,6 +287,15 @@ const semanticTopicFamilies = [
   },
 ] as const;
 
+export function searchTopicIds(query: string) {
+  const terms = new Set(workingKnowledgeTerms(query));
+  return semanticTopicFamilies
+    .filter((topic) => topic.supportTerms.some((term) =>
+      workingKnowledgeTerms(term).some((normalized) => terms.has(normalized)),
+    ))
+    .map((topic) => topic.id);
+}
+
 function normalizedText(value: string) {
   return value
     .normalize("NFKD")
@@ -481,6 +493,23 @@ function uniqueText(values: string[], take = 20) {
   );
 }
 
+function verifiedObservationExcerpts(observations: unknown) {
+  if (!Array.isArray(observations)) {
+    return [];
+  }
+
+  return observations.flatMap((observation) => {
+    if (!observation || typeof observation !== "object" || !Array.isArray(observation.evidence)) {
+      return [];
+    }
+
+    return observation.evidence.filter(
+      (item: unknown): item is string =>
+        typeof item === "string" && verifiedSourceText(item) !== null,
+    );
+  });
+}
+
 function observationEvidence(file: ScanWorkingKnowledgeInputFile) {
   const provisionalWorkingEvidence: string[] = [];
   const trustedObservationEvidence: string[] = [];
@@ -490,16 +519,33 @@ function observationEvidence(file: ScanWorkingKnowledgeInputFile) {
       continue;
     }
 
+    if (session.status === "MODIFIED") {
+      const corrected = session.humanDecisions?.find(
+        (decision) => decision.decisionType === "MODIFY" && decision.editedSuggestion?.trim(),
+      )?.editedSuggestion;
+
+      if (corrected) {
+        trustedObservationEvidence.push(corrected);
+      }
+
+      continue;
+    }
+
     const text = uniqueText([
       ...jsonText(session.observations),
       ...jsonText(session.interpretations),
       ...jsonText(session.explanation),
     ]);
 
+    const usableText = session.observerType === "OPENAI"
+      ? verifiedObservationExcerpts(session.observations)
+          .flatMap((item) => verifiedSourceText(item) ?? [])
+      : text;
+
     if (session.status === "APPROVED" || session.status === "MODIFIED") {
-      trustedObservationEvidence.push(...text);
+      trustedObservationEvidence.push(...usableText);
     } else if (session.status === "AWAITING_REVIEW") {
-      provisionalWorkingEvidence.push(...text);
+      provisionalWorkingEvidence.push(...usableText);
     }
   }
 
@@ -507,6 +553,38 @@ function observationEvidence(file: ScanWorkingKnowledgeInputFile) {
     provisionalWorkingEvidence: uniqueText(provisionalWorkingEvidence),
     trustedObservationEvidence: uniqueText(trustedObservationEvidence),
   };
+}
+
+function deterministicPurposeTerms(observations: unknown) {
+  if (!Array.isArray(observations)) {
+    return [];
+  }
+
+  return observations.flatMap((observation) => {
+    if (!observation || typeof observation !== "object" || observation.label !== "POSSIBLE_PURPOSE") {
+      return [];
+    }
+
+    const evidence = (observation as { evidence?: unknown }).evidence;
+
+    if (!Array.isArray(evidence)) {
+      return [];
+    }
+
+    return evidence.flatMap((item) => {
+      const match = typeof item === "string" ? item.match(/^[a-z]+: ([a-z-]{4,40})$/i) : null;
+
+      return match ? [match[1]] : [];
+    });
+  });
+}
+
+export function observationSourceEvidenceText(observation: { observerType: string; observations: unknown }) {
+  const excerpts = observation.observerType === "OPENAI"
+    ? verifiedObservationExcerpts(observation.observations).slice(0, 8) : [];
+  const terms = observation.observerType === "DETERMINISTIC"
+    ? deterministicPurposeTerms(observation.observations).slice(0, 8) : [];
+  return [...excerpts, ...terms].join(" ");
 }
 
 function addWeightedTerms(
@@ -678,6 +756,45 @@ function titleCaseTerms(terms: string[]) {
     .join(" / ");
 }
 
+function relationshipCandidatePairs(files: ScanWorkingKnowledgeFile[]) {
+  const pairs: Array<[number, number]> = [];
+  if (files.length <= 200) {
+    for (let left = 0; left < files.length; left += 1) {
+      for (let right = left + 1; right < files.length; right += 1) {
+        pairs.push([left, right]);
+      }
+    }
+    return pairs;
+  }
+
+  const postings = new Map<string, number[]>();
+  for (let index = 0; index < files.length; index += 1) {
+    for (const term of files[index].semanticTerms.slice(0, 16)) {
+      const entries = postings.get(term) ?? [];
+      entries.push(index);
+      postings.set(term, entries);
+    }
+  }
+  const seen = new Set<string>();
+  for (const term of [...postings.keys()].sort((left, right) =>
+    (postings.get(left)?.length ?? 0) - (postings.get(right)?.length ?? 0) ||
+    left.localeCompare(right),
+  )) {
+    const entries = postings.get(term) ?? [];
+    if (entries.length > 64) continue;
+    for (let left = 0; left < entries.length; left += 1) {
+      for (let right = left + 1; right < entries.length; right += 1) {
+        const key = `${entries[left]}:${entries[right]}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        pairs.push([entries[left], entries[right]]);
+        if (pairs.length >= 20_000) return pairs;
+      }
+    }
+  }
+  return pairs.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+}
+
 export function buildScanWorkingKnowledge(input: {
   files: ScanWorkingKnowledgeInputFile[];
   memory?: ScanWorkingKnowledgeMemory[];
@@ -689,15 +806,32 @@ export function buildScanWorkingKnowledge(input: {
     .sort((left, right) => left.relativePath.localeCompare(right.relativePath))
     .map((file): ScanWorkingKnowledgeFile => {
       const evidence = observationEvidence(file);
-      const semanticText = [
+      const readablePreview = /^(?:Image technical metadata only|Audio review material|Video review material)/.test(
         file.previewText ?? "",
+      ) ? "" : file.previewText ?? "";
+      const verifiedExcerpts = file.observationSessions
+        .filter((session) => session.observerType === "OPENAI" && session.status !== "REJECTED" && session.status !== "MODIFIED")
+        .flatMap((session) => verifiedObservationExcerpts(session.observations))
+        .slice(0, 8);
+      const deterministicTerms = file.observationSessions
+        .filter((session) => session.observerType === "DETERMINISTIC" && session.status !== "REJECTED" && session.status !== "MODIFIED")
+        .flatMap((session) => deterministicPurposeTerms(session.observations))
+        .slice(0, 8);
+      const sourceEvidenceText = [...verifiedExcerpts, ...deterministicTerms].join(" ");
+      const sourceContent = [
+        ...verifiedExcerpts.flatMap((item) => verifiedSourceText(item) ?? []),
+        ...deterministicTerms,
+      ].join(" ");
+      const semanticText = [
+        readablePreview,
+        sourceContent,
         ...evidence.provisionalWorkingEvidence,
         ...evidence.trustedObservationEvidence,
       ].join(" ");
       const approvedMemoryEvidence = matchingMemory(memory, semanticText);
       const weightedTerms: WeightedTerms = new Map();
 
-      addWeightedTerms(weightedTerms, [file.previewText ?? ""], "CONTENT", 1);
+      addWeightedTerms(weightedTerms, [readablePreview, sourceContent], "CONTENT", 1);
       addWeightedTerms(
         weightedTerms,
         evidence.provisionalWorkingEvidence,
@@ -724,11 +858,12 @@ export function buildScanWorkingKnowledge(input: {
         connectedLibraryId: file.connectedLibraryId,
         fileName: path.posix.basename(file.relativePath),
         fileType: file.fileType,
+        sourceEvidenceText,
         id: file.id,
         normalizedIdentity: identityFor(file.connectedLibraryId, file.relativePath),
         provisionalWorkingEvidence: evidence.provisionalWorkingEvidence,
         relativePath: file.relativePath,
-        semanticPreview: file.previewText ?? "",
+        semanticPreview: readablePreview,
         semanticTerms: [...weightedTerms.entries()]
           .sort(
             (left, right) =>
@@ -741,8 +876,7 @@ export function buildScanWorkingKnowledge(input: {
     });
   const relationships: ScanWorkingKnowledgeRelationship[] = [];
 
-  for (let leftIndex = 0; leftIndex < files.length; leftIndex += 1) {
-    for (let rightIndex = leftIndex + 1; rightIndex < files.length; rightIndex += 1) {
+  for (const [leftIndex, rightIndex] of relationshipCandidatePairs(files)) {
       const left = files[leftIndex];
       const right = files[rightIndex];
       const leftTerms = weightedByFileId.get(left.id) ?? new Map();
@@ -821,7 +955,6 @@ export function buildScanWorkingKnowledge(input: {
           sharedTerms: sharedTerms.map(displaySemanticTerm),
         });
       }
-    }
   }
 
   const fileById = new Map(files.map((file) => [file.id, file]));
@@ -928,8 +1061,18 @@ export function buildScanWorkingKnowledge(input: {
 
 export async function loadScanWorkingKnowledge(
   scanSessionId: string,
+  onlyFileIds?: string[],
 ): Promise<ScanWorkingKnowledgeIndex> {
   const prisma = getPrismaClient();
+  const session = await prisma.scanSession.findFirst({
+    select: { id: true },
+    where: { id: scanSessionId, connectedFolder: {
+      isEnabled: true, readPermission: true, status: "CONNECTED",
+      disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null,
+      canonicalConnectedLibraryId: null,
+    } },
+  });
+  if (!session) throw new Error("This scan is not available for reading.");
   const [files, memory] = await Promise.all([
     prisma.scannedFile.findMany({
       orderBy: { relativePath: "asc" },
@@ -939,9 +1082,14 @@ export async function loadScanWorkingKnowledge(
         libraryDocument: {
           select: {
             observationSessions: {
-              orderBy: { createdAt: "desc" },
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+              take: 1,
               select: {
                 explanation: true,
+                humanDecisions: {
+                  orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+                  select: { decisionType: true, editedSuggestion: true },
+                },
                 interpretations: true,
                 observations: true,
                 observerType: true,
@@ -959,6 +1107,7 @@ export async function loadScanWorkingKnowledge(
         readStatus: "SUPPORTED",
         readingStatus: "READ",
         sessionId: scanSessionId,
+        ...(onlyFileIds ? { id: { in: onlyFileIds } } : {}),
       },
     }),
     prisma.memoryEntry.findMany({
@@ -968,10 +1117,20 @@ export async function loadScanWorkingKnowledge(
         evidence: true,
         id: true,
         memoryType: true,
+        searchSourceCount: true,
+        searchSources: { select: { id: true } },
         title: true,
       },
       take: 80,
-      where: { status: "ACTIVE" },
+      where: { status: "ACTIVE", searchProvenanceComplete: true,
+        searchSources: { some: {}, every: {
+          observationSession: { status: { in: ["APPROVED", "MODIFIED"] } },
+          connectedLibrary: {
+            isEnabled: true, readPermission: true, status: "CONNECTED",
+            disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null,
+            canonicalConnectedLibraryId: null,
+          },
+        } } },
     }),
   ]);
 
@@ -984,7 +1143,8 @@ export async function loadScanWorkingKnowledge(
       previewText: file.previewText,
       relativePath: file.relativePath,
     })),
-    memory: memory as Array<ScanWorkingKnowledgeMemory & { evidence: Prisma.JsonValue }>,
+    memory: memory.filter((entry) => entry.searchSources.length > 0 &&
+      entry.searchSources.length === entry.searchSourceCount) as Array<ScanWorkingKnowledgeMemory & { evidence: Prisma.JsonValue }>,
     scanSessionId,
   });
 }

@@ -735,6 +735,20 @@ export type BridgeScanSessionSummary = {
 };
 
 export type BridgeScanProcessingProgress = {
+  aiUsage?: {
+    models: string[];
+    processingVersions: string[];
+    requests: number;
+    httpAttempts: number;
+    inputTokens: number;
+    outputTokens: number;
+    unreportedTokenRequests: number;
+    newlyObserved: number;
+    reusedObservations: number;
+    failedObservations: number;
+    pendingDocuments: number;
+    avoidedRequests: number;
+  };
   sessionId: string;
   folderDisplayName: string;
   currentStage: BridgeScanSessionStatus;
@@ -757,6 +771,13 @@ export type BridgeScanProcessingProgress = {
 };
 
 export type BridgeScannedFileSummary = {
+  observationOrigin?: string | null;
+  observationVersion?: string | null;
+  aiModel?: string | null;
+  aiRequestCount?: number;
+  aiHttpAttempts?: number;
+  aiInputTokens?: number | null;
+  aiOutputTokens?: number | null;
   id: string;
   relativePath: string;
   fileType: string;
@@ -875,6 +896,7 @@ export type BridgeMonitoringApiResponse =
   | BridgeMonitoringApiFailure;
 
 export type BridgeScanSessionDetail = BridgeScanSessionSummary & {
+  knowledgePersistenceStatus: string;
   organizationSummary: OrganizationSuggestionCounts & {
     filesExamined: number;
   };
@@ -930,6 +952,7 @@ export type BridgeScanProgressApiResponse =
   | BridgeScanApiFailure;
 
 export type BridgeReadPreview = {
+  sourceChecksum?: string | null;
   scannedFileId: string;
   fileName: string;
   relativePath: string;

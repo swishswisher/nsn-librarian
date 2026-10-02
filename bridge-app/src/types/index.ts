@@ -1,3 +1,5 @@
+import type { BridgeImageMetadataDraft } from "../../../src/lib/bridge/types";
+
 export const bridgeVersion = process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0";
 
 export const bridgePlatforms = ["WINDOWS", "MACOS", "LINUX", "UNKNOWN"] as const;
@@ -80,6 +82,7 @@ export type BridgeScannedFileDraft = {
   sourceCreatedAt?: Date | null;
   readStatus: "PENDING" | "SUPPORTED" | "UNSUPPORTED" | "FAILED";
   scanError?: string | null;
+  imageMetadata?: BridgeImageMetadataDraft | null;
 };
 
 export type BridgeFolderScanResult = {
@@ -97,6 +100,7 @@ export type BridgeFolderScanResult = {
 };
 
 export type BridgeReadResult = {
+  sourceChecksum?: string;
   relativePath: string;
   fileName: string;
   fileType: string;

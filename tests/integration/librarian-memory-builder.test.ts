@@ -5,11 +5,13 @@ import { after, before, beforeEach, test } from "node:test";
 import { PrismaClient } from "@prisma/client";
 
 import type { buildMemoryFromApprovedSession as buildMemoryFromApprovedSessionType } from "../../src/lib/library/memory";
+import type { saveHumanDecision as saveHumanDecisionType } from "../../src/lib/library/observation-sessions";
 
 type BuildMemoryFromApprovedSession = typeof buildMemoryFromApprovedSessionType;
 
 let prisma: PrismaClient;
 let buildMemoryFromApprovedSession: BuildMemoryFromApprovedSession;
+let saveHumanDecision: typeof saveHumanDecisionType;
 let testDatabaseUrl: string;
 let testDirectDatabaseUrl: string;
 const testSchemaName = `memory_builder_test_${process.pid}_${Date.now()}`;
@@ -68,6 +70,7 @@ before(async () => {
 
   prisma = prismaModule.getPrismaClient();
   buildMemoryFromApprovedSession = memoryModule.buildMemoryFromApprovedSession;
+  saveHumanDecision = (await import("../../src/lib/library/observation-sessions")).saveHumanDecision;
 });
 
 beforeEach(async () => {
@@ -235,6 +238,7 @@ test("three edits from Recovery to Becoming produce occurrenceCount 3 and increa
     entry.confidence >= 0.69,
     `Expected confidence to grow for three occurrences, received ${entry.confidence}.`,
   );
+  assert.equal(await prisma.memoryEntry.count({ where: { memoryType: "TERM", title: "recovery" } }), 0);
 });
 
 test("ACCEPT decisions without edits do not create preferences", async () => {
@@ -338,4 +342,81 @@ test("Memory Builder remains deterministic when run repeatedly over unchanged da
       title: entry.title,
     })),
   );
+});
+
+test("a completed human revision contributes corrected content, not the superseded proposal", async () => {
+  const batch = await createBatch("corrected-only");
+  const session = await createObservationSession({
+    batchId: batch.id,
+    index: 1,
+    prefix: "corrected-only",
+    status: "MODIFIED",
+  });
+  await prisma.libraryDocument.update({
+    data: { rawText: "attachment regulation clinical therapy" },
+    where: { id: session.libraryDocumentId },
+  });
+  await createModifiedDecision({
+    sessionId: session.id,
+    index: 1,
+    editedSuggestion: "Workshop facilitation guide",
+  });
+
+  await buildMemoryFromApprovedSession(session.id);
+  const themes = await prisma.memoryEntry.findMany({ where: { memoryType: "THEME" } });
+
+  assert.ok(themes.some((entry) => entry.title === "Teaching material"));
+  assert.ok(!themes.some((entry) => entry.title === "Attachment and regulation"));
+  assert.ok(!themes.some((entry) => entry.title === "Clinical practice"));
+  const before = themes.length;
+  assert.equal(await buildMemoryFromApprovedSession(session.id), 0);
+  assert.equal(await prisma.memoryEntry.count({ where: { memoryType: "THEME" } }), before);
+});
+
+test("a revision without a final correction and a rejected session cannot enter Memory", async () => {
+  const batch = await createBatch("unapproved-correction");
+  const modified = await createObservationSession({
+    batchId: batch.id,
+    index: 1,
+    prefix: "unapproved-correction",
+    status: "MODIFIED",
+  });
+  const rejected = await createObservationSession({
+    batchId: batch.id,
+    index: 2,
+    prefix: "unapproved-correction",
+    status: "REJECTED",
+  });
+  await createModifiedDecision({
+    sessionId: rejected.id,
+    index: 2,
+    editedSuggestion: "Workshop facilitation guide",
+  });
+
+  assert.equal(await buildMemoryFromApprovedSession(modified.id), 0);
+  assert.equal(await buildMemoryFromApprovedSession(rejected.id), 0);
+  assert.equal(await prisma.memoryEntry.count(), 0);
+});
+
+test("identical human correction retries do not add decisions or duplicate Memory", async () => {
+  const batch = await createBatch("correction-retry");
+  const session = await createObservationSession({
+    batchId: batch.id,
+    index: 1,
+    prefix: "correction-retry",
+    status: "APPROVED",
+  });
+  const first = await saveHumanDecision(session.id, {
+    decisionType: "MODIFY",
+    editedSuggestion: "Workshop facilitation guide",
+  });
+  const second = await saveHumanDecision(session.id, {
+    decisionType: "MODIFY",
+    editedSuggestion: "Workshop facilitation guide",
+  });
+
+  assert.equal(first.decisionId, second.decisionId);
+  assert.equal(await prisma.humanDecision.count({ where: { observationSessionId: session.id } }), 1);
+  await buildMemoryFromApprovedSession(session.id);
+  assert.equal(await buildMemoryFromApprovedSession(session.id), 0);
 });
