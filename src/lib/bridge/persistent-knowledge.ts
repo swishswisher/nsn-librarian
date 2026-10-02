@@ -1027,10 +1027,12 @@ export async function reviewPersistentRelationship(id: string, action: "CONFIRM"
     const status = action === "CONFIRM" ? "CONFIRMED" : action === "SEPARATE" ? "REJECTED" : "NEW";
     if (action === "CONFIRM" && connection.generationVersion === humanIdentityCorrectionVersion) {
       await supersedeCompetingCorrections(tx, connection);
-      if (connection.relationshipKind === "SAME_CLIENT" && connection.sourceFileKey && connection.sourceChecksum &&
+      const separatedKind = connection.relationshipKind === "SAME_CLIENT" ? "SAME_CLIENT" :
+        connection.relationshipKind === "BELONGS_TO_PROJECT" ? "SAME_PROJECT" : null;
+      if (separatedKind && connection.sourceFileKey && connection.sourceChecksum &&
           connection.targetFileKey && connection.targetChecksum) {
         await tx.knowledgeConnection.updateMany({ data: { supersededAt: new Date() }, where: {
-          generationVersion: documentSignalVersion, relationshipKind: "SAME_CLIENT",
+          generationVersion: documentSignalVersion, relationshipKind: separatedKind,
           status: "REJECTED", supersededAt: null,
           decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
           OR: [
@@ -1151,12 +1153,12 @@ export async function createIdentityCorrection(input: {
     // Submitting an exact human correction is an intentional later rejoin.
     // Retire an older generated SEPARATE boundary before resolving the target's
     // canonical class. A separation saved later remains active and wins.
-    if (input.kind === "SAME_CLIENT") {
+    if (input.kind === "SAME_CLIENT" || input.kind === "BELONGS_TO_PROJECT") {
       await tx.knowledgeConnection.updateMany({
         data: { supersededAt: new Date() },
         where: {
           generationVersion: documentSignalVersion,
-          relationshipKind: "SAME_CLIENT",
+          relationshipKind: input.kind === "SAME_CLIENT" ? "SAME_CLIENT" : "SAME_PROJECT",
           status: "REJECTED",
           supersededAt: null,
           decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
@@ -1301,7 +1303,9 @@ export async function createIdentityCorrection(input: {
   });
 }
 
-export async function getEffectiveDocumentSignals(permittedRootIds?: string[]) {
+export async function getEffectiveDocumentSignals(permittedRootIds?: string[], options?: {
+  historicalEntries: Array<{ checksum: string; connectedLibraryId: string; fileKey: string; isCurrent: boolean }>;
+}) {
   const prisma = getPrismaClient();
   const libraries = await prisma.connectedLibrary.findMany({
     select: { id: true },
@@ -1310,10 +1314,14 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[]) {
       hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null },
   });
   const libraryIds = libraries.map((library) => library.id);
+  const historicalEntries = options?.historicalEntries.filter((entry) => !entry.isCurrent) ?? [];
   const candidateRows = await prisma.knowledgeDocumentSignal.findMany({
     orderBy: { lastSeenAt: "desc" },
-    where: { status: "ACTIVE", supersededAt: null, generationVersion: documentSignalVersion,
-      connectedLibraryId: { in: libraryIds } },
+    where: { generationVersion: documentSignalVersion, connectedLibraryId: { in: libraryIds }, OR: [
+      { status: "ACTIVE", supersededAt: null },
+      ...historicalEntries.map((entry) => ({ connectedLibraryId: entry.connectedLibraryId,
+        fileKey: entry.fileKey, checksum: entry.checksum, status: { in: ["ACTIVE", "SUPERSEDED"] as const } })),
+    ] },
   });
   const humanCorrections = await prisma.knowledgeConnection.findMany({
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
@@ -1321,18 +1329,39 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[]) {
     where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null,
       sourceFileKey: { in: candidateRows.map((row) => row.fileKey) } },
   });
-  const separatedClientRows = await prisma.knowledgeConnection.findMany({
-    select: { sourceChecksum: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
+  const separatedIdentityRows = await prisma.knowledgeConnection.findMany({
+    select: { relationshipKind: true, sourceChecksum: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
     where: { decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
-      generationVersion: documentSignalVersion, relationshipKind: "SAME_CLIENT",
+      generationVersion: documentSignalVersion, relationshipKind: { in: ["SAME_CLIENT", "SAME_PROJECT"] },
       status: "REJECTED", supersededAt: null,
       sourceFileKey: { in: candidateRows.map((row) => row.fileKey) },
       targetFileKey: { in: candidateRows.map((row) => row.fileKey) } },
   });
-  const rows = await currentSnapshotSignals(candidateRows);
+  const currentRows = await currentSnapshotSignals(candidateRows);
+  const currentKeys = new Set(currentRows.map((row) => `${row.connectedLibraryId}\0${row.fileKey}\0${row.checksum}\0${row.id}`));
+  const historicalKeys = new Set(historicalEntries.map((entry) =>
+    `${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`));
+  const historicalCandidates = candidateRows.filter((row) => !currentKeys.has(
+    `${row.connectedLibraryId}\0${row.fileKey}\0${row.checksum}\0${row.id}`) && historicalKeys.has(
+    `${row.connectedLibraryId}\0${row.fileKey}\0${row.checksum}`));
+  const historicalObservations = historicalCandidates.length ? await prisma.observationSession.findMany({
+    where: { id: { in: historicalCandidates.map((row) => row.observationSessionId) },
+      status: { in: ["NEW", "AWAITING_REVIEW", "IN_REVIEW", "APPROVED", "MODIFIED"] } },
+    select: { id: true, status: true, humanDecisions: { where: { decisionType: "MODIFY" },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1, select: { editedSuggestion: true } } },
+  }) : [];
+  const historicalObservationById = new Map(historicalObservations.map((item) => [item.id, item]));
+  const historicalRows = historicalCandidates.filter((row) => {
+    const observation = historicalObservationById.get(row.observationSessionId);
+    if (!observation) return false;
+    if (observation.status !== "MODIFIED") return true;
+    return extractDocumentSignals(observation.humanDecisions[0]?.editedSuggestion ?? "", row.connectedLibraryId)
+      .some((signal) => signal.kind === row.kind && signal.identityHash === row.identityHash);
+  });
+  const rows = [...currentRows, ...historicalRows];
   const effectiveRows = [...rows];
   const correctedIdentities = new Map<string, string>();
-  const separatedClientPairs = new Set(separatedClientRows.flatMap((row) => row.sourceFileKey && row.sourceChecksum &&
+  const separatedClientPairs = new Set(separatedIdentityRows.flatMap((row) => row.relationshipKind === "SAME_CLIENT" && row.sourceFileKey && row.sourceChecksum &&
     row.targetFileKey && row.targetChecksum ? [knowledgeRelationshipPairKey(
       { fileKey: row.sourceFileKey, checksum: row.sourceChecksum },
       { fileKey: row.targetFileKey, checksum: row.targetChecksum },
@@ -1356,6 +1385,12 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[]) {
       (row.kind === kind || row.kind === "UNRESOLVED_PROJECT") &&
       row.identityHash === evidence.identityHash && row.connectedLibraryId === source?.connectedLibraryId);
     if (!source || !target || evidence.connectedLibraryId !== source.connectedLibraryId) continue;
+    const separatedProjectPair = separatedIdentityRows.some((row) => row.relationshipKind === "SAME_PROJECT" &&
+      row.sourceFileKey && row.sourceChecksum && row.targetFileKey && row.targetChecksum &&
+      knowledgeRelationshipPairKey(source, target) === knowledgeRelationshipPairKey(
+        { fileKey: row.sourceFileKey, checksum: row.sourceChecksum },
+        { fileKey: row.targetFileKey, checksum: row.targetChecksum }));
+    if (separatedProjectPair) continue;
     const key = `${source.fileKey}:${kind}`;
     if (correctedIdentities.has(key)) continue;
     correctedIdentities.set(key, target.identityHash);

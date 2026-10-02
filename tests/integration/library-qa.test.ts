@@ -436,6 +436,66 @@ for (const [kind, name] of [["CLIENT", "Alice"], ["PROJECT", "Atlas"]] as const)
   });
 }
 
+test("Ask binds ambiguity to the requested signal on a multi-client file", async () => {
+  const r = await root("Multi-client Ask Root"); const s = await scan(r.id);
+  const quote = "Client: Alice; Client: Bob; Alice engagement is active";
+  const mixed = await file({ rootId: r.id, sessionId: s.id, relativePath: "mixed.txt",
+    quote, entityHashes: ["ask-alice", "ask-bob"] });
+  const related = await file({ rootId: r.id, sessionId: s.id, relativePath: "alice-related.txt",
+    quote: "Alice identity-linked detail", entityHashes: ["ask-alice"] });
+  const signal = (item: typeof mixed, identityHash: string, sourceRanges: Array<{ start: number; end: number }>) => ({
+    signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+    relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!, kind: "CLIENT",
+    identityHash, sourceRanges, observationSessionId: item.observation.id,
+    generationVersion: documentSignalVersion,
+  });
+  await prisma.knowledgeDocumentSignal.createMany({ data: [
+    signal(mixed, "ask-alice", [{ start: 0, end: 14 }]),
+    signal(mixed, "ask-bob", [{ start: 14, end: 27 }]),
+    signal(related, "ask-alice", []),
+  ] });
+  const context = await retrieve.retrieveQuestionContext("What do we have for client Alice?", [r.id]);
+  assert.equal(context.ambiguousEntity, false);
+  assert.deepEqual(new Set(context.sources.map((source) => source.relativePath)),
+    new Set([mixed.scanned.relativePath, related.scanned.relativePath]));
+  const result = await answer.answerLibraryQuestion("What do we have for client Alice?", {
+    permittedRootIds: [r.id], model: model([claim("Alice engagement is active", ["S1"])]) });
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+});
+
+test("historical list Ask uses historical-only client and project identities without version lineage", async () => {
+  for (const [kind, name, other] of [["CLIENT", "Alice", "Bob"], ["PROJECT", "Atlas", "Beacon"]] as const) {
+    const label = kind === "CLIENT" ? "Client" : "Project";
+    const r = await root(`Historical-only ${kind} Ask Root`); const oldScan = await scan(r.id);
+    const old = await file({ rootId: r.id, sessionId: oldScan.id,
+      relativePath: `archive/${name.toLowerCase()}-note.txt`,
+      quote: `${label}: ${name}; archived engagement summary`,
+      entityHashes: [`qa-historical-${kind.toLowerCase()}`] });
+    await prisma.knowledgeDocumentSignal.create({ data: {
+      signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: old.index.fileKey,
+      relativePath: old.scanned.relativePath, checksum: old.scanned.checksum!, kind,
+      identityHash: `qa-historical-${kind.toLowerCase()}`, sourceRanges: [],
+      observationSessionId: old.observation.id, generationVersion: documentSignalVersion,
+    } });
+    const currentScan = await scan(r.id);
+    await file({ rootId: r.id, sessionId: currentScan.id,
+      relativePath: `current/${other.toLowerCase()}-note.txt`,
+      quote: `${label}: ${other}; current engagement summary`,
+      entityHashes: [`qa-current-${kind.toLowerCase()}`] });
+    await prisma.librarySearchEntry.update({ where: { id: old.index.id }, data: { isCurrent: false } });
+
+    const question = `Show older files for ${label.toLowerCase()} ${name}`;
+    const context = await retrieve.retrieveQuestionContext(question, [r.id]);
+    assert.equal(context.route.kind, "HISTORY");
+    assert.equal(context.ambiguousEntity, false);
+    assert.equal(context.versions.length, 0);
+    assert.deepEqual(context.sources.map((source) => source.relativePath), [old.scanned.relativePath]);
+    const result = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id],
+      model: model([claim("The archived engagement summary is available", ["S1"])]) });
+    assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  }
+});
+
 async function identityCorrectionFixture(kind: "CLIENT" | "PROJECT") {
   const r = await root(`Corrected ${kind} QA Root`); const s = await scan(r.id);
   const a = await file({ rootId: r.id, sessionId: s.id, relativePath: "Alice/intake.txt",
@@ -534,6 +594,32 @@ for (const kind of ["CLIENT", "PROJECT"] as const) {
     assert.equal((await retrieve.retrieveQuestionContext(versionQuestion, [r.id])).ambiguousEntity, true);
   });
 }
+
+test("newer project separation overrides a direct correction until an intentional rejoin", async () => {
+  const { r, a, b, signals, question } = await identityCorrectionFixture("PROJECT");
+  await identity.createIdentityCorrection({ sourceSignalId: signals[1].id,
+    targetSignalId: signals[0].id, kind: "BELONGS_TO_PROJECT", note: "Join project records" });
+  assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, false);
+  const separated = await prisma.knowledgeConnection.create({ data: {
+    sourceObservationSessionId: b.observation.id, targetObservationSessionId: a.observation.id,
+    sourceChecksum: b.scanned.checksum, targetChecksum: a.scanned.checksum,
+    sourceFileKey: b.index.fileKey, targetFileKey: a.index.fileKey,
+    generationVersion: documentSignalVersion, relationshipKind: "SAME_PROJECT",
+    sharedTerms: [], reasoning: "Later explicit project separation", status: "REJECTED",
+    sourceEvidence: { identityHash: "identity-a" },
+  } });
+  await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: separated.id,
+    action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+  const separatedSignals = await identity.getEffectiveDocumentSignals([r.id]);
+  assert.ok(separatedSignals.some((signal) => signal.fileKey === b.index.fileKey &&
+    signal.kind === "PROJECT" && signal.identityHash === "identity-b"));
+  assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, true);
+
+  await identity.createIdentityCorrection({ sourceSignalId: signals[1].id,
+    targetSignalId: signals[0].id, kind: "BELONGS_TO_PROJECT", note: "Deliberate later rejoin" });
+  assert.ok((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: separated.id } })).supersededAt);
+  assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, false);
+});
 
 test("confirmed joins never merge an unrelated same-name client", async () => {
   const { r, s, signals, question } = await identityCorrectionFixture("CLIENT");
@@ -1057,6 +1143,9 @@ test("routing distinguishes client, project, version, topic and Memory intent", 
   assert.equal(routing.routeLibraryQuestion("What did we decide?").kind, "MEMORY");
   assert.equal(routing.routeLibraryQuestion("What is the latest supported information about Project Y?").kind, "PROJECT");
   assert.equal(routing.routeLibraryQuestion("What is the latest proposal version?").kind, "VERSION");
+  assert.equal(routing.routeLibraryQuestion("Show older files for client Alice").kind, "HISTORY");
+  assert.equal(routing.routeLibraryQuestion("Find previous documents").kind, "HISTORY");
+  assert.equal(routing.routeLibraryQuestion("Which version is older for client Alice?").kind, "VERSION");
   assert.deepEqual(
     ["Which version is newer for client Alice?", "Show earlier files for project North Star"].map((question) => {
       const route = routing.routeLibraryQuestion(question);

@@ -68,7 +68,9 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     root.scanSessions[0].searchIndexStatus !== "COMPLETED" ||
     Boolean(newerActiveSessions[index]));
 
-  const results = await searchLibrary(route.searchQuery, rootIds);
+  const results = await searchLibrary(route.searchQuery, rootIds, { includeEntityMatches: true });
+  const requestedHashesByResultId = new Map(results.flatMap((result) =>
+    result.matchedEntityHashes?.length ? [[result.id, result.matchedEntityHashes] as const] : []));
   const indexIds = results.filter((result) => result.kind === "FILE").map((result) => result.id);
   const [entries, memories, metadataFiles] = await Promise.all([
     prisma.librarySearchEntry.findMany({
@@ -252,9 +254,12 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     getEffectiveDocumentSignals(rootIds),
     getSeparatedRelationshipPairIdentities(fileEntries, [`SAME_${identityKind}`]),
   ]) : [[], new Map<string, Set<string>>()];
-  const entityHashes = identityKind ? new Set(effectiveSignals.filter((signal) => signal.kind === identityKind &&
-    fileEntries.some((entry) => entry.fileKey === signal.fileKey && entry.checksum === signal.checksum))
-    .map((signal) => `${signal.connectedLibraryId}:${signal.identityHash}`)) : new Set<string>();
+  // Search has already bound the requested name to exact typed evidence. Use
+  // those admitted identities rather than every same-kind signal on a selected
+  // multi-signal document (for example, a file mentioning both Alice and Bob).
+  const entityHashes = identityKind ? new Set([...sourceEntryById.values()].flatMap((entry) =>
+    (requestedHashesByResultId.get(entry.id) ?? []).map((hash) =>
+      `${entry.connectedLibraryId}:${hash}`))) : new Set<string>();
   const effectiveIdentitiesByEndpoint = new Map<string, Set<string>>();
   for (const signal of effectiveSignals) {
     if (signal.kind !== identityKind || !fileEntries.some((entry) =>

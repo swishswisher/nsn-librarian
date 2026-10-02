@@ -479,6 +479,30 @@ test("history-aware identity expansion includes retained historical entries only
     result.state === "Historical scan"));
 });
 
+test("historical-only typed identity can seed its retained entry", async () => {
+  const r = await root("Historical-only identity root"); const oldSession = await session(r.id);
+  const old = await observedFile({ rootId: r.id, sessionId: oldSession.id,
+    path: "archive/alice.txt", checksum: "historical-only-alice",
+    evidence: evidence("Client: Alice; archived engagement notes") });
+  await prisma.knowledgeDocumentSignal.create({ data: {
+    checksum: old.file.checksum!, connectedLibraryId: r.id,
+    fileKey: fileKey.persistentFileKey(r.id, old.file.relativePath),
+    generationVersion: documentSignalVersion, identityHash: "historical-only-alice", kind: "CLIENT",
+    observationSessionId: old.observation.id, relativePath: old.file.relativePath,
+    signalKey: crypto.randomUUID(), sourceRanges: [],
+  } });
+  await indexFiles(oldSession.id, [old]);
+  const currentSession = await session(r.id);
+  const current = await observedFile({ rootId: r.id, sessionId: currentSession.id,
+    path: "current/unrelated.txt", evidence: evidence("Client: Bob; current notes") });
+  await indexFiles(currentSession.id, [current]);
+
+  assert.equal((await search.searchLibrary("client Alice", [r.id])).length, 0);
+  const historical = await search.searchLibrary("show older files for client Alice", [r.id]);
+  assert.deepEqual(historical.map((result) => result.relativePath), [old.file.relativePath]);
+  assert.equal(historical[0].state, "Historical scan");
+});
+
 test("same-name clients have distinct identity hashes", async () => {
   const r = await root("Same Name Root"); const s = await session(r.id);
   const a = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/a.txt", evidence: evidence("Client: Alice; Client ID: C-111") });

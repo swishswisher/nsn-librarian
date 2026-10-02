@@ -7,7 +7,9 @@ const leadWords = /\b(?:what|which|where|when|who|how|do|does|did|we|have|the|a|
 export function routeLibraryQuestion(value: string): QuestionRoute {
   const question = value.trim().slice(0, 500);
   const entity = parseExplicitEntityQuery(question);
-  const version = /\b(changed|changes|different|difference|versions?|revision|newer|previous|older)\b/iu.test(question) ||
+  // Historical list words alone request retained files, not a structured
+  // document-family comparison. Comparative wording remains VERSION.
+  const version = /\b(changed|changes|different|difference|versions?|revision|newer|compare|comparison|timeline)\b/iu.test(question) ||
     (/\blatest\b/iu.test(question) && /\b(proposal|draft|document|file|version)\b/iu.test(question));
   const history = /\b(history|historical|earlier|previous|older)\b/iu.test(question);
   const memory = /\b(decid(?:e|ed|ing)|approved|memory|preference)\b/iu.test(question);

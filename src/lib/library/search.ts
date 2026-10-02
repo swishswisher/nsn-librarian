@@ -32,6 +32,8 @@ export type LibrarySearchResult = {
   sourceRange: { start: number; end: number } | null;
   score: number;
   kind?: "FILE" | "MEMORY";
+  /** Root-scoped effective identities that admitted an explicit entity result. */
+  matchedEntityHashes?: string[];
 };
 
 export type SearchIntent = {
@@ -173,7 +175,9 @@ export function rankSearchEntry(entry: {
   return { score, reason, matchingExcerpt };
 }
 
-export async function searchLibrary(value: string, permittedRootIds?: string[]): Promise<LibrarySearchResult[]> {
+export async function searchLibrary(value: string, permittedRootIds?: string[], options?: {
+  includeEntityMatches?: boolean;
+}): Promise<LibrarySearchResult[]> {
   const intent = parseSearchIntent(value);
   if (intent.query.length < 2) return [];
   const prisma = getPrismaClient();
@@ -254,7 +258,12 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   // effective signals of the requested kind; otherwise an organization or person
   // mentioned by a client file can pull unrelated material into the result set.
   const effectiveEntitySignals = intent.entityKind
-    ? await getEffectiveDocumentSignals(rootIds)
+    ? await getEffectiveDocumentSignals(rootIds, intent.wantsHistory ? {
+      historicalEntries: initial.map((entry) => ({
+        checksum: entry.checksum, connectedLibraryId: entry.connectedLibraryId,
+        fileKey: entry.fileKey, isCurrent: entry.isCurrent,
+      })),
+    } : undefined)
     : [];
   const effectiveEndpoints = new Set(effectiveEntitySignals.filter((signal) => signal.kind === intent.entityKind)
     .map((signal) => `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`));
@@ -420,6 +429,11 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
       relativePath: entry.relativePath,
       rootName: root.displayName,
       score: ranked.score,
+      matchedEntityHashes: options?.includeEntityMatches && intent.entityKind
+        ? [...(effectiveHashesByEndpoint.get(
+          `${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`,
+        ) ?? entry.entityHashes)].filter((hash) => rootSeedHashes.has(hash)).sort()
+        : undefined,
       sourceRange: ranked.matchingExcerpt
         ? { start: ranked.matchingExcerpt.start, end: ranked.matchingExcerpt.end } : null,
       state,
