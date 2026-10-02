@@ -352,6 +352,8 @@ test("relationship replay ignores legacy corrections on ambiguous identity endpo
   const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
   const mixed = await createObservedFile({ checksum: "a".repeat(64), libraryId: library.id,
     relativePath: "mixed.txt", sessionId: scan.id });
+  const mixedProject = await createObservedFile({ checksum: "e".repeat(64), libraryId: library.id,
+    relativePath: "mixed-project.txt", sessionId: scan.id });
   const alice = await createObservedFile({ checksum: "b".repeat(64), libraryId: library.id,
     relativePath: "alice.txt", sessionId: scan.id });
   const bob = await createObservedFile({ checksum: "c".repeat(64), libraryId: library.id,
@@ -360,16 +362,20 @@ test("relationship replay ignores legacy corrections on ambiguous identity endpo
     relativePath: "filler.txt", sessionId: scan.id });
   const index = knowledgeIndex(scan.id, library.id, mixed, alice);
   index.relationships = [];
-  index.files.push(...knowledgeIndex(scan.id, library.id, bob, filler).files);
-  withVerifiedFields(index, mixed.file.id,
-    "Client ID: Bob-1; Project ID: Beacon-1");
+  index.files.push(...knowledgeIndex(scan.id, library.id, bob, filler).files,
+    ...knowledgeIndex(scan.id, library.id, mixedProject, filler).files.slice(0, 1));
+  withVerifiedFields(index, mixed.file.id, "Client ID: Bob-1");
+  withVerifiedFields(index, mixedProject.file.id, "Project ID: Beacon-1");
   withVerifiedFields(index, alice.file.id, "Client ID: Alice-1; Project ID: Atlas-1");
   withVerifiedFields(index, bob.file.id, "Client ID: Bob-1; Project ID: Beacon-1");
+  withVerifiedFields(index, filler.file.id, "Project ID: Beacon-1");
   await persistent.persistScanWorkingKnowledge(index);
 
   const mixedKey = persistent.persistentFileKey(library.id, mixed.file.relativePath);
+  const mixedProjectKey = persistent.persistentFileKey(library.id, mixedProject.file.relativePath);
   const aliceKey = persistent.persistentFileKey(library.id, alice.file.relativePath);
   const bobKey = persistent.persistentFileKey(library.id, bob.file.relativePath);
+  const beaconKey = persistent.persistentFileKey(library.id, filler.file.relativePath);
   const signals = await prisma.knowledgeDocumentSignal.findMany({ where: {
     connectedLibraryId: library.id, kind: { in: ["CLIENT", "PROJECT"] },
   } });
@@ -378,34 +384,39 @@ test("relationship replay ignores legacy corrections on ambiguous identity endpo
   const aliceClient = signal(aliceKey, "CLIENT")!;
   const atlasProject = signal(aliceKey, "PROJECT")!;
   const mixedClient = signal(mixedKey, "CLIENT")!;
-  const mixedProject = signal(mixedKey, "PROJECT")!;
+  const beaconProject = signal(mixedProjectKey, "PROJECT")!;
   await prisma.knowledgeDocumentSignal.createMany({ data: [
     { ...aliceClient, id: undefined, signalKey: crypto.randomUUID(), fileKey: mixedKey,
       relativePath: mixed.file.relativePath, checksum: mixed.file.checksum!,
       observationSessionId: mixed.observation.id },
-    { ...atlasProject, id: undefined, signalKey: crypto.randomUUID(), fileKey: mixedKey,
-      relativePath: mixed.file.relativePath, checksum: mixed.file.checksum!,
-      observationSessionId: mixed.observation.id },
+    { ...atlasProject, id: undefined, signalKey: crypto.randomUUID(), fileKey: mixedProjectKey,
+      relativePath: mixedProject.file.relativePath, checksum: mixedProject.file.checksum!,
+      observationSessionId: mixedProject.observation.id },
   ] });
   signals.push(...await prisma.knowledgeDocumentSignal.findMany({ where: {
-    fileKey: mixedKey, id: { notIn: [mixedClient.id, mixedProject.id] },
+    OR: [
+      { fileKey: mixedKey, id: { not: mixedClient.id } },
+      { fileKey: mixedProjectKey, id: { not: beaconProject.id } },
+    ],
   } }));
   assert.equal(signals.filter((row) => row.fileKey === mixedKey && row.kind === "CLIENT").length, 2);
-  assert.equal(signals.filter((row) => row.fileKey === mixedKey && row.kind === "PROJECT").length, 2);
+  assert.equal(signals.filter((row) => row.fileKey === mixedProjectKey && row.kind === "PROJECT").length, 2);
 
   await prisma.knowledgeConnection.deleteMany({ where: {
     generationVersion: documentSignalVersion,
-    OR: [{ sourceFileKey: mixedKey }, { targetFileKey: mixedKey }],
+    OR: [{ sourceFileKey: { in: [mixedKey, mixedProjectKey] } },
+      { targetFileKey: { in: [mixedKey, mixedProjectKey] } }],
   } });
-  for (const [relationshipKind, target] of [
-    ["SAME_CLIENT", aliceClient], ["BELONGS_TO_PROJECT", atlasProject],
+  for (const [relationshipKind, source, sourceKey, target] of [
+    ["SAME_CLIENT", mixed, mixedKey, aliceClient],
+    ["BELONGS_TO_PROJECT", mixedProject, mixedProjectKey, atlasProject],
   ] as const) {
     await prisma.knowledgeConnection.create({ data: {
       relationshipKey: crypto.randomUUID(), relationshipKind,
       generationVersion: persistent.humanIdentityCorrectionVersion, status: "CONFIRMED",
       reasoning: "Legacy endpoint-level correction", sharedTerms: [],
-      sourceFileKey: mixedKey, sourceChecksum: mixed.file.checksum,
-      sourceObservationSessionId: mixed.observation.id,
+      sourceFileKey: sourceKey, sourceChecksum: source.file.checksum,
+      sourceObservationSessionId: source.observation.id,
       targetFileKey: target.fileKey, targetChecksum: target.checksum,
       targetObservationSessionId: target.observationSessionId,
       sourceEvidence: { connectedLibraryId: library.id, identityHash: target.identityHash },
@@ -414,21 +425,24 @@ test("relationship replay ignores legacy corrections on ambiguous identity endpo
 
   await persistent.persistScanWorkingKnowledge(index);
   const effective = await persistent.getEffectiveDocumentSignals([library.id]);
-  for (const kind of ["CLIENT", "PROJECT"] as const) {
-    const rawHashes = new Set(signals.filter((row) => row.fileKey === mixedKey && row.kind === kind)
+  for (const [kind, fileKey] of [["CLIENT", mixedKey], ["PROJECT", mixedProjectKey]] as const) {
+    const rawHashes = new Set(signals.filter((row) => row.fileKey === fileKey && row.kind === kind)
       .map((row) => row.identityHash));
-    const effectiveHashes = new Set(effective.filter((row) => row.fileKey === mixedKey && row.kind === kind)
+    const effectiveHashes = new Set(effective.filter((row) => row.fileKey === fileKey && row.kind === kind)
       .map((row) => row.identityHash));
     assert.deepEqual(effectiveHashes, rawHashes);
   }
   const generated = await prisma.knowledgeConnection.findMany({ where: {
     generationVersion: documentSignalVersion, status: { in: ["NEW", "CONFIRMED"] },
-    OR: [{ sourceFileKey: mixedKey }, { targetFileKey: mixedKey }],
+    OR: [{ sourceFileKey: { in: [mixedKey, mixedProjectKey] } },
+      { targetFileKey: { in: [mixedKey, mixedProjectKey] } }],
   } });
   const generatedPair = (kind: string, peerKey: string) => generated.some((row) =>
     row.relationshipKind === kind && new Set([row.sourceFileKey, row.targetFileKey]).has(peerKey));
   assert.equal(generatedPair("SAME_CLIENT", bobKey), true);
-  assert.equal(generatedPair("SAME_PROJECT", bobKey), true);
+  assert.equal(generated.some((row) => row.relationshipKind === "SAME_PROJECT" &&
+    new Set([row.sourceFileKey, row.targetFileKey]).has(mixedProjectKey) &&
+    new Set([row.sourceFileKey, row.targetFileKey]).has(beaconKey)), true);
 });
 
 test("repeated name-only mentions remain separate unresolved files", async () => {
