@@ -164,6 +164,68 @@ test("client identity search expands only shared resolved hashes", async () => {
   assert.ok(results.some((result) => result.relativePath === b.file.relativePath));
 });
 
+test("all-term reservation finds an older entity seed beyond the generic candidate window", async () => {
+  const r = await root("Reserved specific candidates"); const s = await session(r.id);
+  const seed = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/invoice.txt",
+    evidence: evidence("Client: Alice; invoice balance is settled"), status: "APPROVED" });
+  const related = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/private-ledger.txt",
+    evidence: evidence("Settled balance details without query wording") });
+  await prisma.knowledgeDocumentSignal.createMany({ data: [seed, related].map((item) => ({
+    checksum: item.file.checksum!, connectedLibraryId: r.id,
+    fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
+    generationVersion: documentSignalVersion, identityHash: "reserved-alice-identity", kind: "CLIENT",
+    observationSessionId: item.observation.id, relativePath: item.file.relativePath,
+    signalKey: crypto.randomUUID(), sourceRanges: [],
+  })) });
+  await indexFiles(s.id, [seed, related]);
+  const seedEntry = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: seed.file.id } });
+  await prisma.librarySearchEntry.update({ where: { id: seedEntry.id }, data: {
+    indexedAt: new Date("2024-01-01T00:00:00.000Z"), sourceTerms: ["client"],
+    reviewedTerms: ["alic"], concepts: ["invoic"],
+  } });
+
+  const genericFiles = await prisma.scannedFile.createManyAndReturn({ data: Array.from({ length: 125 }, (_, index) => ({
+    sessionId: s.id, localPath: `bridge://${r.id}/generic-${index}.txt`,
+    relativePath: `generic-${String(index).padStart(3, "0")}.txt`, checksum: crypto.randomUUID(),
+    fileType: "TEXT", readStatus: "SUPPORTED" as const, readingStatus: "READ" as const,
+    extractionStatus: "COMPLETED" as const,
+  })) });
+  await prisma.librarySearchEntry.createMany({ data: genericFiles.map((file, index) => ({
+    entryKey: crypto.randomUUID(), fileKey: fileKey.persistentFileKey(r.id, file.relativePath),
+    connectedLibraryId: r.id, scannedFileId: file.id, scanSessionId: s.id,
+    relativePath: file.relativePath, fileName: file.relativePath, checksum: file.checksum!, fileType: "TEXT",
+    indexVersion: "library-search-v1", fingerprint: crypto.randomUUID(), isCurrent: true,
+    knowledgeState: "PROVISIONAL", sourceExcerpts: [], sourceTerms: ["client"],
+    reviewedTerms: [], concepts: [], entityHashes: [], indexedAt: new Date(2026, 0, 1, 0, 0, index),
+  })) });
+
+  const results = await search.searchLibrary("client Alice's invoices", [r.id]);
+  assert.ok(results.some((result) => result.relativePath === seed.file.relativePath));
+  assert.ok(results.some((result) => result.relativePath === related.file.relativePath));
+  assert.ok(!results.some((result) => result.relativePath.startsWith("generic-")));
+});
+
+for (const [kind, query, label] of [
+  ["CLIENT", "client O'Connor invoices", "Client: O'Connor; invoice is current"],
+  ["PROJECT", "project North Star’s files", "Project: North Star; project files are current"],
+] as const) {
+  test(`${kind.toLowerCase()} possessive parsing preserves real apostrophes and retrieves identity evidence`, async () => {
+    const r = await root(`${kind} possessive root`); const s = await session(r.id);
+    const item = await observedFile({ rootId: r.id, sessionId: s.id, path: "neutral-record.txt",
+      evidence: evidence(label) });
+    await prisma.knowledgeDocumentSignal.create({ data: {
+      checksum: item.file.checksum!, connectedLibraryId: r.id,
+      fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath), generationVersion: documentSignalVersion,
+      identityHash: `possessive-${kind.toLowerCase()}-${crypto.randomUUID()}`, kind,
+      observationSessionId: item.observation.id, relativePath: item.file.relativePath,
+      signalKey: crypto.randomUUID(), sourceRanges: [],
+    } });
+    await indexFiles(s.id, [item]);
+    assert.ok((await search.searchLibrary(query, [r.id]))
+      .some((result) => result.relativePath === item.file.relativePath));
+  });
+}
+
 for (const [kind, query, name] of [
   ["CLIENT", "client Alice", "Alice"],
   ["PROJECT", "project Atlas", "Atlas"],
@@ -455,6 +517,7 @@ test("metadata-only audio and video never claim transcript content", async () =>
 
 test("candidate and final result limits are explicit", () => {
   assert.equal(search.searchCandidateLimit, 120);
+  assert.equal(search.searchSpecificCandidateLimit, 32);
   assert.equal(search.searchResultLimit, 20);
   assert.equal(indexer.searchEvidenceLimit, 8);
   assert.equal(indexer.searchExcerptLimit, 240);
@@ -1470,6 +1533,15 @@ test("multiword client and project parsing preserves phrases and stops at filter
     ["client Alice Smith", "alice smith"], ["project North Star", "north star"],
     ["client named Alice Smith with invoices", "alice smith"],
     ["project North Star pdf files", "north star"], ["client Alice", "alice"],
+  ]) assert.equal(search.parseSearchIntent(query).entityName, expected);
+});
+
+test("entity parsing removes grammatical possessives but preserves name apostrophes", () => {
+  for (const [query, expected] of [
+    ["client Alice's invoices", "alice"], ["client Alice’s files", "alice"],
+    ["project Atlas's documents", "atlas"], ["project Atlas’s versions", "atlas"],
+    ["client O'Connor invoices", "o'connor"], ["client O’Connor files", "o’connor"],
+    ["client Alice's", "alice's"],
   ]) assert.equal(search.parseSearchIntent(query).entityName, expected);
 });
 

@@ -332,6 +332,53 @@ test("same-name clients with distinct identity hashes trigger clarification", as
   assert.equal(versionResult.state, "AMBIGUOUS_ENTITY");
 });
 
+test("Ask reserves an older possessive entity match beyond 120 generic candidates", async () => {
+  const r = await root("Reserved possessive QA Root"); const s = await scan(r.id);
+  const seed = await file({ rootId: r.id, sessionId: s.id, relativePath: "Alice/invoice.txt",
+    quote: "Client: Alice; invoice balance is settled", knowledgeState: "APPROVED",
+    entityHashes: ["qa-reserved-alice"] });
+  const related = await file({ rootId: r.id, sessionId: s.id, relativePath: "Alice/private-ledger.txt",
+    quote: "Settled balance details without query wording", entityHashes: ["qa-reserved-alice"] });
+  await prisma.knowledgeDocumentSignal.createMany({ data: [seed, related].map((item) => ({
+    signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+    relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!, kind: "CLIENT",
+    identityHash: "qa-reserved-alice", sourceRanges: [], observationSessionId: item.observation.id,
+    generationVersion: documentSignalVersion,
+  })) });
+  await prisma.librarySearchEntry.update({ where: { id: seed.index.id }, data: {
+    indexedAt: new Date("2024-01-01T00:00:00.000Z"), sourceTerms: ["client"],
+    reviewedTerms: ["alic"], concepts: ["invoic"],
+  } });
+  const genericFiles = await prisma.scannedFile.createManyAndReturn({ data: Array.from({ length: 125 }, (_, index) => ({
+    sessionId: s.id, localPath: `bridge://${r.id}/generic-${index}.txt`,
+    relativePath: `generic-${String(index).padStart(3, "0")}.txt`, checksum: crypto.randomUUID(),
+    fileType: "TEXT", readStatus: "SUPPORTED" as const, readingStatus: "READ" as const,
+    extractionStatus: "COMPLETED" as const,
+  })) });
+  await prisma.librarySearchEntry.createMany({ data: genericFiles.map((scanned, index) => ({
+    entryKey: crypto.randomUUID(), fileKey: identity.persistentFileKey(r.id, scanned.relativePath),
+    connectedLibraryId: r.id, scannedFileId: scanned.id, scanSessionId: s.id,
+    relativePath: scanned.relativePath, fileName: scanned.relativePath, checksum: scanned.checksum!,
+    fileType: "TEXT", indexVersion: "library-search-v1", fingerprint: crypto.randomUUID(),
+    isCurrent: true, knowledgeState: "PROVISIONAL", sourceExcerpts: [], sourceTerms: ["client"],
+    reviewedTerms: [], concepts: [], entityHashes: [], indexedAt: new Date(2026, 0, 1, 0, 0, index),
+  })) });
+
+  const question = "What do client Alice's invoices say?";
+  const context = await retrieve.retrieveQuestionContext(question, [r.id]);
+  assert.deepEqual(new Set(context.sources.map((source) => source.relativePath)),
+    new Set([seed.scanned.relativePath, related.scanned.relativePath]));
+  assert.ok(!context.sources.some((source) => source.relativePath?.startsWith("generic-")));
+  let modelCalled = false;
+  const result = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id], model: async () => {
+    modelCalled = true;
+    return model([claim("The invoice balance is settled", ["S1"])])();
+  } });
+  assert.equal(modelCalled, true);
+  assert.ok(["ANSWERED_FROM_SOURCES", "PARTIALLY_ANSWERED"].includes(result.state));
+  assert.ok(result.sources.every((source) => !source.relativePath?.startsWith("generic-")));
+});
+
 for (const [kind, name] of [["CLIENT", "Alice"], ["PROJECT", "Atlas"]] as const) {
   test(`${kind.toLowerCase()} Ask context excludes files sharing only mixed identity kinds`, async () => {
     const r = await root(`${kind} Typed Ask Root`); const s = await scan(r.id);
@@ -999,4 +1046,12 @@ test("routing distinguishes client, project, version, topic and Memory intent", 
     }),
     [["VERSION", "CLIENT", "Alice"], ["HISTORY", "PROJECT", "North Star"]],
   );
+  assert.deepEqual(
+    ["What do client Alice's invoices say?", "Show project Atlas’s files"].map((question) => {
+      const route = routing.routeLibraryQuestion(question);
+      return [route.entityKind, route.entityName];
+    }),
+    [["CLIENT", "Alice"], ["PROJECT", "Atlas"]],
+  );
+  assert.equal(routing.routeLibraryQuestion("Show client O'Connor invoices").entityName, "O'Connor");
 });

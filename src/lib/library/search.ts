@@ -12,9 +12,11 @@ import {
 import { mediaCategoryForFileType } from "@/lib/bridge/media-kind";
 import { searchTopicIds, workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
 import { getScannedFileExamineRoute, getScanSessionRoute } from "@/lib/library/routes";
+import { parseExplicitEntityQuery } from "./entity-query";
 import { librarySearchIndexVersion, type SearchExcerpt } from "./search-index";
 
 export const searchCandidateLimit = 120;
+export const searchSpecificCandidateLimit = 32;
 export const searchResultLimit = 20;
 
 export type LibrarySearchResult = {
@@ -51,18 +53,15 @@ export function parseSearchIntent(value: string): SearchIntent {
   const query = value.trim().slice(0, 120);
   const normalized = query.toLowerCase();
   const fileType = /\b(pdf|docx?|html?|markdown|images?|audio|video)\b/i.exec(query)?.[1]?.toLowerCase() ?? null;
-  const entityMatch = /\b(client|project)\s+(?:named\s+)?([\p{L}\p{N}][\p{L}\p{N} .'-]{0,70})/iu.exec(query);
-  const entityPhrase = entityMatch?.[2];
-  const entityName = entityPhrase?.split(/\b(?:and|with|about|have|in|on|for|from|documents?|files?|invoices?|versions?|pdf|docx?|html?|markdown|images?|audio|video|older|earlier|previous|history)\b/iu)[0]?.trim().toLowerCase() || null;
+  const entity = parseExplicitEntityQuery(query);
   return {
     query,
     terms: workingKnowledgeTerms(query).slice(0, 12),
     concepts: searchTopicIds(query),
     wantsHistory: /\b(older|earlier|previous|versions?|history|historical)\b/.test(normalized),
     fileType,
-    entityName,
-    entityKind: entityMatch?.[1]?.toLowerCase() === "client" ? "CLIENT" :
-      entityMatch?.[1]?.toLowerCase() === "project" ? "PROJECT" : null,
+    entityName: entity.entityName?.toLowerCase() ?? null,
+    entityKind: entity.entityKind,
   };
 }
 
@@ -184,12 +183,31 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
       { relativePath: { equals: intent.query, mode: "insensitive" } },
     ] },
   }).catch(() => []);
-  const broader = await prisma.librarySearchEntry.findMany({
-    take: searchCandidateLimit - exact.length,
+  // Reserve part of the bounded window for entries that satisfy every query
+  // term. Without this pass, a common first term can consume the hasSome window
+  // before an older, more specific identity seed is considered. A term may be
+  // supported by source evidence, a reviewed correction, or an indexed concept.
+  const specific = intent.terms.length ? await prisma.librarySearchEntry.findMany({
+    take: Math.min(searchSpecificCandidateLimit, searchCandidateLimit - exact.length),
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
       { connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: {
       ...scope,
+      AND: intent.terms.map((term) => ({ OR: [
+        { sourceTerms: { has: term } },
+        { reviewedTerms: { has: term } },
+        { concepts: { has: term } },
+      ] })),
+    },
+  }).catch(() => []) : [];
+  const reserved = [...new Map([...exact, ...specific].map((entry) => [entry.id, entry])).values()];
+  const broader = await prisma.librarySearchEntry.findMany({
+    take: Math.max(0, searchCandidateLimit - reserved.length),
+    orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
+      { connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
+    where: {
+      ...scope,
+      id: { notIn: reserved.map((entry) => entry.id) },
       OR: [
         { relativePath: { contains: intent.query, mode: "insensitive" } },
         ...intent.terms.length ? [{ sourceTerms: { hasSome: intent.terms } },
@@ -198,7 +216,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
       ],
     },
   }).catch(() => []);
-  const initial = [...new Map([...exact, ...broader].map((entry) => [entry.id, entry])).values()];
+  const initial = [...new Map([...reserved, ...broader]
+    .map((entry) => [entry.id, entry])).values()];
 
   // Resolved identity expansion uses only identities from already scoped matches.
   // Human SEPARATE decisions suppress only the rejected identity hash for that
@@ -244,7 +263,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
     expansionHashesByRoot.set(connectedLibraryId, hashes);
   }
   const relatedCandidates = seedPairs.length ? await prisma.librarySearchEntry.findMany({
-    take: Math.min(40, searchCandidateLimit - initial.length),
+    take: 40,
     orderBy: [{ connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: {
       ...scope,
@@ -276,7 +295,14 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   const filteredInitial = initial.filter((entry) =>
     seedEntries.some((seed) => seed.id === entry.id) || !crossesSeedSeparation(entry));
   const related = relatedCandidates.filter((entry) => !crossesSeedSeparation(entry));
-  const candidateById = new Map([...filteredInitial, ...related].map((entry) => [entry.id, entry]));
+  const exactIds = new Set(exact.map((entry) => entry.id));
+  const boundedCandidates = [...new Map([
+    ...filteredInitial.filter((entry) => exactIds.has(entry.id)),
+    ...seedEntries,
+    ...related,
+    ...filteredInitial,
+  ].map((entry) => [entry.id, entry])).values()].slice(0, searchCandidateLimit);
+  const candidateById = new Map(boundedCandidates.map((entry) => [entry.id, entry]));
   const currentSourceIds = new Set((await prisma.scannedFile.findMany({
     select: { id: true }, where: { id: { in: [...candidateById.values()].map((entry) => entry.scannedFileId) },
       sourceUnavailableAt: null },
