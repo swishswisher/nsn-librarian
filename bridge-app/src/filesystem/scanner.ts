@@ -60,6 +60,10 @@ const ignoredSystemFileNames = new Set([
   "thumbs.db",
 ]);
 
+type ScanBridgeRootOptions = {
+  imageMetadataExtractor?: typeof extractImageMetadata;
+};
+
 function relativePathFor(rootPath: string, filePath: string) {
   const relative = path.relative(rootPath, filePath);
 
@@ -107,7 +111,12 @@ async function checksumFile(filePath: string) {
   });
 }
 
-async function fileDraft(rootId: string, rootPath: string, filePath: string) {
+async function fileDraft(
+  rootId: string,
+  rootPath: string,
+  filePath: string,
+  imageMetadataExtractor: typeof extractImageMetadata,
+) {
   const relativePath = relativePathFor(rootPath, filePath);
   const fileType = classifyFileType(relativePath);
 
@@ -144,7 +153,7 @@ async function fileDraft(rootId: string, rootPath: string, filePath: string) {
 
     const checksumBefore = await checksumFile(filePath);
     const imageMetadata = fileType.startsWith("IMAGE_")
-      ? await extractImageMetadata(filePath, relativePath, stats).catch(() => null)
+      ? await imageMetadataExtractor(filePath, relativePath, stats).catch(() => null)
       : null;
     const checksumAfter = fileType.startsWith("IMAGE_")
       ? await checksumFile(filePath)
@@ -189,6 +198,7 @@ async function scanDirectory(
   rootPath: string,
   currentPath: string,
   files: BridgeScannedFileDraft[],
+  imageMetadataExtractor: typeof extractImageMetadata,
 ) {
   const currentStats = await lstat(currentPath);
 
@@ -239,17 +249,20 @@ async function scanDirectory(
     }
 
     if (stats.isDirectory()) {
-      await scanDirectory(rootId, rootPath, entryPath, files);
+      await scanDirectory(rootId, rootPath, entryPath, files, imageMetadataExtractor);
       continue;
     }
 
     if (stats.isFile()) {
-      files.push(await fileDraft(rootId, rootPath, entryPath));
+      files.push(await fileDraft(rootId, rootPath, entryPath, imageMetadataExtractor));
     }
   }
 }
 
-export async function scanBridgeRoot(rootId: string): Promise<BridgeFolderScanResult> {
+export async function scanBridgeRoot(
+  rootId: string,
+  options: ScanBridgeRootOptions = {},
+): Promise<BridgeFolderScanResult> {
   const root = await requireRootPermission(rootId, "readPermission", "scan files");
   const startedAt = new Date();
   const files: BridgeScannedFileDraft[] = [];
@@ -262,7 +275,13 @@ export async function scanBridgeRoot(rootId: string): Promise<BridgeFolderScanRe
     );
   }
 
-  await scanDirectory(root.id, root.actualPath, root.actualPath, files);
+  await scanDirectory(
+    root.id,
+    root.actualPath,
+    root.actualPath,
+    files,
+    options.imageMetadataExtractor ?? extractImageMetadata,
+  );
 
   const completedAt = new Date();
   const supportedFiles = files.filter((file) => file.readStatus === "SUPPORTED").length;

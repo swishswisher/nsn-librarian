@@ -130,10 +130,26 @@ function mp4VideoBuffer(options: { hasAudioTrack?: boolean } = {}) {
     ], { stdio: "pipe" });
     return readFileSync(fixturePath);
   } catch (error) {
-    const stderr = error && typeof error === "object" && "stderr" in error
-      ? String((error as { stderr?: Buffer | string }).stderr ?? "")
-      : String(error);
-    throw new Error(`FFmpeg could not create the synthetic MP4 fixture: ${stderr}`);
+    const details = error && typeof error === "object"
+      ? error as {
+          code?: unknown;
+          message?: unknown;
+          signal?: unknown;
+          status?: unknown;
+          stderr?: Buffer | string;
+        }
+      : null;
+    const diagnostics = [
+      `message=${details?.message ?? String(error)}`,
+      `code=${details?.code ?? "unknown"}`,
+      `status=${details?.status ?? "unknown"}`,
+      `signal=${details?.signal ?? "unknown"}`,
+      `stderr=${String(details?.stderr ?? "<empty>") || "<empty>"}`,
+    ].join("; ");
+
+    throw new Error(`FFmpeg could not create the synthetic MP4 fixture: ${diagnostics}`, {
+      cause: error,
+    });
   } finally {
     rmSync(fixtureDirectory, { force: true, recursive: true });
   }
