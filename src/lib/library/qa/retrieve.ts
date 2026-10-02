@@ -73,6 +73,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     // Search remains display-bounded, but Ask must see every candidate from the
     // bounded retrieval window before deciding whether an entity is ambiguous.
     includeAllEntityMatches: true,
+    includeAllVersionMatches: route.kind === "VERSION",
   });
   const requestedHashesByResultId = new Map(results.flatMap((result) =>
     result.matchedEntityHashes?.length ? [[result.id, result.matchedEntityHashes] as const] : []));
@@ -127,10 +128,101 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     entry.checksum ? `sha256:${entry.checksum}` : `${entry.connectedLibraryId}:${entry.fileKey}`,
     entry,
   ])).values()];
+  const versionEntries = route.kind === "VERSION"
+    ? [...new Map(results.flatMap((result) => {
+      const entry = result.kind === "FILE" ? entriesById.get(result.id) : null;
+      return entry && rootById.has(entry.connectedLibraryId) &&
+      entry.checksum === entry.scannedFile.checksum &&
+      entry.relativePath === entry.scannedFile.relativePath &&
+      entry.scanSessionId === entry.scannedFile.sessionId &&
+      entry.connectedLibraryId === entry.scannedFile.scanSession.connectedFolderId &&
+      (route.wantsHistory || entry.isCurrent && latestIds.has(entry.scanSessionId))
+        ? [[entry.checksum ? `sha256:${entry.checksum}` : `${entry.connectedLibraryId}:${entry.fileKey}`, entry] as const]
+        : [];
+    })).values()]
+    : [];
+  const [allVersionSignals, allSeparatedVersionPairs] = route.kind === "VERSION"
+    ? await Promise.all([
+      getDocumentVersionSignals(versionEntries, route.wantsHistory),
+      getSeparatedRelationshipPairIdentities(versionEntries, ["PROBABLE_REVISION"]),
+    ]) : [[], new Map<string, Set<string>>()];
+  const versionEntryByEndpoint = new Map(versionEntries.map((entry) =>
+    [`${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`, entry]));
+  const versionFamilyMap = new Map<string, typeof allVersionSignals>();
+  for (const signal of allVersionSignals) {
+    if (!versionEntryByEndpoint.has(`${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`)) continue;
+    const key = `${signal.connectedLibraryId}\0${signal.identityHash}`;
+    versionFamilyMap.set(key, [...(versionFamilyMap.get(key) ?? []), signal]);
+  }
+  const versionFamilies = [...versionFamilyMap.values()]
+    .filter((family) => family.length > 1)
+    .sort((left, right) => {
+      const leftKey = `${left[0].connectedLibraryId}\0${left[0].identityHash}`;
+      const rightKey = `${right[0].connectedLibraryId}\0${right[0].identityHash}`;
+      return leftKey.localeCompare(rightKey);
+    });
+  const assessedFamilies = versionFamilies.map((family) => {
+    const comparisons = family.flatMap((left, index) => family.slice(index + 1).map((right) => ({
+      left, right, order: compareDocumentVersions(left, right),
+      separated: allSeparatedVersionPairs.has(knowledgeRelationshipPairKey(left, right)),
+    })));
+    const separated = comparisons.some((comparison) => comparison.separated);
+    const ambiguous = comparisons.some((comparison) => comparison.order === null);
+    const older = new Set(comparisons.flatMap((comparison) => comparison.order === null ? [] : [
+      comparison.order === 1
+        ? `${comparison.right.connectedLibraryId}\0${comparison.right.fileKey}\0${comparison.right.checksum}`
+        : `${comparison.left.connectedLibraryId}\0${comparison.left.fileKey}\0${comparison.left.checksum}`,
+    ]));
+    const maxima = family.filter((signal) => !older.has(
+      `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`));
+    const maximum = !separated && !ambiguous && maxima.length === 1 ? maxima[0] : null;
+    const olderSignals = maximum ? family.filter((signal) => signal !== maximum)
+      .sort((left, right) => `${left.fileKey}\0${left.checksum}`.localeCompare(`${right.fileKey}\0${right.checksum}`)) : [];
+    return { maximum, olderSignals, safe: Boolean(maximum), separated, family };
+  });
+  const assessableVersionEndpoints = new Set(assessedFamilies.flatMap((family) => !family.separated
+    ? family.family.map((signal) =>
+      `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`) : []));
+  const reservedVersionEntryIds: string[] = [];
+  // Give each safely ordered family a maximal-revision comparison before
+  // reserving supplemental comparisons. This keeps the model context bounded
+  // while preventing an early family from consuming the entire source budget.
+  for (const family of assessedFamilies) {
+    if (!family.maximum || !family.olderSignals[0]) continue;
+    for (const signal of [family.maximum, family.olderSignals[0]]) {
+      const entry = versionEntryByEndpoint.get(
+        `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`);
+      if (entry && !reservedVersionEntryIds.includes(entry.id) && reservedVersionEntryIds.length < maxAnswerSources) {
+        reservedVersionEntryIds.push(entry.id);
+      }
+    }
+  }
+  for (const assessed of assessedFamilies) {
+    if (assessed.safe || assessed.separated) continue;
+    for (const signal of assessed.family.slice(0, 2)) {
+      const entry = versionEntryByEndpoint.get(
+        `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`);
+      if (entry && !reservedVersionEntryIds.includes(entry.id) && reservedVersionEntryIds.length < maxAnswerSources) {
+        reservedVersionEntryIds.push(entry.id);
+      }
+    }
+  }
+  for (const family of assessedFamilies) {
+    for (const signal of family.olderSignals.slice(1)) {
+      const entry = versionEntryByEndpoint.get(
+        `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`);
+      if (entry && !reservedVersionEntryIds.includes(entry.id) && reservedVersionEntryIds.length < maxAnswerSources) {
+        reservedVersionEntryIds.push(entry.id);
+      }
+    }
+  }
+  const resultById = new Map(results.map((result) => [result.id, result]));
+  const sourceResults = [...reservedVersionEntryIds.flatMap((id) => resultById.get(id) ?? []),
+    ...results.filter((result) => !reservedVersionEntryIds.includes(result.id))];
   const sources: AnswerContextSource[] = [];
   const sourceEntryById = new Map<string, (typeof entries)[number]>();
   const physicalSeen = new Set<string>();
-  for (const result of results) {
+  for (const result of sourceResults) {
     if (sources.length >= maxAnswerSources) break;
     if (result.kind === "MEMORY") {
       const entry = memoriesById.get(result.id);
@@ -212,6 +304,10 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
         signal.connectedLibraryId === leftSignal?.connectedLibraryId &&
         signal.identityHash === leftSignal?.identityHash);
       if (!leftSignal || !rightSignal) continue;
+      if (route.kind === "VERSION" && (!assessableVersionEndpoints.has(
+        `${leftSignal.connectedLibraryId}\0${leftSignal.fileKey}\0${leftSignal.checksum}`) ||
+        !assessableVersionEndpoints.has(
+          `${rightSignal.connectedLibraryId}\0${rightSignal.fileKey}\0${rightSignal.checksum}`))) continue;
       if (separatedVersionPairs.has(knowledgeRelationshipPairKey(leftSignal, rightSignal))) continue;
       const order = compareDocumentVersions(leftSignal, rightSignal);
       versions.push({ leftSourceId: leftId, rightSourceId: rightId,
@@ -308,6 +404,8 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
         leftIdentities.has(hash) && rightIdentities.has(hash)));
     }));
   return { route, sources, relationships, versions,
+    versionFamilyCount: assessedFamilies.length,
+    versionAssessmentComplete: assessedFamilies.every((family) => family.safe),
     indexIncomplete: indexIncomplete || sources.some((source) => source.trustState === "Metadata only"),
     ambiguousEntity: entityHashes.size > 1 || hasSeparatedMatchingIdentity };
 }

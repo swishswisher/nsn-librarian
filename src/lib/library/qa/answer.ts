@@ -114,11 +114,14 @@ function explicitConflict(sources: AnswerContext["sources"]) {
       negative.test(left.text) && positive.test(right.text))));
 }
 
-function latestVersionClaims(context: AnswerContext): AnswerClaim[] {
+function latestVersionClaims(context: AnswerContext): { claims: AnswerClaim[]; representedFamilies: number } {
+  if (context.versionAssessmentComplete === false) return { claims: [], representedFamilies: 0 };
   const remaining = new Set(context.versions.flatMap((version) =>
     [version.leftSourceId, version.rightSourceId]));
   const claims: AnswerClaim[] = [];
-  while (remaining.size && claims.length < 3) {
+  const supplemental: AnswerClaim[] = [];
+  let representedFamilies = 0;
+  while (remaining.size) {
     const first = remaining.values().next().value as string;
     const component = new Set([first]);
     let changed = true;
@@ -148,17 +151,25 @@ function latestVersionClaims(context: AnswerContext): AnswerClaim[] {
         const rightOlder = right.leftSourceId === newestId ? right.rightSourceId : right.leftSourceId;
         return leftOlder.localeCompare(rightOlder);
       });
+    const familyClaims: AnswerClaim[] = [];
     for (const version of comparisons) {
-      if (claims.length >= 3) break;
       const newer = context.sources.find((source) => source.id === newestId);
       const olderId = version.leftSourceId === newestId ? version.rightSourceId : version.leftSourceId;
       const older = context.sources.find((source) => source.id === olderId);
-      if (newer && older) claims.push({ kind: "FACT",
+      if (newer && older) familyClaims.push({ kind: "FACT",
         text: `${newer.title} is newer than ${older.title} according to recorded version markers.`,
         sourceIds: [newer.id, older.id] });
     }
+    if (familyClaims.length) {
+      if (claims.length < 3) {
+        claims.push(familyClaims[0]);
+        representedFamilies += 1;
+      }
+      supplemental.push(...familyClaims.slice(1));
+    }
   }
-  return claims;
+  claims.push(...supplemental.slice(0, Math.max(0, 3 - claims.length)));
+  return { claims, representedFamilies };
 }
 
 export function validateAnswerClaims(output: unknown, context: AnswerContext): AnswerClaim[] {
@@ -250,16 +261,21 @@ export async function answerLibraryQuestion(question: string, dependencies: Answ
   if (!contextStillCurrent(context, current)) return emptyAnswer(current, "SOURCE_CHANGED",
     "The library information changed while I was answering. Please ask again.", null, usage);
   const modelClaims = validateAnswerClaims(response.output, context);
-  const lineageClaims: AnswerClaim[] = context.route.kind === "VERSION"
-    ? latestVersionClaims(context) : [];
+  const lineage = context.route.kind === "VERSION"
+    ? latestVersionClaims(context) : { claims: [], representedFamilies: 0 };
+  const lineageClaims = lineage.claims;
   const claims = [...lineageClaims, ...modelClaims];
   if (!claims.length) return emptyAnswer(context, "INSUFFICIENT_EVIDENCE",
     "The available source evidence is not strong enough for a supported answer.",
     context.indexIncomplete ? "Search preparation is incomplete for part of this library." : null, usage);
   const submittedClaims = Array.isArray((response.output as { claims?: unknown }).claims)
     ? (response.output as { claims: unknown[] }).claims.length : 0;
+  const incompleteVersionCoverage = context.route.kind === "VERSION" &&
+    (context.versionAssessmentComplete === false ||
+      (context.versionFamilyCount ?? lineage.representedFamilies) > lineage.representedFamilies);
   const state: LibraryAnswer["state"] = claims.some((claim) => claim.kind === "CONFLICT")
     ? "CONFLICTING_SOURCES" : context.indexIncomplete || modelClaims.length < submittedClaims ||
+      incompleteVersionCoverage ||
       (context.route.kind === "VERSION" && !modelClaims.length && /\b(changed|difference|different)\b/i.test(safeQuestion))
       ? "PARTIALLY_ANSWERED" : "ANSWERED_FROM_SOURCES";
   return { state, answer: claims.map((claim) => claim.text).join(" "), claims,

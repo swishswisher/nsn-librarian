@@ -47,6 +47,10 @@ export type AnswerContext = {
   sources: AnswerContextSource[];
   relationships: AnswerRelationship[];
   versions: AnswerVersion[];
+  /** Number of complete document-family components found before source truncation. */
+  versionFamilyCount?: number;
+  /** False when a family cannot be safely ordered or represented from verified evidence. */
+  versionAssessmentComplete?: boolean;
   indexIncomplete: boolean;
   ambiguousEntity: boolean;
 };

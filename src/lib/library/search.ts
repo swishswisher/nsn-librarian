@@ -180,6 +180,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   includeEntityMatches?: boolean;
   /** Keep the bounded ranked file set so Ask can check identity ambiguity before UI truncation. */
   includeAllEntityMatches?: boolean;
+  /** Keep all ranked file candidates so Ask can assess complete version families before source truncation. */
+  includeAllVersionMatches?: boolean;
 }): Promise<LibrarySearchResult[]> {
   const intent = parseSearchIntent(value);
   if (intent.query.length < 2) return [];
@@ -210,6 +212,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   // bounded candidate window. In that mode the database query is exhaustive,
   // but only the small ranked source window is ever sent to the answer model.
   const exhaustiveEntityCandidates = Boolean(options?.includeAllEntityMatches && intent.entityKind);
+  const exhaustiveVersionCandidates = Boolean(options?.includeAllVersionMatches && intent.wantsHistory);
+  const exhaustiveCandidates = exhaustiveEntityCandidates || exhaustiveVersionCandidates;
   const exact = await prisma.librarySearchEntry.findMany({
     take: 20,
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
@@ -225,7 +229,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   // supported by source evidence, a reviewed correction, an indexed concept, or
   // the normalized path terms that ranking also treats as evidence.
   const specific = intent.terms.length ? await prisma.librarySearchEntry.findMany({
-    ...(!exhaustiveEntityCandidates ? {
+    ...(!exhaustiveCandidates ? {
       take: Math.min(searchSpecificCandidateLimit, searchCandidateLimit - exact.length),
     } : {}),
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
@@ -242,7 +246,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   }).catch(() => []) : [];
   const reserved = [...new Map([...exact, ...specific].map((entry) => [entry.id, entry])).values()];
   const broader = await prisma.librarySearchEntry.findMany({
-    ...(!exhaustiveEntityCandidates ? {
+    ...(!exhaustiveCandidates ? {
       take: Math.max(0, searchCandidateLimit - reserved.length),
     } : {}),
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
@@ -394,7 +398,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     ...related,
     ...filteredInitial,
   ].map((entry) => [entry.id, entry])).values()]
-    .slice(0, exhaustiveEntityCandidates ? undefined : searchCandidateLimit);
+    .slice(0, exhaustiveCandidates ? undefined : searchCandidateLimit);
   const candidateById = new Map(boundedCandidates.map((entry) => [entry.id, entry]));
   const currentSourceIds = new Set((await prisma.scannedFile.findMany({
     select: { id: true }, where: { id: { in: [...candidateById.values()].map((entry) => entry.scannedFileId) },
@@ -525,7 +529,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
       excerpt: null, sourceRange: null, score: Math.min(45, 28 + matchingTerms.length * 6) });
   }
   const rankedResults = results.sort(compareSearchResults);
-  return options?.includeAllEntityMatches && intent.entityKind
+  return exhaustiveCandidates
     ? rankedResults
     : rankedResults.slice(0, searchResultLimit);
 }

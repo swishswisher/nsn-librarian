@@ -120,6 +120,81 @@ test("factual answer cites one authorized source and its character range", async
   assert.equal("physicalIdentity" in result.sources[0], false);
 });
 
+test("version retrieval reserves the true newest revision beyond the eight-source cap", async () => {
+  const r = await root("Nine revision family root"); const s = await scan(r.id);
+  const revisions = [];
+  for (let revision = 1; revision <= 9; revision += 1) {
+    const item = await file({ rootId: r.id, sessionId: s.id,
+      relativePath: `plans/plan-v${revision}.txt`,
+      quote: "Plan version release notes" });
+    await prisma.knowledgeDocumentSignal.create({ data: {
+      signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+      relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!,
+      kind: "DOCUMENT_FAMILY", identityHash: "nine-revision-family",
+      revisionNumber: String(revision), sourceRanges: [], observationSessionId: item.observation.id,
+      generationVersion: documentSignalVersion,
+    } });
+    revisions.push(item);
+  }
+  const question = "Which plan version is latest?";
+  const context = await retrieve.retrieveQuestionContext(question, [r.id]);
+  assert.equal(context.sources.length, 8);
+  assert.ok(context.sources.some((source) => source.relativePath === "plans/plan-v9.txt"));
+  assert.equal(context.versionFamilyCount, 1);
+  assert.equal(context.versionAssessmentComplete, true);
+
+  const result = await answer.answerLibraryQuestion(question, {
+    permittedRootIds: [r.id], model: model([]),
+  });
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  assert.ok(result.claims.length > 0);
+  assert.ok(result.claims.every((versionClaim) => versionClaim.sourceIds.some((sourceId) =>
+    result.sources.find((source) => source.id === sourceId)?.relativePath === "plans/plan-v9.txt")));
+  assert.ok(!result.claims.some((versionClaim) => /plan-v8\.txt is newer/.test(versionClaim.text)));
+});
+
+test("version claims allocate capped context across families and report excess families as partial", async () => {
+  const makeFamilies = async (label: string, sizes: number[]) => {
+    const r = await root(label); const s = await scan(r.id);
+    const newestPaths: string[] = [];
+    for (const [familyIndex, size] of sizes.entries()) {
+      for (let revision = 1; revision <= size; revision += 1) {
+        const relativePath = `${label}/family-${familyIndex + 1}-v${revision}.txt`;
+        const item = await file({ rootId: r.id, sessionId: s.id, relativePath,
+          quote: "Release version comparison notes" });
+        await prisma.knowledgeDocumentSignal.create({ data: {
+          signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+          relativePath, checksum: item.scanned.checksum!, kind: "DOCUMENT_FAMILY",
+          identityHash: `${label}-family-${familyIndex + 1}`, revisionNumber: String(revision),
+          sourceRanges: [], observationSessionId: item.observation.id,
+          generationVersion: documentSignalVersion,
+        } });
+        if (revision === size) newestPaths.push(relativePath);
+      }
+    }
+    return { r, newestPaths };
+  };
+
+  const two = await makeFamilies("two-families", [4, 2]);
+  const complete = await answer.answerLibraryQuestion("Which release versions are latest?", {
+    permittedRootIds: [two.r.id], model: model([]),
+  });
+  assert.equal(complete.state, "ANSWERED_FROM_SOURCES");
+  for (const newestPath of two.newestPaths) assert.ok(complete.claims.some((versionClaim) =>
+    versionClaim.sourceIds.some((sourceId) =>
+      complete.sources.find((source) => source.id === sourceId)?.relativePath === newestPath)));
+
+  const four = await makeFamilies("four-families", [2, 2, 2, 2]);
+  const partial = await answer.answerLibraryQuestion("Which release versions are latest?", {
+    permittedRootIds: [four.r.id], model: model([]),
+  });
+  assert.equal(partial.state, "PARTIALLY_ANSWERED");
+  assert.equal(partial.claims.length, 3);
+  assert.equal(new Set(partial.claims.flatMap((versionClaim) => versionClaim.sourceIds)
+    .map((sourceId) => partial.sources.find((source) => source.id === sourceId)?.relativePath)
+    .filter((relativePath) => four.newestPaths.includes(relativePath ?? ""))).size, 3);
+});
+
 test("Ask selects the same stable latest completed scan as Search when timestamps tie", async () => {
   const r = await root("Tied completed snapshots root");
   const startedAt = new Date("2026-06-01T12:00:00.000Z");

@@ -132,6 +132,59 @@ test("version answers cite the actual newest member before the lineage claim cap
   assert.match(result.answer, /plan-v5\.txt is newer/);
 });
 
+test("version claim cap represents each family before supplemental comparisons", async () => {
+  const context = answerContext();
+  context.route = { kind: "VERSION", entityKind: null, searchQuery: "latest versions",
+    wantsHistory: true, entityName: null };
+  context.sources = Array.from({ length: 6 }, (_, index) => ({
+    ...context.sources[0], id: `S${index + 1}`, title: `version-${index + 1}.txt`,
+    relativePath: `version-${index + 1}.txt`, physicalIdentity: `sha256:${index + 1}`,
+  }));
+  context.relationships = [];
+  context.versions = [
+    ...["S1", "S2", "S3"].map((older) => ({ leftSourceId: older, rightSourceId: "S4",
+      newerSourceId: "S4", ordering: "ORDERED" as const })),
+    { leftSourceId: "S5", rightSourceId: "S6", newerSourceId: "S6", ordering: "ORDERED" },
+  ];
+  context.versionFamilyCount = 2;
+  context.versionAssessmentComplete = true;
+  const result = await answerLibraryQuestion("Which versions are latest?", {
+    retrieve: async () => structuredClone(context),
+    model: async () => ({ output: { claims: [] }, model: "mock", inputTokens: 1,
+      outputTokens: 1, httpAttempts: 1 }), recordUsage: async () => undefined,
+  });
+
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  assert.equal(result.claims.length, 3);
+  assert.ok(result.claims.some((claim) => claim.sourceIds.includes("S4")));
+  assert.ok(result.claims.some((claim) => claim.sourceIds.includes("S6")));
+});
+
+test("version answers report partial coverage when more families exist than the claim cap", async () => {
+  const context = answerContext();
+  context.route = { kind: "VERSION", entityKind: null, searchQuery: "latest versions",
+    wantsHistory: true, entityName: null };
+  context.sources = Array.from({ length: 8 }, (_, index) => ({
+    ...context.sources[0], id: `S${index + 1}`, title: `family-version-${index + 1}.txt`,
+    relativePath: `family-version-${index + 1}.txt`, physicalIdentity: `sha256:${index + 1}`,
+  }));
+  context.relationships = [];
+  context.versions = Array.from({ length: 4 }, (_, index) => ({
+    leftSourceId: `S${index * 2 + 1}`, rightSourceId: `S${index * 2 + 2}`,
+    newerSourceId: `S${index * 2 + 2}`, ordering: "ORDERED" as const,
+  }));
+  context.versionFamilyCount = 4;
+  context.versionAssessmentComplete = true;
+  const result = await answerLibraryQuestion("Which versions are latest?", {
+    retrieve: async () => structuredClone(context),
+    model: async () => ({ output: { claims: [] }, model: "mock", inputTokens: 1,
+      outputTokens: 1, httpAttempts: 1 }), recordUsage: async () => undefined,
+  });
+
+  assert.equal(result.state, "PARTIALLY_ANSWERED");
+  assert.equal(result.claims.length, 3);
+});
+
 test("version answers abstain when a family has ambiguous ordering", async () => {
   const context = answerContext();
   context.route = { kind: "VERSION", entityKind: null, searchQuery: "latest version",
