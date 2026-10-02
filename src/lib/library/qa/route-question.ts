@@ -17,11 +17,13 @@ export function routeLibraryQuestion(value: string): QuestionRoute {
     document ? "DOCUMENT" : memory ? "MEMORY" :
     /\b(topic|theme|subject|workshop|finance|invoice|training)\b/iu.test(question) ? "TOPIC" : "BROAD";
   const entityName = entity?.[2]?.trim().split(/\b(?:and|with|about|have|in|on|for|from|documents?|files?|invoices?|versions?)\b/iu)[0]?.trim() ?? null;
+  const entityKind = entity?.[1]?.toUpperCase() === "CLIENT" ? "CLIENT" as const :
+    entity?.[1]?.toUpperCase() === "PROJECT" ? "PROJECT" as const : null;
   const stripped = question.replace(leadWords, " ").replace(/[?.,:;]+/g, " ").replace(/\s+/g, " ").trim();
   const query = entityName && (kind === "CLIENT" || kind === "PROJECT")
     ? `${kind.toLowerCase()} ${entityName}` : stripped;
   const tokens = workingKnowledgeTerms(query);
   const searchQuery = (tokens.length ? query : question).slice(0, 120);
-  return { kind, searchQuery: version || history ? `older ${searchQuery} versions` : searchQuery,
+  return { kind, entityKind, searchQuery: version || history ? `older ${searchQuery} versions` : searchQuery,
     wantsHistory: version || history, entityName };
 }

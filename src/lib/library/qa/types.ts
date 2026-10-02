@@ -4,6 +4,7 @@ export const maxAnswerExcerptsPerFile = 1;
 
 export type QuestionRoute = {
   kind: "BROAD" | "CLIENT" | "PROJECT" | "DOCUMENT" | "VERSION" | "TOPIC" | "MEMORY" | "HISTORY";
+  entityKind: "CLIENT" | "PROJECT" | null;
   searchQuery: string;
   wantsHistory: boolean;
   entityName: string | null;

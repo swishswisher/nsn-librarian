@@ -1058,13 +1058,31 @@ export async function createIdentityCorrection(input: {
     const relationshipKey = digest([humanIdentityCorrectionVersion, input.kind, source.fileKey, source.checksum,
       target.fileKey, target.checksum, target.identityHash].join("\0"));
     const existing = await tx.knowledgeConnection.findUnique({
-      select: { id: true, status: true },
+      select: { id: true, status: true, supersededAt: true },
       where: { relationshipKey },
     });
     await supersedeCompetingCorrections(tx, { id: existing?.id, relationshipKind: input.kind,
       sourceFileKey: source.fileKey, sourceChecksum: source.checksum });
+    const evidence = {
+      connectedLibraryId: source.connectedLibraryId,
+      evidenceKinds: ["HUMAN_REVIEW"],
+      identityHash: target.identityHash,
+      sourceRanges: source.sourceRanges,
+      sourceRelativePath: source.relativePath,
+      supportingTopics: [input.kind === "SAME_CLIENT" ? "client identity" : "project membership"],
+      targetRanges: target.sourceRanges,
+      targetRelativePath: target.relativePath,
+    };
     if (existing?.status === "CONFIRMED") {
-      return tx.knowledgeConnection.findUniqueOrThrow({ where: { id: existing.id } });
+      if (!existing.supersededAt) {
+        return tx.knowledgeConnection.findUniqueOrThrow({ where: { id: existing.id } });
+      }
+      return tx.knowledgeConnection.update({ where: { id: existing.id }, data: {
+        lastSeenAt: new Date(), sourceEvidence: evidence,
+        sourceObservationSession: { connect: { id: source.observationSessionId } },
+        targetObservationSession: { connect: { id: target.observationSessionId } },
+        supersededAt: null,
+      } });
     }
     const conflictingProposals = await tx.knowledgeConnection.findMany({
       select: { id: true, sourceEvidence: true },
@@ -1094,16 +1112,6 @@ export async function createIdentityCorrection(input: {
         },
       });
     }
-    const evidence = {
-      connectedLibraryId: source.connectedLibraryId,
-      evidenceKinds: ["HUMAN_REVIEW"],
-      identityHash: target.identityHash,
-      sourceRanges: source.sourceRanges,
-      sourceRelativePath: source.relativePath,
-      supportingTopics: [input.kind === "SAME_CLIENT" ? "client identity" : "project membership"],
-      targetRanges: target.sourceRanges,
-      targetRelativePath: target.relativePath,
-    };
     const connection = await tx.knowledgeConnection.upsert({
       create: {
         confidence: 0,

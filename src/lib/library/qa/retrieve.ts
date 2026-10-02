@@ -239,7 +239,9 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
         ? "CONFIRMED" as const : "PROVISIONAL" as const,
         explanation: connection.reasoning.slice(0, 240) }] : [];
   });
-  const identityKind = route.kind === "CLIENT" ? "CLIENT" : route.kind === "PROJECT" ? "PROJECT" : null;
+  // VERSION/HISTORY deliberately take routing precedence, so retain the entity
+  // type parsed from the question rather than trying to infer it from its name.
+  const identityKind = route.entityKind;
   const [effectiveSignals, separatedIdentityPairs] = identityKind ? await Promise.all([
     getEffectiveDocumentSignals(rootIds),
     getSeparatedRelationshipPairIdentities(fileEntries, [`SAME_${identityKind}`]),

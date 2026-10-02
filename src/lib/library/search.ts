@@ -39,6 +39,12 @@ export type SearchIntent = {
   entityName: string | null;
 };
 
+export function compareSearchResults(a: LibrarySearchResult, b: LibrarySearchResult) {
+  return b.score - a.score || a.relativePath.localeCompare(b.relativePath) ||
+    a.rootName.localeCompare(b.rootName) || (a.kind ?? "FILE").localeCompare(b.kind ?? "FILE") ||
+    a.id.localeCompare(b.id);
+}
+
 export function parseSearchIntent(value: string): SearchIntent {
   const query = value.trim().slice(0, 120);
   const normalized = query.toLowerCase();
@@ -166,7 +172,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   } as const;
   const exact = await prisma.librarySearchEntry.findMany({
     take: 20,
-    orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" }],
+    orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
+      { connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: { ...scope, OR: [
       { fileName: { equals: intent.query, mode: "insensitive" } },
       { relativePath: { equals: intent.query, mode: "insensitive" } },
@@ -174,7 +181,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   }).catch(() => []);
   const broader = await prisma.librarySearchEntry.findMany({
     take: searchCandidateLimit - exact.length,
-    orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" }],
+    orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
+      { connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: {
       ...scope,
       OR: [
@@ -214,6 +222,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   }
   const relatedCandidates = seedPairs.length ? await prisma.librarySearchEntry.findMany({
     take: Math.min(40, searchCandidateLimit - initial.length),
+    orderBy: [{ connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: {
       ...scope,
       OR: [...expansionHashesByRoot].map(([connectedLibraryId, hashes]) => ({
@@ -292,6 +301,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   // Metadata fallback works before indexing and for incomplete/unsupported files.
   const fallback = await prisma.scannedFile.findMany({
     take: 40,
+    orderBy: [{ scanSession: { connectedFolderId: "asc" } }, { relativePath: "asc" }, { id: "asc" }],
     select: { fileType: true, id: true, relativePath: true, sessionId: true,
       readingStatus: true, libraryDocument: { select: { observationSessions: {
         select: { id: true }, take: 1,
@@ -329,6 +339,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   // contains the Memory wording. Every contributing root must remain readable.
   const memories = await prisma.memoryEntry.findMany({
     take: 60,
+    orderBy: [{ title: "asc" }, { id: "asc" }],
     select: { id: true, title: true, description: true, searchSourceCount: true, searchSources: {
       select: { connectedLibraryId: true, observationSession: { select: { status: true } } },
     } },
@@ -359,6 +370,6 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
       state: "Human-approved Memory", reason: "Matches a human-approved library memory, not a quotation from a file",
       excerpt: null, sourceRange: null, score: Math.min(45, 28 + matchingTerms.length * 6) });
   }
-  return results.sort((a, b) => b.score - a.score || a.relativePath.localeCompare(b.relativePath))
+  return results.sort(compareSearchResults)
     .slice(0, searchResultLimit);
 }

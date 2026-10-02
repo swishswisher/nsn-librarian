@@ -136,6 +136,18 @@ test("generic lexical overlap ranks below source-supported topic", () => {
   assert.ok((strong?.score ?? 0) > (weak?.score ?? 0));
 });
 
+test("result cutoff is stable for tied paths across roots and retrieval order", () => {
+  const tied = Array.from({ length: 25 }, (_, index) => ({
+    id: `row-${String(index).padStart(2, "0")}`, kind: "FILE" as const,
+    rootName: `Root ${String(index).padStart(2, "0")}`, relativePath: "reports/summary.txt",
+    fileType: "TEXT", href: `/file/${index}`, state: "Current", reason: "Metadata match",
+    excerpt: null, sourceRange: null, score: 45,
+  }));
+  const selected = (rows: typeof tied) => rows.sort(search.compareSearchResults).slice(0, 20).map((row) => row.id);
+  assert.deepEqual(selected([...tied]), selected([...tied].reverse()));
+  assert.deepEqual(selected([...tied]), tied.slice(0, 20).map((row) => row.id));
+});
+
 test("client identity search expands only shared resolved hashes", async () => {
   const r = await root("Client Root"); const s = await session(r.id);
   const a = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/intake.txt", evidence: evidence("Client: Alice; Client ID: C-001") });

@@ -524,6 +524,23 @@ test("human corrections join distinct client labels and assign a document to a p
   assert.equal(await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: provisionalPeerLink.id, action: "HUMAN_CORRECTION" } }), 1);
   await persistent.createIdentityCorrection({ sourceSignalId: source.id, targetSignalId: target.id, kind: "SAME_CLIENT", note: "Repeated click" });
   assert.equal(await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: sameClient.id } }), 1);
+  await prisma.knowledgeConnection.update({ where: { id: sameClient.id }, data: {
+    supersededAt: new Date(), sourceEvidence: { stale: true },
+    sourceObservationSession: { connect: { id: peer.observation.id } },
+    targetObservationSession: { connect: { id: peer.observation.id } },
+  } });
+  const restoredCorrection = await persistent.createIdentityCorrection({
+    sourceSignalId: source.id, targetSignalId: target.id, kind: "SAME_CLIENT",
+    note: "The exact source bytes returned; restore this correction.",
+  });
+  assert.equal(restoredCorrection.id, sameClient.id);
+  assert.equal(restoredCorrection.supersededAt, null);
+  assert.equal(restoredCorrection.sourceObservationSessionId, source.observationSessionId);
+  assert.equal(restoredCorrection.targetObservationSessionId, target.observationSessionId);
+  assert.equal((restoredCorrection.sourceEvidence as { identityHash?: string }).identityHash, target.identityHash);
+  assert.equal(await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: sameClient.id } }), 1);
+  assert.ok((await persistent.getEffectiveDocumentSignals([library.id])).some((signal) =>
+    signal.fileKey === source.fileKey && signal.identityHash === target.identityHash));
   assert.ok((await persistent.getPersistentIdentityGroups()).some((group) => group.kind === "CLIENT" &&
     group.members.some((member) => member.relativePath === first.file.relativePath) &&
     group.members.some((member) => member.relativePath === second.file.relativePath)));

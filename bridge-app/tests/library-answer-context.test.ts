@@ -6,7 +6,7 @@ import type { AnswerContext } from "../../src/lib/library/qa/types";
 
 function answerContext(): AnswerContext {
   return {
-    route: { kind: "BROAD", searchQuery: "orchid", wantsHistory: false, entityName: null },
+    route: { kind: "BROAD", entityKind: null, searchQuery: "orchid", wantsHistory: false, entityName: null },
     sources: [
       { id: "S1", sourceType: "SOURCE_EXCERPT", title: "one.txt", rootName: "Library",
         relativePath: "one.txt", href: "/one", trustState: "Human reviewed", timeState: "Current scan",

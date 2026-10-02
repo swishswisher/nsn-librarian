@@ -294,6 +294,9 @@ test("same-name clients with distinct identity hashes trigger clarification", as
   const result = await answer.answerLibraryQuestion("What do we have about Client Alice?", {
     permittedRootIds: [r.id], model: async () => { throw new Error("should not call"); } });
   assert.equal(result.state, "AMBIGUOUS_ENTITY");
+  const versionResult = await answer.answerLibraryQuestion("Which version is newer for client Alice?", {
+    permittedRootIds: [r.id], model: async () => { throw new Error("should not call"); } });
+  assert.equal(versionResult.state, "AMBIGUOUS_ENTITY");
 });
 
 async function identityCorrectionFixture(kind: "CLIENT" | "PROJECT") {
@@ -349,7 +352,9 @@ for (const kind of ["CLIENT", "PROJECT"] as const) {
       generationVersion: documentSignalVersion,
     })) });
     const question = `What do we have about ${kind.toLowerCase()} Alice?`;
+    const versionQuestion = `Which version is newer for ${kind.toLowerCase()} Alice?`;
     assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, false);
+    assert.equal((await retrieve.retrieveQuestionContext(versionQuestion, [r.id])).ambiguousEntity, false);
 
     const stale = await prisma.knowledgeConnection.create({ data: {
       sourceObservationSessionId: items[0].observation.id,
@@ -389,6 +394,7 @@ for (const kind of ["CLIENT", "PROJECT"] as const) {
       await separatePair();
     }
     assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, true);
+    assert.equal((await retrieve.retrieveQuestionContext(versionQuestion, [r.id])).ambiguousEntity, true);
   });
 }
 
@@ -858,4 +864,11 @@ test("routing distinguishes client, project, version, topic and Memory intent", 
   assert.equal(routing.routeLibraryQuestion("What did we decide?").kind, "MEMORY");
   assert.equal(routing.routeLibraryQuestion("What is the latest supported information about Project Y?").kind, "PROJECT");
   assert.equal(routing.routeLibraryQuestion("What is the latest proposal version?").kind, "VERSION");
+  assert.deepEqual(
+    ["Which version is newer for client Alice?", "Show earlier files for project North Star"].map((question) => {
+      const route = routing.routeLibraryQuestion(question);
+      return [route.kind, route.entityKind, route.entityName];
+    }),
+    [["VERSION", "CLIENT", "Alice"], ["HISTORY", "PROJECT", "North Star"]],
+  );
 });
