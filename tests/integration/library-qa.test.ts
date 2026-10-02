@@ -153,6 +153,40 @@ test("version retrieval reserves the true newest revision beyond the eight-sourc
   assert.ok(!result.claims.some((versionClaim) => /plan-v8\.txt is newer/.test(versionClaim.text)));
 });
 
+test("version retrieval expands a seeded family completely beyond signal pagination", async () => {
+  const r = await root("Expanded version family root"); const s = await scan(r.id);
+  const revisionCount = 242;
+  for (let revision = 1; revision <= revisionCount; revision += 1) {
+    const item = await file({ rootId: r.id, sessionId: s.id,
+      relativePath: `opaque/member-${String(revision).padStart(3, "0")}.txt`,
+      quote: revision <= 2 ? "Zebra release comparison evidence" : "Unrelated retained content" });
+    await prisma.knowledgeDocumentSignal.create({ data: {
+      signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+      relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!,
+      kind: "DOCUMENT_FAMILY", identityHash: "expanded-zebra-family",
+      revisionNumber: String(revision), sourceRanges: [], observationSessionId: item.observation.id,
+      generationVersion: documentSignalVersion,
+    } });
+  }
+
+  const question = "Which zebra version is latest?";
+  const context = await retrieve.retrieveQuestionContext(question, [r.id]);
+  assert.equal(context.versionAssessmentComplete, true);
+  assert.equal(context.versionFamilyCount, 1);
+  assert.ok(context.sources.some((source) =>
+    source.relativePath === `opaque/member-${revisionCount}.txt`));
+
+  const result = await answer.answerLibraryQuestion(question, {
+    permittedRootIds: [r.id], model: model([]),
+  });
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  assert.ok(result.claims.length > 0);
+  assert.ok(result.claims.every((versionClaim) => versionClaim.sourceIds.some((sourceId) =>
+    result.sources.find((source) => source.id === sourceId)?.relativePath ===
+      `opaque/member-${revisionCount}.txt`)));
+  assert.ok(!result.claims.some((versionClaim) => /member-002\.txt is newer/.test(versionClaim.text)));
+});
+
 test("version claims allocate capped context across families and report excess families as partial", async () => {
   const makeFamilies = async (label: string, sizes: number[]) => {
     const r = await root(label); const s = await scan(r.id);

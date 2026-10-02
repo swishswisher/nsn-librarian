@@ -6,6 +6,7 @@ import { getDocumentVersionSignals, getEffectiveDocumentSignals, getSeparatedRel
 import { workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
 import { searchLibrary } from "@/lib/library/search";
 import { librarySearchIndexVersion } from "@/lib/library/search-index";
+import { getScannedFileExamineRoute, getScanSessionRoute } from "@/lib/library/routes";
 import { routeLibraryQuestion } from "./route-question";
 import { maxAnswerSources, type AnswerContext, type AnswerContextSource, type AnswerVersion } from "./types";
 
@@ -68,7 +69,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     root.scanSessions[0].searchIndexStatus !== "COMPLETED" ||
     Boolean(newerActiveSessions[index]));
 
-  const results = await searchLibrary(route.searchQuery, rootIds, {
+  let results = await searchLibrary(route.searchQuery, rootIds, {
     includeEntityMatches: true,
     // Search remains display-bounded, but Ask must see every candidate from the
     // bounded retrieval window before deciding whether an entity is ambiguous.
@@ -78,7 +79,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   const requestedHashesByResultId = new Map(results.flatMap((result) =>
     result.matchedEntityHashes?.length ? [[result.id, result.matchedEntityHashes] as const] : []));
   const indexIds = results.filter((result) => result.kind === "FILE").map((result) => result.id);
-  const [entries, memories, metadataFiles] = await Promise.all([
+  const [loadedEntries, memories, metadataFiles] = await Promise.all([
     prisma.librarySearchEntry.findMany({
       where: { id: { in: indexIds }, connectedLibraryId: { in: rootIds },
         indexVersion: librarySearchIndexVersion, connectedLibrary: readableRoot,
@@ -106,7 +107,8 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
         scanSession: { select: { connectedFolderId: true } } },
     }),
   ]);
-  const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
+  let entries = loadedEntries;
+  let entriesById = new Map(entries.map((entry) => [entry.id, entry]));
   const memoriesById = new Map(memories.map((entry) => [entry.id, entry]));
   const metadataById = new Map(metadataFiles.map((file) => [file.id, file]));
   const eligibleMatchedEntries = results.flatMap((result) => {
@@ -128,7 +130,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     entry.checksum ? `sha256:${entry.checksum}` : `${entry.connectedLibraryId}:${entry.fileKey}`,
     entry,
   ])).values()];
-  const versionEntries = route.kind === "VERSION"
+  let versionEntries = route.kind === "VERSION"
     ? [...new Map(results.flatMap((result) => {
       const entry = result.kind === "FILE" ? entriesById.get(result.id) : null;
       return entry && rootById.has(entry.connectedLibraryId) &&
@@ -141,11 +143,49 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
         : [];
     })).values()]
     : [];
-  const [allVersionSignals, allSeparatedVersionPairs] = route.kind === "VERSION"
-    ? await Promise.all([
-      getDocumentVersionSignals(versionEntries, route.wantsHistory),
-      getSeparatedRelationshipPairIdentities(versionEntries, ["PROBABLE_REVISION"]),
-    ]) : [[], new Map<string, Set<string>>()];
+  let allVersionSignals = route.kind === "VERSION"
+    ? await getDocumentVersionSignals(versionEntries, route.wantsHistory, true) : [];
+  if (route.kind === "VERSION" && allVersionSignals.length) {
+    const endpoints = [...new Map(allVersionSignals.map((signal) => [
+      `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`,
+      { connectedLibraryId: signal.connectedLibraryId, fileKey: signal.fileKey, checksum: signal.checksum },
+    ])).values()];
+    const chunks = Array.from({ length: Math.ceil(endpoints.length / 100) }, (_, index) =>
+      endpoints.slice(index * 100, index * 100 + 100));
+    const expandedEntries = (await Promise.all(chunks.map((chunk) => prisma.librarySearchEntry.findMany({
+      where: { indexVersion: librarySearchIndexVersion, connectedLibrary: readableRoot,
+        scannedFile: { sourceUnavailableAt: null }, OR: chunk },
+      include: { scannedFile: { select: { libraryDocumentId: true, checksum: true,
+        relativePath: true, sessionId: true, scanSession: { select: { connectedFolderId: true } } } } },
+      orderBy: [{ connectedLibraryId: "asc" }, { fileKey: "asc" }, { checksum: "asc" }, { id: "asc" }],
+    })))).flat().filter((entry) => rootById.has(entry.connectedLibraryId) &&
+      entry.checksum === entry.scannedFile.checksum && entry.relativePath === entry.scannedFile.relativePath &&
+      entry.scanSessionId === entry.scannedFile.sessionId &&
+      entry.connectedLibraryId === entry.scannedFile.scanSession.connectedFolderId &&
+      (route.wantsHistory || entry.isCurrent && latestIds.has(entry.scanSessionId)));
+    const expandedByPhysical = new Map(expandedEntries.map((entry) => [
+      entry.checksum ? `sha256:${entry.checksum}` : `${entry.connectedLibraryId}:${entry.fileKey}`, entry,
+    ]));
+    versionEntries = [...expandedByPhysical.values()];
+    entries = [...new Map([...entries, ...versionEntries].map((entry) => [entry.id, entry])).values()];
+    entriesById = new Map(entries.map((entry) => [entry.id, entry]));
+    const existingResultIds = new Set(results.map((result) => result.id));
+    results = [...results, ...versionEntries.flatMap((entry) => existingResultIds.has(entry.id) ? [] : [{
+      id: entry.id, kind: "FILE" as const, rootName: rootById.get(entry.connectedLibraryId)!.displayName,
+      relativePath: entry.relativePath, fileType: entry.fileType,
+      href: entry.isCurrent ? getScannedFileExamineRoute(entry.scanSessionId, entry.scannedFileId)
+        : getScanSessionRoute(entry.scanSessionId),
+      state: entry.isCurrent ? "Current scan" : "Historical scan",
+      reason: "Member of a matched document family", excerpt: null, sourceRange: null, score: 0,
+    }])];
+    const eligibleEndpoints = new Set(versionEntries.map((entry) =>
+      `${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`));
+    allVersionSignals = allVersionSignals.filter((signal) => eligibleEndpoints.has(
+      `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`));
+  }
+  const allSeparatedVersionPairs = route.kind === "VERSION"
+    ? await getSeparatedRelationshipPairIdentities(versionEntries, ["PROBABLE_REVISION"])
+    : new Map<string, Set<string>>();
   const versionEntryByEndpoint = new Map(versionEntries.map((entry) =>
     [`${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`, entry]));
   const versionFamilyMap = new Map<string, typeof allVersionSignals>();

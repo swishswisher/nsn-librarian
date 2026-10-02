@@ -110,19 +110,50 @@ function correctedClientIdentities(
 
 export async function getDocumentVersionSignals(entries: Array<{
   connectedLibraryId: string; fileKey: string; checksum: string; isCurrent: boolean;
-}>, includeHistory: boolean) {
+}>, includeHistory: boolean, expandSeededFamilies = false) {
   if (!entries.length) return [];
   const prisma = getPrismaClient();
-  const signals = await prisma.knowledgeDocumentSignal.findMany({
-    take: 240, orderBy: [{ status: "asc" }, { id: "asc" }],
-    where: { kind: "DOCUMENT_FAMILY", generationVersion: documentSignalVersion,
-      OR: entries.map((entry) => ({
-        connectedLibraryId: entry.connectedLibraryId, fileKey: entry.fileKey, checksum: entry.checksum,
+  const pageSize = 200;
+  const findAll = async (where: Prisma.KnowledgeDocumentSignalWhereInput) => {
+    const rows: Awaited<ReturnType<typeof prisma.knowledgeDocumentSignal.findMany>> = [];
+    let cursor: string | undefined;
+    do {
+      const page = await prisma.knowledgeDocumentSignal.findMany({
+        take: pageSize, orderBy: { id: "asc" }, where,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      });
+      rows.push(...page);
+      cursor = page.length === pageSize ? page.at(-1)?.id : undefined;
+    } while (cursor);
+    return rows;
+  };
+  const endpointChunks = Array.from({ length: Math.ceil(entries.length / 100) }, (_, index) =>
+    entries.slice(index * 100, index * 100 + 100));
+  const seededSignals = (await Promise.all(endpointChunks.map((chunk) => findAll({
+    kind: "DOCUMENT_FAMILY", generationVersion: documentSignalVersion,
+    OR: chunk.map((entry) => ({
+      connectedLibraryId: entry.connectedLibraryId, fileKey: entry.fileKey, checksum: entry.checksum,
+      OR: [{ status: "ACTIVE", supersededAt: null },
+        ...(includeHistory && !entry.isCurrent ? [{ status: "SUPERSEDED" }] : [])],
+    })),
+  })))).flat();
+  const familyPairs = [...new Map(seededSignals.map((signal) => [
+    `${signal.connectedLibraryId}\0${signal.identityHash}`,
+    { connectedLibraryId: signal.connectedLibraryId, identityHash: signal.identityHash },
+  ])).values()];
+  const familyChunks = Array.from({ length: Math.ceil(familyPairs.length / 100) }, (_, index) =>
+    familyPairs.slice(index * 100, index * 100 + 100));
+  const expandedSignals = expandSeededFamilies && familyPairs.length
+    ? (await Promise.all(familyChunks.map((chunk) => findAll({
+      kind: "DOCUMENT_FAMILY", generationVersion: documentSignalVersion,
+      OR: chunk.map((family) => ({ ...family,
         OR: [{ status: "ACTIVE", supersededAt: null },
-          ...(includeHistory && !entry.isCurrent ? [{ status: "SUPERSEDED" }] : [])],
+          ...(includeHistory ? [{ status: "SUPERSEDED" }] : [])],
       })),
-    },
-  });
+    })))).flat()
+    : seededSignals;
+  const signals = [...new Map(expandedSignals.map((signal) => [signal.id, signal])).values()]
+    .sort((left, right) => left.status.localeCompare(right.status) || left.id.localeCompare(right.id));
   const observations = await prisma.observationSession.findMany({
     where: { id: { in: signals.map((signal) => signal.observationSessionId) } },
     select: { id: true, status: true, humanDecisions: {
