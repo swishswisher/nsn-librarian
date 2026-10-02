@@ -231,21 +231,29 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
       })),
     },
   }) : [];
-  const separatedIdentityPairs = relatedCandidates.length && seedEntries.length
+  const identityCandidates = [...new Map([...initial, ...relatedCandidates]
+    .map((entry) => [entry.id, entry])).values()];
+  const separatedIdentityPairs = identityCandidates.length && seedEntries.length
     ? await getSeparatedRelationshipPairIdentities(
-      [...seedEntries, ...relatedCandidates],
+      identityCandidates,
       ["SAME_CLIENT", "SAME_PROJECT"],
     )
     : new Map<string, Set<string>>();
-  const related = relatedCandidates.filter((entry) => !seedEntries.some((seed) => {
+  const crossesSeedSeparation = (entry: typeof initial[number]) => seedEntries.some((seed) => {
     if (seed.id === entry.id) return false;
     const separatedHashes = separatedIdentityPairs.get(knowledgeRelationshipPairKey(seed, entry));
     const seedHashes = seedHashesByRoot.get(seed.connectedLibraryId) ?? new Set<string>();
     return Boolean(separatedHashes && [...separatedHashes].some((hash) =>
       seedHashes.has(hash) && seed.entityHashes.includes(hash) && entry.entityHashes.includes(hash),
     ));
-  }));
-  const candidateById = new Map([...initial, ...related].map((entry) => [entry.id, entry]));
+  });
+  // Direct entity matches remain authoritative seeds. Other lexical candidates are
+  // expansion-dependent when they rely on a seeded identity hash, and must obey
+  // the same checksum-bound human separation as candidates found by expansion.
+  const filteredInitial = initial.filter((entry) =>
+    seedEntries.some((seed) => seed.id === entry.id) || !crossesSeedSeparation(entry));
+  const related = relatedCandidates.filter((entry) => !crossesSeedSeparation(entry));
+  const candidateById = new Map([...filteredInitial, ...related].map((entry) => [entry.id, entry]));
   const currentSourceIds = new Set((await prisma.scannedFile.findMany({
     select: { id: true }, where: { id: { in: [...candidateById.values()].map((entry) => entry.scannedFileId) },
       sourceUnavailableAt: null },

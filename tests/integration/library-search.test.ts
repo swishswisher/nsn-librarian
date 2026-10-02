@@ -207,6 +207,39 @@ for (const [kind, query] of [["CLIENT", "client alice"], ["PROJECT", "project at
     assert.ok(results.some((result) => result.relativePath === secondSeed.file.relativePath));
     assert.ok(results.some((result) => result.relativePath === secondUnrelated.file.relativePath));
   });
+
+  test(`${kind.toLowerCase()} separation filters generic initial candidates`, async () => {
+    const r = await root(`${kind} Initial Separation Root`); const s = await session(r.id);
+    const name = kind === "CLIENT" ? "Alice" : "Atlas";
+    const seed = await observedFile({ rootId: r.id, sessionId: s.id, path: "named/seed.txt",
+      evidence: evidence(`${kind === "CLIENT" ? "Client" : "Project"}: ${name}; authoritative record`) });
+    const generic = await observedFile({ rootId: r.id, sessionId: s.id, path: "generic/notes.txt",
+      evidence: evidence(`${kind === "CLIENT" ? "Client" : "Project"} scheduling notes`) });
+    const identityHash = `separated-initial-${kind.toLowerCase()}-${crypto.randomUUID()}`;
+    await prisma.knowledgeDocumentSignal.createMany({ data: [seed, generic].map((item) => ({
+      checksum: item.file.checksum!, connectedLibraryId: r.id,
+      fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
+      generationVersion: documentSignalVersion, identityHash, kind,
+      observationSessionId: item.observation.id, relativePath: item.file.relativePath,
+      signalKey: crypto.randomUUID(), sourceRanges: [],
+    })) });
+    await indexFiles(s.id, [seed, generic]);
+    const separated = await prisma.knowledgeConnection.create({ data: {
+      sourceObservationSessionId: generic.observation.id, targetObservationSessionId: seed.observation.id,
+      sourceChecksum: generic.file.checksum, targetChecksum: seed.file.checksum,
+      sourceFileKey: fileKey.persistentFileKey(r.id, generic.file.relativePath),
+      targetFileKey: fileKey.persistentFileKey(r.id, seed.file.relativePath),
+      generationVersion: documentSignalVersion, relationshipKind: `SAME_${kind}`,
+      sharedTerms: [], reasoning: "Human separated generic initial candidate", status: "REJECTED",
+      sourceEvidence: { identityHash },
+    } });
+    await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: separated.id,
+      action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+
+    const results = await search.searchLibrary(query);
+    assert.ok(results.some((result) => result.relativePath === seed.file.relativePath));
+    assert.ok(!results.some((result) => result.relativePath === generic.file.relativePath));
+  });
 }
 
 test("history-aware identity expansion includes retained historical entries only for history queries", async () => {

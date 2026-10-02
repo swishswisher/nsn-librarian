@@ -57,7 +57,10 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     indexIncomplete: false, ambiguousEntity: false };
   const newerActiveSessions = await Promise.all(roots.map((root) => prisma.scanSession.findFirst({
     where: { connectedFolderId: root.id, status: { in: [...activeScanStatuses] },
-      ...(root.scanSessions[0] ? { startedAt: { gt: root.scanSessions[0].startedAt } } : {}) },
+      ...(root.scanSessions[0] ? { OR: [
+        { startedAt: { gt: root.scanSessions[0].startedAt } },
+        { startedAt: root.scanSessions[0].startedAt, id: { gt: root.scanSessions[0].id } },
+      ] } : {}) },
     orderBy: [{ startedAt: "desc" }, { id: "desc" }],
     select: { id: true },
   })));

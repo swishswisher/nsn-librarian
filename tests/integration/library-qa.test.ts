@@ -136,6 +136,23 @@ test("Ask selects the same stable latest completed scan as Search when timestamp
   assert.equal(first.sources[0]?.relativePath, "stable-snapshot.txt");
 });
 
+test("Ask compares active and completed scans by timestamp and ID", async () => {
+  const startedAt = new Date("2026-06-02T12:00:00.000Z");
+  const newerRoot = await root("Tied newer active scan root");
+  await prisma.scanSession.create({ data: { id: "tied-active-completed-m", connectedFolderId: newerRoot.id,
+    startedAt, status: "COMPLETED", searchIndexStatus: "COMPLETED" } });
+  await prisma.scanSession.create({ data: { id: "tied-active-z", connectedFolderId: newerRoot.id,
+    startedAt, status: "SCANNING" } });
+  assert.equal((await retrieve.retrieveQuestionContext("anything", [newerRoot.id])).indexIncomplete, true);
+
+  const olderRoot = await root("Tied older active scan root");
+  await prisma.scanSession.create({ data: { id: "tied-active-completed-m2", connectedFolderId: olderRoot.id,
+    startedAt, status: "COMPLETED", searchIndexStatus: "COMPLETED" } });
+  await prisma.scanSession.create({ data: { id: "tied-active-a", connectedFolderId: olderRoot.id,
+    startedAt, status: "SCANNING" } });
+  assert.equal((await retrieve.retrieveQuestionContext("anything", [olderRoot.id])).indexIncomplete, false);
+});
+
 test("two independent documents can support synthesis", async () => {
   const r = await root("Synthesis Root"); const s = await scan(r.id);
   await file({ rootId: r.id, sessionId: s.id, relativePath: "facilitation-a.txt", quote: "Facilitation supports workshops" });
