@@ -166,8 +166,8 @@ test("client identity search expands only shared resolved hashes", async () => {
 
 test("all-term reservation finds an older entity seed beyond the generic candidate window", async () => {
   const r = await root("Reserved specific candidates"); const s = await session(r.id);
-  const seed = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/invoice.txt",
-    evidence: evidence("Client: Alice; invoice balance is settled"), status: "APPROVED" });
+  const seed = await observedFile({ rootId: r.id, sessionId: s.id, path: "Invoices/alice-record.txt",
+    evidence: evidence("Client: Alice; balance is settled"), status: "APPROVED" });
   const related = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/private-ledger.txt",
     evidence: evidence("Settled balance details without query wording") });
   await prisma.knowledgeDocumentSignal.createMany({ data: [seed, related].map((item) => ({
@@ -181,7 +181,7 @@ test("all-term reservation finds an older entity seed beyond the generic candida
   const seedEntry = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: seed.file.id } });
   await prisma.librarySearchEntry.update({ where: { id: seedEntry.id }, data: {
     indexedAt: new Date("2024-01-01T00:00:00.000Z"), sourceTerms: ["client"],
-    reviewedTerms: ["alic"], concepts: ["invoic"],
+    reviewedTerms: ["alic"], concepts: [],
   } });
 
   const genericFiles = await prisma.scannedFile.createManyAndReturn({ data: Array.from({ length: 125 }, (_, index) => ({
@@ -203,6 +203,110 @@ test("all-term reservation finds an older entity seed beyond the generic candida
   assert.ok(results.some((result) => result.relativePath === seed.file.relativePath));
   assert.ok(results.some((result) => result.relativePath === related.file.relativePath));
   assert.ok(!results.some((result) => result.relativePath.startsWith("generic-")));
+});
+
+for (const [kind, label, name, wrongName] of [
+  ["CLIENT", "Client", "Alice", "Bob"],
+  ["PROJECT", "Project", "Atlas", "Beacon"],
+] as const) {
+  test(`${kind.toLowerCase()} seeds bind names to the matching typed signal`, async () => {
+    const r = await root(`${kind} typed-name binding`); const s = await session(r.id);
+    const misleading = await observedFile({ rootId: r.id, sessionId: s.id,
+      path: `${name}/misleading.txt`, evidence: evidence(`${label}: ${wrongName}; Person: ${name}`) });
+    const seed = await observedFile({ rootId: r.id, sessionId: s.id,
+      path: "neutral-seed.txt", evidence: evidence(`${label}: ${name}; verified record`) });
+    const legitimate = await observedFile({ rootId: r.id, sessionId: s.id,
+      path: "legitimate-related.txt", evidence: evidence("Identity-linked details") });
+    const wrongRelated = await observedFile({ rootId: r.id, sessionId: s.id,
+      path: "wrong-related.txt", evidence: evidence("Wrong identity details") });
+    const signal = (item: typeof seed, identityHash: string) => ({
+      checksum: item.file.checksum!, connectedLibraryId: r.id,
+      fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
+      generationVersion: documentSignalVersion, identityHash, kind,
+      observationSessionId: item.observation.id, relativePath: item.file.relativePath,
+      signalKey: crypto.randomUUID(), sourceRanges: [],
+    });
+    await prisma.knowledgeDocumentSignal.createMany({ data: [
+      signal(misleading, `${kind}-wrong`), signal(wrongRelated, `${kind}-wrong`),
+      signal(seed, `${kind}-right`), signal(legitimate, `${kind}-right`),
+    ] });
+    await indexFiles(s.id, [misleading, seed, legitimate, wrongRelated]);
+
+    const results = await search.searchLibrary(`${label.toLowerCase()} ${name}`);
+    assert.ok(results.some((result) => result.relativePath === seed.file.relativePath));
+    assert.ok(results.some((result) => result.relativePath === legitimate.file.relativePath));
+    assert.ok(!results.some((result) => result.relativePath === misleading.file.relativePath));
+    assert.ok(!results.some((result) => result.relativePath === wrongRelated.file.relativePath));
+  });
+}
+
+test("multiple same-kind signals seed only the name-bound hash", async () => {
+  const r = await root("Multiple typed signals"); const s = await session(r.id);
+  const quote = "Client: Alice; Client: Bob";
+  const mixed = await observedFile({ rootId: r.id, sessionId: s.id,
+    path: "mixed.txt", evidence: evidence(quote) });
+  const alice = await observedFile({ rootId: r.id, sessionId: s.id,
+    path: "alice-related.txt", evidence: evidence("Alice identity-only details") });
+  const bob = await observedFile({ rootId: r.id, sessionId: s.id,
+    path: "bob-related.txt", evidence: evidence("Bob identity-only details") });
+  const signal = (item: typeof mixed, identityHash: string, sourceRanges: Array<{ start: number; end: number }>) => ({
+    checksum: item.file.checksum!, connectedLibraryId: r.id,
+    fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
+    generationVersion: documentSignalVersion, identityHash, kind: "CLIENT",
+    observationSessionId: item.observation.id, relativePath: item.file.relativePath,
+    signalKey: crypto.randomUUID(), sourceRanges,
+  });
+  await prisma.knowledgeDocumentSignal.createMany({ data: [
+    signal(mixed, "multi-alice", [{ start: 0, end: 13 }]),
+    signal(mixed, "multi-bob", [{ start: 13, end: quote.length }]),
+    signal(alice, "multi-alice", []), signal(bob, "multi-bob", []),
+  ] });
+  await indexFiles(s.id, [mixed, alice, bob]);
+
+  const results = await search.searchLibrary("client Alice");
+  assert.ok(results.some((result) => result.relativePath === mixed.file.relativePath));
+  assert.ok(results.some((result) => result.relativePath === alice.file.relativePath));
+  assert.ok(!results.some((result) => result.relativePath === bob.file.relativePath));
+});
+
+test("project path terms reserve an older mixed-evidence seed beyond generic candidates", async () => {
+  const r = await root("Reserved project path candidates"); const s = await session(r.id);
+  const seed = await observedFile({ rootId: r.id, sessionId: s.id,
+    path: "Invoices/atlas-record.txt", evidence: evidence("Project: Atlas; balance is settled") });
+  const related = await observedFile({ rootId: r.id, sessionId: s.id,
+    path: "atlas-related.txt", evidence: evidence("Project identity-only details") });
+  await prisma.knowledgeDocumentSignal.createMany({ data: [seed, related].map((item) => ({
+    checksum: item.file.checksum!, connectedLibraryId: r.id,
+    fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
+    generationVersion: documentSignalVersion, identityHash: "reserved-atlas", kind: "PROJECT",
+    observationSessionId: item.observation.id, relativePath: item.file.relativePath,
+    signalKey: crypto.randomUUID(), sourceRanges: [],
+  })) });
+  await indexFiles(s.id, [seed, related]);
+  const seedEntry = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: seed.file.id } });
+  await prisma.librarySearchEntry.update({ where: { id: seedEntry.id }, data: {
+    indexedAt: new Date("2024-01-01T00:00:00.000Z"), sourceTerms: ["project"],
+    reviewedTerms: ["atla"], concepts: [],
+  } });
+  const genericFiles = await prisma.scannedFile.createManyAndReturn({ data: Array.from({ length: 125 }, (_, index) => ({
+    sessionId: s.id, localPath: `bridge://${r.id}/project-generic-${index}.txt`,
+    relativePath: `project-generic-${String(index).padStart(3, "0")}.txt`, checksum: crypto.randomUUID(),
+    fileType: "TEXT", readStatus: "SUPPORTED" as const, readingStatus: "READ" as const,
+    extractionStatus: "COMPLETED" as const,
+  })) });
+  await prisma.librarySearchEntry.createMany({ data: genericFiles.map((file, index) => ({
+    entryKey: crypto.randomUUID(), fileKey: fileKey.persistentFileKey(r.id, file.relativePath),
+    connectedLibraryId: r.id, scannedFileId: file.id, scanSessionId: s.id,
+    relativePath: file.relativePath, fileName: file.relativePath, checksum: file.checksum!, fileType: "TEXT",
+    indexVersion: "library-search-v1", fingerprint: crypto.randomUUID(), isCurrent: true,
+    knowledgeState: "PROVISIONAL", sourceExcerpts: [], sourceTerms: ["project"],
+    reviewedTerms: [], concepts: [], entityHashes: [], indexedAt: new Date(2026, 0, 1, 0, 0, index),
+  })) });
+
+  const results = await search.searchLibrary("project Atlas invoices", [r.id]);
+  assert.ok(results.some((result) => result.relativePath === seed.file.relativePath));
+  assert.ok(results.some((result) => result.relativePath === related.file.relativePath));
+  assert.ok(!results.some((result) => result.relativePath.startsWith("project-generic-")));
 });
 
 for (const [kind, query, label] of [

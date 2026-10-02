@@ -397,6 +397,12 @@ for (const [kind, name] of [["CLIENT", "Alice"], ["PROJECT", "Atlas"]] as const)
     const unrelated = await file({ rootId: r.id, sessionId: s.id, relativePath: "unrelated.txt",
       quote: `${label} scheduling for Acme without the named identity`,
       entityHashes: mixed.map(([, hash]) => hash) });
+    const misleading = await file({ rootId: r.id, sessionId: s.id,
+      relativePath: `${name}/misleading.txt`, quote: `${label}: Other; Person: ${name}`,
+      entityHashes: [`wrong-${kind.toLowerCase()}`] });
+    const wrongRelated = await file({ rootId: r.id, sessionId: s.id,
+      relativePath: "wrong-related.txt", quote: "Wrong entity details",
+      entityHashes: [`wrong-${kind.toLowerCase()}`] });
     const signal = (item: typeof seed, signalKind: string, identityHash: string) => ({
       signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
       relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!, kind: signalKind,
@@ -405,6 +411,8 @@ for (const [kind, name] of [["CLIENT", "Alice"], ["PROJECT", "Atlas"]] as const)
     });
     await prisma.knowledgeDocumentSignal.createMany({ data: [
       signal(seed, kind, requestedHash), signal(related, kind, requestedHash),
+      signal(misleading, kind, `wrong-${kind.toLowerCase()}`),
+      signal(wrongRelated, kind, `wrong-${kind.toLowerCase()}`),
       ...mixed.flatMap(([mixedKind, hash]) => [signal(seed, mixedKind, hash), signal(unrelated, mixedKind, hash)]),
     ] });
     const question = `What do we have about ${label.toLowerCase()} ${name}?`;
@@ -412,6 +420,8 @@ for (const [kind, name] of [["CLIENT", "Alice"], ["PROJECT", "Atlas"]] as const)
     assert.deepEqual(new Set(context.sources.map((source) => source.relativePath)),
       new Set([seed.scanned.relativePath, related.scanned.relativePath]));
     assert.equal(context.ambiguousEntity, false);
+    assert.ok(!context.sources.some((source) => [misleading.scanned.relativePath,
+      wrongRelated.scanned.relativePath].includes(source.relativePath ?? "")));
 
     let modelCalled = false;
     const result = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id], model: async () => {
@@ -421,6 +431,8 @@ for (const [kind, name] of [["CLIENT", "Alice"], ["PROJECT", "Atlas"]] as const)
     assert.equal(modelCalled, true);
     assert.equal(result.state, "ANSWERED_FROM_SOURCES");
     assert.ok(!result.sources.some((source) => source.relativePath === unrelated.scanned.relativePath));
+    assert.ok(!result.sources.some((source) => [misleading.scanned.relativePath,
+      wrongRelated.scanned.relativePath].includes(source.relativePath ?? "")));
   });
 }
 
@@ -573,10 +585,16 @@ test("unauthorized or changed correction targets cannot influence QA or search i
 
 test("project question does not pull another project into context", async () => {
   const r = await root("Project QA Root"); const s = await scan(r.id);
-  await file({ rootId: r.id, sessionId: s.id, relativePath: "ProjectY/invoice.txt",
-    quote: "Project Y invoice recorded" });
-  await file({ rootId: r.id, sessionId: s.id, relativePath: "ProjectZ/invoice.txt",
-    quote: "Project Z invoice recorded" });
+  const projectY = await file({ rootId: r.id, sessionId: s.id, relativePath: "ProjectY/invoice.txt",
+    quote: "Project Y invoice recorded", entityHashes: ["project-0"] });
+  const projectZ = await file({ rootId: r.id, sessionId: s.id, relativePath: "ProjectZ/invoice.txt",
+    quote: "Project Z invoice recorded", entityHashes: ["project-1"] });
+  await prisma.knowledgeDocumentSignal.createMany({ data: [projectY, projectZ].map((item, index) => ({
+    signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+    relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!, kind: "PROJECT",
+    identityHash: `project-${index}`, sourceRanges: [], observationSessionId: item.observation.id,
+    generationVersion: documentSignalVersion,
+  })) });
   const context = await retrieve.retrieveQuestionContext("What invoices do we have for Project Y?", [r.id]);
   assert.ok(context.sources.some((source) => source.relativePath?.includes("ProjectY")));
   assert.ok(!context.sources.some((source) => source.relativePath?.includes("ProjectZ")));

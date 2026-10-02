@@ -1,7 +1,8 @@
 import path from "node:path";
 
+import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 import { getPrismaClient } from "@/lib/db/prisma";
-import { compareDocumentVersions } from "@/lib/bridge/document-signals";
+import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/document-signals";
 import {
   getDocumentVersionSignals,
   getEffectiveDocumentSignals,
@@ -87,6 +88,30 @@ function matchesEntityPhrase(value: string, phrase: string) {
     offset = text.indexOf(name, offset + 1);
   }
   return false;
+}
+
+function signalEvidenceMatchesEntity(
+  excerptsValue: unknown,
+  rangesValue: unknown,
+  kind: "CLIENT" | "PROJECT",
+  entityName: string,
+  allowUnranged: boolean,
+) {
+  if (!Array.isArray(rangesValue)) return false;
+  const ranges = rangesValue.flatMap((range) => range && typeof range === "object" &&
+    !Array.isArray(range) && typeof range.start === "number" && typeof range.end === "number"
+    ? [{ start: range.start, end: range.end }] : []);
+  if (!ranges.length && !allowUnranged) return false;
+  const label = kind === "CLIENT" ? "client" : "project";
+  return validExcerpts(excerptsValue).some((excerpt) => {
+    const fields = excerpt.text.matchAll(/(?:^|[;\n])\s*(client|project)(?:\s*:\s*|\s+)([^;\n]{2,100})/gi);
+    return [...fields].some((field) => {
+      const fieldStart = excerpt.start + (field.index ?? 0);
+      const fieldEnd = fieldStart + field[0].length;
+      return field[1].toLowerCase() === label && matchesEntityPhrase(field[2], entityName) &&
+        (allowUnranged || ranges.some((range) => range.start < fieldEnd && range.end > fieldStart));
+    });
+  });
 }
 
 export function rankSearchEntry(entry: {
@@ -186,7 +211,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   // Reserve part of the bounded window for entries that satisfy every query
   // term. Without this pass, a common first term can consume the hasSome window
   // before an older, more specific identity seed is considered. A term may be
-  // supported by source evidence, a reviewed correction, or an indexed concept.
+  // supported by source evidence, a reviewed correction, an indexed concept, or
+  // the normalized path terms that ranking also treats as evidence.
   const specific = intent.terms.length ? await prisma.librarySearchEntry.findMany({
     take: Math.min(searchSpecificCandidateLimit, searchCandidateLimit - exact.length),
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
@@ -197,6 +223,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
         { sourceTerms: { has: term } },
         { reviewedTerms: { has: term } },
         { concepts: { has: term } },
+        { relativePath: { contains: term, mode: "insensitive" } },
       ] })),
     },
   }).catch(() => []) : [];
@@ -222,13 +249,6 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   // Resolved identity expansion uses only identities from already scoped matches.
   // Human SEPARATE decisions suppress only the rejected identity hash for that
   // exact file/checksum pair; independent matches and other identities remain valid.
-  const seedEntries = initial.filter((entry) =>
-    intent.entityName
-      ? validExcerpts(entry.sourceExcerpts).some((excerpt) => matchesEntityPhrase(excerpt.text, intent.entityName!)) ||
-        matchesEntityPhrase(entry.relativePath, intent.entityName)
-      : intent.terms.filter((term) => entry.sourceTerms.includes(term) ||
-          workingKnowledgeTerms(entry.relativePath).includes(term)).length >= 2,
-  );
   // Search entries intentionally retain every identity kind for general discovery.
   // Explicit entity searches must instead seed from the active, checksum-bound
   // effective signals of the requested kind; otherwise an organization or person
@@ -236,14 +256,67 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
   const effectiveEntitySignals = intent.entityKind
     ? await getEffectiveDocumentSignals(rootIds)
     : [];
+  const effectiveEndpoints = new Set(effectiveEntitySignals.filter((signal) => signal.kind === intent.entityKind)
+    .map((signal) => `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`));
+  const rawEntitySignals = intent.entityKind && intent.entityName && effectiveEndpoints.size
+    ? await prisma.knowledgeDocumentSignal.findMany({
+      select: { checksum: true, connectedLibraryId: true, fileKey: true, identityHash: true,
+        kind: true, observationSessionId: true, sourceRanges: true },
+      where: { connectedLibraryId: { in: rootIds }, generationVersion: documentSignalVersion,
+        fileKey: { in: initial.map((entry) => entry.fileKey) },
+        status: "ACTIVE", supersededAt: null,
+        kind: { in: [intent.entityKind, `UNRESOLVED_${intent.entityKind}`] } },
+    })
+    : [];
+  const reviewedObservations = rawEntitySignals.length ? await prisma.observationSession.findMany({
+    select: { id: true, status: true, humanDecisions: {
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { editedSuggestion: true }, take: 1,
+      where: { decisionType: "MODIFY" },
+    } },
+    where: { id: { in: [...new Set(rawEntitySignals.map((signal) => signal.observationSessionId))] } },
+  }) : [];
+  const reviewedExcerptsByObservation = new Map(reviewedObservations.flatMap((observation) => {
+    const edited = observation.status === "MODIFIED" ? observation.humanDecisions[0]?.editedSuggestion : null;
+    if (!edited) return [];
+    const verified = verifiedSourceExcerpts(edited);
+    return [[observation.id, verified.length ? verified : [{ start: 0, end: edited.length, text: edited }]]];
+  }));
+  const entryByEndpoint = new Map(initial.map((entry) => [
+    `${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`, entry,
+  ]));
+  const matchingRawHashesByEndpoint = new Map<string, Set<string>>();
+  const rawSignalCountByEndpoint = new Map<string, number>();
+  for (const signal of rawEntitySignals) {
+    const endpoint = `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`;
+    rawSignalCountByEndpoint.set(endpoint, (rawSignalCountByEndpoint.get(endpoint) ?? 0) + 1);
+  }
+  for (const signal of rawEntitySignals) {
+    const endpoint = `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`;
+    const entry = entryByEndpoint.get(endpoint);
+    if (!entry || !effectiveEndpoints.has(endpoint) || !signalEvidenceMatchesEntity(
+      reviewedExcerptsByObservation.get(signal.observationSessionId) ?? entry.sourceExcerpts,
+      signal.sourceRanges, intent.entityKind!, intent.entityName!,
+      rawSignalCountByEndpoint.get(endpoint) === 1,
+    )) continue;
+    const hashes = matchingRawHashesByEndpoint.get(endpoint) ?? new Set<string>();
+    hashes.add(signal.identityHash);
+    matchingRawHashesByEndpoint.set(endpoint, hashes);
+  }
   const effectiveHashesByEndpoint = new Map<string, Set<string>>();
   for (const signal of effectiveEntitySignals) {
     if (signal.kind !== intent.entityKind) continue;
     const endpoint = `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`;
+    const matchingRawHashes = matchingRawHashesByEndpoint.get(endpoint);
+    if (intent.entityName && (!matchingRawHashes?.size ||
+        signal.generationVersion === documentSignalVersion && !matchingRawHashes.has(signal.identityHash))) continue;
     const hashes = effectiveHashesByEndpoint.get(endpoint) ?? new Set<string>();
     hashes.add(signal.identityHash);
     effectiveHashesByEndpoint.set(endpoint, hashes);
   }
+  const seedEntries = initial.filter((entry) => intent.entityName
+    ? (effectiveHashesByEndpoint.get(`${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`)?.size ?? 0) > 0
+    : intent.terms.filter((term) => entry.sourceTerms.includes(term) ||
+      workingKnowledgeTerms(entry.relativePath).includes(term)).length >= 2);
   const seedHashesByRoot = new Map<string, Set<string>>();
   for (const entry of seedEntries) {
     const hashes = seedHashesByRoot.get(entry.connectedLibraryId) ?? new Set<string>();
@@ -317,9 +390,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
     const rootSeedHashes = seedHashesByRoot.get(entry.connectedLibraryId) ?? new Set<string>();
     if (!root || !currentSourceIds.has(entry.scannedFileId) ||
         (!intent.wantsHistory && !root.scanSessions.some((session) => session.id === entry.scanSessionId))) continue;
-    if (intent.entityName && !entry.entityHashes.some((hash) => rootSeedHashes.has(hash)) &&
-        !matchesEntityPhrase(entry.relativePath, intent.entityName) &&
-        !validExcerpts(entry.sourceExcerpts).some((excerpt) => matchesEntityPhrase(excerpt.text, intent.entityName!))) continue;
+    if (intent.entityName && !entry.entityHashes.some((hash) => rootSeedHashes.has(hash))) continue;
     if (intent.fileType && !entry.fileType.toLowerCase().includes(intent.fileType.replace(/s$/, ""))) continue;
     const ranked = rankSearchEntry(entry, intent, rootSeedHashes);
     if (!ranked) continue;
