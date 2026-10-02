@@ -29,11 +29,46 @@ function answerContext(): AnswerContext {
   };
 }
 
-test("answer context comparison ignores nondeterministic set ordering", async () => {
+function swapSourceOrdinals(context: AnswerContext) {
+  const remap = new Map([["S1", "S2"], ["S2", "S1"]]);
+  const sourceId = (id: string) => remap.get(id) ?? id;
+  context.sources.reverse();
+  for (const source of context.sources) source.id = sourceId(source.id);
+  for (const relationship of context.relationships) {
+    relationship.leftSourceId = sourceId(relationship.leftSourceId);
+    relationship.rightSourceId = sourceId(relationship.rightSourceId);
+  }
+  for (const version of context.versions) {
+    version.leftSourceId = sourceId(version.leftSourceId);
+    version.rightSourceId = sourceId(version.rightSourceId);
+    if (version.newerSourceId) version.newerSourceId = sourceId(version.newerSourceId);
+  }
+}
+
+async function answerWithContexts(before: AnswerContext, after: AnswerContext,
+  sourceIds: string[] = ["S1"]) {
+  let retrieval = 0;
+  return answerLibraryQuestion("orchid", {
+    retrieve: async () => retrieval++ === 0 ? before : after,
+    model: async () => ({ output: { claims: [{ text: "Orchid workshop notes", kind: "FACT", sourceIds }] },
+      model: "mock", inputTokens: 1, outputTokens: 1, httpAttempts: 1 }),
+    recordUsage: async () => undefined,
+  });
+}
+
+test("answer context comparison remaps tied source ordinals without changing citations", async () => {
   const before = answerContext();
+  before.sources[0].rootName = "Root A";
+  before.sources[0].relativePath = "reports/summary.txt";
+  before.sources[1].rootName = "Root B";
+  before.sources[1].relativePath = "reports/summary.txt";
   const after = answerContext();
-  after.sources.reverse();
-  after.sources[1].corroborationKeys.reverse();
+  after.sources[0].rootName = "Root A";
+  after.sources[0].relativePath = "reports/summary.txt";
+  after.sources[1].rootName = "Root B";
+  after.sources[1].relativePath = "reports/summary.txt";
+  swapSourceOrdinals(after);
+  after.sources[0].corroborationKeys.reverse();
   after.relationships.reverse();
   after.relationships[0] = {
     ...after.relationships[0],
@@ -45,16 +80,12 @@ test("answer context comparison ignores nondeterministic set ordering", async ()
     leftSourceId: after.versions[0].rightSourceId,
     rightSourceId: after.versions[0].leftSourceId,
   };
-  let retrieval = 0;
-  const result = await answerLibraryQuestion("orchid", {
-    retrieve: async () => retrieval++ === 0 ? before : after,
-    model: async () => ({ output: { claims: [{ text: "Orchid workshop notes", kind: "FACT", sourceIds: ["S1"] }] },
-      model: "mock", inputTokens: 1, outputTokens: 1, httpAttempts: 1 }),
-    recordUsage: async () => undefined,
-  });
+  const result = await answerWithContexts(before, after);
 
   assert.equal(result.state, "ANSWERED_FROM_SOURCES");
   assert.equal(result.claims.length, 1);
+  assert.deepEqual(result.claims[0]?.sourceIds, ["S1"]);
+  assert.equal(result.sources.find((source) => source.id === "S1")?.rootName, "Root A");
 });
 
 test("answer context comparison still detects review changes", async () => {
@@ -70,3 +101,24 @@ test("answer context comparison still detects review changes", async () => {
 
   assert.equal(result.state, "SOURCE_CHANGED");
 });
+
+for (const [name, change] of [
+  ["source checksum", (context: AnswerContext) => { context.sources[0].physicalIdentity = "sha256:changed"; }],
+  ["source root", (context: AnswerContext) => { context.sources[0].rootName = "Different root"; }],
+  ["source provenance", (context: AnswerContext) => { context.sources[0].corroborationKeys = ["sha256:other"]; }],
+  ["relationship review", (context: AnswerContext) => { context.relationships[0].status = "PROVISIONAL"; }],
+  ["version direction", (context: AnswerContext) => { context.versions[0].newerSourceId = "S1"; }],
+  ["version ordering", (context: AnswerContext) => {
+    context.versions[0].ordering = "AMBIGUOUS";
+    context.versions[0].newerSourceId = null;
+  }],
+] as const) {
+  test(`answer context comparison detects changed ${name} after ordinal remapping`, async () => {
+    const before = answerContext();
+    const after = answerContext();
+    change(after);
+    swapSourceOrdinals(after);
+
+    assert.equal((await answerWithContexts(before, after)).state, "SOURCE_CHANGED");
+  });
+}

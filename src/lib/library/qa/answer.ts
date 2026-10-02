@@ -36,20 +36,32 @@ function compareKeys(left: string, right: string) {
   return left.localeCompare(right);
 }
 
+function stableSourceId(source: AnswerContext["sources"][number]) {
+  // S1/S2 describe presentation order, not source identity. Search results with
+  // equal ranks may be returned in either order, so use the identity that is
+  // bound to the underlying file checksum (or Memory row) for comparison.
+  return JSON.stringify([source.sourceType, source.physicalIdentity]);
+}
+
 function canonicalAnswerContext(context: AnswerContext): AnswerContext {
+  const stableIdByOrdinal = new Map(context.sources.map((source) =>
+    [source.id, stableSourceId(source)]));
+  const remapSourceId = (sourceId: string) => stableIdByOrdinal.get(sourceId) ??
+    JSON.stringify(["MISSING_SOURCE_REFERENCE", sourceId]);
   return {
     ...context,
     sources: context.sources.map((source) => ({
       ...source,
-      corroborationKeys: [...source.corroborationKeys].sort(compareKeys),
+      id: remapSourceId(source.id),
+      corroborationKeys: [...new Set(source.corroborationKeys)].sort(compareKeys),
     })).sort((left, right) => compareKeys(
-      `${left.sourceType}\u0000${left.physicalIdentity}\u0000${left.id}`,
-      `${right.sourceType}\u0000${right.physicalIdentity}\u0000${right.id}`,
+      left.id,
+      right.id,
     )),
     relationships: context.relationships.map((relationship) => {
       const [leftSourceId, rightSourceId] = [
-        relationship.leftSourceId,
-        relationship.rightSourceId,
+        remapSourceId(relationship.leftSourceId),
+        remapSourceId(relationship.rightSourceId),
       ].sort(compareKeys);
       return { ...relationship, leftSourceId, rightSourceId };
     }).sort((left, right) => compareKeys(
@@ -58,10 +70,12 @@ function canonicalAnswerContext(context: AnswerContext): AnswerContext {
     )),
     versions: context.versions.map((version) => {
       const [leftSourceId, rightSourceId] = [
-        version.leftSourceId,
-        version.rightSourceId,
+        remapSourceId(version.leftSourceId),
+        remapSourceId(version.rightSourceId),
       ].sort(compareKeys);
-      return { ...version, leftSourceId, rightSourceId };
+      return { ...version, leftSourceId, rightSourceId,
+        newerSourceId: version.newerSourceId === null
+          ? null : remapSourceId(version.newerSourceId) };
     }).sort((left, right) => compareKeys(
       `${left.leftSourceId}\u0000${left.rightSourceId}\u0000${left.newerSourceId ?? ""}\u0000${left.ordering}`,
       `${right.leftSourceId}\u0000${right.rightSourceId}\u0000${right.newerSourceId ?? ""}\u0000${right.ordering}`,
