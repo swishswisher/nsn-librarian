@@ -305,6 +305,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
     select: { fileType: true, id: true, relativePath: true, sessionId: true,
       readingStatus: true, libraryDocument: { select: { observationSessions: {
         select: { id: true }, take: 1,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       } } },
       scanSession: { select: { connectedFolderId: true } } },
     where: { sessionId: { in: latestSessionIds }, sourceUnavailableAt: null,

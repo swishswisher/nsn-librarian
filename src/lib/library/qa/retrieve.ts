@@ -203,7 +203,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   const observations = documentIds.length ? await prisma.observationSession.findMany({
     where: { libraryDocumentId: { in: documentIds } },
     select: { id: true, libraryDocumentId: true, status: true }, take: 80,
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
   }) : [];
   const latestObservationByDocument = new Map<string, { id: string; status: string }>();
   for (const observation of observations) {
@@ -218,6 +218,9 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
       .map(([sourceId]) => [observation.id, sourceId] as const)));
   const connections = sourceIdByObservation.size > 1 ? await prisma.knowledgeConnection.findMany({
     take: 24,
+    // The cap is semantic: reviewed relationships win, and equal-priority rows
+    // have stable membership across the initial and post-model retrievals.
+    orderBy: [{ status: "desc" }, { id: "asc" }],
     where: { status: { in: ["CONFIRMED", "NEW"] },
       supersededAt: null,
       generationVersion: { in: [relationshipGenerationVersion, documentSignalVersion,

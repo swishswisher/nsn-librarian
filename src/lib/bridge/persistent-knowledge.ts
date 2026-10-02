@@ -24,7 +24,7 @@ export async function getDocumentVersionSignals(entries: Array<{
   if (!entries.length) return [];
   const prisma = getPrismaClient();
   const signals = await prisma.knowledgeDocumentSignal.findMany({
-    take: 240, orderBy: { status: "asc" },
+    take: 240, orderBy: [{ status: "asc" }, { id: "asc" }],
     where: { kind: "DOCUMENT_FAMILY", generationVersion: documentSignalVersion,
       OR: entries.map((entry) => ({
         connectedLibraryId: entry.connectedLibraryId, fileKey: entry.fileKey, checksum: entry.checksum,
@@ -36,7 +36,7 @@ export async function getDocumentVersionSignals(entries: Array<{
   const observations = await prisma.observationSession.findMany({
     where: { id: { in: signals.map((signal) => signal.observationSessionId) } },
     select: { id: true, status: true, humanDecisions: {
-      where: { decisionType: "MODIFY" }, orderBy: { createdAt: "desc" }, take: 1,
+      where: { decisionType: "MODIFY" }, orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1,
       select: { editedSuggestion: true },
     } },
   });
@@ -1131,7 +1131,12 @@ export async function createIdentityCorrection(input: {
         targetFileKey: target.fileKey,
         targetObservationSessionId: target.observationSessionId,
       },
-      update: { lastSeenAt: new Date(), status: "CONFIRMED" },
+      update: {
+        lastSeenAt: new Date(), status: "CONFIRMED", supersededAt: null,
+        sourceEvidence: evidence,
+        sourceObservationSession: { connect: { id: source.observationSessionId } },
+        targetObservationSession: { connect: { id: target.observationSessionId } },
+      },
       where: { relationshipKey },
     });
     await tx.knowledgeConnectionDecision.create({

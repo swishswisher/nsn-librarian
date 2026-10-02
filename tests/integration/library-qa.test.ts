@@ -635,6 +635,56 @@ test("unconfirmed relationship stays provisional in context", async () => {
   assert.equal(context.relationships[0]?.status, "PROVISIONAL");
 });
 
+test("relationship context caps a stable confirmed-first subset and detects selected review changes", async () => {
+  const r = await root("Bounded Relationship QA Root"); const s = await scan(r.id);
+  const items = await Promise.all(Array.from({ length: 8 }, (_, index) => file({
+    rootId: r.id, sessionId: s.id, relativePath: `bounded-${index}.txt`,
+    quote: `Boundedcontext evidence ${index}`,
+  })));
+  const created = [];
+  for (let left = 0; left < items.length; left += 1) {
+    for (let right = left + 1; right < items.length; right += 1) {
+      const confirmed = created.length % 3 === 0;
+      created.push(await prisma.knowledgeConnection.create({ data: {
+        sourceObservationSessionId: items[left].observation.id,
+        targetObservationSessionId: items[right].observation.id,
+        sourceChecksum: items[left].scanned.checksum,
+        targetChecksum: items[right].scanned.checksum,
+        generationVersion: identity.relationshipGenerationVersion,
+        sharedTerms: ["boundedcontext"], reasoning: `bounded-${left}-${right}`,
+        status: confirmed ? "CONFIRMED" : "NEW",
+      } }));
+    }
+  }
+  assert.equal(created.length, 28);
+  const expected = created.toSorted((left, right) => {
+    const priority = (status: string) => status === "CONFIRMED" ? 0 : 1;
+    return priority(left.status) - priority(right.status) || left.id.localeCompare(right.id);
+  }).slice(0, 24);
+  const initial = await retrieve.retrieveQuestionContext("boundedcontext", [r.id]);
+  assert.equal(initial.relationships.length, 24);
+  assert.deepEqual(initial.relationships.map((relationship) => relationship.explanation),
+    expected.map((connection) => connection.reasoning));
+  assert.ok(initial.relationships.slice(0, created.filter((item) => item.status === "CONFIRMED").length)
+    .every((relationship) => relationship.status === "CONFIRMED"));
+
+  const excluded = created.find((connection) => !expected.some((selected) => selected.id === connection.id))!;
+  const unchanged = await answer.answerLibraryQuestion("boundedcontext", { permittedRootIds: [r.id],
+    model: async () => {
+      await prisma.knowledgeConnection.update({ where: { id: excluded.id }, data: { reasoning: "irrelevant reordered candidate" } });
+      return model([claim("Boundedcontext evidence remains current", ["S1"])])();
+    } });
+  assert.notEqual(unchanged.state, "SOURCE_CHANGED");
+
+  const selected = expected.find((connection) => connection.status === "NEW")!;
+  const changed = await answer.answerLibraryQuestion("boundedcontext", { permittedRootIds: [r.id],
+    model: async () => {
+      await prisma.knowledgeConnection.update({ where: { id: selected.id }, data: { status: "REJECTED" } });
+      return model([claim("Boundedcontext evidence changed", ["S1"])])();
+    } });
+  assert.equal(changed.state, "SOURCE_CHANGED");
+});
+
 test("superseded and checksum-mismatched relationships cannot enter QA context", async () => {
   const r = await root("Stale Relationship Root"); const s = await scan(r.id);
   const a = await file({ rootId: r.id, sessionId: s.id, relativePath: "link-a.txt", quote: "Linked evidence one" });

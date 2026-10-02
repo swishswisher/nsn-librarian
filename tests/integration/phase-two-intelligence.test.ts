@@ -544,6 +544,26 @@ test("human corrections join distinct client labels and assign a document to a p
   assert.ok((await persistent.getPersistentIdentityGroups()).some((group) => group.kind === "CLIENT" &&
     group.members.some((member) => member.relativePath === first.file.relativePath) &&
     group.members.some((member) => member.relativePath === second.file.relativePath)));
+  await prisma.knowledgeConnection.update({ where: { id: sameClient.id }, data: {
+    status: "REJECTED", supersededAt: new Date(), sourceEvidence: { stale: true },
+    sourceObservationSession: { connect: { id: peer.observation.id } },
+    targetObservationSession: { connect: { id: peer.observation.id } },
+  } });
+  const reappliedRejected = await persistent.createIdentityCorrection({
+    sourceSignalId: source.id, targetSignalId: target.id, kind: "SAME_CLIENT",
+    note: "Reapply the rejected correction after the exact bytes returned.",
+  });
+  assert.equal(reappliedRejected.id, sameClient.id);
+  assert.equal(reappliedRejected.status, "CONFIRMED");
+  assert.equal(reappliedRejected.supersededAt, null);
+  assert.equal(reappliedRejected.sourceObservationSessionId, source.observationSessionId);
+  assert.equal(reappliedRejected.targetObservationSessionId, target.observationSessionId);
+  assert.equal((reappliedRejected.sourceEvidence as { identityHash?: string }).identityHash, target.identityHash);
+  assert.ok((await persistent.getEffectiveDocumentSignals([library.id])).some((signal) =>
+    signal.fileKey === source.fileKey && signal.identityHash === target.identityHash));
+  await persistent.createIdentityCorrection({ sourceSignalId: source.id, targetSignalId: target.id,
+    kind: "SAME_CLIENT", note: "Repeated reapply remains idempotent." });
+  assert.equal(await prisma.knowledgeConnection.count({ where: { relationshipKey: sameClient.relationshipKey } }), 1);
   const belongs = await persistent.createIdentityCorrection({ sourceSignalId: plainAnchor.id, targetSignalId: projectSignal.id, kind: "BELONGS_TO_PROJECT", note: "This is part of Outreach." });
   assert.equal(belongs.status, "CONFIRMED");
   assert.ok((await persistent.getPersistentIdentityGroups()).some((group) => group.kind === "PROJECT" &&
