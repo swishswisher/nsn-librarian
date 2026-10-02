@@ -103,6 +103,17 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
   const memoriesById = new Map(memories.map((entry) => [entry.id, entry]));
   const metadataById = new Map(metadataFiles.map((file) => [file.id, file]));
+  const eligibleMatchedEntries = results.flatMap((result) => {
+    if (result.kind !== "FILE" || !requestedHashesByResultId.has(result.id)) return [];
+    const entry = entriesById.get(result.id);
+    return entry && rootById.has(entry.connectedLibraryId) &&
+      entry.checksum === entry.scannedFile.checksum &&
+      entry.relativePath === entry.scannedFile.relativePath &&
+      entry.scanSessionId === entry.scannedFile.sessionId &&
+      entry.connectedLibraryId === entry.scannedFile.scanSession.connectedFolderId &&
+      (route.wantsHistory || entry.isCurrent && latestIds.has(entry.scanSessionId))
+      ? [entry] : [];
+  });
   const sources: AnswerContextSource[] = [];
   const sourceEntryById = new Map<string, (typeof entries)[number]>();
   const physicalSeen = new Set<string>();
@@ -252,30 +263,31 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   const identityKind = route.entityKind;
   const [effectiveSignals, separatedIdentityPairs] = identityKind ? await Promise.all([
     getEffectiveDocumentSignals(rootIds, route.wantsHistory ? {
-      historicalEntries: fileEntries.map((entry) => ({
+      historicalEntries: eligibleMatchedEntries.map((entry) => ({
         checksum: entry.checksum, connectedLibraryId: entry.connectedLibraryId,
         fileKey: entry.fileKey, isCurrent: entry.isCurrent,
       })),
     } : undefined),
-    getSeparatedRelationshipPairIdentities(fileEntries, [`SAME_${identityKind}`]),
+    getSeparatedRelationshipPairIdentities(eligibleMatchedEntries, [`SAME_${identityKind}`]),
   ]) : [[], new Map<string, Set<string>>()];
   // Search has already bound the requested name to exact typed evidence. Use
   // those admitted identities rather than every same-kind signal on a selected
   // multi-signal document (for example, a file mentioning both Alice and Bob).
-  const entityHashes = identityKind ? new Set([...sourceEntryById.values()].flatMap((entry) =>
+  const entityHashes = identityKind ? new Set(eligibleMatchedEntries.flatMap((entry) =>
     (requestedHashesByResultId.get(entry.id) ?? []).map((hash) =>
       `${entry.connectedLibraryId}:${hash}`))) : new Set<string>();
   const effectiveIdentitiesByEndpoint = new Map<string, Set<string>>();
   for (const signal of effectiveSignals) {
-    if (signal.kind !== identityKind || !fileEntries.some((entry) =>
+    if (signal.kind !== identityKind || !eligibleMatchedEntries.some((entry) =>
+      entry.connectedLibraryId === signal.connectedLibraryId &&
       entry.fileKey === signal.fileKey && entry.checksum === signal.checksum)) continue;
     const endpoint = `${signal.fileKey}\0${signal.checksum}`;
     effectiveIdentitiesByEndpoint.set(endpoint, new Set([
       ...(effectiveIdentitiesByEndpoint.get(endpoint) ?? []), signal.identityHash,
     ]));
   }
-  const hasSeparatedMatchingIdentity = fileEntries.some((left, leftIndex) =>
-    fileEntries.slice(leftIndex + 1).some((right) => {
+  const hasSeparatedMatchingIdentity = eligibleMatchedEntries.some((left, leftIndex) =>
+    eligibleMatchedEntries.slice(leftIndex + 1).some((right) => {
       const separated = separatedIdentityPairs.get(knowledgeRelationshipPairKey(left, right));
       const leftIdentities = effectiveIdentitiesByEndpoint.get(`${left.fileKey}\0${left.checksum}`);
       const rightIdentities = effectiveIdentitiesByEndpoint.get(`${right.fileKey}\0${right.checksum}`);

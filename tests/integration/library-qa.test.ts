@@ -332,6 +332,89 @@ test("same-name clients with distinct identity hashes trigger clarification", as
   assert.equal(versionResult.state, "AMBIGUOUS_ENTITY");
 });
 
+test("Ask checks entity ambiguity beyond the eight-source answer cap", async () => {
+  const primaryRoot = await root("Capped Alice Primary Root");
+  const laterRoot = await root("Capped Alice Distinct Root");
+  const primaryScan = await scan(primaryRoot.id);
+  const laterScan = await scan(laterRoot.id);
+  const primary = await Promise.all(Array.from({ length: 8 }, (_, index) => file({
+    rootId: primaryRoot.id, sessionId: primaryScan.id,
+    relativePath: `00-primary/alice-${index}.txt`, quote: `Client Alice priority evidence ${index}`,
+    entityHashes: ["capped-alice-primary"],
+  })));
+  const distinct = await file({ rootId: laterRoot.id, sessionId: laterScan.id,
+    relativePath: "zz-distinct/alice.txt", quote: "Client Alice distinct identity evidence",
+    entityHashes: ["capped-alice-distinct"],
+  });
+  const historicalDistinct = await file({ rootId: laterRoot.id, sessionId: laterScan.id,
+    relativePath: "zzz-historical/alice.txt", quote: "Client Alice retained historical identity",
+    entityHashes: ["capped-alice-historical"], isCurrent: false,
+  });
+  await prisma.knowledgeDocumentSignal.createMany({ data: [...primary, distinct, historicalDistinct].map((item) => ({
+    signalKey: crypto.randomUUID(), connectedLibraryId: item.scanned.sessionId === laterScan.id
+      ? laterRoot.id : primaryRoot.id,
+    fileKey: item.index.fileKey, relativePath: item.scanned.relativePath,
+    checksum: item.scanned.checksum!, kind: "CLIENT", identityHash: item === distinct
+      ? "capped-alice-distinct" : item === historicalDistinct
+        ? "capped-alice-historical" : "capped-alice-primary",
+    sourceRanges: [], observationSessionId: item.observation.id,
+    generationVersion: documentSignalVersion,
+  })) });
+
+  const question = "What do we have about client Alice?";
+  const search = await import("../../src/lib/library/search");
+  const matches = (await search.searchLibrary(question, [primaryRoot.id, laterRoot.id], {
+    includeEntityMatches: true,
+  })).filter((result) => result.kind === "FILE");
+  assert.equal(matches.length, 10);
+  assert.equal(matches.at(-2)?.relativePath, distinct.scanned.relativePath);
+
+  const context = await retrieve.retrieveQuestionContext(question, [primaryRoot.id, laterRoot.id]);
+  assert.equal(context.sources.length, 8);
+  assert.ok(context.sources.every((source) => source.rootName === primaryRoot.displayName));
+  assert.equal(context.ambiguousEntity, true);
+  let modelCalled = false;
+  const result = await answer.answerLibraryQuestion(question, {
+    permittedRootIds: [primaryRoot.id, laterRoot.id], model: async () => {
+      modelCalled = true;
+      return model([claim("Client Alice priority evidence", ["S1"])])();
+    },
+  });
+  assert.equal(result.state, "AMBIGUOUS_ENTITY");
+  assert.equal(modelCalled, false);
+
+  const historyResult = await answer.answerLibraryQuestion("Show older files for client Alice", {
+    permittedRootIds: [primaryRoot.id, laterRoot.id], model: async () => {
+      throw new Error("historical ambiguity must not call the model");
+    },
+  });
+  assert.equal(historyResult.state, "AMBIGUOUS_ENTITY");
+});
+
+test("Ask answers a single identity normally when more than eight files match", async () => {
+  const r = await root("Capped Single Identity Root"); const s = await scan(r.id);
+  const items = await Promise.all(Array.from({ length: 9 }, (_, index) => file({
+    rootId: r.id, sessionId: s.id, relativePath: `Carol/file-${index}.txt`,
+    quote: `Client Carol evidence ${index}`, entityHashes: ["capped-carol"],
+  })));
+  await prisma.knowledgeDocumentSignal.createMany({ data: items.map((item) => ({
+    signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+    relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!, kind: "CLIENT",
+    identityHash: "capped-carol", sourceRanges: [], observationSessionId: item.observation.id,
+    generationVersion: documentSignalVersion,
+  })) });
+  let modelCalled = false;
+  const result = await answer.answerLibraryQuestion("What do we have about client Carol?", {
+    permittedRootIds: [r.id], model: async () => {
+      modelCalled = true;
+      return model([claim("Client Carol evidence 0", ["S1"])])();
+    },
+  });
+  assert.equal(modelCalled, true);
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  assert.equal(result.sources.length, 8);
+});
+
 test("Ask reserves an older possessive entity match beyond 120 generic candidates", async () => {
   const r = await root("Reserved possessive QA Root"); const s = await scan(r.id);
   const seed = await file({ rootId: r.id, sessionId: s.id, relativePath: "Alice/invoice.txt",
