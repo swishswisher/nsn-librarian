@@ -251,7 +251,12 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   // type parsed from the question rather than trying to infer it from its name.
   const identityKind = route.entityKind;
   const [effectiveSignals, separatedIdentityPairs] = identityKind ? await Promise.all([
-    getEffectiveDocumentSignals(rootIds),
+    getEffectiveDocumentSignals(rootIds, route.wantsHistory ? {
+      historicalEntries: fileEntries.map((entry) => ({
+        checksum: entry.checksum, connectedLibraryId: entry.connectedLibraryId,
+        fileKey: entry.fileKey, isCurrent: entry.isCurrent,
+      })),
+    } : undefined),
     getSeparatedRelationshipPairIdentities(fileEntries, [`SAME_${identityKind}`]),
   ]) : [[], new Map<string, Set<string>>()];
   // Search has already bound the requested name to exact typed evidence. Use

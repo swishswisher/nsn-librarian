@@ -503,6 +503,38 @@ test("historical-only typed identity can seed its retained entry", async () => {
   assert.equal(historical[0].state, "Historical scan");
 });
 
+test("persisted same-path replacement keeps superseded identity evidence searchable only in history", async () => {
+  const r = await root("Superseded historical identity root");
+  const snapshots = [];
+  for (const [index, client] of ["Alice", "Bob"].entries()) {
+    const s = await session(r.id);
+    await prisma.scanSession.update({ where: { id: s.id }, data: {
+      searchIndexStatus: "COMPLETED", startedAt: new Date(2026, 6, index + 1),
+    } });
+    const item = await observedFile({ rootId: r.id, sessionId: s.id,
+      path: "clients/account.txt", checksum: String(index + 1).repeat(64),
+      evidence: evidence(`Client: ${client}; Client ID: ${client === "Alice" ? "A-OLD" : "B-NEW"}; verified ${client} account history`) });
+    const working = { clusters: [], files: [item.working], relationships: [], scanSessionId: s.id };
+    await fileKey.persistScanWorkingKnowledge(working);
+    await indexer.indexScanKnowledge(working);
+    snapshots.push(item);
+  }
+  const signals = await prisma.knowledgeDocumentSignal.findMany({ where: {
+    connectedLibraryId: r.id, fileKey: fileKey.persistentFileKey(r.id, "clients/account.txt"), kind: "CLIENT",
+  }, orderBy: { checksum: "asc" } });
+  assert.equal(signals.length, 2);
+  assert.equal(signals[0].status, "SUPERSEDED");
+  assert.ok(signals[0].supersededAt);
+  assert.equal(signals[1].status, "ACTIVE");
+
+  const historical = await search.searchLibrary("show older files for client Alice", [r.id]);
+  assert.deepEqual(historical.map((result) => result.relativePath), [snapshots[0].file.relativePath]);
+  assert.equal(historical[0].state, "Historical scan");
+  assert.equal((await search.searchLibrary("client Alice", [r.id])).length, 0);
+  assert.deepEqual((await search.searchLibrary("client Bob", [r.id])).map((result) => result.relativePath),
+    [snapshots[1].file.relativePath]);
+});
+
 test("same-name clients have distinct identity hashes", async () => {
   const r = await root("Same Name Root"); const s = await session(r.id);
   const a = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/a.txt", evidence: evidence("Client: Alice; Client ID: C-111") });

@@ -5,6 +5,7 @@ import { getPrismaClient } from "@/lib/db/prisma";
 import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/document-signals";
 import {
   getDocumentVersionSignals,
+  getEligibleDocumentSignals,
   getEffectiveDocumentSignals,
   getSeparatedRelationshipPairIdentities,
   knowledgeRelationshipPairKey,
@@ -268,14 +269,13 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   const effectiveEndpoints = new Set(effectiveEntitySignals.filter((signal) => signal.kind === intent.entityKind)
     .map((signal) => `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`));
   const rawEntitySignals = intent.entityKind && intent.entityName && effectiveEndpoints.size
-    ? await prisma.knowledgeDocumentSignal.findMany({
-      select: { checksum: true, connectedLibraryId: true, fileKey: true, identityHash: true,
-        kind: true, observationSessionId: true, sourceRanges: true },
-      where: { connectedLibraryId: { in: rootIds }, generationVersion: documentSignalVersion,
-        fileKey: { in: initial.map((entry) => entry.fileKey) },
-        status: "ACTIVE", supersededAt: null,
-        kind: { in: [intent.entityKind, `UNRESOLVED_${intent.entityKind}`] } },
-    })
+    ? (await getEligibleDocumentSignals(rootIds, intent.wantsHistory ? {
+      historicalEntries: initial.map((entry) => ({
+        checksum: entry.checksum, connectedLibraryId: entry.connectedLibraryId,
+        fileKey: entry.fileKey, isCurrent: entry.isCurrent,
+      })),
+    } : undefined)).filter((signal) =>
+      signal.kind === intent.entityKind || signal.kind === `UNRESOLVED_${intent.entityKind}`)
     : [];
   const reviewedObservations = rawEntitySignals.length ? await prisma.observationSession.findMany({
     select: { id: true, status: true, humanDecisions: {

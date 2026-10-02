@@ -1304,8 +1304,16 @@ export async function createIdentityCorrection(input: {
   });
 }
 
-export async function getEffectiveDocumentSignals(permittedRootIds?: string[], options?: {
-  historicalEntries: Array<{ checksum: string; connectedLibraryId: string; fileKey: string; isCurrent: boolean }>;
+export type HistoricalDocumentSignalEntry = {
+  checksum: string;
+  connectedLibraryId: string;
+  fileKey: string;
+  isCurrent: boolean;
+};
+
+/** Load original signals eligible for the current or explicitly retained snapshots. */
+export async function getEligibleDocumentSignals(permittedRootIds?: string[], options?: {
+  historicalEntries: HistoricalDocumentSignalEntry[];
 }) {
   const prisma = getPrismaClient();
   const libraries = await prisma.connectedLibrary.findMany({
@@ -1330,20 +1338,6 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
     where: { generationVersion: documentSignalVersion, connectedLibraryId: { in: libraryIds },
       OR: candidateSignalFilters },
   });
-  const humanCorrections = await prisma.knowledgeConnection.findMany({
-    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-    select: { id: true, relationshipKind: true, sourceChecksum: true, sourceEvidence: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
-    where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null,
-      sourceFileKey: { in: candidateRows.map((row) => row.fileKey) } },
-  });
-  const separatedIdentityRows = await prisma.knowledgeConnection.findMany({
-    select: { relationshipKind: true, sourceChecksum: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
-    where: { decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
-      generationVersion: documentSignalVersion, relationshipKind: { in: ["SAME_CLIENT", "SAME_PROJECT"] },
-      status: "REJECTED", supersededAt: null,
-      sourceFileKey: { in: candidateRows.map((row) => row.fileKey) },
-      targetFileKey: { in: candidateRows.map((row) => row.fileKey) } },
-  });
   const currentRows = await currentSnapshotSignals(candidateRows);
   const currentKeys = new Set(currentRows.map((row) => `${row.connectedLibraryId}\0${row.fileKey}\0${row.checksum}\0${row.id}`));
   const historicalKeys = new Set(historicalEntries.map((entry) =>
@@ -1365,7 +1359,28 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
     return extractDocumentSignals(observation.humanDecisions[0]?.editedSuggestion ?? "", row.connectedLibraryId)
       .some((signal) => signal.kind === row.kind && signal.identityHash === row.identityHash);
   });
-  const rows = [...currentRows, ...historicalRows];
+  return [...currentRows, ...historicalRows];
+}
+
+export async function getEffectiveDocumentSignals(permittedRootIds?: string[], options?: {
+  historicalEntries: HistoricalDocumentSignalEntry[];
+}) {
+  const prisma = getPrismaClient();
+  const rows = await getEligibleDocumentSignals(permittedRootIds, options);
+  const humanCorrections = await prisma.knowledgeConnection.findMany({
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    select: { id: true, relationshipKind: true, sourceChecksum: true, sourceEvidence: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
+    where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null,
+      sourceFileKey: { in: rows.map((row) => row.fileKey) } },
+  });
+  const separatedIdentityRows = await prisma.knowledgeConnection.findMany({
+    select: { relationshipKind: true, sourceChecksum: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
+    where: { decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
+      generationVersion: documentSignalVersion, relationshipKind: { in: ["SAME_CLIENT", "SAME_PROJECT"] },
+      status: "REJECTED", supersededAt: null,
+      sourceFileKey: { in: rows.map((row) => row.fileKey) },
+      targetFileKey: { in: rows.map((row) => row.fileKey) } },
+  });
   const effectiveRows = [...rows];
   const correctedIdentities = new Map<string, string>();
   const correctionKey = (row: Pick<EffectiveIdentitySignal, "fileKey" | "checksum" | "kind">) =>

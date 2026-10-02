@@ -471,7 +471,7 @@ test("historical list Ask uses historical-only client and project identities wit
       relativePath: `archive/${name.toLowerCase()}-note.txt`,
       quote: `${label}: ${name}; archived engagement summary`,
       entityHashes: [`qa-historical-${kind.toLowerCase()}`] });
-    await prisma.knowledgeDocumentSignal.create({ data: {
+    const historicalSignal = await prisma.knowledgeDocumentSignal.create({ data: {
       signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: old.index.fileKey,
       relativePath: old.scanned.relativePath, checksum: old.scanned.checksum!, kind,
       identityHash: `qa-historical-${kind.toLowerCase()}`, sourceRanges: [],
@@ -483,6 +483,8 @@ test("historical list Ask uses historical-only client and project identities wit
       quote: `${label}: ${other}; current engagement summary`,
       entityHashes: [`qa-current-${kind.toLowerCase()}`] });
     await prisma.librarySearchEntry.update({ where: { id: old.index.id }, data: { isCurrent: false } });
+    await prisma.knowledgeDocumentSignal.update({ where: { id: historicalSignal.id },
+      data: { status: "SUPERSEDED", supersededAt: new Date() } });
 
     const question = `Show older files for ${label.toLowerCase()} ${name}`;
     const context = await retrieve.retrieveQuestionContext(question, [r.id]);
@@ -493,7 +495,62 @@ test("historical list Ask uses historical-only client and project identities wit
     const result = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id],
       model: model([claim("The archived engagement summary is available", ["S1"])]) });
     assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+    assert.deepEqual(result.sources.map((source) => source.relativePath), [old.scanned.relativePath]);
+    assert.deepEqual(result.claims[0]?.sourceIds, ["S1"]);
   }
+});
+
+test("historical Ask honors checksum-bound generated identity separations", async () => {
+  const r = await root("Separated historical Ask root"); const oldScan = await scan(r.id);
+  const old = [];
+  for (const suffix of ["a", "b"]) {
+    const item = await file({ rootId: r.id, sessionId: oldScan.id,
+      relativePath: `archive/alice-${suffix}.txt`, checksum: suffix.repeat(64),
+      quote: `Client: Alice; retained historical record ${suffix}`, entityHashes: ["historical-alice"] });
+    const signal = await prisma.knowledgeDocumentSignal.create({ data: {
+      signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+      relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!, kind: "CLIENT",
+      identityHash: "historical-alice", sourceRanges: [], observationSessionId: item.observation.id,
+      generationVersion: documentSignalVersion,
+    } });
+    old.push({ ...item, signal });
+  }
+  const generated = await prisma.knowledgeConnection.create({ data: {
+    sourceObservationSessionId: old[0].observation.id, targetObservationSessionId: old[1].observation.id,
+    sourceChecksum: old[0].scanned.checksum, targetChecksum: old[1].scanned.checksum,
+    sourceFileKey: old[0].index.fileKey, targetFileKey: old[1].index.fileKey,
+    generationVersion: documentSignalVersion, relationshipKind: "SAME_CLIENT",
+    sharedTerms: [], reasoning: "Generated same-client evidence", status: "NEW",
+    sourceEvidence: { connectedLibraryId: r.id, identityHash: "historical-alice",
+      sourceRelativePath: old[0].scanned.relativePath, targetRelativePath: old[1].scanned.relativePath },
+  } });
+  await identity.reviewPersistentRelationship(generated.id, "SEPARATE", "These retained clients are distinct.");
+  const currentScan = await scan(r.id);
+  await file({ rootId: r.id, sessionId: currentScan.id, relativePath: "current/bob.txt",
+    quote: "Client: Bob; current record", entityHashes: ["current-bob"] });
+  await prisma.librarySearchEntry.updateMany({ where: { id: { in: old.map((item) => item.index.id) } },
+    data: { isCurrent: false } });
+  await prisma.knowledgeDocumentSignal.updateMany({ where: { id: { in: old.map((item) => item.signal.id) } },
+    data: { status: "SUPERSEDED", supersededAt: new Date() } });
+
+  const question = "Show older files for client Alice";
+  const context = await retrieve.retrieveQuestionContext(question, [r.id]);
+  assert.equal(context.sources.length, 2);
+  assert.equal(context.ambiguousEntity, true);
+  let modelCalled = false;
+  const result = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id], model: async () => {
+    modelCalled = true;
+    return model([claim("Should not be generated", ["S1"])])();
+  } });
+  assert.equal(result.state, "AMBIGUOUS_ENTITY");
+  assert.equal(modelCalled, false);
+  assert.equal((await retrieve.retrieveQuestionContext("client Alice", [r.id])).sources.length, 0);
+
+  await prisma.knowledgeConnection.update({ where: { id: generated.id }, data: { supersededAt: new Date() } });
+  assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, false);
+  await prisma.knowledgeConnection.update({ where: { id: generated.id }, data: { supersededAt: null,
+    sourceChecksum: "stale-checksum" } });
+  assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, false);
 });
 
 async function identityCorrectionFixture(kind: "CLIENT" | "PROJECT") {
