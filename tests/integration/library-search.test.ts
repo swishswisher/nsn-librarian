@@ -152,6 +152,83 @@ test("client identity search expands only shared resolved hashes", async () => {
   assert.ok(results.some((result) => result.relativePath === b.file.relativePath));
 });
 
+for (const [kind, query] of [["CLIENT", "client alice"], ["PROJECT", "project atlas"]] as const) {
+  test(`${kind.toLowerCase()} identity expansion is scoped to each independently matching root`, async () => {
+    const firstRoot = await root(`${kind} Seed Root`); const firstSession = await session(firstRoot.id);
+    const secondRoot = await root(`${kind} Other Root`); const secondSession = await session(secondRoot.id);
+    const phrase = kind === "CLIENT" ? "Client: Alice" : "Project: Atlas";
+    const firstSeed = await observedFile({ rootId: firstRoot.id, sessionId: firstSession.id,
+      path: `${kind.toLowerCase()}/seed.txt`, evidence: evidence(`${phrase}; authoritative brief`) });
+    const firstRelated = await observedFile({ rootId: firstRoot.id, sessionId: firstSession.id,
+      path: `${kind.toLowerCase()}/related.txt`, evidence: evidence("Identity-linked notes without query words") });
+    const secondUnrelated = await observedFile({ rootId: secondRoot.id, sessionId: secondSession.id,
+      path: "unrelated/notes.txt", evidence: evidence("Unrelated notes without query words") });
+    const sharedHash = `raw-shared-${kind.toLowerCase()}-${crypto.randomUUID()}`;
+    await prisma.knowledgeDocumentSignal.createMany({ data: [
+      [firstRoot.id, firstSeed], [firstRoot.id, firstRelated], [secondRoot.id, secondUnrelated],
+    ].map(([rootId, item]) => {
+      const observed = item as Awaited<ReturnType<typeof observedFile>>;
+      return { checksum: observed.file.checksum!, connectedLibraryId: rootId as string,
+        fileKey: fileKey.persistentFileKey(rootId as string, observed.file.relativePath),
+        generationVersion: documentSignalVersion, identityHash: sharedHash, kind,
+        observationSessionId: observed.observation.id, relativePath: observed.file.relativePath,
+        signalKey: crypto.randomUUID(), sourceRanges: [] };
+    }) });
+    await indexFiles(firstSession.id, [firstSeed, firstRelated]);
+    await indexFiles(secondSession.id, [secondUnrelated]);
+
+    let results = await search.searchLibrary(query);
+    assert.ok(results.some((result) => result.relativePath === firstRelated.file.relativePath));
+    assert.ok(!results.some((result) => result.relativePath === secondUnrelated.file.relativePath));
+
+    const secondSeed = await observedFile({ rootId: secondRoot.id, sessionId: secondSession.id,
+      path: "matching/seed.txt", evidence: evidence(`${phrase}; independently matching brief`) });
+    await prisma.knowledgeDocumentSignal.create({ data: {
+      checksum: secondSeed.file.checksum!, connectedLibraryId: secondRoot.id,
+      fileKey: fileKey.persistentFileKey(secondRoot.id, secondSeed.file.relativePath),
+      generationVersion: documentSignalVersion, identityHash: sharedHash, kind,
+      observationSessionId: secondSeed.observation.id, relativePath: secondSeed.file.relativePath,
+      signalKey: crypto.randomUUID(), sourceRanges: [],
+    } });
+    await indexFiles(secondSession.id, [secondUnrelated, secondSeed]);
+    results = await search.searchLibrary(query);
+    assert.ok(results.some((result) => result.relativePath === secondSeed.file.relativePath));
+    assert.ok(results.some((result) => result.relativePath === secondUnrelated.file.relativePath));
+  });
+}
+
+test("history-aware identity expansion includes retained historical entries only for history queries", async () => {
+  const r = await root("Identity History Root"); const oldSession = await session(r.id);
+  const oldRelated = await observedFile({ rootId: r.id, sessionId: oldSession.id,
+    path: "archive/legacy-record.txt", checksum: "history-old", evidence: evidence("Legacy identity-only material") });
+  await prisma.knowledgeDocumentSignal.create({ data: {
+    checksum: oldRelated.file.checksum!, connectedLibraryId: r.id,
+    fileKey: fileKey.persistentFileKey(r.id, oldRelated.file.relativePath),
+    generationVersion: documentSignalVersion, identityHash: "alice-history-identity", kind: "CLIENT",
+    observationSessionId: oldRelated.observation.id, relativePath: oldRelated.file.relativePath,
+    signalKey: crypto.randomUUID(), sourceRanges: [],
+  } });
+  await indexFiles(oldSession.id, [oldRelated]);
+
+  const currentSession = await session(r.id);
+  const currentSeed = await observedFile({ rootId: r.id, sessionId: currentSession.id,
+    path: "current/intake.txt", checksum: "history-current", evidence: evidence("Client: Alice; current intake") });
+  await prisma.knowledgeDocumentSignal.create({ data: {
+    checksum: currentSeed.file.checksum!, connectedLibraryId: r.id,
+    fileKey: fileKey.persistentFileKey(r.id, currentSeed.file.relativePath),
+    generationVersion: documentSignalVersion, identityHash: "alice-history-identity", kind: "CLIENT",
+    observationSessionId: currentSeed.observation.id, relativePath: currentSeed.file.relativePath,
+    signalKey: crypto.randomUUID(), sourceRanges: [],
+  } });
+  await indexFiles(currentSession.id, [currentSeed]);
+
+  assert.ok(!(await search.searchLibrary("client alice")).some((result) =>
+    result.relativePath === oldRelated.file.relativePath));
+  const historical = await search.searchLibrary("older files for client alice");
+  assert.ok(historical.some((result) => result.relativePath === oldRelated.file.relativePath &&
+    result.state === "Historical scan"));
+});
+
 test("same-name clients have distinct identity hashes", async () => {
   const r = await root("Same Name Root"); const s = await session(r.id);
   const a = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/a.txt", evidence: evidence("Client: Alice; Client ID: C-111") });

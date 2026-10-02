@@ -197,15 +197,30 @@ export async function searchLibrary(value: string, permittedRootIds?: string[]):
       : intent.terms.filter((term) => entry.sourceTerms.includes(term) ||
           workingKnowledgeTerms(entry.relativePath).includes(term)).length >= 2,
   );
-  const seedHashes = [...new Set(seedEntries.flatMap((entry) => entry.entityHashes))].slice(0, 24);
-  const relatedCandidates = seedHashes.length ? await prisma.librarySearchEntry.findMany({
+  const seedHashesByRoot = new Map<string, Set<string>>();
+  for (const entry of seedEntries) {
+    const hashes = seedHashesByRoot.get(entry.connectedLibraryId) ?? new Set<string>();
+    for (const hash of entry.entityHashes) hashes.add(hash);
+    seedHashesByRoot.set(entry.connectedLibraryId, hashes);
+  }
+  const seedPairs = [...seedHashesByRoot].flatMap(([connectedLibraryId, hashes]) =>
+    [...hashes].map((hash) => ({ connectedLibraryId, hash })),
+  ).slice(0, 24);
+  const seedHashes = [...new Set(seedPairs.map(({ hash }) => hash))];
+  const expansionHashesByRoot = new Map<string, string[]>();
+  for (const { connectedLibraryId, hash } of seedPairs) {
+    const hashes = expansionHashesByRoot.get(connectedLibraryId) ?? [];
+    hashes.push(hash);
+    expansionHashesByRoot.set(connectedLibraryId, hashes);
+  }
+  const relatedCandidates = seedPairs.length ? await prisma.librarySearchEntry.findMany({
     take: Math.min(40, searchCandidateLimit - initial.length),
     where: {
-      connectedLibraryId: { in: rootIds },
-      indexVersion: librarySearchIndexVersion,
-      isCurrent: true,
-      scanSessionId: { in: latestSessionIds },
-      entityHashes: { hasSome: seedHashes },
+      ...scope,
+      OR: [...expansionHashesByRoot].map(([connectedLibraryId, hashes]) => ({
+        connectedLibraryId,
+        entityHashes: { hasSome: hashes },
+      })),
     },
   }) : [];
   const separatedIdentityPairs = relatedCandidates.length && seedEntries.length
