@@ -45,6 +45,15 @@ function correctedClientIdentities(
   const clientRows = rows.filter((row) => ["CLIENT", "UNRESOLVED_CLIENT"].includes(row.kind));
   const endpointKey = (row: Pick<EffectiveIdentitySignal, "fileKey" | "checksum">) =>
     `${row.fileKey}\0${row.checksum}`;
+  const identitiesByEndpoint = new Map<string, Set<string>>();
+  for (const row of clientRows) {
+    const key = endpointKey(row);
+    const identities = identitiesByEndpoint.get(key) ?? new Set<string>();
+    identities.add(row.identityHash);
+    identitiesByEndpoint.set(key, identities);
+  }
+  const ambiguousEndpoints = new Set([...identitiesByEndpoint]
+    .filter(([, identities]) => identities.size > 1).map(([key]) => key));
   const byEndpoint = new Map(clientRows.map((row) => [endpointKey(row), row]));
   const parent = new Map(clientRows.map((row) => [endpointKey(row), endpointKey(row)]));
   const members = new Map(clientRows.map((row) => [endpointKey(row), new Set([endpointKey(row)])]));
@@ -63,7 +72,8 @@ function correctedClientIdentities(
     const source = byEndpoint.get(`${correction.sourceFileKey}\0${correction.sourceChecksum}`);
     const target = byEndpoint.get(`${correction.targetFileKey}\0${correction.targetChecksum}`);
     const evidence = correction.sourceEvidence;
-    if (!source || !target || source.connectedLibraryId !== target.connectedLibraryId ||
+    if (!source || !target || ambiguousEndpoints.has(endpointKey(source)) || ambiguousEndpoints.has(endpointKey(target)) ||
+        source.connectedLibraryId !== target.connectedLibraryId ||
         !evidence || Array.isArray(evidence) || typeof evidence !== "object" ||
         evidence.connectedLibraryId !== source.connectedLibraryId || typeof evidence.identityHash !== "string") continue;
     const sourceRoot = find(endpointKey(source));
@@ -1151,6 +1161,31 @@ export async function createIdentityCorrection(input: {
     ))) {
       throw new RelationshipReviewError("One of these files is no longer in the latest scan. Scan again before correcting it.", 409);
     }
+    const relevantKinds = input.kind === "SAME_CLIENT"
+      ? ["CLIENT", "UNRESOLVED_CLIENT"]
+      : ["PROJECT", "UNRESOLVED_PROJECT"];
+    const endpointSignals = await tx.knowledgeDocumentSignal.findMany({
+      select: { fileKey: true, checksum: true, identityHash: true },
+      where: {
+        connectedLibraryId: source.connectedLibraryId,
+        generationVersion: documentSignalVersion,
+        kind: { in: relevantKinds }, status: "ACTIVE", supersededAt: null,
+        OR: [
+          { fileKey: source.fileKey, checksum: source.checksum },
+          { fileKey: target.fileKey, checksum: target.checksum },
+        ],
+      },
+    });
+    const distinctIdentities = (fileKey: string, checksum: string) => new Set(endpointSignals
+      .filter((signal) => signal.fileKey === fileKey && signal.checksum === checksum)
+      .map((signal) => signal.identityHash));
+    if (distinctIdentities(source.fileKey, source.checksum).size > 1 ||
+        distinctIdentities(target.fileKey, target.checksum).size > 1) {
+      throw new RelationshipReviewError(
+        `This file contains multiple ${input.kind === "SAME_CLIENT" ? "client" : "project"} identities. Choose files with one unambiguous identity before correcting this relationship.`,
+        409,
+      );
+    }
     // Submitting an exact human correction is an intentional later rejoin.
     // Retire an older generated SEPARATE boundary before resolving the target's
     // canonical class. A separation saved later remains active and wins.
@@ -1214,6 +1249,9 @@ export async function createIdentityCorrection(input: {
       connectedLibraryId: source.connectedLibraryId,
       evidenceKinds: ["HUMAN_REVIEW"],
       identityHash: targetIdentityHash,
+      sourceIdentityHash: source.identityHash,
+      sourceSignalId: source.id,
+      sourceSignalKind: source.kind,
       sourceRanges: source.sourceRanges,
       sourceRelativePath: source.relativePath,
       supportingTopics: [input.kind === "SAME_CLIENT" ? "client identity" : "project membership"],
@@ -1398,6 +1436,13 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
     effectiveRows.push({ ...row, kind: "CLIENT", identityHash, sourceRanges: [],
       generationVersion: humanIdentityCorrectionVersion });
   }
+  const projectIdentitiesByEndpoint = new Map<string, Set<string>>();
+  for (const row of rows.filter((signal) => ["PROJECT", "UNRESOLVED_PROJECT"].includes(signal.kind))) {
+    const key = `${row.fileKey}\0${row.checksum}`;
+    const identities = projectIdentitiesByEndpoint.get(key) ?? new Set<string>();
+    identities.add(row.identityHash);
+    projectIdentitiesByEndpoint.set(key, identities);
+  }
   for (const correction of humanCorrections) {
     const kind = correction.relationshipKind === "BELONGS_TO_PROJECT" ? "PROJECT" : null;
     const evidence = correction.sourceEvidence;
@@ -1408,7 +1453,9 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
     const target = rows.find((row) => row.fileKey === correction.targetFileKey && row.checksum === correction.targetChecksum &&
       (row.kind === kind || row.kind === "UNRESOLVED_PROJECT") &&
       row.identityHash === evidence.identityHash && row.connectedLibraryId === source?.connectedLibraryId);
-    if (!source || !target || evidence.connectedLibraryId !== source.connectedLibraryId) continue;
+    if (!source || !target || evidence.connectedLibraryId !== source.connectedLibraryId ||
+        (projectIdentitiesByEndpoint.get(`${source.fileKey}\0${source.checksum}`)?.size ?? 0) > 1 ||
+        (projectIdentitiesByEndpoint.get(`${target.fileKey}\0${target.checksum}`)?.size ?? 0) > 1) continue;
     const separatedProjectPair = separatedIdentityRows.some((row) => row.relationshipKind === "SAME_PROJECT" &&
       row.sourceFileKey && row.sourceChecksum && row.targetFileKey && row.targetChecksum &&
       knowledgeRelationshipPairKey(source, target) === knowledgeRelationshipPairKey(

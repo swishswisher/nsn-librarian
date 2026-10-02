@@ -438,7 +438,7 @@ for (const [kind, name] of [["CLIENT", "Alice"], ["PROJECT", "Atlas"]] as const)
 
 test("Ask binds ambiguity to the requested signal on a multi-client file", async () => {
   const r = await root("Multi-client Ask Root"); const s = await scan(r.id);
-  const quote = "Client: Alice; Client: Bob; Alice engagement is active";
+  const quote = "Client: Alice; Client: Bob; Alice engagement is active; Bob engagement remains active";
   const mixed = await file({ rootId: r.id, sessionId: s.id, relativePath: "mixed.txt",
     quote, entityHashes: ["ask-alice", "ask-bob"] });
   const related = await file({ rootId: r.id, sessionId: s.id, relativePath: "alice-related.txt",
@@ -451,7 +451,7 @@ test("Ask binds ambiguity to the requested signal on a multi-client file", async
   });
   await prisma.knowledgeDocumentSignal.createMany({ data: [
     signal(mixed, "ask-alice", [{ start: 0, end: 14 }]),
-    signal(mixed, "ask-bob", [{ start: 14, end: 27 }]),
+    signal(mixed, "ask-bob", [{ start: 15, end: 27 }]),
     signal(related, "ask-alice", []),
   ] });
   const context = await retrieve.retrieveQuestionContext("What do we have for client Alice?", [r.id]);
@@ -461,6 +461,56 @@ test("Ask binds ambiguity to the requested signal on a multi-client file", async
   const result = await answer.answerLibraryQuestion("What do we have for client Alice?", {
     permittedRootIds: [r.id], model: model([claim("Alice engagement is active", ["S1"])]) });
   assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+
+  const mixedAlice = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: {
+    fileKey: mixed.index.fileKey, identityHash: "ask-alice",
+  } });
+  const relatedAlice = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: {
+    fileKey: related.index.fileKey, identityHash: "ask-alice",
+  } });
+  await assert.rejects(identity.createIdentityCorrection({
+    sourceSignalId: mixedAlice.id, targetSignalId: relatedAlice.id, kind: "SAME_CLIENT",
+    note: "Only the selected Alice signal should move.",
+  }), (error: unknown) => error instanceof identity.RelationshipReviewError && error.statusCode === 409 &&
+    /multiple client identities/i.test(error.message));
+  assert.equal(await prisma.knowledgeConnection.count({ where: {
+    generationVersion: identity.humanIdentityCorrectionVersion,
+    sourceFileKey: mixed.index.fileKey,
+  } }), 0);
+  const effectiveAfterRejection = await identity.getEffectiveDocumentSignals([r.id]);
+  assert.ok(effectiveAfterRejection.some((signal) => signal.fileKey === mixed.index.fileKey &&
+    signal.kind === "CLIENT" && signal.identityHash === "ask-alice"));
+  assert.ok(effectiveAfterRejection.some((signal) => signal.fileKey === mixed.index.fileKey &&
+    signal.kind === "CLIENT" && signal.identityHash === "ask-bob"));
+  const unchanged = await retrieve.retrieveQuestionContext("What do we have for client Alice?", [r.id]);
+  assert.equal(unchanged.ambiguousEntity, false);
+  assert.deepEqual(new Set(unchanged.sources.map((source) => source.relativePath)),
+    new Set([mixed.scanned.relativePath, related.scanned.relativePath]));
+});
+
+test("project corrections reject ambiguous multi-project endpoints without changing effective identities", async () => {
+  const r = await root("Multi-project correction Root"); const s = await scan(r.id);
+  const mixed = await file({ rootId: r.id, sessionId: s.id, relativePath: "mixed-projects.txt",
+    quote: "Project: Atlas; Project: Beacon", entityHashes: ["project-atlas", "project-beacon"] });
+  const target = await file({ rootId: r.id, sessionId: s.id, relativePath: "atlas-target.txt",
+    quote: "Project: Atlas", entityHashes: ["project-atlas-target"] });
+  const createSignal = (item: typeof mixed, identityHash: string) => prisma.knowledgeDocumentSignal.create({ data: {
+    signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+    relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!, kind: "PROJECT",
+    identityHash, sourceRanges: [], observationSessionId: item.observation.id,
+    generationVersion: documentSignalVersion,
+  } });
+  const atlas = await createSignal(mixed, "project-atlas");
+  await createSignal(mixed, "project-beacon");
+  const targetAtlas = await createSignal(target, "project-atlas-target");
+  await assert.rejects(identity.createIdentityCorrection({ sourceSignalId: atlas.id,
+    targetSignalId: targetAtlas.id, kind: "BELONGS_TO_PROJECT", note: "Ambiguous source project" }),
+  (error: unknown) => error instanceof identity.RelationshipReviewError && error.statusCode === 409 &&
+    /multiple project identities/i.test(error.message));
+  const hashes = new Set((await identity.getEffectiveDocumentSignals([r.id]))
+    .filter((signal) => signal.fileKey === mixed.index.fileKey && signal.kind === "PROJECT")
+    .map((signal) => signal.identityHash));
+  assert.deepEqual(hashes, new Set(["project-atlas", "project-beacon"]));
 });
 
 test("historical list Ask uses historical-only client and project identities without version lineage", async () => {
