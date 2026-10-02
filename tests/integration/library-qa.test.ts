@@ -120,6 +120,22 @@ test("factual answer cites one authorized source and its character range", async
   assert.equal("physicalIdentity" in result.sources[0], false);
 });
 
+test("Ask selects the same stable latest completed scan as Search when timestamps tie", async () => {
+  const r = await root("Tied completed snapshots root");
+  const startedAt = new Date("2026-06-01T12:00:00.000Z");
+  await prisma.scanSession.create({ data: { id: "tied-completed-a", connectedFolderId: r.id,
+    startedAt, status: "COMPLETED", searchIndexStatus: "COMPLETED" } });
+  const latest = await prisma.scanSession.create({ data: { id: "tied-completed-z", connectedFolderId: r.id,
+    startedAt, status: "COMPLETED", searchIndexStatus: "COMPLETED" } });
+  await file({ rootId: r.id, sessionId: latest.id, relativePath: "stable-snapshot.txt",
+    quote: "Stable snapshot evidence" });
+  const first = await retrieve.retrieveQuestionContext("stable snapshot", [r.id]);
+  const second = await retrieve.retrieveQuestionContext("stable snapshot", [r.id]);
+  assert.equal(first.indexIncomplete, false);
+  assert.deepEqual(first.sources, second.sources);
+  assert.equal(first.sources[0]?.relativePath, "stable-snapshot.txt");
+});
+
 test("two independent documents can support synthesis", async () => {
   const r = await root("Synthesis Root"); const s = await scan(r.id);
   await file({ rootId: r.id, sessionId: s.id, relativePath: "facilitation-a.txt", quote: "Facilitation supports workshops" });

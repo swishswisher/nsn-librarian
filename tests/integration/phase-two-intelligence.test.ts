@@ -642,6 +642,32 @@ test("same-client corrections form a canonical transitive equivalence regardless
   }
   assert.ok(effective.some((row) => row.fileKey === signals[3].fileKey && row.identityHash === signals[3].identityHash));
   assert.ok(!effective.some((row) => row.fileKey === signals[2].fileKey && row.identityHash === signals[0].identityHash));
+
+  const directSeparation = await prisma.knowledgeConnection.create({ data: {
+    sourceObservationSessionId: signals[0].observationSessionId,
+    targetObservationSessionId: signals[1].observationSessionId,
+    sourceChecksum: signals[0].checksum, targetChecksum: signals[1].checksum,
+    sourceFileKey: signals[0].fileKey, targetFileKey: signals[1].fileKey,
+    generationVersion: documentSignalVersion, relationshipKind: "SAME_CLIENT",
+    sharedTerms: [], reasoning: "A newer review separates the exact corrected pair.", status: "REJECTED",
+    sourceEvidence: { connectedLibraryId: library.id, identityHash: signals[1].identityHash },
+  } });
+  await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: directSeparation.id,
+    action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+  const afterDirectSeparation = await persistent.getEffectiveDocumentSignals([library.id]);
+  assert.ok(afterDirectSeparation.some((row) => row.fileKey === signals[0].fileKey &&
+    row.kind === "CLIENT" && row.identityHash === signals[0].identityHash));
+  assert.ok(!afterDirectSeparation.some((row) => row.fileKey === signals[0].fileKey &&
+    row.kind === "CLIENT" && row.identityHash === signals[1].identityHash));
+
+  await persistent.createIdentityCorrection({ sourceSignalId: signals[0].id, targetSignalId: signals[1].id,
+    kind: "SAME_CLIENT", note: "A later explicit correction intentionally rejoins A and B." });
+  const afterRejoin = await persistent.getEffectiveDocumentSignals([library.id]);
+  for (const signal of signals.slice(0, 3)) {
+    assert.ok(afterRejoin.some((row) => row.fileKey === signal.fileKey && row.kind === "CLIENT" &&
+      row.identityHash === signals[1].identityHash));
+  }
+  assert.ok((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: directSeparation.id } })).supersededAt);
 });
 
 test("explicit v1/v2 forms a revision link while identical copies and filenames do not", async () => {

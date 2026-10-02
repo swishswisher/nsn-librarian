@@ -1082,12 +1082,12 @@ export async function loadScanWorkingKnowledge(
         libraryDocument: {
           select: {
             observationSessions: {
-              orderBy: { createdAt: "desc" },
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
               take: 1,
               select: {
                 explanation: true,
                 humanDecisions: {
-                  orderBy: { createdAt: "desc" },
+                  orderBy: [{ createdAt: "desc" }, { id: "desc" }],
                   select: { decisionType: true, editedSuggestion: true },
                 },
                 interpretations: true,

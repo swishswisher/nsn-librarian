@@ -45,7 +45,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   const roots = await prisma.connectedLibrary.findMany({
     select: { id: true, displayName: true, scanSessions: {
       select: { id: true, searchIndexStatus: true, startedAt: true }, take: 1,
-      orderBy: { startedAt: "desc" },
+      orderBy: [{ startedAt: "desc" }, { id: "desc" }],
       where: { status: { in: ["COMPLETED", "COMPLETED_WITH_ERRORS"] } },
     } },
     where: { ...readableRoot, ...(permittedRootIds ? { id: { in: permittedRootIds } } : {}) },

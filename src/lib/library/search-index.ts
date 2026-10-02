@@ -173,16 +173,45 @@ export async function refreshSearchForIdentityRelationship(relationshipId: strin
   const prisma = getPrismaClient();
   const relationship = await prisma.knowledgeConnection.findUnique({ where: { id: relationshipId } });
   if (!relationship) return;
-  // Superseding a join can also retract the identity assigned to its former target.
-  const relatedCorrections = relationship.sourceFileKey ? await prisma.knowledgeConnection.findMany({
-    select: { targetFileKey: true },
-    where: { generationVersion: humanIdentityCorrectionVersion, sourceFileKey: relationship.sourceFileKey },
-  }) : [];
+  const evidence = relationship.sourceEvidence;
+  const connectedLibraryId = evidence && !Array.isArray(evidence) && typeof evidence === "object" &&
+    typeof evidence.connectedLibraryId === "string" ? evidence.connectedLibraryId : null;
+  if (!connectedLibraryId) return;
+  // Corrections are an undirected equivalence graph. Walk both incoming and
+  // outgoing edges so changing A also refreshes B in B→A→C.
+  const corrections = await prisma.knowledgeConnection.findMany({
+    select: { sourceChecksum: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
+    where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null,
+      sourceEvidence: { path: ["connectedLibraryId"], equals: connectedLibraryId } },
+  });
+  const affected = new Set<string>();
+  const addEndpoint = (fileKey: string | null, checksum: string | null) => {
+    if (fileKey && checksum) affected.add(`${fileKey}\0${checksum}`);
+  };
+  addEndpoint(relationship.sourceFileKey, relationship.sourceChecksum);
+  addEndpoint(relationship.targetFileKey, relationship.targetChecksum);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const correction of corrections) {
+      if (!correction.sourceFileKey || !correction.sourceChecksum ||
+          !correction.targetFileKey || !correction.targetChecksum) continue;
+      const source = `${correction.sourceFileKey}\0${correction.sourceChecksum}`;
+      const target = `${correction.targetFileKey}\0${correction.targetChecksum}`;
+      if (!affected.has(source) && !affected.has(target)) continue;
+      if (!affected.has(source)) { affected.add(source); changed = true; }
+      if (!affected.has(target)) { affected.add(target); changed = true; }
+    }
+  }
   const entries = await prisma.librarySearchEntry.findMany({
     select: { id: true, connectedLibraryId: true, fileKey: true, checksum: true },
-    where: { isCurrent: true, fileKey: { in: [relationship.sourceFileKey, relationship.targetFileKey,
-      ...relatedCorrections.map((correction) => correction.targetFileKey)]
-      .filter((key): key is string => Boolean(key)) } },
+    where: { isCurrent: true, connectedLibraryId,
+      connectedLibrary: { isEnabled: true, readPermission: true, status: "CONNECTED",
+        disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null },
+      OR: [...affected].map((endpoint) => {
+        const [fileKey, checksum] = endpoint.split("\0");
+        return { fileKey, checksum };
+      }) },
   });
   const signals = await getEffectiveDocumentSignals([...new Set(entries.map((entry) => entry.connectedLibraryId))]);
   for (const entry of entries) {

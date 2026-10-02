@@ -312,7 +312,7 @@ test("search indexing deterministically selects same-millisecond observation rev
     confidence: 1, explanation: [], interpretations: [], observations: [], observerType: "DETERMINISTIC",
     planSuggestions: [], status: "REJECTED", warnings: [],
   } });
-  await indexFiles(s.id, [rejected]);
+  await indexer.refreshSearchForObservation("tie-observation-z");
   const rejectedEntry = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: rejected.file.id } });
   assert.equal(rejectedEntry.knowledgeState, "PROVISIONAL");
   assert.deepEqual(rejectedEntry.sourceExcerpts, []);
@@ -326,11 +326,11 @@ test("search indexing deterministically selects same-millisecond observation rev
     { id: "tie-decision-z", observationSessionId: modified.observation.id, decisionType: "MODIFY",
       editedSuggestion: "deterministic latest correction", createdAt: tiedAt },
   ] });
-  await indexFiles(s.id, [rejected, modified]);
+  await indexer.refreshSearchForObservation(modified.observation.id);
   const first = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: modified.file.id } });
   assert.ok(first.reviewedTerms.includes("latest"));
   assert.ok(!first.reviewedTerms.includes("obsolete"));
-  await indexFiles(s.id, [rejected, modified]);
+  await indexer.refreshSearchForObservation(modified.observation.id);
   const second = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: modified.file.id } });
   assert.equal(second.fingerprint, first.fingerprint);
   assert.deepEqual(second.reviewedTerms, first.reviewedTerms);
@@ -901,6 +901,39 @@ test("identity decision APIs immediately refresh affected search hashes and pres
     assert.deepEqual(afterUnrelated.entityHashes, ["client-2"]);
     assert.equal(await prisma.executionRun.count(), 0);
     assert.equal(await prisma.bridgeCommand.count(), 0);
+  } finally {
+    revalidation.mock.restore();
+  }
+});
+
+test("correction API refreshes incoming and outgoing members of the full identity component", async () => {
+  const r = await root("Bidirectional correction refresh root"); const s = await session(r.id);
+  const items = await Promise.all(["B", "A", "C", "Unrelated"].map((name) => observedFile({
+    rootId: r.id, sessionId: s.id, path: `${name}/neutral.txt`, evidence: evidence(`Record ${name}`),
+  })));
+  const signals = await Promise.all(items.map((item, index) => prisma.knowledgeDocumentSignal.create({ data: {
+    checksum: item.file.checksum!, connectedLibraryId: r.id,
+    fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath), generationVersion: documentSignalVersion,
+    identityHash: `component-${index}`, kind: "CLIENT", observationSessionId: item.observation.id,
+    relativePath: item.file.relativePath, signalKey: crypto.randomUUID(), sourceRanges: [],
+  } })));
+  await indexFiles(s.id, items);
+  const cache = createRequire(path.resolve("package.json"))("next/cache") as typeof import("next/cache");
+  const revalidation = mock.method(cache, "revalidatePath", () => undefined);
+  try {
+    const route = await import("../../src/app/api/library/knowledge/document-relationships/correction/route");
+    const save = async (sourceSignalId: string, targetSignalId: string) => {
+      const response = await route.POST(new Request("http://localhost/correction", { method: "POST",
+        body: JSON.stringify({ sourceSignalId, targetSignalId, kind: "SAME_CLIENT", note: "Verified component" }) }));
+      assert.equal(response.status, 200);
+    };
+    await save(signals[0].id, signals[1].id); // B → A
+    await save(signals[1].id, signals[2].id); // A → C must also refresh incoming B
+    const entries = await prisma.librarySearchEntry.findMany({ where: { scannedFileId: { in: items.map((item) => item.file.id) } } });
+    for (const item of items.slice(0, 3)) {
+      assert.deepEqual(entries.find((entry) => entry.scannedFileId === item.file.id)?.entityHashes, ["component-2"]);
+    }
+    assert.deepEqual(entries.find((entry) => entry.scannedFileId === items[3].file.id)?.entityHashes, ["component-3"]);
   } finally {
     revalidation.mock.restore();
   }

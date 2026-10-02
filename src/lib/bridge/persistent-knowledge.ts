@@ -73,12 +73,10 @@ function correctedClientIdentities(
     if (sourceRoot === targetRoot) continue;
     const sourceMembers = members.get(sourceRoot) ?? new Set([source.fileKey]);
     const targetMembers = members.get(targetRoot) ?? new Set([target.fileKey]);
-    const directPair = knowledgeRelationshipPairKey(source, target);
     if ([...sourceMembers].some((sourceKey) => [...targetMembers].some((targetKey) => {
       const sourceRow = byFile.get(sourceKey);
       const targetRow = byFile.get(targetKey);
-      return sourceRow && targetRow && separatedPairs.has(knowledgeRelationshipPairKey(sourceRow, targetRow)) &&
-        knowledgeRelationshipPairKey(sourceRow, targetRow) !== directPair;
+      return sourceRow && targetRow && separatedPairs.has(knowledgeRelationshipPairKey(sourceRow, targetRow));
     }))) continue;
     for (const key of sourceMembers) {
       parent.set(key, targetRoot);
@@ -1029,6 +1027,20 @@ export async function reviewPersistentRelationship(id: string, action: "CONFIRM"
     const status = action === "CONFIRM" ? "CONFIRMED" : action === "SEPARATE" ? "REJECTED" : "NEW";
     if (action === "CONFIRM" && connection.generationVersion === humanIdentityCorrectionVersion) {
       await supersedeCompetingCorrections(tx, connection);
+      if (connection.relationshipKind === "SAME_CLIENT" && connection.sourceFileKey && connection.sourceChecksum &&
+          connection.targetFileKey && connection.targetChecksum) {
+        await tx.knowledgeConnection.updateMany({ data: { supersededAt: new Date() }, where: {
+          generationVersion: documentSignalVersion, relationshipKind: "SAME_CLIENT",
+          status: "REJECTED", supersededAt: null,
+          decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
+          OR: [
+            { sourceFileKey: connection.sourceFileKey, sourceChecksum: connection.sourceChecksum,
+              targetFileKey: connection.targetFileKey, targetChecksum: connection.targetChecksum },
+            { sourceFileKey: connection.targetFileKey, sourceChecksum: connection.targetChecksum,
+              targetFileKey: connection.sourceFileKey, targetChecksum: connection.sourceChecksum },
+          ],
+        } });
+      }
     }
     if (connection.status === status) return connection;
     const changed = await tx.knowledgeConnection.updateMany({
@@ -1135,6 +1147,27 @@ export async function createIdentityCorrection(input: {
       file.checksum === signal.checksum && normalizePhysicalRelativePath(file.relativePath) === normalizePhysicalRelativePath(signal.relativePath),
     ))) {
       throw new RelationshipReviewError("One of these files is no longer in the latest scan. Scan again before correcting it.", 409);
+    }
+    // Submitting an exact human correction is an intentional later rejoin.
+    // Retire an older generated SEPARATE boundary before resolving the target's
+    // canonical class. A separation saved later remains active and wins.
+    if (input.kind === "SAME_CLIENT") {
+      await tx.knowledgeConnection.updateMany({
+        data: { supersededAt: new Date() },
+        where: {
+          generationVersion: documentSignalVersion,
+          relationshipKind: "SAME_CLIENT",
+          status: "REJECTED",
+          supersededAt: null,
+          decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
+          OR: [
+            { sourceFileKey: source.fileKey, sourceChecksum: source.checksum,
+              targetFileKey: target.fileKey, targetChecksum: target.checksum },
+            { sourceFileKey: target.fileKey, sourceChecksum: target.checksum,
+              targetFileKey: source.fileKey, targetChecksum: source.checksum },
+          ],
+        },
+      });
     }
     let targetIdentityHash = target.identityHash;
     if (input.kind === "SAME_CLIENT") {
