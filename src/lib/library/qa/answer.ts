@@ -114,6 +114,53 @@ function explicitConflict(sources: AnswerContext["sources"]) {
       negative.test(left.text) && positive.test(right.text))));
 }
 
+function latestVersionClaims(context: AnswerContext): AnswerClaim[] {
+  const remaining = new Set(context.versions.flatMap((version) =>
+    [version.leftSourceId, version.rightSourceId]));
+  const claims: AnswerClaim[] = [];
+  while (remaining.size && claims.length < 3) {
+    const first = remaining.values().next().value as string;
+    const component = new Set([first]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const version of context.versions) {
+        if (!component.has(version.leftSourceId) && !component.has(version.rightSourceId)) continue;
+        for (const id of [version.leftSourceId, version.rightSourceId]) {
+          if (!component.has(id)) { component.add(id); changed = true; }
+        }
+      }
+    }
+    for (const id of component) remaining.delete(id);
+    const family = context.versions.filter((version) =>
+      component.has(version.leftSourceId) && component.has(version.rightSourceId));
+    // A tie or incomparable pair means the actual maximum is not established.
+    // Abstain rather than turning partial lineage into a "latest" assertion.
+    if (family.some((version) => version.ordering !== "ORDERED" || !version.newerSourceId)) continue;
+    const olderIds = new Set(family.map((version) => version.newerSourceId === version.leftSourceId
+      ? version.rightSourceId : version.leftSourceId));
+    const maxima = [...component].filter((id) => !olderIds.has(id));
+    if (maxima.length !== 1) continue;
+    const newestId = maxima[0];
+    const comparisons = family.filter((version) => version.newerSourceId === newestId)
+      .sort((left, right) => {
+        const leftOlder = left.leftSourceId === newestId ? left.rightSourceId : left.leftSourceId;
+        const rightOlder = right.leftSourceId === newestId ? right.rightSourceId : right.leftSourceId;
+        return leftOlder.localeCompare(rightOlder);
+      });
+    for (const version of comparisons) {
+      if (claims.length >= 3) break;
+      const newer = context.sources.find((source) => source.id === newestId);
+      const olderId = version.leftSourceId === newestId ? version.rightSourceId : version.leftSourceId;
+      const older = context.sources.find((source) => source.id === olderId);
+      if (newer && older) claims.push({ kind: "FACT",
+        text: `${newer.title} is newer than ${older.title} according to recorded version markers.`,
+        sourceIds: [newer.id, older.id] });
+    }
+  }
+  return claims;
+}
+
 export function validateAnswerClaims(output: unknown, context: AnswerContext): AnswerClaim[] {
   if (!output || typeof output !== "object" || !Array.isArray((output as { claims?: unknown }).claims)) return [];
   const sourceById = new Map(context.sources.map((source) => [source.id, source]));
@@ -204,16 +251,7 @@ export async function answerLibraryQuestion(question: string, dependencies: Answ
     "The library information changed while I was answering. Please ask again.", null, usage);
   const modelClaims = validateAnswerClaims(response.output, context);
   const lineageClaims: AnswerClaim[] = context.route.kind === "VERSION"
-    ? context.versions.filter((version) => version.ordering === "ORDERED" && version.newerSourceId)
-      .slice(0, 3).flatMap((version) => {
-        const newer = context.sources.find((source) => source.id === version.newerSourceId);
-        const olderId = version.leftSourceId === version.newerSourceId
-          ? version.rightSourceId : version.leftSourceId;
-        const older = context.sources.find((source) => source.id === olderId);
-        return newer && older ? [{ kind: "FACT" as const,
-          text: `${newer.title} is newer than ${older.title} according to recorded version markers.`,
-          sourceIds: [newer.id, older.id] }] : [];
-      }) : [];
+    ? latestVersionClaims(context) : [];
   const claims = [...lineageClaims, ...modelClaims];
   if (!claims.length) return emptyAnswer(context, "INSUFFICIENT_EVIDENCE",
     "The available source evidence is not strong enough for a supported answer.",

@@ -367,12 +367,12 @@ test("Ask treats authorized byte-identical cross-root copies as one physical ide
   }
 });
 
-test("Ask checks entity ambiguity beyond the eight-source answer cap", async () => {
+test("Ask checks entity ambiguity beyond every candidate and answer-context cap", async () => {
   const primaryRoot = await root("Capped Alice Primary Root");
   const laterRoot = await root("Capped Alice Distinct Root");
   const primaryScan = await scan(primaryRoot.id);
   const laterScan = await scan(laterRoot.id);
-  const primary = await Promise.all(Array.from({ length: 20 }, (_, index) => file({
+  const primary = await Promise.all(Array.from({ length: 125 }, (_, index) => file({
     rootId: primaryRoot.id, sessionId: primaryScan.id,
     relativePath: `00-primary/alice-${index}.txt`, quote: `Client Alice priority evidence ${index}`,
     entityHashes: ["capped-alice-primary"],
@@ -406,8 +406,8 @@ test("Ask checks entity ambiguity beyond the eight-source answer cap", async () 
     includeEntityMatches: true,
     includeAllEntityMatches: true,
   })).filter((result) => result.kind === "FILE");
-  assert.equal(matches.length, 22);
-  assert.equal(matches.at(-2)?.relativePath, distinct.scanned.relativePath);
+  assert.equal(matches.length, 126);
+  assert.equal(matches.at(-1)?.relativePath, distinct.scanned.relativePath);
 
   const context = await retrieve.retrieveQuestionContext(question, [primaryRoot.id, laterRoot.id]);
   assert.equal(context.sources.length, 8);

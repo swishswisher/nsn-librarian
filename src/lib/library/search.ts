@@ -206,6 +206,10 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     indexVersion: librarySearchIndexVersion,
     ...(intent.wantsHistory ? {} : { isCurrent: true, scanSessionId: { in: latestSessionIds } }),
   } as const;
+  // Ask must not infer that an explicitly named entity is unique from the UI's
+  // bounded candidate window. In that mode the database query is exhaustive,
+  // but only the small ranked source window is ever sent to the answer model.
+  const exhaustiveEntityCandidates = Boolean(options?.includeAllEntityMatches && intent.entityKind);
   const exact = await prisma.librarySearchEntry.findMany({
     take: 20,
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
@@ -221,7 +225,9 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   // supported by source evidence, a reviewed correction, an indexed concept, or
   // the normalized path terms that ranking also treats as evidence.
   const specific = intent.terms.length ? await prisma.librarySearchEntry.findMany({
-    take: Math.min(searchSpecificCandidateLimit, searchCandidateLimit - exact.length),
+    ...(!exhaustiveEntityCandidates ? {
+      take: Math.min(searchSpecificCandidateLimit, searchCandidateLimit - exact.length),
+    } : {}),
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
       { connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: {
@@ -236,7 +242,9 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   }).catch(() => []) : [];
   const reserved = [...new Map([...exact, ...specific].map((entry) => [entry.id, entry])).values()];
   const broader = await prisma.librarySearchEntry.findMany({
-    take: Math.max(0, searchCandidateLimit - reserved.length),
+    ...(!exhaustiveEntityCandidates ? {
+      take: Math.max(0, searchCandidateLimit - reserved.length),
+    } : {}),
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
       { connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: {
@@ -385,7 +393,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     ...seedEntries,
     ...related,
     ...filteredInitial,
-  ].map((entry) => [entry.id, entry])).values()].slice(0, searchCandidateLimit);
+  ].map((entry) => [entry.id, entry])).values()]
+    .slice(0, exhaustiveEntityCandidates ? undefined : searchCandidateLimit);
   const candidateById = new Map(boundedCandidates.map((entry) => [entry.id, entry]));
   const currentSourceIds = new Set((await prisma.scannedFile.findMany({
     select: { id: true }, where: { id: { in: [...candidateById.values()].map((entry) => entry.scannedFileId) },

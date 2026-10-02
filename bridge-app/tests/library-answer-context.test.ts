@@ -102,6 +102,53 @@ test("answer context comparison still detects review changes", async () => {
   assert.equal(result.state, "SOURCE_CHANGED");
 });
 
+test("version answers cite the actual newest member before the lineage claim cap", async () => {
+  const context = answerContext();
+  context.route = { kind: "VERSION", entityKind: null, searchQuery: "latest plan version",
+    wantsHistory: true, entityName: null };
+  context.sources = Array.from({ length: 5 }, (_, index) => ({
+    ...context.sources[0], id: `S${index + 1}`, title: `plan-v${index + 1}.txt`,
+    relativePath: `plan-v${index + 1}.txt`, physicalIdentity: `sha256:v${index + 1}`,
+    corroborationKeys: [`sha256:v${index + 1}`],
+  }));
+  context.relationships = [];
+  context.versions = [];
+  for (let left = 1; left <= 5; left += 1) {
+    for (let right = left + 1; right <= 5; right += 1) {
+      context.versions.push({ leftSourceId: `S${left}`, rightSourceId: `S${right}`,
+        newerSourceId: `S${right}`, ordering: "ORDERED" });
+    }
+  }
+  const result = await answerLibraryQuestion("Which plan version is latest?", {
+    retrieve: async () => structuredClone(context),
+    model: async () => ({ output: { claims: [] }, model: "mock", inputTokens: 1,
+      outputTokens: 1, httpAttempts: 1 }),
+    recordUsage: async () => undefined,
+  });
+
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  assert.equal(result.claims.length, 3);
+  assert.ok(result.claims.every((claim) => claim.sourceIds.includes("S5")));
+  assert.match(result.answer, /plan-v5\.txt is newer/);
+});
+
+test("version answers abstain when a family has ambiguous ordering", async () => {
+  const context = answerContext();
+  context.route = { kind: "VERSION", entityKind: null, searchQuery: "latest version",
+    wantsHistory: true, entityName: null };
+  context.versions.push({ leftSourceId: "S1", rightSourceId: "S2",
+    newerSourceId: null, ordering: "AMBIGUOUS" });
+  const result = await answerLibraryQuestion("Which version is latest?", {
+    retrieve: async () => structuredClone(context),
+    model: async () => ({ output: { claims: [] }, model: "mock", inputTokens: 1,
+      outputTokens: 1, httpAttempts: 1 }),
+    recordUsage: async () => undefined,
+  });
+
+  assert.equal(result.state, "INSUFFICIENT_EVIDENCE");
+  assert.equal(result.claims.length, 0);
+});
+
 for (const [name, change] of [
   ["source checksum", (context: AnswerContext) => { context.sources[0].physicalIdentity = "sha256:changed"; }],
   ["source root", (context: AnswerContext) => { context.sources[0].rootName = "Different root"; }],
