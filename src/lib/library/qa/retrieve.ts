@@ -234,11 +234,31 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
         explanation: connection.reasoning.slice(0, 240) }] : [];
   });
   const identityKind = route.kind === "CLIENT" ? "CLIENT" : route.kind === "PROJECT" ? "PROJECT" : null;
-  const effectiveSignals = identityKind ? await getEffectiveDocumentSignals(rootIds) : [];
+  const [effectiveSignals, separatedIdentityPairs] = identityKind ? await Promise.all([
+    getEffectiveDocumentSignals(rootIds),
+    getSeparatedRelationshipPairIdentities(fileEntries, [`SAME_${identityKind}`]),
+  ]) : [[], new Map<string, Set<string>>()];
   const entityHashes = identityKind ? new Set(effectiveSignals.filter((signal) => signal.kind === identityKind &&
     fileEntries.some((entry) => entry.fileKey === signal.fileKey && entry.checksum === signal.checksum))
     .map((signal) => `${signal.connectedLibraryId}:${signal.identityHash}`)) : new Set<string>();
+  const effectiveIdentitiesByEndpoint = new Map<string, Set<string>>();
+  for (const signal of effectiveSignals) {
+    if (signal.kind !== identityKind || !fileEntries.some((entry) =>
+      entry.fileKey === signal.fileKey && entry.checksum === signal.checksum)) continue;
+    const endpoint = `${signal.fileKey}\0${signal.checksum}`;
+    effectiveIdentitiesByEndpoint.set(endpoint, new Set([
+      ...(effectiveIdentitiesByEndpoint.get(endpoint) ?? []), signal.identityHash,
+    ]));
+  }
+  const hasSeparatedMatchingIdentity = fileEntries.some((left, leftIndex) =>
+    fileEntries.slice(leftIndex + 1).some((right) => {
+      const separated = separatedIdentityPairs.get(knowledgeRelationshipPairKey(left, right));
+      const leftIdentities = effectiveIdentitiesByEndpoint.get(`${left.fileKey}\0${left.checksum}`);
+      const rightIdentities = effectiveIdentitiesByEndpoint.get(`${right.fileKey}\0${right.checksum}`);
+      return Boolean(separated && leftIdentities && rightIdentities && [...separated].some((hash) =>
+        leftIdentities.has(hash) && rightIdentities.has(hash)));
+    }));
   return { route, sources, relationships, versions,
     indexIncomplete: indexIncomplete || sources.some((source) => source.trustState === "Metadata only"),
-    ambiguousEntity: entityHashes.size > 1 };
+    ambiguousEntity: entityHashes.size > 1 || hasSeparatedMatchingIdentity };
 }

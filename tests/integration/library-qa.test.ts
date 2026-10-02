@@ -334,6 +334,62 @@ for (const kind of ["CLIENT", "PROJECT"] as const) {
     assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, true);
     assert.equal(await prisma.executionRun.count(), 0);
   });
+
+  test(`separated generated ${kind} pairs make matching QA identities ambiguous`, async () => {
+    const r = await root(`Separated generated ${kind} QA Root`); const s = await scan(r.id);
+    const identityHash = `shared-${kind.toLowerCase()}-identity`;
+    const items = await Promise.all(["one", "two"].map((suffix) => file({
+      rootId: r.id, sessionId: s.id, relativePath: `Alice/${suffix}.txt`,
+      quote: `${kind} Alice ${suffix}`, entityHashes: [identityHash],
+    })));
+    await prisma.knowledgeDocumentSignal.createMany({ data: items.map((item) => ({
+      signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+      relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!, kind,
+      identityHash, sourceRanges: [], observationSessionId: item.observation.id,
+      generationVersion: documentSignalVersion,
+    })) });
+    const question = `What do we have about ${kind.toLowerCase()} Alice?`;
+    assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, false);
+
+    const stale = await prisma.knowledgeConnection.create({ data: {
+      sourceObservationSessionId: items[0].observation.id,
+      targetObservationSessionId: items[1].observation.id,
+      sourceChecksum: "stale-checksum", targetChecksum: items[1].scanned.checksum,
+      sourceFileKey: items[0].index.fileKey, targetFileKey: items[1].index.fileKey,
+      generationVersion: documentSignalVersion, relationshipKind: `SAME_${kind}`,
+      sharedTerms: [], reasoning: "Stale separated identity", status: "REJECTED",
+      sourceEvidence: { identityHash },
+    } });
+    await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: stale.id,
+      action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+    assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, false);
+
+    const separatePair = async () => {
+      const separated = await prisma.knowledgeConnection.create({ data: {
+        // Store the endpoints opposite their creation order to exercise orientation-independent matching.
+        sourceObservationSessionId: items[1].observation.id,
+        targetObservationSessionId: items[0].observation.id,
+        sourceChecksum: items[1].scanned.checksum, targetChecksum: items[0].scanned.checksum,
+        sourceFileKey: items[1].index.fileKey, targetFileKey: items[0].index.fileKey,
+        generationVersion: documentSignalVersion, relationshipKind: `SAME_${kind}`,
+        sharedTerms: [], reasoning: "Human separated matching generated identities", status: "REJECTED",
+        sourceEvidence: { identityHash },
+      } });
+      await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: separated.id,
+        action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+    };
+    if (kind === "CLIENT") {
+      const changed = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id],
+        model: async () => {
+          await separatePair();
+          return model([claim("CLIENT Alice one", ["S1"])])();
+        } });
+      assert.equal(changed.state, "SOURCE_CHANGED");
+    } else {
+      await separatePair();
+    }
+    assert.equal((await retrieve.retrieveQuestionContext(question, [r.id])).ambiguousEntity, true);
+  });
 }
 
 test("confirmed joins never merge an unrelated same-name client", async () => {
