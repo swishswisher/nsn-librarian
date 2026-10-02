@@ -2,7 +2,7 @@ import path from "node:path";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/document-signals";
-import { getDocumentVersionSignals, getEffectiveDocumentSignals, humanIdentityCorrectionVersion, relationshipGenerationVersion } from "@/lib/bridge/persistent-knowledge";
+import { getDocumentVersionSignals, getEffectiveDocumentSignals, getSeparatedRelationshipPairIdentities, humanIdentityCorrectionVersion, knowledgeRelationshipPairKey, relationshipGenerationVersion } from "@/lib/bridge/persistent-knowledge";
 import { workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
 import { searchLibrary } from "@/lib/library/search";
 import { librarySearchIndexVersion } from "@/lib/library/search-index";
@@ -156,7 +156,10 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   }
 
   const fileEntries = [...sourceEntryById.values()];
-  const signals = await getDocumentVersionSignals(fileEntries, route.wantsHistory);
+  const [signals, separatedVersionPairs] = await Promise.all([
+    getDocumentVersionSignals(fileEntries, route.wantsHistory),
+    getSeparatedRelationshipPairIdentities(fileEntries, ["PROBABLE_REVISION"]),
+  ]);
   const byEntry = new Map([...sourceEntryById.entries()]);
   const versions: AnswerVersion[] = [];
   const sourceIds = [...byEntry.keys()];
@@ -173,6 +176,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
         signal.connectedLibraryId === leftSignal?.connectedLibraryId &&
         signal.identityHash === leftSignal?.identityHash);
       if (!leftSignal || !rightSignal) continue;
+      if (separatedVersionPairs.has(knowledgeRelationshipPairKey(leftSignal, rightSignal))) continue;
       const order = compareDocumentVersions(leftSignal, rightSignal);
       versions.push({ leftSourceId: leftId, rightSourceId: rightId,
         newerSourceId: order === null ? null : order === 1 ? leftId : rightId,

@@ -61,8 +61,14 @@ const ignoredSystemFileNames = new Set([
 ]);
 
 type ScanBridgeRootOptions = {
+  beforeImageChecksum?: (filePath: string) => Promise<void>;
   imageMetadataExtractor?: typeof extractImageMetadata;
 };
+
+function sameFileIdentity(left: Awaited<ReturnType<typeof lstat>>, right: Awaited<ReturnType<typeof lstat>>) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
+    left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
 
 function relativePathFor(rootPath: string, filePath: string) {
   const relative = path.relative(rootPath, filePath);
@@ -116,6 +122,7 @@ async function fileDraft(
   rootPath: string,
   filePath: string,
   imageMetadataExtractor: typeof extractImageMetadata,
+  beforeImageChecksum?: (filePath: string) => Promise<void>,
 ) {
   const relativePath = relativePathFor(rootPath, filePath);
   const fileType = classifyFileType(relativePath);
@@ -151,13 +158,25 @@ async function fileDraft(
 
     await access(filePath, fsConstants.R_OK);
 
+    if (fileType.startsWith("IMAGE_")) await beforeImageChecksum?.(filePath);
     const checksumBefore = await checksumFile(filePath);
-    const imageMetadata = fileType.startsWith("IMAGE_")
-      ? await imageMetadataExtractor(filePath, relativePath, stats).catch(() => null)
-      : null;
-    const checksumAfter = fileType.startsWith("IMAGE_")
-      ? await checksumFile(filePath)
-      : checksumBefore;
+    let verifiedStats = stats;
+    let imageMetadata: Awaited<ReturnType<typeof extractImageMetadata>> | null = null;
+    let checksumAfter = checksumBefore;
+    if (fileType.startsWith("IMAGE_")) {
+      verifiedStats = await lstat(filePath);
+      if (!verifiedStats.isFile() || verifiedStats.isSymbolicLink()) {
+        throw new BridgeAppError("The image is no longer a regular file.", "FILE_CHANGED_DURING_SCAN", 409);
+      }
+      imageMetadata = await imageMetadataExtractor(filePath, relativePath, verifiedStats).catch(() => null);
+      checksumAfter = await checksumFile(filePath);
+      const statsAfter = await lstat(filePath);
+      if (!statsAfter.isFile() || statsAfter.isSymbolicLink() ||
+          !sameFileIdentity(verifiedStats, statsAfter)) {
+        throw new BridgeAppError("This image changed while its metadata was being inspected.",
+          "FILE_CHANGED_DURING_SCAN", 409);
+      }
+    }
 
     if (checksumBefore !== checksumAfter) {
       throw new BridgeAppError(
@@ -171,12 +190,12 @@ async function fileDraft(
       checksum: checksumAfter,
       fileType,
       imageMetadata,
-      lastModified: stats.mtime,
+      lastModified: verifiedStats.mtime,
       localPath: bridgeRootUri(rootId, relativePath),
       readStatus: "SUPPORTED",
       relativePath,
-      sizeBytes: BigInt(stats.size),
-      sourceCreatedAt: stats.birthtime,
+      sizeBytes: BigInt(verifiedStats.size),
+      sourceCreatedAt: verifiedStats.birthtime,
     } satisfies BridgeScannedFileDraft;
   } catch {
     return {
@@ -199,6 +218,7 @@ async function scanDirectory(
   currentPath: string,
   files: BridgeScannedFileDraft[],
   imageMetadataExtractor: typeof extractImageMetadata,
+  beforeImageChecksum?: (filePath: string) => Promise<void>,
 ) {
   const currentStats = await lstat(currentPath);
 
@@ -249,12 +269,12 @@ async function scanDirectory(
     }
 
     if (stats.isDirectory()) {
-      await scanDirectory(rootId, rootPath, entryPath, files, imageMetadataExtractor);
+      await scanDirectory(rootId, rootPath, entryPath, files, imageMetadataExtractor, beforeImageChecksum);
       continue;
     }
 
     if (stats.isFile()) {
-      files.push(await fileDraft(rootId, rootPath, entryPath, imageMetadataExtractor));
+      files.push(await fileDraft(rootId, rootPath, entryPath, imageMetadataExtractor, beforeImageChecksum));
     }
   }
 }
@@ -281,6 +301,7 @@ export async function scanBridgeRoot(
     root.actualPath,
     files,
     options.imageMetadataExtractor ?? extractImageMetadata,
+    options.beforeImageChecksum,
   );
 
   const completedAt = new Date();

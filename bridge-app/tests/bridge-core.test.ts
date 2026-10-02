@@ -686,6 +686,26 @@ describe("NSN Bridge core", () => {
     });
   });
 
+  it("uses the replacement image stats when replacement happens before the checksum guard", async () => {
+    const folder = await makeSafeFolder("library-image-scan-pre-guard-replacement");
+    const imagePath = path.join(folder, "replaced.png");
+    const root = await connectFolder(folder);
+    await writeFile(imagePath, pngMetadataFixture());
+    const replacement = Buffer.concat([pngMetadataFixture(1024, 768), Buffer.alloc(37, 7)]);
+
+    const scan = await scanBridgeRoot(root.id, {
+      beforeImageChecksum: async () => writeFile(imagePath, replacement),
+    });
+    const image = scan.files[0];
+
+    assert.equal(image.readStatus, "SUPPORTED");
+    assert.equal(image.checksum, createHash("sha256").update(replacement).digest("hex"));
+    assert.equal(image.sizeBytes, BigInt(replacement.length));
+    assert.equal(image.imageMetadata?.sizeBytes, BigInt(replacement.length));
+    assert.equal(image.imageMetadata?.width, 1024);
+    assert.equal(image.imageMetadata?.height, 768);
+  });
+
   it("keeps unchanged images supported with matching metadata", async () => {
     const folder = await makeSafeFolder("library-image-scan-stable");
     const bytes = pngMetadataFixture();

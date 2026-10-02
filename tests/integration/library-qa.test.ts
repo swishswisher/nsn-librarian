@@ -428,6 +428,76 @@ test("version comparison uses structured revision lineage", async () => {
   assert.ok(!result.answer.includes("workshop-proposal-v1.txt is newer than workshop-proposal-v2.txt"));
 });
 
+test("version comparison honors a separated revision pair in either endpoint orientation", async () => {
+  const r = await root("Separated Version QA Root"); const s = await scan(r.id);
+  const a = await file({ rootId: r.id, sessionId: s.id, relativePath: "brief-v1.txt",
+    quote: "Separated brief version one" });
+  const b = await file({ rootId: r.id, sessionId: s.id, relativePath: "brief-v2.txt",
+    quote: "Separated brief version two" });
+  await prisma.knowledgeDocumentSignal.createMany({ data: [a, b].map((item, index) => ({
+    signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+    relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!,
+    kind: "DOCUMENT_FAMILY", identityHash: "separated-brief-family", revisionNumber: `${index + 1}`,
+    sourceRanges: [], observationSessionId: item.observation.id, generationVersion: documentSignalVersion,
+  })) });
+  const irrelevant = await prisma.knowledgeConnection.create({ data: {
+    sourceObservationSessionId: b.observation.id, targetObservationSessionId: a.observation.id,
+    sourceChecksum: "an-old-checksum", targetChecksum: a.scanned.checksum,
+    sourceFileKey: b.index.fileKey, targetFileKey: a.index.fileKey,
+    generationVersion: documentSignalVersion, relationshipKind: "PROBABLE_REVISION",
+    sharedTerms: [], reasoning: "Old pair", status: "REJECTED",
+    sourceEvidence: { identityHash: "separated-brief-family" },
+  } });
+  await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: irrelevant.id,
+    action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+  assert.equal((await retrieve.retrieveQuestionContext("separated brief versions", [r.id])).versions.length, 1);
+
+  const separated = await prisma.knowledgeConnection.create({ data: {
+    sourceObservationSessionId: b.observation.id, targetObservationSessionId: a.observation.id,
+    sourceChecksum: b.scanned.checksum, targetChecksum: a.scanned.checksum,
+    sourceFileKey: b.index.fileKey, targetFileKey: a.index.fileKey,
+    generationVersion: documentSignalVersion, relationshipKind: "PROBABLE_REVISION",
+    sharedTerms: [], reasoning: "Human separated this pair", status: "REJECTED",
+    sourceEvidence: { identityHash: "separated-brief-family" },
+  } });
+  await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: separated.id,
+    action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+  const context = await retrieve.retrieveQuestionContext("separated brief versions", [r.id]);
+  assert.equal(context.versions.length, 0);
+  assert.ok(context.sources.every((source) => source.timeState !== "Earlier document version"));
+});
+
+test("separating a revision pair during generation invalidates its ordered answer context", async () => {
+  const r = await root("Midflight Version Separation Root"); const s = await scan(r.id);
+  const a = await file({ rootId: r.id, sessionId: s.id, relativePath: "plan-v1.txt",
+    quote: "Midflight plan version one" });
+  const b = await file({ rootId: r.id, sessionId: s.id, relativePath: "plan-v2.txt",
+    quote: "Midflight plan version two" });
+  await prisma.knowledgeDocumentSignal.createMany({ data: [a, b].map((item, index) => ({
+    signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+    relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!, kind: "DOCUMENT_FAMILY",
+    identityHash: "midflight-plan-family", revisionNumber: `${index + 1}`, sourceRanges: [],
+    observationSessionId: item.observation.id, generationVersion: documentSignalVersion,
+  })) });
+  const result = await answer.answerLibraryQuestion("Which midflight plan version is newer?", {
+    permittedRootIds: [r.id], model: async () => {
+      const separated = await prisma.knowledgeConnection.create({ data: {
+        sourceObservationSessionId: a.observation.id, targetObservationSessionId: b.observation.id,
+        sourceChecksum: a.scanned.checksum, targetChecksum: b.scanned.checksum,
+        sourceFileKey: a.index.fileKey, targetFileKey: b.index.fileKey,
+        generationVersion: documentSignalVersion, relationshipKind: "PROBABLE_REVISION",
+        sharedTerms: [], reasoning: "Separated while answering", status: "REJECTED",
+        sourceEvidence: { identityHash: "midflight-plan-family" },
+      } });
+      await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: separated.id,
+        action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+      return model([claim("plan-v2.txt is newer than plan-v1.txt", ["S1", "S2"])])();
+    },
+  });
+  assert.equal(result.state, "SOURCE_CHANGED");
+  assert.equal(result.claims.length, 0);
+});
+
 test("ambiguous version ordering is reported without choosing a winner", async () => {
   const r = await root("Ambiguous Version QA Root"); const s = await scan(r.id);
   const a = await file({ rootId: r.id, sessionId: s.id, relativePath: "proposal-left.txt", quote: "Proposal left" });
