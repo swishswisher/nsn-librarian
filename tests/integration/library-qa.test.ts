@@ -198,6 +198,41 @@ test("approved Memory contributes when its source root is authorized", async () 
   assert.equal(result.sources[0]?.sourceType, "APPROVED_MEMORY");
 });
 
+test("multi-root Memory answers survive provenance row reordering during generation", async () => {
+  const a = await root("Memory Alpha Root"); const sa = await scan(a.id);
+  const b = await root("Memory Beta Root"); const sb = await scan(b.id);
+  const first = await file({ rootId: a.id, sessionId: sa.id, relativePath: "alpha.txt",
+    quote: "Sharedrootquartz source alpha", knowledgeState: "APPROVED" });
+  const second = await file({ rootId: b.id, sessionId: sb.id, relativePath: "beta.txt",
+    quote: "Sharedrootquartz source beta", knowledgeState: "APPROVED" });
+  const memory = await prisma.memoryEntry.create({ data: { memoryType: "NOTE",
+    memoryKey: crypto.randomUUID(), title: "sharedrootquartz terminology",
+    description: "Sharedrootquartz is approved terminology", evidence: [],
+    searchProvenanceComplete: true, searchSourceCount: 2,
+    searchSources: { create: [
+      { connectedLibraryId: a.id, observationSessionId: first.observation.id },
+      { connectedLibraryId: b.id, observationSessionId: second.observation.id },
+    ] },
+  } });
+
+  const result = await answer.answerLibraryQuestion("What did we decide about sharedrootquartz?", {
+    permittedRootIds: [a.id, b.id],
+    model: async () => {
+      await prisma.memorySearchSource.deleteMany({ where: { memoryEntryId: memory.id } });
+      await prisma.memorySearchSource.createMany({ data: [
+        { memoryEntryId: memory.id, connectedLibraryId: b.id,
+          observationSessionId: second.observation.id },
+        { memoryEntryId: memory.id, connectedLibraryId: a.id,
+          observationSessionId: first.observation.id },
+      ] });
+      return model([claim("Sharedrootquartz is approved terminology", ["S1"])])();
+    },
+  });
+
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  assert.equal(result.sources[0]?.rootName, "Memory Alpha Root; Memory Beta Root");
+});
+
 test("approved Memory cannot be mislabeled as a direct document quotation", async () => {
   const r = await root("Memory Quote Root"); const s = await scan(r.id);
   const item = await file({ rootId: r.id, sessionId: s.id, relativePath: "source.txt",

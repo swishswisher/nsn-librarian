@@ -104,7 +104,8 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
           !["APPROVED", "MODIFIED"].includes(source.observationSession.status))) continue;
       sources.push({ id: `S${sources.length + 1}`, sourceType: "APPROVED_MEMORY",
         title: entry.title.slice(0, 160), rootName: [...new Set(entry.searchSources.map((source) =>
-          rootById.get(source.connectedLibraryId)!.displayName))].join("; "),
+          rootById.get(source.connectedLibraryId)!.displayName))].sort((left, right) =>
+          left.localeCompare(right)).join("; "),
         relativePath: null, href: "/admin/library/memory", trustState: "Human-approved Memory",
         timeState: "Active", text: `${entry.title}. ${entry.description}`.slice(0, 400),
         sourceRange: null, physicalIdentity: `memory:${entry.id}`,
