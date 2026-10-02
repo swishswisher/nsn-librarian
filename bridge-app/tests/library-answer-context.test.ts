@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { answerLibraryQuestion } from "../../src/lib/library/qa/answer";
-import { assessDocumentVersionFamily } from "../../src/lib/library/qa/retrieve";
+import { assessDocumentVersionFamily, groupDocumentVersionSignalsByFamily } from "../../src/lib/library/qa/retrieve";
 import type { AnswerContext } from "../../src/lib/library/qa/types";
 
 function answerContext(): AnswerContext {
@@ -52,6 +52,21 @@ test("complete version-family assessment stays linear at scan scale", () => {
     { ...family[1], revisionNumber: "1", revisionDate: "2026-01-01" },
   ], false).safe, false);
   assert.equal(assessDocumentVersionFamily(family.slice(0, 2), true).safe, false);
+});
+
+test("production version-family aggregation stays linear for duplicate revisions", () => {
+  type Signal = Parameters<typeof assessDocumentVersionFamily>[0][number];
+  const family = Array.from({ length: 20_000 }, (_, index) => ({
+    connectedLibraryId: "root", fileKey: `duplicate-${index}`, checksum: `checksum-${index}`,
+    identityHash: "duplicate-family", revisionNumber: null, revisionDate: null,
+  } as Signal));
+
+  const grouped = groupDocumentVersionSignalsByFamily(family);
+  assert.equal(grouped.size, 1);
+  const assessed = assessDocumentVersionFamily(grouped.values().next().value!, false);
+  assert.equal(assessed.safe, false);
+  assert.equal(assessed.maximum, null);
+  assert.equal(assessed.family.length, 20_000);
 });
 
 function swapSourceOrdinals(context: AnswerContext) {

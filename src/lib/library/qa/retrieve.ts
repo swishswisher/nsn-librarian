@@ -26,7 +26,9 @@ function familyHasAmbiguousPair(family: VersionSignal[]) {
   for (const signal of family) {
     const revision = normalizedRevision(signal.revisionNumber);
     const key = revision ? revision.join(".") : "<missing>";
-    groups.set(key, [...(groups.get(key) ?? []), signal]);
+    const group = groups.get(key);
+    if (group) group.push(signal);
+    else groups.set(key, [signal]);
   }
   for (const group of groups.values()) {
     if (group.length > 1 && (group.some((signal) => !signal.revisionDate) ||
@@ -62,6 +64,17 @@ function familyHasAmbiguousPair(family: VersionSignal[]) {
     }
   }
   return false;
+}
+
+export function groupDocumentVersionSignalsByFamily(signals: VersionSignal[]) {
+  const families = new Map<string, VersionSignal[]>();
+  for (const signal of signals) {
+    const key = `${signal.connectedLibraryId}\0${signal.identityHash}`;
+    const family = families.get(key);
+    if (family) family.push(signal);
+    else families.set(key, [signal]);
+  }
+  return families;
 }
 
 export function assessDocumentVersionFamily(
@@ -272,12 +285,8 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     : new Map<string, Set<string>>();
   const versionEntryByEndpoint = new Map(versionEntries.map((entry) =>
     [`${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`, entry]));
-  const versionFamilyMap = new Map<string, typeof allVersionSignals>();
-  for (const signal of allVersionSignals) {
-    if (!versionEntryByEndpoint.has(`${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`)) continue;
-    const key = `${signal.connectedLibraryId}\0${signal.identityHash}`;
-    versionFamilyMap.set(key, [...(versionFamilyMap.get(key) ?? []), signal]);
-  }
+  const versionFamilyMap = groupDocumentVersionSignalsByFamily(allVersionSignals.filter((signal) =>
+    versionEntryByEndpoint.has(`${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`)));
   const versionFamilies = [...versionFamilyMap.values()]
     .filter((family) => family.length > 1)
     .sort((left, right) => {
