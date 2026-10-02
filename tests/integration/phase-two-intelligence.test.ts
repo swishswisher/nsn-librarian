@@ -670,6 +670,58 @@ test("same-client corrections form a canonical transitive equivalence regardless
   assert.ok((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: directSeparation.id } })).supersededAt);
 });
 
+test("historical identities at a reused canonical path remain checksum-scoped from current corrections", async () => {
+  const library = await createLibrary("Checksum-scoped correction history");
+  const oldScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
+  const oldFile = await createObservedFile({ checksum: "1".repeat(64), libraryId: library.id,
+    relativePath: "Records/shared.txt", sessionId: oldScan.id });
+  const currentScan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
+  const currentFile = await createObservedFile({ checksum: "2".repeat(64), libraryId: library.id,
+    relativePath: oldFile.file.relativePath, sessionId: currentScan.id });
+  const targetFile = await createObservedFile({ checksum: "3".repeat(64), libraryId: library.id,
+    relativePath: "Records/target.txt", sessionId: currentScan.id });
+  const canonicalFileKey = persistent.persistentFileKey(library.id, oldFile.file.relativePath);
+
+  for (const kind of ["CLIENT", "PROJECT"] as const) {
+    const oldIdentity = `old-${kind.toLowerCase()}`;
+    const currentIdentity = `current-${kind.toLowerCase()}`;
+    const targetIdentity = `target-${kind.toLowerCase()}`;
+    const oldSignal = await prisma.knowledgeDocumentSignal.create({ data: {
+      checksum: oldFile.file.checksum!, connectedLibraryId: library.id, fileKey: canonicalFileKey,
+      generationVersion: documentSignalVersion, identityHash: oldIdentity, kind,
+      observationSessionId: oldFile.observation.id, relativePath: oldFile.file.relativePath,
+      signalKey: crypto.randomUUID(), sourceRanges: [], status: "SUPERSEDED", supersededAt: new Date(),
+    } });
+    const currentSignal = await prisma.knowledgeDocumentSignal.create({ data: {
+      checksum: currentFile.file.checksum!, connectedLibraryId: library.id, fileKey: canonicalFileKey,
+      generationVersion: documentSignalVersion, identityHash: currentIdentity, kind,
+      observationSessionId: currentFile.observation.id, relativePath: currentFile.file.relativePath,
+      signalKey: crypto.randomUUID(), sourceRanges: [],
+    } });
+    const targetSignal = await prisma.knowledgeDocumentSignal.create({ data: {
+      checksum: targetFile.file.checksum!, connectedLibraryId: library.id,
+      fileKey: persistent.persistentFileKey(library.id, targetFile.file.relativePath),
+      generationVersion: documentSignalVersion, identityHash: targetIdentity, kind,
+      observationSessionId: targetFile.observation.id, relativePath: targetFile.file.relativePath,
+      signalKey: crypto.randomUUID(), sourceRanges: [],
+    } });
+
+    await persistent.createIdentityCorrection({ sourceSignalId: currentSignal.id, targetSignalId: targetSignal.id,
+      kind: kind === "CLIENT" ? "SAME_CLIENT" : "BELONGS_TO_PROJECT",
+      note: "This correction applies only to the reviewed current bytes." });
+    const effective = await persistent.getEffectiveDocumentSignals([library.id], { historicalEntries: [
+      { checksum: oldFile.file.checksum!, connectedLibraryId: library.id, fileKey: canonicalFileKey, isCurrent: false },
+      { checksum: currentFile.file.checksum!, connectedLibraryId: library.id, fileKey: canonicalFileKey, isCurrent: true },
+    ] });
+    assert.ok(effective.some((row) => row.id === oldSignal.id && row.identityHash === oldIdentity));
+    assert.ok(!effective.some((row) => row.checksum === oldFile.file.checksum && row.identityHash === targetIdentity));
+    assert.ok(effective.some((row) => row.checksum === currentFile.file.checksum && row.kind === kind &&
+      row.identityHash === targetIdentity));
+    assert.ok(!effective.some((row) => row.checksum === currentFile.file.checksum && row.kind === kind &&
+      row.identityHash === currentIdentity));
+  }
+});
+
 test("explicit v1/v2 forms a revision link while identical copies and filenames do not", async () => {
   const library = await createLibrary("Version root");
   const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });

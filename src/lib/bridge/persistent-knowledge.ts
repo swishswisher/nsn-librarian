@@ -43,11 +43,12 @@ function correctedClientIdentities(
   separatedPairs: Set<string> = new Set(),
 ) {
   const clientRows = rows.filter((row) => ["CLIENT", "UNRESOLVED_CLIENT"].includes(row.kind));
-  const byEndpoint = new Map(clientRows.map((row) => [`${row.fileKey}\0${row.checksum}`, row]));
-  const byFile = new Map(clientRows.map((row) => [row.fileKey, row]));
-  const parent = new Map(clientRows.map((row) => [row.fileKey, row.fileKey]));
-  const members = new Map(clientRows.map((row) => [row.fileKey, new Set([row.fileKey])]));
-  const canonical = new Map(clientRows.map((row) => [row.fileKey, row.identityHash]));
+  const endpointKey = (row: Pick<EffectiveIdentitySignal, "fileKey" | "checksum">) =>
+    `${row.fileKey}\0${row.checksum}`;
+  const byEndpoint = new Map(clientRows.map((row) => [endpointKey(row), row]));
+  const parent = new Map(clientRows.map((row) => [endpointKey(row), endpointKey(row)]));
+  const members = new Map(clientRows.map((row) => [endpointKey(row), new Set([endpointKey(row)])]));
+  const canonical = new Map(clientRows.map((row) => [endpointKey(row), row.identityHash]));
   const find = (key: string): string => {
     const next = parent.get(key);
     if (!next || next === key) return key;
@@ -65,17 +66,17 @@ function correctedClientIdentities(
     if (!source || !target || source.connectedLibraryId !== target.connectedLibraryId ||
         !evidence || Array.isArray(evidence) || typeof evidence !== "object" ||
         evidence.connectedLibraryId !== source.connectedLibraryId || typeof evidence.identityHash !== "string") continue;
-    const sourceRoot = find(source.fileKey);
-    const targetRoot = find(target.fileKey);
+    const sourceRoot = find(endpointKey(source));
+    const targetRoot = find(endpointKey(target));
     const targetIdentity = canonical.get(targetRoot) ?? target.identityHash;
     // Older rows stored the target's raw hash; newer rows store its effective canonical hash.
     if (evidence.identityHash !== target.identityHash && evidence.identityHash !== targetIdentity) continue;
     if (sourceRoot === targetRoot) continue;
-    const sourceMembers = members.get(sourceRoot) ?? new Set([source.fileKey]);
-    const targetMembers = members.get(targetRoot) ?? new Set([target.fileKey]);
+    const sourceMembers = members.get(sourceRoot) ?? new Set([endpointKey(source)]);
+    const targetMembers = members.get(targetRoot) ?? new Set([endpointKey(target)]);
     if ([...sourceMembers].some((sourceKey) => [...targetMembers].some((targetKey) => {
-      const sourceRow = byFile.get(sourceKey);
-      const targetRow = byFile.get(targetKey);
+      const sourceRow = byEndpoint.get(sourceKey);
+      const targetRow = byEndpoint.get(targetKey);
       return sourceRow && targetRow && separatedPairs.has(knowledgeRelationshipPairKey(sourceRow, targetRow));
     }))) continue;
     for (const key of sourceMembers) {
@@ -92,7 +93,7 @@ function correctedClientIdentities(
   for (const [root, group] of members) {
     if (group.size < 2) continue;
     const identity = canonical.get(find(root));
-    if (identity) for (const fileKey of group) result.set(fileKey, identity);
+    if (identity) for (const endpoint of group) result.set(endpoint, identity);
   }
   return result;
 }
@@ -1199,7 +1200,7 @@ export async function createIdentityCorrection(input: {
           { fileKey: row.targetFileKey, checksum: row.targetChecksum },
         )] : []));
       targetIdentityHash = correctedClientIdentities(clientSignals, activeCorrections, separatedPairs)
-        .get(target.fileKey) ?? target.identityHash;
+        .get(`${target.fileKey}\0${target.checksum}`) ?? target.identityHash;
     }
     const relationshipKey = digest([humanIdentityCorrectionVersion, input.kind, source.fileKey, source.checksum,
       target.fileKey, target.checksum, targetIdentityHash].join("\0"));
@@ -1367,6 +1368,8 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
   const rows = [...currentRows, ...historicalRows];
   const effectiveRows = [...rows];
   const correctedIdentities = new Map<string, string>();
+  const correctionKey = (row: Pick<EffectiveIdentitySignal, "fileKey" | "checksum" | "kind">) =>
+    `${row.fileKey}\0${row.checksum}\0${row.kind}`;
   const separatedClientPairs = new Set(separatedIdentityRows.flatMap((row) => row.relationshipKind === "SAME_CLIENT" && row.sourceFileKey && row.sourceChecksum &&
     row.targetFileKey && row.targetChecksum ? [knowledgeRelationshipPairKey(
       { fileKey: row.sourceFileKey, checksum: row.sourceChecksum },
@@ -1374,9 +1377,9 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
     )] : []));
   const correctedClients = correctedClientIdentities(rows, humanCorrections, separatedClientPairs);
   for (const row of rows) {
-    const identityHash = correctedClients.get(row.fileKey);
+    const identityHash = correctedClients.get(`${row.fileKey}\0${row.checksum}`);
     if (!identityHash || !["CLIENT", "UNRESOLVED_CLIENT"].includes(row.kind)) continue;
-    correctedIdentities.set(`${row.fileKey}:CLIENT`, identityHash);
+    correctedIdentities.set(correctionKey({ ...row, kind: "CLIENT" }), identityHash);
     effectiveRows.push({ ...row, kind: "CLIENT", identityHash, sourceRanges: [],
       generationVersion: humanIdentityCorrectionVersion });
   }
@@ -1397,20 +1400,20 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
         { fileKey: row.sourceFileKey, checksum: row.sourceChecksum },
         { fileKey: row.targetFileKey, checksum: row.targetChecksum }));
     if (separatedProjectPair) continue;
-    const key = `${source.fileKey}:${kind}`;
+    const key = correctionKey({ ...source, kind });
     if (correctedIdentities.has(key)) continue;
     correctedIdentities.set(key, target.identityHash);
     effectiveRows.push({ ...source, kind, identityHash: target.identityHash, sourceRanges: [], generationVersion: humanIdentityCorrectionVersion });
     if (target.kind !== kind) {
-      correctedIdentities.set(`${target.fileKey}:${kind}`, target.identityHash);
+      correctedIdentities.set(correctionKey({ ...target, kind }), target.identityHash);
       effectiveRows.push({ ...target, kind, generationVersion: humanIdentityCorrectionVersion });
     }
   }
   return effectiveRows.filter((row) => {
-    const correction = correctedIdentities.get(`${row.fileKey}:${row.kind}`);
+    const correction = correctedIdentities.get(correctionKey(row));
     return (!correction || correction === row.identityHash) &&
-      !(row.kind === "UNRESOLVED_CLIENT" && correctedIdentities.has(`${row.fileKey}:CLIENT`)) &&
-      !(row.kind === "UNRESOLVED_PROJECT" && correctedIdentities.has(`${row.fileKey}:PROJECT`));
+      !(row.kind === "UNRESOLVED_CLIENT" && correctedIdentities.has(correctionKey({ ...row, kind: "CLIENT" }))) &&
+      !(row.kind === "UNRESOLVED_PROJECT" && correctedIdentities.has(correctionKey({ ...row, kind: "PROJECT" })));
   });
 }
 
