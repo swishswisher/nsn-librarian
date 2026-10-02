@@ -1062,6 +1062,49 @@ test("two reviewed moves propose a local rule, but only explicit approval activa
   assert.equal(await prisma.organizationPreferenceRevision.count({ where: { preferenceId: proposal.id } }), 2);
 });
 
+test("production suggestions honor an older matching approval beyond forty unrelated approvals", async () => {
+  const library = await createLibrary("Paginated preference Root");
+  const matching = await prisma.organizationPreference.create({ data: {
+    approvedAt: new Date("2025-01-01T00:00:00.000Z"),
+    connectedLibraryId: library.id,
+    destinationRelativePath: "Finance",
+    evidence: [], proposalKey: crypto.randomUUID(),
+    scopeTerms: ["invoice", "payment"], sourceDecisionIds: [], status: "APPROVED",
+  } });
+  await prisma.organizationPreference.createMany({ data: Array.from({ length: 45 }, (_, index) => ({
+    approvedAt: new Date(`2026-01-${String(index % 28 + 1).padStart(2, "0")}T00:00:00.000Z`),
+    connectedLibraryId: library.id,
+    destinationRelativePath: `Unrelated/${index}`,
+    evidence: [], proposalKey: crypto.randomUUID(),
+    scopeTerms: [`unrelated-${index}`, `archive-${index}`], sourceDecisionIds: [],
+    status: "APPROVED" as const,
+  })) });
+
+  const active = await preferences.applicableApprovedPreferences({
+    connectedLibraryId: library.id,
+    contentText: "Invoice payment expenses accounting records for the current office.",
+  });
+  assert.deepEqual(active.map((preference) => preference.id), [matching.id]);
+
+  const session = await prisma.scanSession.create({ data: {
+    connectedFolderId: library.id, status: "COMPLETED",
+  } });
+  const observed = await createObservedFile({
+    checksum: "9".repeat(64), libraryId: library.id,
+    relativePath: "Loose/older-rule-invoice.txt", sessionId: session.id,
+  });
+  const { generateOrganizationSuggestionsForScannedFileWithText } = await import("../../src/lib/bridge/organization-suggestions");
+  await generateOrganizationSuggestionsForScannedFileWithText(
+    observed.file.id,
+    "Invoice payment expenses accounting records for the current office.",
+  );
+  const suggestion = await prisma.organizationSuggestion.findFirstOrThrow({ where: {
+    scannedFileId: observed.file.id, suggestionType: "MOVE_FILE",
+  } });
+  assert.match(suggestion.proposedRelativePath ?? "", /^Finance\//);
+  assert.match(JSON.stringify(suggestion.supportingInformation), /separately approved organization preference/);
+});
+
 test("reset or regeneration disputes supporting decisions without filesystem commands", async () => {
   const library = await createLibrary("Dispute Root");
   const first = await createReviewedMove(library.id, "Loose/invoice-a.txt");

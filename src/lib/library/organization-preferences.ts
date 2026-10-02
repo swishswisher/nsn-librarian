@@ -229,15 +229,23 @@ export async function applicableApprovedPreferences(input: {
     where: { id: input.connectedLibraryId },
   });
   if (!library?.isEnabled || library.status === "DISCONNECTED") return [];
-  const preferences = await prisma.organizationPreference.findMany({
-    orderBy: { approvedAt: "desc" },
-    take: 40,
-    where: {
-      connectedLibraryId: input.connectedLibraryId,
-      disputedAt: null,
-      status: "APPROVED",
-    },
-  });
+  const preferences: Awaited<ReturnType<typeof prisma.organizationPreference.findMany>> = [];
+  const pageSize = 200;
+  let cursor: string | undefined;
+  do {
+    const page = await prisma.organizationPreference.findMany({
+      orderBy: [{ approvedAt: "desc" }, { id: "desc" }],
+      take: pageSize,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      where: {
+        connectedLibraryId: input.connectedLibraryId,
+        disputedAt: null,
+        status: "APPROVED",
+      },
+    });
+    preferences.push(...page);
+    cursor = page.length === pageSize ? page.at(-1)?.id : undefined;
+  } while (cursor);
   const text = input.contentText.toLowerCase();
   const matching = preferences.filter((preference) =>
     (!input.destination || preference.destinationRelativePath.toLowerCase() === input.destination.toLowerCase()) &&
@@ -254,7 +262,7 @@ export async function applicableApprovedPreferences(input: {
   }
   return matching.filter((preference) =>
     (destinationsForScope.get(jsonStrings(preference.scopeTerms).slice().sort().join("\0"))?.size ?? 0) === 1,
-  );
+  ).slice(0, 40);
 }
 
 export async function disputePreferencesFromDecisions(suggestionIds: string[]) {

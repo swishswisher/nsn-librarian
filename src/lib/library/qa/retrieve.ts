@@ -12,6 +12,90 @@ import { maxAnswerSources, type AnswerContext, type AnswerContextSource, type An
 
 type StoredExcerpt = { start: number; end: number; text: string };
 
+type VersionSignal = Awaited<ReturnType<typeof getDocumentVersionSignals>>[number];
+
+function normalizedRevision(value: string | null) {
+  if (!value) return null;
+  const parts = value.split(".").map(Number);
+  while (parts.length > 1 && parts.at(-1) === 0) parts.pop();
+  return parts;
+}
+
+function familyHasAmbiguousPair(family: VersionSignal[]) {
+  const groups = new Map<string, VersionSignal[]>();
+  for (const signal of family) {
+    const revision = normalizedRevision(signal.revisionNumber);
+    const key = revision ? revision.join(".") : "<missing>";
+    groups.set(key, [...(groups.get(key) ?? []), signal]);
+  }
+  for (const group of groups.values()) {
+    if (group.length > 1 && (group.some((signal) => !signal.revisionDate) ||
+      new Set(group.map((signal) => signal.revisionDate)).size !== group.length)) return true;
+  }
+  const missingRevision = groups.get("<missing>");
+  if (missingRevision?.length && (family.some((signal) => !signal.revisionDate) ||
+    new Set(family.map((signal) => signal.revisionDate)).size !== family.length)) return true;
+  if (family.some((signal) => !signal.revisionDate &&
+    (!signal.revisionNumber || (groups.get(normalizedRevision(signal.revisionNumber)!.join("."))?.length ?? 0) > 1))) {
+    return true;
+  }
+
+  // Numeric and date markers must not order two revision groups in opposite
+  // directions. Checking group date ranges after numeric sorting detects every
+  // such inversion without comparing every member pair.
+  const orderedGroups = [...groups.entries()].filter(([key]) => key !== "<missing>")
+    .map(([, signals]) => signals)
+    .sort((left, right) => {
+      const a = normalizedRevision(left[0].revisionNumber)!;
+      const b = normalizedRevision(right[0].revisionNumber)!;
+      for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+        if ((a[index] ?? 0) !== (b[index] ?? 0)) return (a[index] ?? 0) - (b[index] ?? 0);
+      }
+      return 0;
+    });
+  let latestEarlierDate: string | null = null;
+  for (const group of orderedGroups) {
+    const dates = group.flatMap((signal) => signal.revisionDate ? [signal.revisionDate] : []).sort();
+    if (dates.length && latestEarlierDate && dates[0] < latestEarlierDate) return true;
+    if (dates.length && (!latestEarlierDate || dates.at(-1)! > latestEarlierDate)) {
+      latestEarlierDate = dates.at(-1)!;
+    }
+  }
+  return false;
+}
+
+export function assessDocumentVersionFamily(
+  family: VersionSignal[],
+  separated: boolean,
+) {
+  if (separated || family.length < 2 || familyHasAmbiguousPair(family)) {
+    return { maximum: null, olderSignals: [], safe: false, separated, family };
+  }
+
+  // A complete family can contain every file in a scan. Never materialize its
+  // pairwise comparison graph: retain one candidate, then verify that candidate
+  // against the complete family. This is linear in both work and memory.
+  let maximum = family[0];
+  for (let index = 1; index < family.length; index += 1) {
+    const order = compareDocumentVersions(maximum, family[index]);
+    if (order === null) {
+      return { maximum: null, olderSignals: [], safe: false, separated: false, family };
+    }
+    if (order === -1) maximum = family[index];
+  }
+  const olderSignals: VersionSignal[] = [];
+  for (const signal of family) {
+    if (signal === maximum) continue;
+    if (compareDocumentVersions(maximum, signal) !== 1) {
+      return { maximum: null, olderSignals: [], safe: false, separated: false, family };
+    }
+    olderSignals.push(signal);
+  }
+  olderSignals.sort((left, right) =>
+    `${left.fileKey}\0${left.checksum}`.localeCompare(`${right.fileKey}\0${right.checksum}`));
+  return { maximum, olderSignals, safe: true, separated: false, family };
+}
+
 function excerpts(value: unknown): StoredExcerpt[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item) => item && typeof item === "object" &&
@@ -201,25 +285,14 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
       const rightKey = `${right[0].connectedLibraryId}\0${right[0].identityHash}`;
       return leftKey.localeCompare(rightKey);
     });
-  const assessedFamilies = versionFamilies.map((family) => {
-    const comparisons = family.flatMap((left, index) => family.slice(index + 1).map((right) => ({
-      left, right, order: compareDocumentVersions(left, right),
-      separated: allSeparatedVersionPairs.has(knowledgeRelationshipPairKey(left, right)),
-    })));
-    const separated = comparisons.some((comparison) => comparison.separated);
-    const ambiguous = comparisons.some((comparison) => comparison.order === null);
-    const older = new Set(comparisons.flatMap((comparison) => comparison.order === null ? [] : [
-      comparison.order === 1
-        ? `${comparison.right.connectedLibraryId}\0${comparison.right.fileKey}\0${comparison.right.checksum}`
-        : `${comparison.left.connectedLibraryId}\0${comparison.left.fileKey}\0${comparison.left.checksum}`,
-    ]));
-    const maxima = family.filter((signal) => !older.has(
-      `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`));
-    const maximum = !separated && !ambiguous && maxima.length === 1 ? maxima[0] : null;
-    const olderSignals = maximum ? family.filter((signal) => signal !== maximum)
-      .sort((left, right) => `${left.fileKey}\0${left.checksum}`.localeCompare(`${right.fileKey}\0${right.checksum}`)) : [];
-    return { maximum, olderSignals, safe: Boolean(maximum), separated, family };
-  });
+  const separatedVersionIdentities = new Set([...allSeparatedVersionPairs.values()].flatMap((identities) =>
+    [...identities]));
+  const hasUnscopedVersionSeparation = [...allSeparatedVersionPairs.values()].some((identities) =>
+    identities.size === 0);
+  const assessedFamilies = versionFamilies.map((family) => assessDocumentVersionFamily(
+    family,
+    hasUnscopedVersionSeparation || separatedVersionIdentities.has(family[0].identityHash),
+  ));
   const assessableVersionEndpoints = new Set(assessedFamilies.flatMap((family) => !family.separated
     ? family.family.map((signal) =>
       `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`) : []));

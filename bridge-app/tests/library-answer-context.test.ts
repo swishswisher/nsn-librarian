@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { answerLibraryQuestion } from "../../src/lib/library/qa/answer";
+import { assessDocumentVersionFamily } from "../../src/lib/library/qa/retrieve";
 import type { AnswerContext } from "../../src/lib/library/qa/types";
 
 function answerContext(): AnswerContext {
@@ -28,6 +29,30 @@ function answerContext(): AnswerContext {
     ambiguousEntity: false,
   };
 }
+
+test("complete version-family assessment stays linear at scan scale", () => {
+  type Signal = Parameters<typeof assessDocumentVersionFamily>[0][number];
+  const family = Array.from({ length: 20_000 }, (_, index) => ({
+    connectedLibraryId: "root", fileKey: `file-${index}`, checksum: `checksum-${index}`,
+    identityHash: "large-family", revisionNumber: String(index + 1), revisionDate: null,
+  } as Signal));
+
+  const assessed = assessDocumentVersionFamily(family, false);
+  assert.equal(assessed.safe, true);
+  assert.equal(assessed.maximum?.revisionNumber, "20000");
+  assert.equal(assessed.olderSignals.length, 19_999);
+
+  assert.equal(assessDocumentVersionFamily([
+    { ...family[0], revisionNumber: "1", revisionDate: "2026-02-01" },
+    { ...family[1], revisionNumber: "2", revisionDate: "2026-01-01" },
+  ], false).safe, false);
+  assert.equal(assessDocumentVersionFamily([
+    { ...family[2], revisionNumber: "3", revisionDate: "2026-03-01" },
+    { ...family[0], revisionNumber: "1", revisionDate: null },
+    { ...family[1], revisionNumber: "1", revisionDate: "2026-01-01" },
+  ], false).safe, false);
+  assert.equal(assessDocumentVersionFamily(family.slice(0, 2), true).safe, false);
+});
 
 function swapSourceOrdinals(context: AnswerContext) {
   const remap = new Map([["S1", "S2"], ["S2", "S1"]]);
