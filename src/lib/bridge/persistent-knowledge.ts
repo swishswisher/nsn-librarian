@@ -1315,13 +1315,19 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
   });
   const libraryIds = libraries.map((library) => library.id);
   const historicalEntries = options?.historicalEntries.filter((entry) => !entry.isCurrent) ?? [];
+  const candidateSignalFilters: Prisma.KnowledgeDocumentSignalWhereInput[] = [
+    { status: "ACTIVE", supersededAt: null },
+    ...historicalEntries.map((entry): Prisma.KnowledgeDocumentSignalWhereInput => ({
+      connectedLibraryId: entry.connectedLibraryId,
+      fileKey: entry.fileKey,
+      checksum: entry.checksum,
+      status: { in: ["ACTIVE", "SUPERSEDED"] },
+    })),
+  ];
   const candidateRows = await prisma.knowledgeDocumentSignal.findMany({
     orderBy: { lastSeenAt: "desc" },
-    where: { generationVersion: documentSignalVersion, connectedLibraryId: { in: libraryIds }, OR: [
-      { status: "ACTIVE", supersededAt: null },
-      ...historicalEntries.map((entry) => ({ connectedLibraryId: entry.connectedLibraryId,
-        fileKey: entry.fileKey, checksum: entry.checksum, status: { in: ["ACTIVE", "SUPERSEDED"] as const } })),
-    ] },
+    where: { generationVersion: documentSignalVersion, connectedLibraryId: { in: libraryIds },
+      OR: candidateSignalFilters },
   });
   const humanCorrections = await prisma.knowledgeConnection.findMany({
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
