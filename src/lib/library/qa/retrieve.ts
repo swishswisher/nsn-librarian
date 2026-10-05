@@ -236,7 +236,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
       entry.scanSessionId === entry.scannedFile.sessionId &&
       entry.connectedLibraryId === entry.scannedFile.scanSession.connectedFolderId &&
       (route.wantsHistory || entry.isCurrent && latestIds.has(entry.scanSessionId))
-        ? [[entry.checksum ? `sha256:${entry.checksum}` : `${entry.connectedLibraryId}:${entry.fileKey}`, entry] as const]
+        ? [[`${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`, entry] as const]
         : [];
     })).values()]
     : [];
@@ -260,10 +260,13 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
       entry.scanSessionId === entry.scannedFile.sessionId &&
       entry.connectedLibraryId === entry.scannedFile.scanSession.connectedFolderId &&
       (route.wantsHistory || entry.isCurrent && latestIds.has(entry.scanSessionId)));
-    const expandedByPhysical = new Map(expandedEntries.map((entry) => [
-      entry.checksum ? `sha256:${entry.checksum}` : `${entry.connectedLibraryId}:${entry.fileKey}`, entry,
+    const expandedByEndpoint = new Map(expandedEntries.map((entry) => [
+      `${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`, entry,
     ]));
-    versionEntries = [...expandedByPhysical.values()];
+    // Family identities are root-scoped. Keep every authorized endpoint
+    // through discovery and expansion even when two roots contain identical
+    // bytes; physical-copy deduplication belongs to bounded source selection.
+    versionEntries = [...expandedByEndpoint.values()];
     entries = [...new Map([...entries, ...versionEntries].map((entry) => [entry.id, entry])).values()];
     entriesById = new Map(entries.map((entry) => [entry.id, entry]));
     const existingResultIds = new Set(results.map((result) => result.id));

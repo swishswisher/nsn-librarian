@@ -187,6 +187,60 @@ test("version retrieval expands a seeded family completely beyond signal paginat
   assert.ok(!result.claims.some((versionClaim) => /member-002\.txt is newer/.test(versionClaim.text)));
 });
 
+test("version retrieval preserves byte-identical seed endpoints across roots", async () => {
+  const retainedRoot = await prisma.connectedLibrary.create({ data: {
+    id: "version-copy-root-a", bridgeRootId: crypto.randomUUID(), displayName: "Version Copy A",
+    localPath: "bridge://qa-test/version-copy-a", platform: "MACOS",
+  } });
+  const expandedRoot = await prisma.connectedLibrary.create({ data: {
+    id: "version-copy-root-b", bridgeRootId: crypto.randomUUID(), displayName: "Version Copy B",
+    localPath: "bridge://qa-test/version-copy-b", platform: "MACOS",
+  } });
+  const retainedScan = await scan(retainedRoot.id);
+  const expandedScan = await scan(expandedRoot.id);
+  const duplicateChecksum = "identical-version-seed";
+  const a1 = await file({ rootId: retainedRoot.id, sessionId: retainedScan.id,
+    relativePath: "proposal/a-v1.txt", quote: "Orchid proposal version comparison" });
+  const a2 = await file({ rootId: retainedRoot.id, sessionId: retainedScan.id,
+    relativePath: "proposal/a-v2.txt", quote: "Orchid proposal version comparison",
+    checksum: duplicateChecksum });
+  const b2 = await file({ rootId: expandedRoot.id, sessionId: expandedScan.id,
+    relativePath: "proposal/b-v2-copy.txt", quote: "Orchid proposal version comparison",
+    checksum: duplicateChecksum });
+  const b3 = await file({ rootId: expandedRoot.id, sessionId: expandedScan.id,
+    relativePath: "opaque/newest.txt", quote: "Content without the query vocabulary" });
+  for (const [item, rootId, family, revision] of [
+    [a1, retainedRoot.id, "family-a", "1"], [a2, retainedRoot.id, "family-a", "2"],
+    [b2, expandedRoot.id, "family-b", "2"], [b3, expandedRoot.id, "family-b", "3"],
+  ] as const) {
+    await prisma.knowledgeDocumentSignal.create({ data: {
+      signalKey: crypto.randomUUID(), connectedLibraryId: rootId, fileKey: item.index.fileKey,
+      relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!,
+      kind: "DOCUMENT_FAMILY", identityHash: family, revisionNumber: revision,
+      sourceRanges: [], observationSessionId: item.observation.id,
+      generationVersion: documentSignalVersion,
+    } });
+  }
+
+  const question = "Which orchid proposal version is latest?";
+  const context = await retrieve.retrieveQuestionContext(question, [retainedRoot.id, expandedRoot.id]);
+  assert.equal(context.versionFamilyCount, 2);
+  assert.ok(context.sources.some((source) => source.relativePath === "opaque/newest.txt"));
+  assert.equal(context.sources.filter((source) => source.corroborationKeys.includes(
+    `sha256:${duplicateChecksum}`)).length, 1);
+  assert.equal(context.sources.find((source) => source.corroborationKeys.includes(
+    `sha256:${duplicateChecksum}`))?.relativePath, "proposal/a-v2.txt");
+  const retainedOnly = await retrieve.retrieveQuestionContext(question, [retainedRoot.id]);
+  assert.equal(retainedOnly.versionFamilyCount, 1);
+  assert.ok(!retainedOnly.sources.some((source) => source.relativePath === "opaque/newest.txt"));
+
+  const result = await answer.answerLibraryQuestion(question, {
+    permittedRootIds: [retainedRoot.id, expandedRoot.id], model: model([]),
+  });
+  assert.equal(result.state, "PARTIALLY_ANSWERED");
+  assert.ok(result.sources.some((source) => source.relativePath === "opaque/newest.txt"));
+});
+
 test("version claims allocate capped context across families and report excess families as partial", async () => {
   const makeFamilies = async (label: string, sizes: number[]) => {
     const r = await root(label); const s = await scan(r.id);
