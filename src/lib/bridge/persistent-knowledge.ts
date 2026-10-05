@@ -36,6 +36,39 @@ type EffectiveIdentityCorrection = {
   targetFileKey: string | null;
 };
 
+type SeparatedRelationshipRow = Prisma.KnowledgeConnectionGetPayload<{
+  select: {
+    sourceChecksum: true;
+    sourceEvidence: true;
+    sourceFileKey: true;
+    targetChecksum: true;
+    targetFileKey: true;
+  };
+}>;
+
+type HumanIdentityCorrectionRow = Prisma.KnowledgeConnectionGetPayload<{
+  select: {
+    createdAt: true;
+    id: true;
+    relationshipKind: true;
+    sourceChecksum: true;
+    sourceEvidence: true;
+    sourceFileKey: true;
+    targetChecksum: true;
+    targetFileKey: true;
+  };
+}>;
+
+type SeparatedIdentityRow = Prisma.KnowledgeConnectionGetPayload<{
+  select: {
+    relationshipKind: true;
+    sourceChecksum: true;
+    sourceFileKey: true;
+    targetChecksum: true;
+    targetFileKey: true;
+  };
+}>;
+
 /** Resolve human identity joins as ordered equivalence classes, not one-hop aliases. */
 function correctedClientIdentities(
   rows: EffectiveIdentitySignal[],
@@ -204,7 +237,7 @@ export async function getSeparatedRelationshipPairIdentities(
   const endpointKeys = new Set(entries.map((entry) => `${entry.fileKey}\0${entry.checksum}`));
   const fileKeys = [...new Set(entries.map((entry) => entry.fileKey))];
   const fileKeySet = new Set(fileKeys);
-  const rows = [] as Awaited<ReturnType<typeof prisma.knowledgeConnection.findMany>>;
+  const rows: SeparatedRelationshipRow[] = [];
   for (let offset = 0; offset < fileKeys.length; offset += 500) {
     rows.push(...await prisma.knowledgeConnection.findMany({
       select: {
@@ -1467,8 +1500,8 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
   const fileKeySet = new Set(fileKeys);
   const fileKeyChunks = Array.from({ length: Math.ceil(fileKeys.length / 500) }, (_, index) =>
     fileKeys.slice(index * 500, index * 500 + 500));
-  const humanCorrections = [] as Awaited<ReturnType<typeof prisma.knowledgeConnection.findMany>>;
-  const separatedIdentityRows = [] as Awaited<ReturnType<typeof prisma.knowledgeConnection.findMany>>;
+  const humanCorrections: HumanIdentityCorrectionRow[] = [];
+  const separatedIdentityRows: SeparatedIdentityRow[] = [];
   for (const sourceFileKeys of fileKeyChunks) {
     humanCorrections.push(...await prisma.knowledgeConnection.findMany({
       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
