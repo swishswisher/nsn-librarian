@@ -371,33 +371,69 @@ export function persistentFileKey(libraryId: string, relativePath: string) {
 }
 
 export type ExecutedMoveAlias = {
+  actionId?: string;
   checksum: string | null;
   destinationRelativePath: string;
   sourceRelativePath: string;
   undone: boolean;
 };
 
+export type IndexedMoveAlias = { move: ExecutedMoveAlias; ordinal: number };
+
+export type ExecutedMoveIndex = {
+  /** Retained for diagnostics and backwards-compatible scale assertions. */
+  length: number;
+  moves: ExecutedMoveAlias[];
+  predecessors: Map<string, IndexedMoveAlias[]>;
+};
+
+export function buildExecutedMoveIndex(moves: ExecutedMoveAlias[]): ExecutedMoveIndex {
+  const predecessors = new Map<string, IndexedMoveAlias[]>();
+  moves.forEach((move, ordinal) => {
+    if (move.undone || !move.checksum) return;
+    const key = `${move.checksum}\0${normalizePhysicalRelativePath(move.destinationRelativePath)}`;
+    const entries = predecessors.get(key) ?? [];
+    entries.push({ move, ordinal });
+    predecessors.set(key, entries);
+  });
+  return { length: moves.length, moves, predecessors };
+}
+
 export function fileKeyAfterKnownMoves(
   libraryId: string,
   relativePath: string,
   checksum: string | null,
-  moves: ExecutedMoveAlias[],
+  history: ExecutedMoveAlias[] | ExecutedMoveIndex,
 ) {
+  const moves = Array.isArray(history) ? buildExecutedMoveIndex(history) : history;
   let sourcePath = normalizePhysicalRelativePath(relativePath);
-  const visited = new Set<string>();
-  while (checksum && !visited.has(sourcePath)) {
-    visited.add(sourcePath);
-    const move = moves.find((item) =>
-      !item.undone && item.checksum === checksum &&
-      normalizePhysicalRelativePath(item.destinationRelativePath) === sourcePath,
-    );
-    if (!move) break;
-    sourcePath = normalizePhysicalRelativePath(move.sourceRelativePath);
+  let followedOrdinal = -1;
+  const followedActions = new Set<string>();
+  while (checksum) {
+    const candidates = moves.predecessors.get(`${checksum}\0${sourcePath}`);
+    if (!candidates) break;
+    // The move snapshot is newest-first. Once a predecessor is followed, only
+    // strictly older actions can precede it; this preserves legitimate path
+    // revisits without allowing malformed histories to cycle.
+    let low = 0;
+    let high = candidates.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (candidates[middle].ordinal <= followedOrdinal) low = middle + 1;
+      else high = middle;
+    }
+    const candidate = candidates[low];
+    if (!candidate) break;
+    const identity = candidate.move.actionId ?? String(candidate.ordinal);
+    if (followedActions.has(identity)) break;
+    followedActions.add(identity);
+    followedOrdinal = candidate.ordinal;
+    sourcePath = normalizePhysicalRelativePath(candidate.move.sourceRelativePath);
   }
   return persistentFileKey(libraryId, sourcePath);
 }
 
-export async function knownExecutedMoves(connectedLibraryId: string): Promise<ExecutedMoveAlias[]> {
+export async function knownExecutedMoves(connectedLibraryId: string): Promise<ExecutedMoveIndex> {
   const prisma = getPrismaClient();
   const actions: Array<{ id: string; destinationChecksumAfter: string | null;
     destinationRelativePath: string; sourceChecksumBefore: string | null;
@@ -420,12 +456,13 @@ export async function knownExecutedMoves(connectedLibraryId: string): Promise<Ex
     actions.push(...page);
     cursor = page.length === 500 ? page.at(-1)?.id : undefined;
   } while (cursor);
-  return actions.map((action) => ({
+  return buildExecutedMoveIndex(actions.map((action) => ({
+    actionId: action.id,
     checksum: action.destinationChecksumAfter ?? action.sourceChecksumBefore,
     destinationRelativePath: action.destinationRelativePath,
     sourceRelativePath: action.sourceRelativePath,
     undone: action.undoActions.some((undo) => undo.status === "COMPLETED"),
-  }));
+  })));
 }
 
 export function selectPersistentRelationships(index: ScanWorkingKnowledgeIndex) {
@@ -1642,14 +1679,15 @@ export async function getPersistentIdentityGroups() {
       mergedAt: null, canonicalConnectedLibraryId: null },
   });
   const byLibrary = new Map(libraries.map((library) => [library.id, library]));
-  const rejected: Array<{ id: string; sourceEvidence: Prisma.JsonValue;
-    sourceFileKey: string | null; targetFileKey: string | null }> = [];
+  const rejected: Array<{ id: string; sourceChecksum: string | null; sourceEvidence: Prisma.JsonValue;
+    sourceFileKey: string | null; targetChecksum: string | null; targetFileKey: string | null }> = [];
   let rejectedCursor: string | undefined;
   do {
     const page = await prisma.knowledgeConnection.findMany({
       ...(rejectedCursor ? { cursor: { id: rejectedCursor }, skip: 1 } : {}),
       orderBy: { id: "asc" },
-      select: { id: true, sourceEvidence: true, sourceFileKey: true, targetFileKey: true },
+      select: { id: true, sourceChecksum: true, sourceEvidence: true, sourceFileKey: true,
+        targetChecksum: true, targetFileKey: true },
       take: 500,
       where: { decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
         generationVersion: documentSignalVersion, status: "REJECTED", supersededAt: null },
@@ -1657,6 +1695,25 @@ export async function getPersistentIdentityGroups() {
     rejected.push(...page);
     rejectedCursor = page.length === 500 ? page.at(-1)?.id : undefined;
   } while (rejectedCursor);
+  const separatedEndpointsByIdentity = new Map<string, Map<string, Set<string>>>();
+  for (const connection of rejected) {
+    const evidence = connection.sourceEvidence;
+    if (!connection.sourceFileKey || !connection.sourceChecksum ||
+        !connection.targetFileKey || !connection.targetChecksum ||
+        !evidence || Array.isArray(evidence) || typeof evidence !== "object" ||
+        typeof evidence.identityHash !== "string" || typeof evidence.connectedLibraryId !== "string") continue;
+    const identityKey = `${evidence.connectedLibraryId}\0${evidence.identityHash}`;
+    const endpoints = separatedEndpointsByIdentity.get(identityKey) ?? new Map<string, Set<string>>();
+    const source = `${connection.sourceFileKey}\0${connection.sourceChecksum}`;
+    const target = `${connection.targetFileKey}\0${connection.targetChecksum}`;
+    const sourceTargets = endpoints.get(source) ?? new Set<string>();
+    const targetSources = endpoints.get(target) ?? new Set<string>();
+    sourceTargets.add(target);
+    targetSources.add(source);
+    endpoints.set(source, sourceTargets);
+    endpoints.set(target, targetSources);
+    separatedEndpointsByIdentity.set(identityKey, endpoints);
+  }
   const groups = new Map<string, typeof rows>();
   for (const row of effectiveRows) {
     if (![...resolvedSignalKinds, "UNRESOLVED_CLIENT", "UNRESOLVED_PROJECT"].includes(row.kind)) continue;
@@ -1668,14 +1725,11 @@ export async function getPersistentIdentityGroups() {
     groups.set(key, existing);
   }
   return [...groups.values()].flatMap((members) => {
-    const keys = new Set(members.map((member) => member.fileKey));
-    const disputed = rejected.some((connection) => {
-      const evidence = connection.sourceEvidence;
-      return connection.sourceFileKey && connection.targetFileKey &&
-        keys.has(connection.sourceFileKey) && keys.has(connection.targetFileKey) &&
-        evidence && !Array.isArray(evidence) && typeof evidence === "object" &&
-        evidence.identityHash === members[0].identityHash;
-    });
+    const endpoints = new Set(members.map((member) => `${member.fileKey}\0${member.checksum}`));
+    const separated = separatedEndpointsByIdentity.get(
+      `${members[0].connectedLibraryId}\0${members[0].identityHash}`);
+    const disputed = Boolean(separated && [...endpoints].some((endpoint) =>
+      [...(separated.get(endpoint) ?? [])].some((other) => endpoints.has(other))));
     return disputed ? members[0].kind === "DOCUMENT_FAMILY" ? [] : members.map((member) => [member]) : [members];
   }).filter((members) => {
     if (members[0].kind !== "DOCUMENT_FAMILY") return true;

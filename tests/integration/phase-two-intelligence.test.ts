@@ -596,6 +596,18 @@ test("canonical file identity follows complete move histories and chains", async
     persistent.persistentFileKey(library.id, "moves/path-0.txt"));
   assert.equal(persistent.fileKeyAfterKnownMoves(library.id, "moves/path-1005.txt", "e".repeat(64), moves),
     persistent.persistentFileKey(library.id, "moves/path-1005.txt"));
+
+  const repeatedPathMoves = persistent.buildExecutedMoveIndex([
+    { actionId: "move-5", checksum, sourceRelativePath: "A.txt", destinationRelativePath: "B.txt", undone: false },
+    { actionId: "move-4", checksum, sourceRelativePath: "C.txt", destinationRelativePath: "A.txt", undone: false },
+    { actionId: "move-3", checksum, sourceRelativePath: "B.txt", destinationRelativePath: "C.txt", undone: false },
+    { actionId: "move-2", checksum, sourceRelativePath: "A.txt", destinationRelativePath: "B.txt", undone: false },
+    { actionId: "move-undone", checksum, sourceRelativePath: "wrong.txt", destinationRelativePath: "A.txt", undone: true },
+  ]);
+  assert.equal(persistent.fileKeyAfterKnownMoves(library.id, "B.txt", checksum, repeatedPathMoves),
+    persistent.persistentFileKey(library.id, "A.txt"));
+  assert.equal(persistent.fileKeyAfterKnownMoves(library.id, "B.txt", "e".repeat(64), repeatedPathMoves),
+    persistent.persistentFileKey(library.id, "B.txt"));
   await prisma.organizationPlan.delete({ where: { id: plan.id } });
 });
 
@@ -1530,4 +1542,48 @@ test("historical version filtering stays linear for twenty thousand superseded e
   const signals = await persistent.getDocumentVersionSignals(entries, true);
   assert.equal(signals.length, count);
   assert.ok(signals.some((signal) => signal.revisionNumber === String(count)));
+});
+
+test("persistent identity grouping stays linear for twenty thousand unrelated separations", async () => {
+  const library = await createLibrary("Large separated identity library");
+  const scan = await prisma.scanSession.create({ data: {
+    connectedFolderId: library.id, status: "COMPLETED",
+  } });
+  const observed = await createObservedFile({ checksum: "group-source", libraryId: library.id,
+    relativePath: "groups/source.txt", sessionId: scan.id });
+  const count = 20_000;
+  const files = Array.from({ length: count }, (_, index) => ({
+    id: `group-scale-file-${index}`, sessionId: scan.id,
+    libraryDocumentId: observed.observation.libraryDocumentId,
+    localPath: `bridge://${library.id}/groups/${index}.txt`, relativePath: `groups/${index}.txt`,
+    fileType: "TEXT", checksum: `group-scale-checksum-${index}`,
+    readStatus: "SUPPORTED" as const, readingStatus: "READ" as const,
+    extractionStatus: "COMPLETED" as const,
+  }));
+  await prisma.scannedFile.createMany({ data: files });
+  await prisma.knowledgeDocumentSignal.createMany({ data: files.map((file, index) => ({
+    id: `group-scale-signal-${index}`, signalKey: `group-scale-signal-key-${index}`,
+    connectedLibraryId: library.id, fileKey: `group-scale-key-${index}`,
+    relativePath: file.relativePath, checksum: file.checksum, kind: "CLIENT",
+    identityHash: `group-scale-identity-${index}`, sourceRanges: [],
+    observationSessionId: observed.observation.id, generationVersion: documentSignalVersion,
+  })) });
+  await prisma.knowledgeConnection.createMany({ data: files.map((file, index) => ({
+    id: `group-scale-separation-${index}`, confidence: 0,
+    generationVersion: documentSignalVersion, relationshipKey: `group-scale-relationship-${index}`,
+    relationshipKind: "SAME_CLIENT", reasoning: "Unrelated separation", sharedTerms: [], similarityScore: 0,
+    sourceChecksum: file.checksum, sourceFileKey: `unrelated-source-${index}`,
+    sourceObservationSessionId: observed.observation.id, targetChecksum: file.checksum,
+    targetFileKey: `unrelated-target-${index}`, targetObservationSessionId: observed.observation.id,
+    sourceEvidence: { connectedLibraryId: library.id, identityHash: `group-scale-identity-${index}` },
+    status: "REJECTED",
+  })) });
+  await prisma.knowledgeConnectionDecision.createMany({ data: files.map((_, index) => ({
+    knowledgeConnectionId: `group-scale-separation-${index}`, action: "SEPARATE",
+    previousStatus: "NEW", nextStatus: "REJECTED",
+  })) });
+
+  const groups = await persistent.getPersistentIdentityGroups();
+  assert.equal(groups.length, 40);
+  assert.ok(groups.every((group) => group.libraryName === library.displayName && group.members.length === 1));
 });

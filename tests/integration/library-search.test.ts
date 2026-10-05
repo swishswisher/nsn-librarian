@@ -2320,6 +2320,25 @@ test("exhaustive entity search remains linear with twenty thousand candidates an
     generationVersion: documentSignalVersion,
   })) });
 
+  // Exercise canonicalization with a root-scale move snapshot as well as a
+  // root-scale current file set. None of these moves matches a current file,
+  // so a per-file history scan would perform 400 million comparisons.
+  const plan = await prisma.organizationPlan.create({ data: {
+    connectedLibraryId: r.id, scanSessionId: s.id, createdBy: "move-scale-test",
+    status: "EXECUTED", totalActions: count, actions: [], warnings: [], skippedItems: [], history: [],
+  } });
+  const run = await prisma.executionRun.create({ data: {
+    organizationPlanId: plan.id, connectedLibraryId: r.id, status: "COMPLETED",
+    totalActions: count, completedActions: count, successfulActions: count,
+  } });
+  await prisma.executionAction.createMany({ data: Array.from({ length: count }, (_, index) => ({
+    executionRunId: run.id, actionType: "MOVE_FILE" as const,
+    sourceRelativePath: `moved/source-${index}.txt`, destinationRelativePath: `moved/destination-${index}.txt`,
+    sourceChecksumBefore: `move-checksum-${index}`, destinationChecksumAfter: `move-checksum-${index}`,
+    sequence: index + 1, status: "COMPLETED" as const,
+    completedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, 0, index % 1000)),
+  })) });
+
   // Exercise the production full-scan index path at the supported scale. The
   // empty working set keeps writes out of this performance regression while
   // still forcing signal resolution; an endpoint-per-file OR exceeds PG's bind
@@ -2337,6 +2356,7 @@ test("exhaustive entity search remains linear with twenty thousand candidates an
   const context = await qa.retrieveQuestionContext("client Alice", [r.id]);
   assert.equal(context.ambiguousEntity, false);
   assert.equal(context.sources.length, 8);
+  await prisma.organizationPlan.delete({ where: { id: plan.id } });
 });
 
 test("metadata search remains available if the derived index is unavailable", async () => {
