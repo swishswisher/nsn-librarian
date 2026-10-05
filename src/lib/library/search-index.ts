@@ -33,7 +33,10 @@ export function searchEntryFingerprint(input: {
     input.reviewedText, input.concepts, input.entityHashes]));
 }
 
-export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyFileIds?: string[], stats?: { reused: number }) {
+export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyFileIds?: string[], stats?: {
+  reused: number;
+  resolvedSignals?: number;
+}) {
   const prisma = getPrismaClient();
   const session = await prisma.scanSession.findUnique({
     select: {
@@ -67,7 +70,26 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
   });
   const workingById = new Map(index.files.map((file) => [file.id, file]));
   const moves = await knownExecutedMoves(session.connectedFolderId);
-  const effectiveSignals = await getEffectiveDocumentSignals([session.connectedFolderId]);
+  const signalScope = files.flatMap((file) => file.checksum ? [{
+    checksum: file.checksum,
+    connectedLibraryId: session.connectedFolderId,
+    fileKey: fileKeyAfterKnownMoves(session.connectedFolderId, file.relativePath, file.checksum, moves),
+    isCurrent: true,
+  }] : []);
+  // A full scan intentionally resolves the root once. Expressing all 20,000
+  // endpoints as one Prisma OR would exceed PostgreSQL's bind-parameter limit;
+  // targeted/backfill indexing keeps the exact endpoint scope.
+  const effectiveSignals = await getEffectiveDocumentSignals([session.connectedFolderId],
+    onlyFileIds ? { historicalEntries: [], scopedEntries: signalScope } : undefined);
+  if (stats) stats.resolvedSignals = effectiveSignals.length;
+  const entityHashesByEndpoint = new Map<string, Set<string>>();
+  for (const signal of effectiveSignals) {
+    if (signal.kind === "FILE_ANCHOR") continue;
+    const key = `${signal.fileKey}\0${signal.checksum}`;
+    const hashes = entityHashesByEndpoint.get(key) ?? new Set<string>();
+    hashes.add(signal.identityHash);
+    entityHashesByEndpoint.set(key, hashes);
+  }
   let indexed = 0;
   for (const file of files) {
     const working = workingById.get(file.id);
@@ -81,9 +103,7 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
       ? observation.humanDecisions.find((decision) => decision.decisionType === "MODIFY")?.editedSuggestion?.slice(0, searchExcerptLimit) ?? ""
       : "";
     const excerpts = observation?.status === "REJECTED" ? [] : boundedSourceExcerpts(working.sourceEvidenceText);
-    const entityHashes = [...new Set(effectiveSignals.filter((signal) =>
-      signal.fileKey === fileKey && signal.checksum === file.checksum && signal.kind !== "FILE_ANCHOR")
-      .map((signal) => signal.identityHash))].sort();
+    const entityHashes = [...(entityHashesByEndpoint.get(`${fileKey}\0${file.checksum}`) ?? [])].sort();
     const concepts = observation?.status === "REJECTED" ? [] : working.supportingTopics.slice(0, 8);
     const knowledgeState = observation?.status === "APPROVED" || observation?.status === "MODIFIED"
       ? "APPROVED" : "PROVISIONAL";

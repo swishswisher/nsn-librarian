@@ -22,10 +22,15 @@ export function routeLibraryQuestion(value: string): QuestionRoute {
   const entityName = entity.entityName;
   const entityKind = entity.entityKind;
   const stripped = question.replace(leadWords, " ").replace(/[?.,:;]+/g, " ").replace(/\s+/g, " ").trim();
+  const historyListRemainder = stripped.replace(
+    /\b(?:find|show|list|display|give|history|historical|earlier|previous|older|documents?|files?)\b/giu,
+    " ",
+  ).replace(/\s+/g, " ").trim();
+  const historyList = kind === "HISTORY" && !entityName && !historyListRemainder;
   const query = entityName && (kind === "CLIENT" || kind === "PROJECT")
     ? `${kind.toLowerCase()} ${entityName}` : stripped;
   const tokens = workingKnowledgeTerms(query);
   const searchQuery = (tokens.length ? query : question).slice(0, 120);
-  return { kind, entityKind, searchQuery: version || history ? `older ${searchQuery} versions` : searchQuery,
-    wantsHistory: version || history, entityName };
+  return { kind, entityKind, searchQuery: version ? `older ${searchQuery} versions` : searchQuery,
+    wantsHistory: version || history, historyList, entityName };
 }

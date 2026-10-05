@@ -182,6 +182,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   includeAllEntityMatches?: boolean;
   /** Keep all ranked file candidates so Ask can assess complete version families before source truncation. */
   includeAllVersionMatches?: boolean;
+  includeHistoryList?: boolean;
 }): Promise<LibrarySearchResult[]> {
   const intent = parseSearchIntent(value);
   if (intent.query.length < 2) return [];
@@ -262,7 +263,16 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
       ],
     },
   }).catch(() => []);
-  const initial = [...new Map([...reserved, ...broader]
+  const historicalList = options?.includeHistoryList && intent.wantsHistory && !intent.entityKind
+    ? await prisma.librarySearchEntry.findMany({
+      take: searchResultLimit,
+      orderBy: [{ indexedAt: "desc" }, { connectedLibraryId: "asc" },
+        { relativePath: "asc" }, { id: "asc" }],
+      where: { ...scope, isCurrent: false },
+    }).catch(() => [])
+    : [];
+  const historyListIds = new Set(historicalList.map((entry) => entry.id));
+  const initial = [...new Map([...reserved, ...broader, ...historicalList]
     .map((entry) => [entry.id, entry])).values()];
 
   // Resolved identity expansion uses only identities from already scoped matches.
@@ -453,7 +463,9 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
         (!intent.wantsHistory && !root.scanSessions.some((session) => session.id === entry.scanSessionId))) continue;
     if (intent.entityName && !entry.entityHashes.some((hash) => rootSeedHashes.has(hash))) continue;
     if (intent.fileType && !entry.fileType.toLowerCase().includes(intent.fileType.replace(/s$/, ""))) continue;
-    const ranked = rankSearchEntry(entry, intent, rootSeedHashes);
+    const ranked = rankSearchEntry(entry, intent, rootSeedHashes) ??
+      (historyListIds.has(entry.id)
+        ? { score: 1, reason: "Retained historical document", matchingExcerpt: null } : null);
     if (!ranked) continue;
     const category = mediaCategoryForFileType(entry.fileType);
     const member = versions.find((signal) => signal.connectedLibraryId === entry.connectedLibraryId &&

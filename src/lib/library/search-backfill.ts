@@ -30,8 +30,8 @@ export async function getSearchBackfillProgress(sessionId: string) {
     completed: remaining === 0 && failed === 0 };
 }
 
-async function indexOneFile(sessionId: string, fileId: string): Promise<"INDEXED" | "REUSED"> {
-  const stats = { reused: 0 };
+export async function indexOneFile(sessionId: string, fileId: string,
+  stats: { reused: number; resolvedSignals?: number } = { reused: 0 }): Promise<"INDEXED" | "REUSED"> {
   const count = await indexScanKnowledge(
     await loadScanWorkingKnowledge(sessionId, [fileId]), [fileId], stats,
   );

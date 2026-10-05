@@ -7,6 +7,7 @@ export type QuestionRoute = {
   entityKind: "CLIENT" | "PROJECT" | null;
   searchQuery: string;
   wantsHistory: boolean;
+  historyList?: boolean;
   entityName: string | null;
 };
 

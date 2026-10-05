@@ -1443,6 +1443,7 @@ export type HistoricalDocumentSignalEntry = {
 /** Load original signals eligible for the current or explicitly retained snapshots. */
 export async function getEligibleDocumentSignals(permittedRootIds?: string[], options?: {
   historicalEntries: HistoricalDocumentSignalEntry[];
+  scopedEntries?: HistoricalDocumentSignalEntry[];
 }) {
   const prisma = getPrismaClient();
   const libraries = await prisma.connectedLibrary.findMany({
@@ -1453,8 +1454,13 @@ export async function getEligibleDocumentSignals(permittedRootIds?: string[], op
   });
   const libraryIds = libraries.map((library) => library.id);
   const historicalEntries = options?.historicalEntries.filter((entry) => !entry.isCurrent) ?? [];
+  const scopedEntries = options?.scopedEntries ?? [];
+  const currentSignalFilters: Prisma.KnowledgeDocumentSignalWhereInput[] = scopedEntries.length
+    ? scopedEntries.map((entry) => ({ connectedLibraryId: entry.connectedLibraryId,
+      fileKey: entry.fileKey, checksum: entry.checksum, status: "ACTIVE", supersededAt: null }))
+    : [{ status: "ACTIVE", supersededAt: null }];
   const candidateSignalFilters: Prisma.KnowledgeDocumentSignalWhereInput[] = [
-    { status: "ACTIVE", supersededAt: null },
+    ...currentSignalFilters,
     ...historicalEntries.map((entry): Prisma.KnowledgeDocumentSignalWhereInput => ({
       connectedLibraryId: entry.connectedLibraryId,
       fileKey: entry.fileKey,
@@ -1493,9 +1499,47 @@ export async function getEligibleDocumentSignals(permittedRootIds?: string[], op
 
 export async function getEffectiveDocumentSignals(permittedRootIds?: string[], options?: {
   historicalEntries: HistoricalDocumentSignalEntry[];
+  scopedEntries?: HistoricalDocumentSignalEntry[];
 }) {
   const prisma = getPrismaClient();
-  const rows = await getEligibleDocumentSignals(permittedRootIds, options);
+  let scopedEntries = options?.scopedEntries;
+  if (scopedEntries?.length) {
+    const scopedByEndpoint = new Map(scopedEntries.map((entry) =>
+      [`${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`, entry]));
+    let frontier = [...scopedEntries];
+    while (frontier.length) {
+      const fileKeys = [...new Set(frontier.map((entry) => entry.fileKey))];
+      const corrections = await prisma.knowledgeConnection.findMany({
+        select: { sourceChecksum: true, sourceEvidence: true, sourceFileKey: true,
+          targetChecksum: true, targetFileKey: true },
+        where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED",
+          supersededAt: null, OR: [{ sourceFileKey: { in: fileKeys } }, { targetFileKey: { in: fileKeys } }] },
+      });
+      const next: HistoricalDocumentSignalEntry[] = [];
+      for (const correction of corrections) {
+        const evidence = correction.sourceEvidence;
+        const connectedLibraryId = evidence && !Array.isArray(evidence) && typeof evidence === "object" &&
+          typeof evidence.connectedLibraryId === "string" ? evidence.connectedLibraryId : null;
+        if (!connectedLibraryId || !permittedRootIds?.includes(connectedLibraryId)) continue;
+        for (const endpoint of [
+          { fileKey: correction.sourceFileKey, checksum: correction.sourceChecksum },
+          { fileKey: correction.targetFileKey, checksum: correction.targetChecksum },
+        ]) {
+          if (!endpoint.fileKey || !endpoint.checksum) continue;
+          const key = `${connectedLibraryId}\0${endpoint.fileKey}\0${endpoint.checksum}`;
+          if (scopedByEndpoint.has(key)) continue;
+          const entry = { connectedLibraryId, fileKey: endpoint.fileKey,
+            checksum: endpoint.checksum, isCurrent: true };
+          scopedByEndpoint.set(key, entry);
+          next.push(entry);
+        }
+      }
+      frontier = next;
+    }
+    scopedEntries = [...scopedByEndpoint.values()];
+  }
+  const rows = await getEligibleDocumentSignals(permittedRootIds,
+    options ? { ...options, scopedEntries } : undefined);
   const fileKeys = [...new Set(rows.map((row) => row.fileKey))];
   const fileKeySet = new Set(fileKeys);
   const fileKeyChunks = Array.from({ length: Math.ceil(fileKeys.length / 500) }, (_, index) =>

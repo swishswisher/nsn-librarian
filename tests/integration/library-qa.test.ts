@@ -930,6 +930,50 @@ test("historical list Ask uses historical-only client and project identities wit
   }
 });
 
+test("bare history lists retrieve ordinary retained documents without control-word matches", async () => {
+  const r = await root("Bare retained list root");
+  const oldScan = await scan(r.id);
+  const retained = await file({ rootId: r.id, sessionId: oldScan.id,
+    relativePath: "records/quarterly-summary.txt",
+    quote: "Quarterly operating notes and approved totals." });
+  const currentScan = await scan(r.id);
+  await file({ rootId: r.id, sessionId: currentScan.id,
+    relativePath: "records/current-summary.txt", quote: "Current operating notes." });
+  await prisma.librarySearchEntry.update({ where: { id: retained.index.id }, data: { isCurrent: false } });
+
+  const question = "Find previous documents";
+  const context = await retrieve.retrieveQuestionContext(question, [r.id]);
+  assert.equal(context.route.kind, "HISTORY");
+  assert.deepEqual(context.sources.map((source) => source.relativePath), [retained.scanned.relativePath]);
+  const result = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id],
+    model: model([claim("Quarterly operating notes and approved totals.", ["S1"])]) });
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  assert.deepEqual(result.sources.map((source) => source.relativePath), [retained.scanned.relativePath]);
+});
+
+test("named and topical history requests do not broaden to unrelated retained documents", async () => {
+  const r = await root("Scoped retained history root");
+  const oldScan = await scan(r.id);
+  const matching = await file({ rootId: r.id, sessionId: oldScan.id,
+    relativePath: "records/quarterly-summary.txt", quote: "Quarterly operating summary." });
+  const unrelated = await file({ rootId: r.id, sessionId: oldScan.id,
+    relativePath: "records/workshop-notes.txt", quote: "Facilitation workshop notes." });
+  const currentScan = await scan(r.id);
+  await file({ rootId: r.id, sessionId: currentScan.id,
+    relativePath: "records/current.txt", quote: "Current record." });
+  await prisma.librarySearchEntry.updateMany({
+    where: { id: { in: [matching.index.id, unrelated.index.id] } }, data: { isCurrent: false },
+  });
+
+  for (const question of ["Find previous quarterly-summary.txt", "Find previous quarterly documents"]) {
+    const context = await retrieve.retrieveQuestionContext(question, [r.id]);
+    assert.equal(context.route.kind, "HISTORY");
+    assert.equal(context.route.historyList, false);
+    assert.deepEqual(context.sources.map((source) => source.relativePath), [matching.scanned.relativePath]);
+    assert.ok(!context.sources.some((source) => source.relativePath === unrelated.scanned.relativePath));
+  }
+});
+
 test("historical Ask honors checksum-bound generated identity separations", async () => {
   const r = await root("Separated historical Ask root"); const oldScan = await scan(r.id);
   const old = [];

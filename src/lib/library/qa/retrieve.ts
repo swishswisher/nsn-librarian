@@ -172,6 +172,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     // bounded retrieval window before deciding whether an entity is ambiguous.
     includeAllEntityMatches: true,
     includeAllVersionMatches: route.kind === "VERSION",
+    includeHistoryList: route.historyList,
   });
   const requestedHashesByResultId = new Map(results.flatMap((result) =>
     result.matchedEntityHashes?.length ? [[result.id, result.matchedEntityHashes] as const] : []));
@@ -513,24 +514,28 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   const entityHashes = identityKind ? new Set(ambiguityEntries.flatMap((entry) =>
     (requestedHashesByResultId.get(entry.id) ?? []).map((hash) =>
       `${entry.connectedLibraryId}:${hash}`))) : new Set<string>();
+  const ambiguityEndpointKeys = new Set(ambiguityEntries.map((entry) =>
+    `${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`));
   const effectiveIdentitiesByEndpoint = new Map<string, Set<string>>();
   for (const signal of effectiveSignals) {
-    if (signal.kind !== identityKind || !ambiguityEntries.some((entry) =>
-      entry.connectedLibraryId === signal.connectedLibraryId &&
-      entry.fileKey === signal.fileKey && entry.checksum === signal.checksum)) continue;
+    if (signal.kind !== identityKind || !ambiguityEndpointKeys.has(
+      `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`)) continue;
     const endpoint = `${signal.fileKey}\0${signal.checksum}`;
     effectiveIdentitiesByEndpoint.set(endpoint, new Set([
       ...(effectiveIdentitiesByEndpoint.get(endpoint) ?? []), signal.identityHash,
     ]));
   }
-  const hasSeparatedMatchingIdentity = ambiguityEntries.some((left, leftIndex) =>
-    ambiguityEntries.slice(leftIndex + 1).some((right) => {
-      const separated = separatedIdentityPairs.get(knowledgeRelationshipPairKey(left, right));
-      const leftIdentities = effectiveIdentitiesByEndpoint.get(`${left.fileKey}\0${left.checksum}`);
-      const rightIdentities = effectiveIdentitiesByEndpoint.get(`${right.fileKey}\0${right.checksum}`);
-      return Boolean(separated && leftIdentities && rightIdentities && [...separated].some((hash) =>
-        leftIdentities.has(hash) && rightIdentities.has(hash)));
-    }));
+  let hasSeparatedMatchingIdentity = false;
+  for (const [pairKey, separated] of separatedIdentityPairs) {
+    const [leftFileKey, leftChecksum, rightFileKey, rightChecksum] = pairKey.split("\0");
+    const leftIdentities = effectiveIdentitiesByEndpoint.get(`${leftFileKey}\0${leftChecksum}`);
+    const rightIdentities = effectiveIdentitiesByEndpoint.get(`${rightFileKey}\0${rightChecksum}`);
+    if (leftIdentities && rightIdentities && [...separated].some((hash) =>
+      leftIdentities.has(hash) && rightIdentities.has(hash))) {
+      hasSeparatedMatchingIdentity = true;
+      break;
+    }
+  }
   return { route, sources, relationships, versions,
     versionFamilyCount: assessedFamilies.length,
     versionAssessmentComplete: !versionMembersMissingSearchEntries &&

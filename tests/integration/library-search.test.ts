@@ -996,6 +996,31 @@ test("bounded backfill resumes, reuses current rows and has no filesystem comman
   assert.equal(await prisma.bridgeCommand.count(), beforeCommands);
 });
 
+test("production backfill resolves effective identities only for the claimed file component", async () => {
+  const r = await root("Scoped backfill Root"); const s = await session(r.id);
+  const item = await observedFile({ rootId: r.id, sessionId: s.id, path: "claimed.txt",
+    checksum: "claimed-checksum", evidence: evidence("Client: Alice") });
+  await prisma.knowledgeDocumentSignal.create({ data: {
+    signalKey: crypto.randomUUID(), connectedLibraryId: r.id,
+    fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
+    relativePath: item.file.relativePath, checksum: item.file.checksum!, kind: "CLIENT",
+    identityHash: "claimed-alice", sourceRanges: [], observationSessionId: item.observation.id,
+    generationVersion: documentSignalVersion,
+  } });
+  await prisma.knowledgeDocumentSignal.createMany({ data: Array.from({ length: 500 }, (_, index) => ({
+    signalKey: `unrelated-backfill-${crypto.randomUUID()}`, connectedLibraryId: r.id,
+    fileKey: `unrelated-file-key-${index}`, relativePath: `unrelated/${index}.txt`,
+    checksum: `unrelated-checksum-${index}`, kind: "CLIENT", identityHash: `unrelated-${index}`,
+    sourceRanges: [], observationSessionId: item.observation.id, generationVersion: documentSignalVersion,
+  })) });
+
+  const stats = { reused: 0, resolvedSignals: 0 };
+  assert.equal(await backfill.indexOneFile(s.id, item.file.id, stats), "INDEXED");
+  assert.equal(stats.resolvedSignals, 1);
+  const entry = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: item.file.id } });
+  assert.deepEqual(entry.entityHashes, ["claimed-alice"]);
+});
+
 test("Prepare Search continues on processed batches and stops normally when complete", async () => {
   const r = await root("Client continuation Root"); const s = await session(r.id);
   await prisma.scannedFile.createMany({ data: Array.from({ length: 43 }, (_, i) => ({
@@ -2258,6 +2283,7 @@ for (const actionType of ["MOVE_FILE", "RENAME_FILE"] as const) {
 test("exhaustive entity search remains linear with twenty thousand candidates and no separations", async () => {
   const r = await root("Large Alice Root");
   const s = await session(r.id);
+  await prisma.scanSession.update({ where: { id: s.id }, data: { searchIndexStatus: "COMPLETED" } });
   const batch = await prisma.libraryBatch.create({ data: { name: "Large entity search" } });
   const document = await prisma.libraryDocument.create({ data: {
     batchId: batch.id, normalizedFileName: "alice.txt", originalFileName: "alice.txt",
@@ -2294,11 +2320,23 @@ test("exhaustive entity search remains linear with twenty thousand candidates an
     generationVersion: documentSignalVersion,
   })) });
 
+  // Exercise the production full-scan index path at the supported scale. The
+  // empty working set keeps writes out of this performance regression while
+  // still forcing signal resolution; an endpoint-per-file OR exceeds PG's bind
+  // limit before the file loop begins.
+  assert.equal(await indexer.indexScanKnowledge({
+    clusters: [], files: [], relationships: [], scanSessionId: s.id,
+  }), 0);
+
   const results = await search.searchLibrary("client Alice", [r.id], {
     includeEntityMatches: true, includeAllEntityMatches: true,
   });
   assert.equal(results.filter((result) => result.kind === "FILE").length, count);
   assert.ok(results.every((result) => result.rootName === r.displayName));
+  const qa = await import("../../src/lib/library/qa/retrieve");
+  const context = await qa.retrieveQuestionContext("client Alice", [r.id]);
+  assert.equal(context.ambiguousEntity, false);
+  assert.equal(context.sources.length, 8);
 });
 
 test("metadata search remains available if the derived index is unavailable", async () => {
