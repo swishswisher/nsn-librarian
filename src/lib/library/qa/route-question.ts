@@ -4,6 +4,18 @@ import type { QuestionRoute } from "./types";
 
 const leadWords = /\b(?:what|which|where|when|who|how|do|does|did|we|have|the|a|an|about|for|of|in|on|are|is|there|these|those|documents?|files?|information|tell|me|summarize|explain|relate|related|main|themes?|across|anything|some|between)\b/giu;
 
+function historyListRemainder(value: string) {
+  // Remove only leading conversational framing here. Applying these words as a
+  // general stop list would erase legitimate filename, topic, or entity scope.
+  const withoutPoliteLead = value
+    .replace(/^(?:(?:please|kindly)\s+)?(?:(?:could|would|can|will|may|might)\s+you\s+)?(?:please\s+)?/iu, "")
+    .trim();
+  return withoutPoliteLead.replace(
+    /\b(?:find|show|list|display|give|history|historical|earlier|previous|older|documents?|files?)\b/giu,
+    " ",
+  ).replace(/\s+/g, " ").trim();
+}
+
 export function routeLibraryQuestion(value: string): QuestionRoute {
   const question = value.trim().slice(0, 500);
   const entity = parseExplicitEntityQuery(question);
@@ -22,11 +34,7 @@ export function routeLibraryQuestion(value: string): QuestionRoute {
   const entityName = entity.entityName;
   const entityKind = entity.entityKind;
   const stripped = question.replace(leadWords, " ").replace(/[?.,:;]+/g, " ").replace(/\s+/g, " ").trim();
-  const historyListRemainder = stripped.replace(
-    /\b(?:find|show|list|display|give|history|historical|earlier|previous|older|documents?|files?)\b/giu,
-    " ",
-  ).replace(/\s+/g, " ").trim();
-  const historyList = kind === "HISTORY" && !entityName && !historyListRemainder;
+  const historyList = kind === "HISTORY" && !entityName && !historyListRemainder(stripped);
   const query = entityName && (kind === "CLIENT" || kind === "PROJECT")
     ? `${kind.toLowerCase()} ${entityName}` : stripped;
   const tokens = workingKnowledgeTerms(query);

@@ -932,23 +932,37 @@ test("historical list Ask uses historical-only client and project identities wit
 
 test("bare history lists retrieve ordinary retained documents without control-word matches", async () => {
   const r = await root("Bare retained list root");
+  const unavailable = await root("Unavailable retained list root");
   const oldScan = await scan(r.id);
   const retained = await file({ rootId: r.id, sessionId: oldScan.id,
     relativePath: "records/quarterly-summary.txt",
     quote: "Quarterly operating notes and approved totals." });
   const currentScan = await scan(r.id);
-  await file({ rootId: r.id, sessionId: currentScan.id,
+  const current = await file({ rootId: r.id, sessionId: currentScan.id,
     relativePath: "records/current-summary.txt", quote: "Current operating notes." });
+  const unavailableScan = await scan(unavailable.id);
+  const unavailableRetained = await file({ rootId: unavailable.id, sessionId: unavailableScan.id,
+    relativePath: "records/private-summary.txt", quote: "Private retained operating notes." });
+  const unavailableCurrentScan = await scan(unavailable.id);
+  await file({ rootId: unavailable.id, sessionId: unavailableCurrentScan.id,
+    relativePath: "records/private-current.txt", quote: "Private current notes." });
   await prisma.librarySearchEntry.update({ where: { id: retained.index.id }, data: { isCurrent: false } });
+  await prisma.librarySearchEntry.update({ where: { id: unavailableRetained.index.id },
+    data: { isCurrent: false } });
 
-  const question = "Find previous documents";
-  const context = await retrieve.retrieveQuestionContext(question, [r.id]);
-  assert.equal(context.route.kind, "HISTORY");
-  assert.deepEqual(context.sources.map((source) => source.relativePath), [retained.scanned.relativePath]);
-  const result = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id],
-    model: model([claim("Quarterly operating notes and approved totals.", ["S1"])]) });
-  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
-  assert.deepEqual(result.sources.map((source) => source.relativePath), [retained.scanned.relativePath]);
+  for (const question of ["Could you show me previous documents?", "Can you list older files?",
+    "Please show previous documents"]) {
+    const context = await retrieve.retrieveQuestionContext(question, [r.id]);
+    assert.equal(context.route.kind, "HISTORY");
+    assert.equal(context.route.historyList, true);
+    assert.deepEqual(context.sources.map((source) => source.relativePath), [retained.scanned.relativePath]);
+    assert.ok(!context.sources.some((source) => source.relativePath === current.scanned.relativePath));
+    assert.ok(!context.sources.some((source) => source.relativePath === unavailableRetained.scanned.relativePath));
+    const result = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id],
+      model: model([claim("Quarterly operating notes and approved totals.", ["S1"])]) });
+    assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+    assert.deepEqual(result.sources.map((source) => source.relativePath), [retained.scanned.relativePath]);
+  }
 });
 
 test("named and topical history requests do not broaden to unrelated retained documents", async () => {
@@ -965,7 +979,8 @@ test("named and topical history requests do not broaden to unrelated retained do
     where: { id: { in: [matching.index.id, unrelated.index.id] } }, data: { isCurrent: false },
   });
 
-  for (const question of ["Find previous quarterly-summary.txt", "Find previous quarterly documents"]) {
+  for (const question of ["Could you show me previous quarterly-summary.txt?",
+    "Please show previous quarterly documents"]) {
     const context = await retrieve.retrieveQuestionContext(question, [r.id]);
     assert.equal(context.route.kind, "HISTORY");
     assert.equal(context.route.historyList, false);
@@ -1676,6 +1691,17 @@ test("routing distinguishes client, project, version, topic and Memory intent", 
   assert.equal(routing.routeLibraryQuestion("What is the latest proposal version?").kind, "VERSION");
   assert.equal(routing.routeLibraryQuestion("Show older files for client Alice").kind, "HISTORY");
   assert.equal(routing.routeLibraryQuestion("Find previous documents").kind, "HISTORY");
+  assert.deepEqual(
+    ["Could you show me previous documents?", "Can you list older files?",
+      "Please show previous documents"].map((question) => routing.routeLibraryQuestion(question).historyList),
+    [true, true, true],
+  );
+  assert.deepEqual(
+    ["Could you show me previous quarterly-summary.txt?", "Please show previous quarterly documents",
+      "Can you list older files for client Alice?"].map((question) =>
+      routing.routeLibraryQuestion(question).historyList),
+    [false, false, false],
+  );
   assert.equal(routing.routeLibraryQuestion("Which version is older for client Alice?").kind, "VERSION");
   assert.deepEqual(
     ["Which version is newer for client Alice?", "Show earlier files for project North Star"].map((question) => {
