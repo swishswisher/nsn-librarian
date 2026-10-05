@@ -950,6 +950,15 @@ test("bare history lists retrieve ordinary retained documents without control-wo
   await prisma.librarySearchEntry.update({ where: { id: retained.index.id }, data: { isCurrent: false } });
   await prisma.librarySearchEntry.update({ where: { id: unavailableRetained.index.id },
     data: { isCurrent: false } });
+  await prisma.memoryEntry.createMany({ data: Array.from({ length: 10 }, (_, index) => ({
+    memoryType: "NOTE", memoryKey: `bare-history-memory-${index}-${crypto.randomUUID()}`,
+    title: `Previous documents memory ${index}`, description: "Show previous documents from active Memory",
+    evidence: [], searchProvenanceComplete: true, searchSourceCount: 1,
+  })) });
+  const memories = await prisma.memoryEntry.findMany({ where: { title: { startsWith: "Previous documents memory" } } });
+  await prisma.memorySearchSource.createMany({ data: memories.map((memory) => ({
+    memoryEntryId: memory.id, connectedLibraryId: r.id, observationSessionId: retained.observation.id,
+  })) });
 
   for (const question of ["Could you show me previous documents?", "Can you list older files?",
     "Please show previous documents"]) {
@@ -957,6 +966,7 @@ test("bare history lists retrieve ordinary retained documents without control-wo
     assert.equal(context.route.kind, "HISTORY");
     assert.equal(context.route.historyList, true);
     assert.deepEqual(context.sources.map((source) => source.relativePath), [retained.scanned.relativePath]);
+    assert.ok(context.sources.every((source) => source.sourceType !== "APPROVED_MEMORY"));
     assert.ok(!context.sources.some((source) => source.relativePath === current.scanned.relativePath));
     assert.ok(!context.sources.some((source) => source.relativePath === unavailableRetained.scanned.relativePath));
     const result = await answer.answerLibraryQuestion(question, { permittedRootIds: [r.id],

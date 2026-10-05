@@ -385,7 +385,7 @@ export function fileKeyAfterKnownMoves(
 ) {
   let sourcePath = normalizePhysicalRelativePath(relativePath);
   const visited = new Set<string>();
-  for (let step = 0; step < 8 && checksum && !visited.has(sourcePath); step += 1) {
+  while (checksum && !visited.has(sourcePath)) {
     visited.add(sourcePath);
     const move = moves.find((item) =>
       !item.undone && item.checksum === checksum &&
@@ -398,22 +398,28 @@ export function fileKeyAfterKnownMoves(
 }
 
 export async function knownExecutedMoves(connectedLibraryId: string): Promise<ExecutedMoveAlias[]> {
-  const actions = await getPrismaClient().executionAction.findMany({
-    orderBy: { completedAt: "desc" },
-    select: {
-      destinationChecksumAfter: true,
-      destinationRelativePath: true,
-      sourceChecksumBefore: true,
-      sourceRelativePath: true,
-      undoActions: { select: { status: true } },
-    },
-    take: 1000,
-    where: {
-      actionType: { in: ["MOVE_FILE", "RENAME_FILE"] },
-      executionRun: { connectedLibraryId },
-      status: "COMPLETED",
-    },
-  });
+  const prisma = getPrismaClient();
+  const actions: Array<{ id: string; destinationChecksumAfter: string | null;
+    destinationRelativePath: string; sourceChecksumBefore: string | null;
+    sourceRelativePath: string; undoActions: Array<{ status: string }> }> = [];
+  let cursor: string | undefined;
+  do {
+    const page = await prisma.executionAction.findMany({
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      orderBy: [{ completedAt: "desc" }, { id: "desc" }],
+      select: { id: true, destinationChecksumAfter: true, destinationRelativePath: true,
+        sourceChecksumBefore: true, sourceRelativePath: true,
+        undoActions: { select: { status: true } } },
+      take: 500,
+      where: {
+        actionType: { in: ["MOVE_FILE", "RENAME_FILE"] },
+        executionRun: { connectedLibraryId },
+        status: "COMPLETED",
+      },
+    });
+    actions.push(...page);
+    cursor = page.length === 500 ? page.at(-1)?.id : undefined;
+  } while (cursor);
   return actions.map((action) => ({
     checksum: action.destinationChecksumAfter ?? action.sourceChecksumBefore,
     destinationRelativePath: action.destinationRelativePath,
@@ -1636,11 +1642,21 @@ export async function getPersistentIdentityGroups() {
       mergedAt: null, canonicalConnectedLibraryId: null },
   });
   const byLibrary = new Map(libraries.map((library) => [library.id, library]));
-  const rejected = await prisma.knowledgeConnection.findMany({
-    select: { sourceEvidence: true, sourceFileKey: true, targetFileKey: true },
-    take: 1000,
-    where: { generationVersion: documentSignalVersion, status: "REJECTED", supersededAt: null },
-  });
+  const rejected: Array<{ id: string; sourceEvidence: Prisma.JsonValue;
+    sourceFileKey: string | null; targetFileKey: string | null }> = [];
+  let rejectedCursor: string | undefined;
+  do {
+    const page = await prisma.knowledgeConnection.findMany({
+      ...(rejectedCursor ? { cursor: { id: rejectedCursor }, skip: 1 } : {}),
+      orderBy: { id: "asc" },
+      select: { id: true, sourceEvidence: true, sourceFileKey: true, targetFileKey: true },
+      take: 500,
+      where: { decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
+        generationVersion: documentSignalVersion, status: "REJECTED", supersededAt: null },
+    });
+    rejected.push(...page);
+    rejectedCursor = page.length === 500 ? page.at(-1)?.id : undefined;
+  } while (rejectedCursor);
   const groups = new Map<string, typeof rows>();
   for (const row of effectiveRows) {
     if (![...resolvedSignalKinds, "UNRESOLVED_CLIENT", "UNRESOLVED_PROJECT"].includes(row.kind)) continue;

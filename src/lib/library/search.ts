@@ -547,7 +547,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   }
   // Memory is a distinct human-approved result, never evidence that a file
   // contains the Memory wording. Every contributing root must remain readable.
-  const memories = await prisma.memoryEntry.findMany({
+  const memories = retainedHistoryList ? [] : await prisma.memoryEntry.findMany({
     take: 60,
     orderBy: [{ title: "asc" }, { id: "asc" }],
     select: { id: true, title: true, description: true, searchSourceCount: true, searchSources: {

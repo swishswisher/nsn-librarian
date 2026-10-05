@@ -528,9 +528,26 @@ test("changed client identity retires provisional links but preserves a human re
   } });
   await persistent.reviewPersistentRelationship(link.id, "SEPARATE", "These are different clients.");
   assert.equal(await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: link.id } }), 1);
+  await prisma.knowledgeConnection.createMany({ data: Array.from({ length: 1001 }, (_, index) => ({
+    id: `separation-scale-${String(index).padStart(4, "0")}`,
+    confidence: 0.8, generationVersion: documentSignalVersion,
+    relationshipKey: `separation-scale-key-${index}`, relationshipKind: "SAME_CLIENT",
+    reasoning: "Unrelated reviewed separation", sharedTerms: [], similarityScore: 0.8,
+    sourceChecksum: left.file.checksum, sourceFileKey: `unrelated-left-${index}`,
+    sourceObservationSessionId: left.observation.id, targetChecksum: right.file.checksum,
+    targetFileKey: `unrelated-right-${index}`, targetObservationSessionId: right.observation.id,
+    status: "REJECTED",
+  })) });
+  const unrelated = await prisma.knowledgeConnection.findMany({
+    select: { id: true }, where: { id: { startsWith: "separation-scale-" } },
+  });
+  await prisma.knowledgeConnectionDecision.createMany({ data: unrelated.map((row) => ({
+    knowledgeConnectionId: row.id, action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED",
+  })) });
   assert.equal((await persistent.getPersistentIdentityGroups()).some((group) => group.libraryName === library.displayName && group.kind === "CLIENT" &&
     group.members.some((member) => member.relativePath === "a.txt") &&
     group.members.some((member) => member.relativePath === "b.txt")), false);
+  await prisma.knowledgeConnection.deleteMany({ where: { id: { startsWith: "separation-scale-" } } });
   await persistent.persistScanWorkingKnowledge(firstIndex);
   assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: link.id } })).status, "REJECTED");
 
@@ -552,6 +569,34 @@ test("changed client identity retires provisional links but preserves a human re
   const historicalCorrection = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: link.id } });
   assert.equal(historicalCorrection.status, "REJECTED");
   assert.ok(historicalCorrection.supersededAt);
+});
+
+test("canonical file identity follows complete move histories and chains", async () => {
+  const library = await createLibrary("Long move history root");
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
+  const plan = await prisma.organizationPlan.create({ data: {
+    connectedLibraryId: library.id, scanSessionId: scan.id, createdBy: "scale-test",
+    status: "EXECUTED", totalActions: 1005, actions: [], warnings: [], skippedItems: [], history: [],
+  } });
+  const run = await prisma.executionRun.create({ data: {
+    organizationPlanId: plan.id, connectedLibraryId: library.id, status: "COMPLETED",
+    totalActions: 1005, completedActions: 1005, successfulActions: 1005,
+  } });
+  const checksum = "f".repeat(64);
+  await prisma.executionAction.createMany({ data: Array.from({ length: 1005 }, (_, index) => ({
+    executionRunId: run.id, actionType: index % 2 ? "MOVE_FILE" : "RENAME_FILE",
+    sourceRelativePath: `moves/path-${index}.txt`, destinationRelativePath: `moves/path-${index + 1}.txt`,
+    sourceChecksumBefore: checksum, destinationChecksumAfter: checksum, sequence: index + 1,
+    status: "COMPLETED", completedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, 0, index)),
+  })) });
+
+  const moves = await persistent.knownExecutedMoves(library.id);
+  assert.equal(moves.length, 1005);
+  assert.equal(persistent.fileKeyAfterKnownMoves(library.id, "moves/path-1005.txt", checksum, moves),
+    persistent.persistentFileKey(library.id, "moves/path-0.txt"));
+  assert.equal(persistent.fileKeyAfterKnownMoves(library.id, "moves/path-1005.txt", "e".repeat(64), moves),
+    persistent.persistentFileKey(library.id, "moves/path-1005.txt"));
+  await prisma.organizationPlan.delete({ where: { id: plan.id } });
 });
 
 test("a file absent from the latest scan makes its old identity link historical and unreviewable", async () => {
