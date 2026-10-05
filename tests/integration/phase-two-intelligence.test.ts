@@ -4,7 +4,7 @@ import { after, before, test } from "node:test";
 
 import { PrismaClient } from "@prisma/client";
 import { formatOrganizationConcepts, organizationConceptsFromEvidence } from "../../src/lib/bridge/organization-concepts";
-import { documentSignalVersion } from "../../src/lib/bridge/document-signals";
+import { documentSignalVersion, extractDocumentSignals } from "../../src/lib/bridge/document-signals";
 
 const schema = `phase_two_${process.pid}_${Date.now()}`;
 const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -1542,6 +1542,103 @@ test("historical version filtering stays linear for twenty thousand superseded e
   const signals = await persistent.getDocumentVersionSignals(entries, true);
   assert.equal(signals.length, count);
   assert.ok(signals.some((signal) => signal.revisionNumber === String(count)));
+});
+
+test("typed relationship pagination reaches later identities and retains supported prior links", async (t) => {
+  const library = await createLibrary("Paginated typed candidates");
+  const hidden = await createLibrary("Unauthorized typed candidates");
+  await prisma.connectedLibrary.update({ where: { id: hidden.id }, data: { readPermission: false } });
+  t.after(async () => {
+    await prisma.knowledgeConnection.deleteMany({ where: {
+      sourceEvidence: { path: ["connectedLibraryId"], equals: library.id },
+    } });
+    await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: { in: [library.id, hidden.id] } } });
+    await prisma.connectedLibrary.deleteMany({ where: { id: { in: [library.id, hidden.id] } } });
+  });
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
+  const verified = (fields: string) => `Source characters 0-${fields.length}: "${fields}"`;
+  // Hashes are root-scoped. Choose their order explicitly instead of relying on
+  // fixture names to happen to sort the large CLIENT identity first.
+  const clients = Array.from({ length: 12 }, (_, index) => {
+    const fields = `Client ID: pagination-${index}`;
+    return { fields, signal: extractDocumentSignals(verified(fields), library.id)[0] };
+  }).sort((a, b) => a.signal.identityHash.localeCompare(b.signal.identityHash));
+  const large = await createObservedFile({ checksum: "pagination-large", libraryId: library.id,
+    relativePath: "large/source.txt", sessionId: scan.id });
+  const specifications = [
+    { kind: "SAME_CLIENT", fields: clients[1].fields },
+    { kind: "SAME_PROJECT", fields: "Project ID: pagination-project" },
+    { kind: "PROBABLE_REVISION", fields: `${clients[2].fields}; Document ID: pagination-plan; Document Title: Annual Plan` },
+  ];
+  const pairs = [];
+  for (const specification of specifications) {
+    const left = await createObservedFile({ checksum: `${specification.kind}-left`, libraryId: library.id,
+      relativePath: `${specification.kind}/left.txt`, sessionId: scan.id });
+    const right = await createObservedFile({ checksum: `${specification.kind}-right`, libraryId: library.id,
+      relativePath: `${specification.kind}/right.txt`, sessionId: scan.id });
+    const index = knowledgeIndex(scan.id, library.id, left, right);
+    index.relationships = [];
+    withVerifiedFields(index, left.file.id, specification.fields + (specification.kind === "PROBABLE_REVISION" ? "; Version: v1" : ""));
+    withVerifiedFields(index, right.file.id, specification.fields + (specification.kind === "PROBABLE_REVISION" ? "; Version: v2" : ""));
+    pairs.push({ ...specification, left, right, index });
+  }
+  // Seed a genuine previously supported generated link through production.
+  await persistent.persistScanWorkingKnowledge(pairs[0].index);
+  const prior = await prisma.knowledgeConnection.findFirstOrThrow({ where: {
+    relationshipKind: "SAME_CLIENT", sourceFileKey: { in: [
+      persistent.persistentFileKey(library.id, pairs[0].left.file.relativePath),
+      persistent.persistentFileKey(library.id, pairs[0].right.file.relativePath),
+    ] },
+  } });
+  const count = 1501;
+  const extraFiles = Array.from({ length: count }, (_, index) => ({
+    id: crypto.randomUUID(), sessionId: scan.id, libraryDocumentId: large.observation.libraryDocumentId,
+    localPath: `bridge://${library.id}/large/${index}.txt`, relativePath: `large/${index}.txt`,
+    fileType: "TEXT", checksum: `pagination-extra-${index}`,
+    readStatus: "SUPPORTED" as const, readingStatus: "READ" as const, extractionStatus: "COMPLETED" as const,
+  }));
+  await prisma.scannedFile.createMany({ data: extraFiles });
+  await prisma.knowledgeDocumentSignal.createMany({ data: extraFiles.map((file) => ({
+    signalKey: crypto.randomUUID(), connectedLibraryId: library.id,
+    fileKey: persistent.persistentFileKey(library.id, file.relativePath), relativePath: file.relativePath,
+    checksum: file.checksum, kind: "CLIENT", identityHash: clients[0].signal.identityHash,
+    sourceRanges: [], observationSessionId: large.observation.id, generationVersion: documentSignalVersion,
+  })) });
+  const invalid = await createObservedFile({ checksum: "pagination-valid-bytes", libraryId: library.id,
+    relativePath: "invalid/wrong-checksum.txt", sessionId: scan.id });
+  const foreignKey = persistent.persistentFileKey(library.id, invalid.file.relativePath);
+  const laterClient = extractDocumentSignals(verified(clients[1].fields), library.id)[0];
+  await prisma.knowledgeDocumentSignal.createMany({ data: [
+    { connectedLibraryId: library.id, checksum: "stale-bytes" },
+    { connectedLibraryId: hidden.id, checksum: invalid.file.checksum! },
+  ].map((scope) => ({
+    ...scope, signalKey: crypto.randomUUID(), fileKey: foreignKey, relativePath: invalid.file.relativePath,
+    kind: "CLIENT", identityHash: laterClient.identityHash, sourceRanges: [],
+    observationSessionId: invalid.observation.id, generationVersion: documentSignalVersion,
+  })) });
+  const index = knowledgeIndex(scan.id, library.id, large, large);
+  index.relationships = [];
+  index.files = [index.files[0], ...pairs.flatMap((pair) => pair.index.files)];
+  withVerifiedFields(index, large.file.id, clients[0].fields);
+  const readLinks = () => prisma.knowledgeConnection.findMany({
+    where: { generationVersion: documentSignalVersion,
+      sourceEvidence: { path: ["connectedLibraryId"], equals: library.id } },
+    orderBy: { relationshipKey: "asc" },
+    select: { id: true, relationshipKey: true, relationshipKind: true, sourceFileKey: true,
+      targetFileKey: true, status: true, supersededAt: true, sourceEvidence: true },
+  });
+  await persistent.persistScanWorkingKnowledge(index);
+  const initial = await readLinks();
+  for (const pair of pairs) {
+    const keys = [pair.left, pair.right].map((item) => persistent.persistentFileKey(library.id, item.file.relativePath));
+    assert.ok(initial.some((link) => link.relationshipKind === pair.kind &&
+      keys.includes(link.sourceFileKey!) && keys.includes(link.targetFileKey!) &&
+      link.status === "NEW" && link.supersededAt === null), pair.kind);
+  }
+  assert.ok(initial.some((link) => link.id === prior.id && link.status === "NEW" && link.supersededAt === null));
+  assert.ok(initial.every((link) => link.sourceFileKey !== foreignKey && link.targetFileKey !== foreignKey));
+  await persistent.persistScanWorkingKnowledge({ ...index, files: [...index.files].reverse() });
+  assert.deepEqual(await readLinks(), initial);
 });
 
 test("persistent identity grouping stays linear for twenty thousand unrelated separations", async () => {

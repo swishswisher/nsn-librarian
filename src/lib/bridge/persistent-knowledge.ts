@@ -835,21 +835,31 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
   const typedPerFile = new Map<string, number>();
   const seenPairs = new Set<string>();
   for (let offset = 0; offset < candidateKeys.length; offset += 50) {
-    const candidates = await prisma.knowledgeDocumentSignal.findMany({
-      orderBy: [{ kind: "asc" }, { identityHash: "asc" }, { fileKey: "asc" }],
-      take: 1500,
-      where: {
-        connectedLibraryId: session.connectedFolderId,
-        status: "ACTIVE",
-        OR: candidateKeys.slice(offset, offset + 50).map((signal) => ({ kind: signal.kind, identityHash: signal.identityHash })),
-      },
-    });
-    const byIdentity = new Map<string, typeof candidates>();
-    for (const candidate of candidates) {
-      if (checksumByKey.get(candidate.fileKey) !== candidate.checksum) continue;
-      const key = `${candidate.kind}:${candidate.identityHash}`;
-      byIdentity.set(key, [...(byIdentity.get(key) ?? []), candidate]);
-    }
+    // A shared result cap can hide every later identity behind one large group.
+    // Read the complete chunk in bounded, deterministic pages before generation
+    // and archival; append in place so grouping remains linear in signal count.
+    const byIdentity = new Map<string, Prisma.KnowledgeDocumentSignalGetPayload<object>[]>();
+    let candidateCursor: string | undefined;
+    do {
+      const candidates = await prisma.knowledgeDocumentSignal.findMany({
+        ...(candidateCursor ? { cursor: { id: candidateCursor }, skip: 1 } : {}),
+        orderBy: [{ kind: "asc" }, { identityHash: "asc" }, { fileKey: "asc" }, { id: "asc" }],
+        take: 1500,
+        where: {
+          connectedLibraryId: session.connectedFolderId,
+          status: "ACTIVE",
+          OR: candidateKeys.slice(offset, offset + 50).map((signal) => ({ kind: signal.kind, identityHash: signal.identityHash })),
+        },
+      });
+      for (const candidate of candidates) {
+        if (checksumByKey.get(candidate.fileKey) !== candidate.checksum) continue;
+        const key = `${candidate.kind}:${candidate.identityHash}`;
+        const members = byIdentity.get(key) ?? [];
+        members.push(candidate);
+        byIdentity.set(key, members);
+      }
+      candidateCursor = candidates.length === 1500 ? candidates.at(-1)?.id : undefined;
+    } while (candidateCursor);
     for (const current of currentResolved) {
       const currentCorrection = correctedIdentityByFile.get(`${current.fileKey}:${current.kind}`);
       if (currentCorrection && currentCorrection !== current.identityHash) continue;

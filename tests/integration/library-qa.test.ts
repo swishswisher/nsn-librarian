@@ -108,6 +108,73 @@ function claim(text: string, sourceIds: string[], kind = "FACT") {
   return { text, sourceIds, kind };
 }
 
+for (const kind of ["CLIENT", "PROJECT"] as const) {
+  test(`${kind.toLowerCase()} Ask rejects misleading unindexed metadata and preserves evidence and ambiguity gates`, async (t) => {
+    const r = await root(`${kind} metadata QA root`); const s = await scan(r.id);
+    const hidden = await root(`${kind} hidden metadata QA root`); const hs = await scan(hidden.id);
+    t.after(async () => {
+      await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: { in: [r.id, hidden.id] } } });
+      await prisma.connectedLibrary.deleteMany({ where: { id: { in: [r.id, hidden.id] } } });
+    });
+    await prisma.connectedLibrary.update({ where: { id: hidden.id }, data: { readPermission: false } });
+    const misleading = await file({ rootId: r.id, sessionId: s.id,
+      relativePath: "Alice/private-ledger.txt", quote: "Unrelated ledger" });
+    const unauthorized = await file({ rootId: hidden.id, sessionId: hs.id,
+      relativePath: "Alice/private-ledger.txt", quote: `${kind}: Alice; hidden invoice` });
+    await prisma.librarySearchEntry.deleteMany({ where: { id: { in: [misleading.index.id, unauthorized.index.id] } } });
+    let calls = 0;
+    const question = `${kind.toLowerCase()} Alice`;
+    const noMatch = await answer.answerLibraryQuestion(question, {
+      permittedRootIds: [r.id, hidden.id], model: async () => { calls += 1; return model([])(); },
+    });
+    assert.equal(noMatch.state, "NO_AUTHORIZED_MATCH");
+    assert.equal(noMatch.sources.length, 0);
+    assert.equal(calls, 0);
+    const ordinary = await answer.answerLibraryQuestion("private-ledger.txt", {
+      permittedRootIds: [r.id, hidden.id], model: async (_question, context) => {
+        calls += 1;
+        assert.equal(context.sources.length, 1);
+        assert.equal(context.sources[0].sourceType, "FILE_METADATA");
+        assert.equal(context.sources[0].relativePath, misleading.scanned.relativePath);
+        return model([claim("File name: private-ledger.txt", ["S1"])])();
+      },
+    });
+    assert.equal(ordinary.sources.length, 1);
+    assert.equal(calls, 1);
+    const addMatch = async (suffix: string) => {
+      const item = await file({ rootId: r.id, sessionId: s.id,
+        relativePath: `verified-${suffix}.txt`, quote: `${kind}: Alice; invoice ${suffix}`,
+        entityHashes: [`metadata-${kind}-${suffix}`] });
+      await prisma.knowledgeDocumentSignal.create({ data: {
+        checksum: item.scanned.checksum!, connectedLibraryId: r.id, fileKey: item.index.fileKey,
+        generationVersion: documentSignalVersion, identityHash: `metadata-${kind}-${suffix}`, kind,
+        observationSessionId: item.observation.id, relativePath: item.scanned.relativePath,
+        signalKey: crypto.randomUUID(), sourceRanges: [],
+      } });
+      return item;
+    };
+    const authorized = await addMatch("one");
+    const verified = await answer.answerLibraryQuestion(question, {
+      permittedRootIds: [r.id, hidden.id], model: async (_question, context) => {
+        calls += 1;
+        assert.equal(context.ambiguousEntity, false);
+        assert.equal(context.sources.length, 1);
+        assert.equal(context.sources[0].relativePath, authorized.scanned.relativePath);
+        return model([claim(`${kind}: Alice; invoice one`, ["S1"])])();
+      },
+    });
+    assert.equal(verified.state, "ANSWERED_FROM_SOURCES");
+    assert.equal(calls, 2);
+    await addMatch("two");
+    const ambiguous = await answer.answerLibraryQuestion(question, {
+      permittedRootIds: [r.id, hidden.id], model: async () => { calls += 1; return model([])(); },
+    });
+    assert.equal(ambiguous.state, "AMBIGUOUS_ENTITY");
+    assert.equal(calls, 2);
+    assert.ok(ambiguous.sources.every((source) => source.relativePath.startsWith("verified-")));
+  });
+}
+
 test("factual answer cites one authorized source and its character range", async () => {
   const r = await root("Amber Root"); const s = await scan(r.id);
   await file({ rootId: r.id, sessionId: s.id, relativePath: "amber-note.txt",

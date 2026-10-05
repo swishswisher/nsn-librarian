@@ -112,6 +112,41 @@ function evidence(text: string) {
   return `Source characters 0-${text.length}: "${text}"`;
 }
 
+for (const kind of ["CLIENT", "PROJECT"] as const) {
+  test(`${kind.toLowerCase()} search excludes unindexed path-only metadata but keeps verified and ordinary matches`, async (t) => {
+    const r = await root(`${kind} metadata evidence root`); const s = await session(r.id);
+    const hidden = await root(`${kind} unauthorized metadata root`); const hs = await session(hidden.id);
+    t.after(async () => {
+      await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: { in: [r.id, hidden.id] } } });
+      await prisma.connectedLibrary.deleteMany({ where: { id: { in: [r.id, hidden.id] } } });
+    });
+    await prisma.connectedLibrary.update({ where: { id: hidden.id }, data: { readPermission: false } });
+    const misleading = await observedFile({ rootId: r.id, sessionId: s.id,
+      path: "Alice/private-ledger.txt", evidence: evidence("Unrelated private ledger") });
+    const authorized = await observedFile({ rootId: r.id, sessionId: s.id,
+      path: "verified-record.txt", evidence: evidence(`${kind}: Alice; invoice recorded`) });
+    const unauthorized = await observedFile({ rootId: hidden.id, sessionId: hs.id,
+      path: "Alice/private-ledger.txt", evidence: evidence(`${kind}: Alice; hidden invoice`) });
+    await prisma.knowledgeDocumentSignal.createMany({ data: [authorized, unauthorized].map((item) => ({
+      checksum: item.file.checksum!, connectedLibraryId: item.working.connectedLibraryId,
+      fileKey: fileKey.persistentFileKey(item.working.connectedLibraryId, item.file.relativePath),
+      generationVersion: documentSignalVersion, identityHash: `metadata-${kind}`, kind,
+      observationSessionId: item.observation.id, relativePath: item.file.relativePath,
+      signalKey: crypto.randomUUID(), sourceRanges: [],
+    })) });
+    const query = `${kind.toLowerCase()} Alice`;
+    assert.deepEqual(await search.searchLibrary(query, [r.id, hidden.id]), []);
+    await indexFiles(s.id, [authorized]);
+    await indexFiles(hs.id, [unauthorized]);
+    const results = await search.searchLibrary(query, [r.id, hidden.id], { includeEntityMatches: true });
+    assert.deepEqual(results.map((result) => result.relativePath), [authorized.file.relativePath]);
+    assert.deepEqual(results[0].matchedEntityHashes, [`metadata-${kind}`]);
+    const ordinary = await search.searchLibrary("private-ledger.txt", [r.id, hidden.id]);
+    assert.deepEqual(ordinary.map((result) => result.id), [misleading.file.id]);
+    assert.equal(ordinary[0].state, "Not indexed; metadata match only");
+  });
+}
+
 test("exact file name ranks over conceptual matches", async () => {
   const r = await root("Exact Root"); const s = await session(r.id);
   const exact = await observedFile({ rootId: r.id, sessionId: s.id, path: "workshop.txt", evidence: evidence("A workshop agenda for participants"), concepts: ["workshops"] });

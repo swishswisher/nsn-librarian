@@ -507,8 +507,10 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     });
   }
 
-  // Metadata fallback works before indexing and for incomplete/unsupported files.
-  const fallback = retainedHistoryList ? [] : await prisma.scannedFile.findMany({
+  // Path-only metadata cannot bind a requested typed identity. Explicit entity
+  // results must use the checksum-bound effective evidence checked above.
+  // Ordinary metadata discovery still works before indexing.
+  const fallback = retainedHistoryList || intent.entityKind ? [] : await prisma.scannedFile.findMany({
     take: 40,
     orderBy: [{ scanSession: { connectedFolderId: "asc" } }, { relativePath: "asc" }, { id: "asc" }],
     select: { fileType: true, id: true, relativePath: true, sessionId: true,
