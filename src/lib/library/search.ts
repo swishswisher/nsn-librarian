@@ -349,9 +349,14 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     for (const hash of eligibleHashes) hashes.add(hash);
     seedHashesByRoot.set(entry.connectedLibraryId, hashes);
   }
-  const seedPairs = [...seedHashesByRoot].flatMap(([connectedLibraryId, hashes]) =>
+  const allSeedPairs = [...seedHashesByRoot].flatMap(([connectedLibraryId, hashes]) =>
     [...hashes].map((hash) => ({ connectedLibraryId, hash })),
-  ).slice(0, 24);
+  );
+  // Ordinary Search keeps identity expansion bounded for display work. Ask's
+  // explicit-entity path must retain every request-bound root/hash seed so a
+  // later distinct identity cannot disappear from the exhaustive ambiguity
+  // assessment behind many byte-identical copies.
+  const seedPairs = exhaustiveEntityCandidates ? allSeedPairs : allSeedPairs.slice(0, 24);
   const expansionHashesByRoot = new Map<string, string[]>();
   for (const { connectedLibraryId, hash } of seedPairs) {
     const hashes = expansionHashesByRoot.get(connectedLibraryId) ?? [];
@@ -359,7 +364,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     expansionHashesByRoot.set(connectedLibraryId, hashes);
   }
   const relatedCandidates = seedPairs.length ? await prisma.librarySearchEntry.findMany({
-    take: 40,
+    take: exhaustiveEntityCandidates ? undefined : 40,
     orderBy: [{ connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: {
       ...scope,

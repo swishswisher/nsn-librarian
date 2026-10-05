@@ -242,6 +242,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     : [];
   let allVersionSignals = route.kind === "VERSION"
     ? await getDocumentVersionSignals(versionEntries, route.wantsHistory, true) : [];
+  let versionMembersMissingSearchEntries = false;
   if (route.kind === "VERSION" && allVersionSignals.length) {
     const endpoints = [...new Map(allVersionSignals.map((signal) => [
       `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`,
@@ -263,6 +264,8 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     const expandedByEndpoint = new Map(expandedEntries.map((entry) => [
       `${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`, entry,
     ]));
+    versionMembersMissingSearchEntries = allVersionSignals.some((signal) => !expandedByEndpoint.has(
+      `${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`));
     // Family identities are root-scoped. Keep every authorized endpoint
     // through discovery and expansion even when two roots contain identical
     // bytes; physical-copy deduplication belongs to bounded source selection.
@@ -530,7 +533,8 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     }));
   return { route, sources, relationships, versions,
     versionFamilyCount: assessedFamilies.length,
-    versionAssessmentComplete: assessedFamilies.every((family) => family.safe),
+    versionAssessmentComplete: !versionMembersMissingSearchEntries &&
+      assessedFamilies.every((family) => family.safe),
     indexIncomplete: indexIncomplete || sources.some((source) => source.trustState === "Metadata only"),
     ambiguousEntity: entityHashes.size > 1 || hasSeparatedMatchingIdentity };
 }

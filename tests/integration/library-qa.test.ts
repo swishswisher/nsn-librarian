@@ -187,6 +187,38 @@ test("version retrieval expands a seeded family completely beyond signal paginat
   assert.ok(!result.claims.some((versionClaim) => /member-002\.txt is newer/.test(versionClaim.text)));
 });
 
+test("version retrieval fails closed when an expanded newest member has no usable index entry", async () => {
+  const r = await root("Incomplete expanded family root"); const s = await scan(r.id);
+  const revisions = [];
+  for (let revision = 1; revision <= 3; revision += 1) {
+    const item = await file({ rootId: r.id, sessionId: s.id,
+      relativePath: `family/member-${revision}.txt`,
+      quote: revision < 3 ? "Quartz version comparison evidence" : "Lexically unrelated newest material" });
+    await prisma.knowledgeDocumentSignal.create({ data: {
+      signalKey: crypto.randomUUID(), connectedLibraryId: r.id, fileKey: item.index.fileKey,
+      relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!,
+      kind: "DOCUMENT_FAMILY", identityHash: "incomplete-quartz-family",
+      revisionNumber: String(revision), sourceRanges: [], observationSessionId: item.observation.id,
+      generationVersion: documentSignalVersion,
+    } });
+    revisions.push(item);
+  }
+  await prisma.librarySearchEntry.delete({ where: { id: revisions[2].index.id } });
+
+  const question = "Which quartz version is latest?";
+  const context = await retrieve.retrieveQuestionContext(question, [r.id]);
+  assert.equal(context.versionFamilyCount, 1);
+  assert.equal(context.versionAssessmentComplete, false);
+  assert.ok(!context.sources.some((source) => source.relativePath === "family/member-3.txt"));
+
+  const result = await answer.answerLibraryQuestion(question, {
+    permittedRootIds: [r.id], model: model([]),
+  });
+  assert.equal(result.state, "INSUFFICIENT_EVIDENCE");
+  assert.equal(result.claims.length, 0);
+  assert.ok(!result.answer.includes("member-2.txt is newer"));
+});
+
 test("version retrieval preserves byte-identical seed endpoints across roots", async () => {
   const retainedRoot = await prisma.connectedLibrary.create({ data: {
     id: "version-copy-root-a", bridgeRootId: crypto.randomUUID(), displayName: "Version Copy A",
@@ -528,6 +560,68 @@ test("Ask treats authorized byte-identical cross-root copies as one physical ide
     assert.equal(result.state, "ANSWERED_FROM_SOURCES");
     assert.equal(result.sources.length, 1);
   }
+});
+
+test("Ask preserves every authorized root and hash seed beyond twenty-four pairs", async () => {
+  const authorizedRootIds: string[] = [];
+  const items: Array<{ item: Awaited<ReturnType<typeof file>>; rootId: string; hash: string }> = [];
+  const duplicateChecksum = "alice-many-root-physical-copy";
+  for (let index = 0; index < 24; index += 1) {
+    const rootId = `alice-seed-root-${String(index).padStart(2, "0")}`;
+    const r = await prisma.connectedLibrary.create({ data: { id: rootId,
+      bridgeRootId: crypto.randomUUID(), displayName: `Alice Seed Root ${index}`,
+      localPath: `bridge://qa-test/${rootId}`, platform: "MACOS" } });
+    const s = await scan(r.id);
+    const item = await file({ rootId: r.id, sessionId: s.id,
+      relativePath: `copies/alice-${index}.txt`, quote: "Client: Alice; shared physical record",
+      checksum: duplicateChecksum, entityHashes: [`alice-copy-${index}`] });
+    authorizedRootIds.push(r.id);
+    items.push({ item, rootId: r.id, hash: `alice-copy-${index}` });
+  }
+  const distinctRoot = await prisma.connectedLibrary.create({ data: { id: "alice-seed-root-zz",
+    bridgeRootId: crypto.randomUUID(), displayName: "Alice Distinct Root",
+    localPath: "bridge://qa-test/alice-seed-root-zz", platform: "MACOS" } });
+  const distinctScan = await scan(distinctRoot.id);
+  const distinct = await file({ rootId: distinctRoot.id, sessionId: distinctScan.id,
+    relativePath: "distinct/alice.txt", quote: "Client: Alice; distinct authorized record",
+    entityHashes: ["alice-distinct"] });
+  authorizedRootIds.push(distinctRoot.id);
+  items.push({ item: distinct, rootId: distinctRoot.id, hash: "alice-distinct" });
+
+  const unauthorizedRoot = await prisma.connectedLibrary.create({ data: { id: "alice-seed-root-unauthorized",
+    bridgeRootId: crypto.randomUUID(), displayName: "Alice Unauthorized Root",
+    localPath: "bridge://qa-test/alice-seed-root-unauthorized", platform: "MACOS" } });
+  const unauthorizedScan = await scan(unauthorizedRoot.id);
+  const unauthorized = await file({ rootId: unauthorizedRoot.id, sessionId: unauthorizedScan.id,
+    relativePath: "private/alice.txt", quote: "Client: Alice; private record",
+    entityHashes: ["alice-unauthorized"] });
+  items.push({ item: unauthorized, rootId: unauthorizedRoot.id, hash: "alice-unauthorized" });
+
+  await prisma.knowledgeDocumentSignal.createMany({ data: items.map(({ item, rootId, hash }) => ({
+    signalKey: crypto.randomUUID(), connectedLibraryId: rootId, fileKey: item.index.fileKey,
+    relativePath: item.scanned.relativePath, checksum: item.scanned.checksum!,
+    kind: "CLIENT", identityHash: hash, sourceRanges: [],
+    observationSessionId: item.observation.id, generationVersion: documentSignalVersion,
+  })) });
+
+  let modelCalled = false;
+  const result = await answer.answerLibraryQuestion("What do we have about client Alice?", {
+    permittedRootIds: authorizedRootIds,
+    model: async () => { modelCalled = true; return model([])(); },
+  });
+  assert.equal(result.state, "AMBIGUOUS_ENTITY");
+  assert.equal(modelCalled, false);
+  assert.ok(!result.sources.some((source) => source.rootName === unauthorizedRoot.displayName));
+
+  let copiesOnlyModelCalled = false;
+  const copiesOnly = await answer.answerLibraryQuestion("What do we have about client Alice?", {
+    permittedRootIds: authorizedRootIds.slice(0, 24),
+    model: async () => { copiesOnlyModelCalled = true;
+      return model([claim("Client Alice has a shared physical record", ["S1"])])(); },
+  });
+  assert.equal(copiesOnlyModelCalled, true);
+  assert.equal(copiesOnly.state, "ANSWERED_FROM_SOURCES");
+  assert.equal(copiesOnly.sources.length, 1);
 });
 
 test("Ask checks entity ambiguity beyond every candidate and answer-context cap", async () => {
