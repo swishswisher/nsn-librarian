@@ -1583,7 +1583,20 @@ test("persistent identity grouping stays linear for twenty thousand unrelated se
     previousStatus: "NEW", nextStatus: "REJECTED",
   })) });
 
-  const groups = await persistent.getPersistentIdentityGroups();
-  assert.equal(groups.length, 40);
-  assert.ok(groups.every((group) => group.libraryName === library.displayName && group.members.length === 1));
+  const otherEnabledLibraries = await prisma.connectedLibrary.findMany({
+    select: { id: true }, where: { id: { not: library.id }, isEnabled: true },
+  });
+  await prisma.connectedLibrary.updateMany({
+    data: { isEnabled: false }, where: { id: { in: otherEnabledLibraries.map(({ id }) => id) } },
+  });
+  try {
+    const groups = await persistent.getPersistentIdentityGroups();
+    assert.equal(groups.length, 40);
+    assert.ok(groups.every((group) =>
+      group.libraryName === library.displayName && group.members.length === 1));
+  } finally {
+    await prisma.connectedLibrary.updateMany({
+      data: { isEnabled: true }, where: { id: { in: otherEnabledLibraries.map(({ id }) => id) } },
+    });
+  }
 });
