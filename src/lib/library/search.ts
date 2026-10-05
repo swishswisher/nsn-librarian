@@ -204,10 +204,13 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   const latestSessionIds = roots.flatMap((root) => root.scanSessions.map((session) => session.id));
   if (rootIds.length === 0 || latestSessionIds.length === 0) return [];
 
+  const retainedHistoryList = Boolean(options?.includeHistoryList && intent.wantsHistory && !intent.entityKind);
   const scope = {
     connectedLibraryId: { in: rootIds },
     indexVersion: librarySearchIndexVersion,
-    ...(intent.wantsHistory ? {} : { isCurrent: true, scanSessionId: { in: latestSessionIds } }),
+    ...(retainedHistoryList
+      ? { isCurrent: false }
+      : intent.wantsHistory ? {} : { isCurrent: true, scanSessionId: { in: latestSessionIds } }),
   } as const;
   // Ask must not infer that an explicitly named entity is unique from the UI's
   // bounded candidate window. In that mode the database query is exhaustive,
@@ -263,7 +266,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
       ],
     },
   }).catch(() => []);
-  const historicalList = options?.includeHistoryList && intent.wantsHistory && !intent.entityKind
+  const historicalList = retainedHistoryList
     ? await prisma.librarySearchEntry.findMany({
       take: searchResultLimit,
       orderBy: [{ indexedAt: "desc" }, { connectedLibraryId: "asc" },
@@ -505,7 +508,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   }
 
   // Metadata fallback works before indexing and for incomplete/unsupported files.
-  const fallback = await prisma.scannedFile.findMany({
+  const fallback = retainedHistoryList ? [] : await prisma.scannedFile.findMany({
     take: 40,
     orderBy: [{ scanSession: { connectedFolderId: "asc" } }, { relativePath: "asc" }, { id: "asc" }],
     select: { fileType: true, id: true, relativePath: true, sessionId: true,

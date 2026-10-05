@@ -939,7 +939,8 @@ test("bare history lists retrieve ordinary retained documents without control-wo
     quote: "Quarterly operating notes and approved totals." });
   const currentScan = await scan(r.id);
   const current = await file({ rootId: r.id, sessionId: currentScan.id,
-    relativePath: "records/current-summary.txt", quote: "Current operating notes." });
+    relativePath: "records/show-previous-current.txt",
+    quote: "Show the previous-quarter comparison from the current record." });
   const unavailableScan = await scan(unavailable.id);
   const unavailableRetained = await file({ rootId: unavailable.id, sessionId: unavailableScan.id,
     relativePath: "records/private-summary.txt", quote: "Private retained operating notes." });
@@ -973,18 +974,20 @@ test("named and topical history requests do not broaden to unrelated retained do
   const unrelated = await file({ rootId: r.id, sessionId: oldScan.id,
     relativePath: "records/workshop-notes.txt", quote: "Facilitation workshop notes." });
   const currentScan = await scan(r.id);
-  await file({ rootId: r.id, sessionId: currentScan.id,
-    relativePath: "records/current.txt", quote: "Current record." });
+  const current = await file({ rootId: r.id, sessionId: currentScan.id,
+    relativePath: "records/current-quarterly.txt", quote: "Current quarterly operating record." });
   await prisma.librarySearchEntry.updateMany({
     where: { id: { in: [matching.index.id, unrelated.index.id] } }, data: { isCurrent: false },
   });
 
-  for (const question of ["Could you show me previous quarterly-summary.txt?",
-    "Please show previous quarterly documents"]) {
+  for (const [question, expected] of [
+    ["Could you show me previous quarterly-summary.txt?", [current.scanned.relativePath, matching.scanned.relativePath]],
+    ["Please show previous quarterly documents", [current.scanned.relativePath, matching.scanned.relativePath]],
+  ] as const) {
     const context = await retrieve.retrieveQuestionContext(question, [r.id]);
     assert.equal(context.route.kind, "HISTORY");
     assert.equal(context.route.historyList, false);
-    assert.deepEqual(context.sources.map((source) => source.relativePath), [matching.scanned.relativePath]);
+    assert.deepEqual(context.sources.map((source) => source.relativePath), expected);
     assert.ok(!context.sources.some((source) => source.relativePath === unrelated.scanned.relativePath));
   }
 });
