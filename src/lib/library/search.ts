@@ -382,20 +382,52 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
       ["SAME_CLIENT", "SAME_PROJECT"],
     )
     : new Map<string, Set<string>>();
-  const crossesSeedSeparation = (entry: typeof initial[number]) => seedEntries.some((seed) => {
-    if (seed.id === entry.id) return false;
-    const separatedHashes = separatedIdentityPairs.get(knowledgeRelationshipPairKey(seed, entry));
-    const seedHashes = seedHashesByRoot.get(seed.connectedLibraryId) ?? new Set<string>();
-    return Boolean(separatedHashes && [...separatedHashes].some((hash) =>
-      seedHashes.has(hash) && seed.entityHashes.includes(hash) && entry.entityHashes.includes(hash),
-    ));
-  });
+  const seedIds = new Set(seedEntries.map((entry) => entry.id));
+  const separatedFromSeedIds = new Set<string>();
+  if (separatedIdentityPairs.size) {
+    const endpointKey = (entry: typeof initial[number]) => `${entry.fileKey}\0${entry.checksum}`;
+    const seedsByEndpoint = new Map<string, typeof seedEntries>();
+    const candidatesByEndpoint = new Map<string, typeof identityCandidates>();
+    for (const seed of seedEntries) {
+      const key = endpointKey(seed);
+      const values = seedsByEndpoint.get(key) ?? [];
+      values.push(seed);
+      seedsByEndpoint.set(key, values);
+    }
+    for (const candidate of identityCandidates) {
+      const key = endpointKey(candidate);
+      const values = candidatesByEndpoint.get(key) ?? [];
+      values.push(candidate);
+      candidatesByEndpoint.set(key, values);
+    }
+    const markSeparatedCandidates = (seedEndpoint: string, candidateEndpoint: string,
+      separatedHashes: Set<string>) => {
+      for (const seed of seedsByEndpoint.get(seedEndpoint) ?? []) {
+        const seedHashes = seedHashesByRoot.get(seed.connectedLibraryId);
+        if (!seedHashes) continue;
+        for (const candidate of candidatesByEndpoint.get(candidateEndpoint) ?? []) {
+          if (seed.id === candidate.id) continue;
+          if ([...separatedHashes].some((hash) => seedHashes.has(hash) &&
+              seed.entityHashes.includes(hash) && candidate.entityHashes.includes(hash))) {
+            separatedFromSeedIds.add(candidate.id);
+          }
+        }
+      }
+    };
+    for (const [pairKey, separatedHashes] of separatedIdentityPairs) {
+      const [leftFileKey, leftChecksum, rightFileKey, rightChecksum] = pairKey.split("\0");
+      const leftEndpoint = `${leftFileKey}\0${leftChecksum}`;
+      const rightEndpoint = `${rightFileKey}\0${rightChecksum}`;
+      markSeparatedCandidates(leftEndpoint, rightEndpoint, separatedHashes);
+      markSeparatedCandidates(rightEndpoint, leftEndpoint, separatedHashes);
+    }
+  }
   // Direct entity matches remain authoritative seeds. Other lexical candidates are
   // expansion-dependent when they rely on a seeded identity hash, and must obey
   // the same checksum-bound human separation as candidates found by expansion.
   const filteredInitial = initial.filter((entry) =>
-    seedEntries.some((seed) => seed.id === entry.id) || !crossesSeedSeparation(entry));
-  const related = relatedCandidates.filter((entry) => !crossesSeedSeparation(entry));
+    seedIds.has(entry.id) || !separatedFromSeedIds.has(entry.id));
+  const related = relatedCandidates.filter((entry) => !separatedFromSeedIds.has(entry.id));
   const exactIds = new Set(exact.map((entry) => entry.id));
   const boundedCandidates = [...new Map([
     ...filteredInitial.filter((entry) => exactIds.has(entry.id)),

@@ -127,31 +127,33 @@ export async function getDocumentVersionSignals(entries: Array<{
     } while (cursor);
     return rows;
   };
-  const endpointChunks = Array.from({ length: Math.ceil(entries.length / 100) }, (_, index) =>
-    entries.slice(index * 100, index * 100 + 100));
-  const seededSignals = (await Promise.all(endpointChunks.map((chunk) => findAll({
+  const endpointChunks = Array.from({ length: Math.ceil(entries.length / 500) }, (_, index) =>
+    entries.slice(index * 500, index * 500 + 500));
+  const seededSignals = [] as Awaited<ReturnType<typeof findAll>>;
+  for (const chunk of endpointChunks) seededSignals.push(...await findAll({
     kind: "DOCUMENT_FAMILY", generationVersion: documentSignalVersion,
     OR: chunk.map((entry) => ({
       connectedLibraryId: entry.connectedLibraryId, fileKey: entry.fileKey, checksum: entry.checksum,
       OR: [{ status: "ACTIVE", supersededAt: null },
         ...(includeHistory && !entry.isCurrent ? [{ status: "SUPERSEDED" }] : [])],
     })),
-  })))).flat();
+  }));
   const familyPairs = [...new Map(seededSignals.map((signal) => [
     `${signal.connectedLibraryId}\0${signal.identityHash}`,
     { connectedLibraryId: signal.connectedLibraryId, identityHash: signal.identityHash },
   ])).values()];
-  const familyChunks = Array.from({ length: Math.ceil(familyPairs.length / 100) }, (_, index) =>
-    familyPairs.slice(index * 100, index * 100 + 100));
-  const expandedSignals = expandSeededFamilies && familyPairs.length
-    ? (await Promise.all(familyChunks.map((chunk) => findAll({
+  const familyChunks = Array.from({ length: Math.ceil(familyPairs.length / 500) }, (_, index) =>
+    familyPairs.slice(index * 500, index * 500 + 500));
+  const expandedSignals = [] as typeof seededSignals;
+  if (expandSeededFamilies && familyPairs.length) {
+    for (const chunk of familyChunks) expandedSignals.push(...await findAll({
       kind: "DOCUMENT_FAMILY", generationVersion: documentSignalVersion,
       OR: chunk.map((family) => ({ ...family,
         OR: [{ status: "ACTIVE", supersededAt: null },
           ...(includeHistory ? [{ status: "SUPERSEDED" }] : [])],
       })),
-    })))).flat()
-    : seededSignals;
+    }));
+  } else expandedSignals.push(...seededSignals);
   const signals = [...new Map(expandedSignals.map((signal) => [signal.id, signal])).values()]
     .sort((left, right) => left.status.localeCompare(right.status) || left.id.localeCompare(right.id));
   const observations = await prisma.observationSession.findMany({
@@ -162,14 +164,15 @@ export async function getDocumentVersionSignals(entries: Array<{
     } },
   });
   const byObservation = new Map(observations.map((observation) => [observation.id, observation]));
+  const activeEndpoints = new Set(signals.flatMap((signal) => signal.status === "ACTIVE"
+    ? [`${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`]
+    : []));
   return signals.filter((signal) => {
     const observation = byObservation.get(signal.observationSessionId);
     if (!observation || observation.status === "REJECTED") return false;
     if (signal.status === "ACTIVE") return true;
     // Historical revisions are useful; superseded human-corrected claims are not.
-    if (signals.some((current) => current.status === "ACTIVE" &&
-        current.connectedLibraryId === signal.connectedLibraryId &&
-        current.fileKey === signal.fileKey && current.checksum === signal.checksum)) return false;
+    if (activeEndpoints.has(`${signal.connectedLibraryId}\0${signal.fileKey}\0${signal.checksum}`)) return false;
     return observation.status !== "MODIFIED" || extractDocumentSignals(
       observation.humanDecisions[0]?.editedSuggestion ?? "", signal.connectedLibraryId,
     ).some((corrected) => corrected.kind === "DOCUMENT_FAMILY" && corrected.identityHash === signal.identityHash);
@@ -200,27 +203,31 @@ export async function getSeparatedRelationshipPairIdentities(
   const prisma = getPrismaClient();
   const endpointKeys = new Set(entries.map((entry) => `${entry.fileKey}\0${entry.checksum}`));
   const fileKeys = [...new Set(entries.map((entry) => entry.fileKey))];
-  const rows = await prisma.knowledgeConnection.findMany({
-    select: {
-      sourceChecksum: true,
-      sourceEvidence: true,
-      sourceFileKey: true,
-      targetChecksum: true,
-      targetFileKey: true,
-    },
-    where: {
-      decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
-      generationVersion: documentSignalVersion,
-      relationshipKind: { in: relationshipKinds },
-      sourceFileKey: { in: fileKeys },
-      status: "REJECTED",
-      supersededAt: null,
-      targetFileKey: { in: fileKeys },
-    },
-  });
+  const fileKeySet = new Set(fileKeys);
+  const rows = [] as Awaited<ReturnType<typeof prisma.knowledgeConnection.findMany>>;
+  for (let offset = 0; offset < fileKeys.length; offset += 500) {
+    rows.push(...await prisma.knowledgeConnection.findMany({
+      select: {
+        sourceChecksum: true,
+        sourceEvidence: true,
+        sourceFileKey: true,
+        targetChecksum: true,
+        targetFileKey: true,
+      },
+      where: {
+        decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
+        generationVersion: documentSignalVersion,
+        relationshipKind: { in: relationshipKinds },
+        sourceFileKey: { in: fileKeys.slice(offset, offset + 500) },
+        status: "REJECTED",
+        supersededAt: null,
+      },
+    }));
+  }
 
   for (const row of rows) {
     if (!row.sourceFileKey || !row.sourceChecksum || !row.targetFileKey || !row.targetChecksum ||
+        !fileKeySet.has(row.targetFileKey) ||
         !endpointKeys.has(`${row.sourceFileKey}\0${row.sourceChecksum}`) ||
         !endpointKeys.has(`${row.targetFileKey}\0${row.targetChecksum}`)) continue;
     const pairKey = knowledgeRelationshipPairKey(
@@ -1456,25 +1463,35 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
 }) {
   const prisma = getPrismaClient();
   const rows = await getEligibleDocumentSignals(permittedRootIds, options);
-  const humanCorrections = await prisma.knowledgeConnection.findMany({
-    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-    select: { id: true, relationshipKind: true, sourceChecksum: true, sourceEvidence: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
-    where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null,
-      sourceFileKey: { in: rows.map((row) => row.fileKey) } },
-  });
-  const separatedIdentityRows = await prisma.knowledgeConnection.findMany({
-    select: { relationshipKind: true, sourceChecksum: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
-    where: { decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
-      generationVersion: documentSignalVersion, relationshipKind: { in: ["SAME_CLIENT", "SAME_PROJECT"] },
-      status: "REJECTED", supersededAt: null,
-      sourceFileKey: { in: rows.map((row) => row.fileKey) },
-      targetFileKey: { in: rows.map((row) => row.fileKey) } },
-  });
+  const fileKeys = [...new Set(rows.map((row) => row.fileKey))];
+  const fileKeySet = new Set(fileKeys);
+  const fileKeyChunks = Array.from({ length: Math.ceil(fileKeys.length / 500) }, (_, index) =>
+    fileKeys.slice(index * 500, index * 500 + 500));
+  const humanCorrections = [] as Awaited<ReturnType<typeof prisma.knowledgeConnection.findMany>>;
+  const separatedIdentityRows = [] as Awaited<ReturnType<typeof prisma.knowledgeConnection.findMany>>;
+  for (const sourceFileKeys of fileKeyChunks) {
+    humanCorrections.push(...await prisma.knowledgeConnection.findMany({
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+      select: { createdAt: true, id: true, relationshipKind: true, sourceChecksum: true, sourceEvidence: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
+      where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null,
+        sourceFileKey: { in: sourceFileKeys } },
+    }));
+    separatedIdentityRows.push(...await prisma.knowledgeConnection.findMany({
+      select: { relationshipKind: true, sourceChecksum: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
+      where: { decisions: { some: { action: "SEPARATE", nextStatus: "REJECTED" } },
+        generationVersion: documentSignalVersion, relationshipKind: { in: ["SAME_CLIENT", "SAME_PROJECT"] },
+        status: "REJECTED", supersededAt: null, sourceFileKey: { in: sourceFileKeys } },
+    }));
+  }
+  humanCorrections.sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() ||
+    left.id.localeCompare(right.id));
+  const relevantSeparatedIdentityRows = separatedIdentityRows.filter((row) =>
+    row.targetFileKey && fileKeySet.has(row.targetFileKey));
   const effectiveRows = [...rows];
   const correctedIdentities = new Map<string, string>();
   const correctionKey = (row: Pick<EffectiveIdentitySignal, "fileKey" | "checksum" | "kind">) =>
     `${row.fileKey}\0${row.checksum}\0${row.kind}`;
-  const separatedClientPairs = new Set(separatedIdentityRows.flatMap((row) => row.relationshipKind === "SAME_CLIENT" && row.sourceFileKey && row.sourceChecksum &&
+  const separatedClientPairs = new Set(relevantSeparatedIdentityRows.flatMap((row) => row.relationshipKind === "SAME_CLIENT" && row.sourceFileKey && row.sourceChecksum &&
     row.targetFileKey && row.targetChecksum ? [knowledgeRelationshipPairKey(
       { fileKey: row.sourceFileKey, checksum: row.sourceChecksum },
       { fileKey: row.targetFileKey, checksum: row.targetChecksum },
@@ -1507,7 +1524,7 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
     if (!source || !target || evidence.connectedLibraryId !== source.connectedLibraryId ||
         (projectIdentitiesByEndpoint.get(`${source.fileKey}\0${source.checksum}`)?.size ?? 0) > 1 ||
         (projectIdentitiesByEndpoint.get(`${target.fileKey}\0${target.checksum}`)?.size ?? 0) > 1) continue;
-    const separatedProjectPair = separatedIdentityRows.some((row) => row.relationshipKind === "SAME_PROJECT" &&
+    const separatedProjectPair = relevantSeparatedIdentityRows.some((row) => row.relationshipKind === "SAME_PROJECT" &&
       row.sourceFileKey && row.sourceChecksum && row.targetFileKey && row.targetChecksum &&
       knowledgeRelationshipPairKey(source, target) === knowledgeRelationshipPairKey(
         { fileKey: row.sourceFileKey, checksum: row.sourceChecksum },

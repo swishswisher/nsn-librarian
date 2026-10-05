@@ -1459,3 +1459,30 @@ test("incomplete and failed snapshots cannot replace completed identities, searc
   assert.equal((await searchLibrary("followup.txt", [library.id])).length, 0);
   assert.equal(await prisma.bridgeCommand.count(), 0);
 });
+
+test("historical version filtering stays linear for twenty thousand superseded endpoints", async () => {
+  const library = await createLibrary("Large historical version library");
+  const scan = await prisma.scanSession.create({ data: {
+    connectedFolderId: library.id, status: "COMPLETED",
+  } });
+  const observed = await createObservedFile({ checksum: "large-history-source", libraryId: library.id,
+    relativePath: "history/source.txt", sessionId: scan.id });
+  const count = 20_000;
+  const entries = Array.from({ length: count }, (_, index) => ({
+    connectedLibraryId: library.id, fileKey: `large-history-file-${index}`,
+    checksum: `large-history-checksum-${index}`, isCurrent: false,
+  }));
+  await prisma.knowledgeDocumentSignal.createMany({ data: entries.map((entry, index) => ({
+    id: `large-history-signal-${index}`, signalKey: `large-history-signal-key-${index}`,
+    connectedLibraryId: entry.connectedLibraryId, fileKey: entry.fileKey,
+    relativePath: `history/revision-${index}.txt`, checksum: entry.checksum,
+    kind: "DOCUMENT_FAMILY", identityHash: "large-history-family", sourceRanges: [],
+    observationSessionId: observed.observation.id, generationVersion: documentSignalVersion,
+    status: "SUPERSEDED", supersededAt: new Date("2026-01-01T00:00:00.000Z"),
+    revisionNumber: String(index + 1),
+  })) });
+
+  const signals = await persistent.getDocumentVersionSignals(entries, true);
+  assert.equal(signals.length, count);
+  assert.ok(signals.some((signal) => signal.revisionNumber === String(count)));
+});

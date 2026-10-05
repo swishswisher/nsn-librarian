@@ -2255,6 +2255,52 @@ for (const actionType of ["MOVE_FILE", "RENAME_FILE"] as const) {
   });
 }
 
+test("exhaustive entity search remains linear with twenty thousand candidates and no separations", async () => {
+  const r = await root("Large Alice Root");
+  const s = await session(r.id);
+  const batch = await prisma.libraryBatch.create({ data: { name: "Large entity search" } });
+  const document = await prisma.libraryDocument.create({ data: {
+    batchId: batch.id, normalizedFileName: "alice.txt", originalFileName: "alice.txt",
+  } });
+  const observation = await prisma.observationSession.create({ data: {
+    confidence: 0.9, explanation: [], interpretations: [], libraryDocumentId: document.id,
+    observations: [], observerType: "DETERMINISTIC", planSuggestions: [], warnings: [],
+  } });
+  const count = 20_000;
+  const scannedFiles = Array.from({ length: count }, (_, index) => ({
+    id: `large-alice-file-${index}`, sessionId: s.id,
+    localPath: `bridge://${r.id}/Alice/file-${index}.txt`,
+    relativePath: `Alice/file-${String(index).padStart(5, "0")}.txt`, fileType: "TEXT",
+    checksum: `large-alice-checksum-${index}`, readStatus: "SUPPORTED" as const,
+    readingStatus: "READ" as const, extractionStatus: "COMPLETED" as const,
+    libraryDocumentId: document.id,
+  }));
+  await prisma.scannedFile.createMany({ data: scannedFiles });
+  const excerpt = [{ start: 0, end: 13, text: "Client: Alice" }];
+  await prisma.librarySearchEntry.createMany({ data: scannedFiles.map((file, index) => ({
+    id: `large-alice-entry-${index}`, entryKey: `large-alice-entry-key-${index}`,
+    fileKey: fileKey.persistentFileKey(r.id, file.relativePath), connectedLibraryId: r.id,
+    scannedFileId: file.id, scanSessionId: s.id, relativePath: file.relativePath,
+    fileName: `file-${index}.txt`, checksum: file.checksum, fileType: "TEXT",
+    indexVersion: "library-search-v1", fingerprint: `large-alice-fingerprint-${index}`,
+    knowledgeState: "PROVISIONAL", sourceExcerpts: excerpt, sourceTerms: ["client", "alic"],
+    reviewedTerms: [], concepts: [], entityHashes: ["large-alice"],
+  })) });
+  await prisma.knowledgeDocumentSignal.createMany({ data: scannedFiles.map((file, index) => ({
+    id: `large-alice-signal-${index}`, signalKey: `large-alice-signal-key-${index}`,
+    connectedLibraryId: r.id, fileKey: fileKey.persistentFileKey(r.id, file.relativePath),
+    relativePath: file.relativePath, checksum: file.checksum, kind: "CLIENT",
+    identityHash: "large-alice", sourceRanges: [], observationSessionId: observation.id,
+    generationVersion: documentSignalVersion,
+  })) });
+
+  const results = await search.searchLibrary("client Alice", [r.id], {
+    includeEntityMatches: true, includeAllEntityMatches: true,
+  });
+  assert.equal(results.filter((result) => result.kind === "FILE").length, count);
+  assert.ok(results.every((result) => result.rootName === r.displayName));
+});
+
 test("metadata search remains available if the derived index is unavailable", async () => {
   const r = await root("No Index Root"); const s = await session(r.id);
   await prisma.scannedFile.create({ data: {
