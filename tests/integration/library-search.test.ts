@@ -5,8 +5,10 @@ import path from "node:path";
 import { after, before, mock, test } from "node:test";
 
 import { PrismaClient, type KnowledgeDocumentSignal } from "@prisma/client";
-import { documentSignalVersion } from "../../src/lib/bridge/document-signals";
+import { documentSignalVersion, extractDocumentSignals } from "../../src/lib/bridge/document-signals";
 import { runSearchPreparationBatches } from "../../src/lib/library/search-preparation";
+import { workingKnowledgeTerms } from "../../src/lib/bridge/scan-working-knowledge";
+import type { KnowledgeWork } from "../../src/lib/bridge/knowledge-work";
 
 const schema = `phase_three_${process.pid}_${Date.now()}`;
 const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -147,6 +149,131 @@ for (const kind of ["CLIENT", "PROJECT"] as const) {
   });
 }
 
+for (const kind of ["CLIENT", "PROJECT"] as const) {
+  for (const modified of [false, true]) {
+    test(`${kind} provenance binds unique resolved fields and rejects conflicts in ${modified ? "MODIFIED" : "APPROVED"} evidence`, async (t) => {
+      const r = await root(`${kind} field provenance`); const s = await session(r.id);
+      t.after(async () => {
+        await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: r.id } });
+        await prisma.connectedLibrary.delete({ where: { id: r.id } });
+      });
+      const label = kind === "CLIENT" ? "Client" : "Project";
+      const unique = `${label} ID: UNIQUE-77; ${label}: Alison River; Note: ${label}: Outsider Name`;
+      const conflict = `${label} ID: CONFLICT-77; ${label}: Morgan Stone; ${label}: Jamie Brook`;
+      const misleading = `${label} ID: OTHER-77; ${label}: Evelyn Green; ${label}: Taylor Wood`;
+      const files: Array<Awaited<ReturnType<typeof observedFile>>> = [];
+      for (const [index, text] of [unique, conflict, misleading].entries()) {
+        const item = await observedFile({ rootId: r.id, sessionId: s.id, path: `provenance-${index}.txt`,
+          evidence: evidence(text), status: modified ? "MODIFIED" : "APPROVED" });
+        if (modified) await prisma.humanDecision.create({ data: { observationSessionId: item.observation.id,
+          decisionType: "MODIFY", editedSuggestion: text } });
+        files.push(item);
+      }
+      await fileKey.persistScanWorkingKnowledge({ clusters: [], relationships: [], files: files.map((item) => item.working), scanSessionId: s.id });
+      await indexFiles(s.id, files);
+      const signals = await prisma.knowledgeDocumentSignal.findMany({ where: { connectedLibraryId: r.id, kind } });
+      assert.equal(signals.length, 3);
+      if (modified) assert.ok(signals.every((signal) => JSON.stringify(signal.sourceRanges) === "[]"));
+      else assert.equal((signals.find((signal) => signal.relativePath === files[0].file.relativePath)!.sourceRanges as unknown[]).length, 2);
+      const result = await search.searchLibrary(`${label} Alison River`, [r.id], { includeEntityMatches: true });
+      assert.deepEqual(result.map((row) => row.relativePath), [files[0].file.relativePath]);
+      for (const [index, id] of ["UNIQUE-77", "CONFLICT-77", "OTHER-77"].entries()) {
+        assert.deepEqual((await search.searchLibrary(`${label} ${id}`, [r.id])).map((row) => row.relativePath),
+          [files[index].file.relativePath], "Exact resolved IDs remain searchable independently of name conflicts");
+      }
+      assert.deepEqual(await search.searchLibrary(`${label} UNKNOWN-77`, [r.id]), []);
+      for (const name of ["Morgan Stone", "Jamie Brook", "Evelyn Green", "Taylor Wood", "Riverbank", "Outsider Name"]) {
+        assert.deepEqual(await search.searchLibrary(`${label} ${name}`, [r.id]), []);
+      }
+      const resolved = signals.find((signal) => signal.relativePath === files[0].file.relativePath)!;
+      await prisma.knowledgeDocumentSignal.update({ where: { id: resolved.id }, data: { checksum: "wrong-checksum" } });
+      assert.deepEqual(await search.searchLibrary(`${label} Alison River`, [r.id]), []);
+      await prisma.knowledgeDocumentSignal.update({ where: { id: resolved.id }, data: { checksum: files[0].file.checksum!, connectedLibraryId: "wrong-root" } });
+      assert.deepEqual(await search.searchLibrary(`${label} Alison River`, [r.id]), []);
+      await prisma.knowledgeDocumentSignal.delete({ where: { id: resolved.id } });
+    });
+  }
+}
+
+test("history intent excludes current-only metadata while retaining scoped indexed invoices", async (t) => {
+  const r = await root("Invoice history fallback"); const old = await session(r.id);
+  const retained = await observedFile({ rootId: r.id, sessionId: old.id, path: "retained/invoice-2025.txt", evidence: evidence("Invoice for the older annual account") });
+  await indexFiles(old.id, [retained]);
+  const current = await session(r.id);
+  await prisma.scanSession.update({ where: { id: current.id }, data: { startedAt: new Date(old.startedAt.getTime() + 60000) } });
+  await prisma.librarySearchEntry.updateMany({ where: { connectedLibraryId: r.id }, data: { isCurrent: false } });
+  const metadata = await observedFile({ rootId: r.id, sessionId: current.id, path: "invoices.pdf", fileType: "PDF" });
+  const hidden = await root("Unauthorized retained invoice"); const hs = await session(hidden.id);
+  const unauthorized = await observedFile({ rootId: hidden.id, sessionId: hs.id, path: "older-invoices.txt", evidence: evidence("Invoice retained account") });
+  await indexFiles(hs.id, [unauthorized]);
+  await prisma.connectedLibrary.update({ where: { id: hidden.id }, data: { readPermission: false } });
+  t.after(async () => prisma.connectedLibrary.deleteMany({ where: { id: { in: [r.id, hidden.id] } } }));
+  const results = await search.searchLibrary("Show older invoices", [r.id, hidden.id]);
+  assert.deepEqual(results.map((row) => row.relativePath), [retained.file.relativePath]);
+  assert.equal(results[0].state, "Historical scan");
+  assert.ok(!results.some((row) => row.id === metadata.file.id));
+  await prisma.librarySearchEntry.deleteMany({ where: { connectedLibraryId: r.id } });
+  for (const query of ["Show older invoices", "previous invoices", "invoice history", "older versions of invoices"]) {
+    assert.deepEqual(await search.searchLibrary(query, [r.id, hidden.id]), []);
+  }
+  assert.ok((await search.searchLibrary("invoices", [r.id])).some((row) => row.id === metadata.file.id));
+});
+
+test("version state indexes preserve checksum, separation, conflict, root and indexed history controls", async (t) => {
+  const r = await root("Version index controls"); const old = await session(r.id); const current = await session(r.id);
+  await prisma.scanSession.update({ where: { id: current.id }, data: { startedAt: new Date(old.startedAt.getTime() + 60000) } });
+  const hidden = await root("Other root versions"); const hs = await session(hidden.id);
+  const make = async (name: string, number: string, date: string | null, checksum: string, rootId = r.id, scanId = current.id) => {
+    const item = await observedFile({ rootId, sessionId: scanId, path: `${name}.txt`, checksum, evidence: evidence("Annual invoice version") });
+    await indexFiles(scanId, [item]);
+    await prisma.knowledgeDocumentSignal.create({ data: { connectedLibraryId: rootId,
+      fileKey: fileKey.persistentFileKey(rootId, item.file.relativePath), checksum, relativePath: item.file.relativePath,
+      kind: "DOCUMENT_FAMILY", identityHash: "control-family", revisionNumber: number, revisionDate: date,
+      sourceRanges: [], signalKey: crypto.randomUUID(), observationSessionId: item.observation.id, generationVersion: documentSignalVersion } });
+    return item;
+  };
+  const historical = await make("retained-invoice", "0", null, "retained", r.id, old.id);
+  // The historical session is no longer current when this control is created.
+  await prisma.librarySearchEntry.create({ data: { entryKey: crypto.randomUUID(),
+    connectedLibraryId: r.id, scanSessionId: old.id, scannedFileId: historical.file.id,
+    fileKey: fileKey.persistentFileKey(r.id, historical.file.relativePath), checksum: "retained",
+    relativePath: historical.file.relativePath, fileName: historical.file.relativePath,
+    fileType: "TEXT", indexVersion: "library-search-v1", fingerprint: crypto.randomUUID(), isCurrent: false,
+    knowledgeState: "PROVISIONAL", sourceExcerpts: [{ start: 0, end: 22, text: "Annual invoice version" }],
+    sourceTerms: workingKnowledgeTerms("Annual invoice version"), reviewedTerms: [], concepts: [], entityHashes: [],
+  } });
+  await prisma.librarySearchEntry.updateMany({ where: { scannedFileId: historical.file.id }, data: { isCurrent: false } });
+  const lower = await make("lower-invoice", "1", "2026-02-01", "lower");
+  const higher = await make("higher-invoice", "2", "2026-03-01", "higher");
+  const conflicting = await make("conflicting-invoice", "3", "2026-01-01", "conflict");
+  await make("foreign-invoice", "99", null, "higher", hidden.id, hs.id);
+  t.after(async () => {
+    await prisma.knowledgeConnection.deleteMany({ where: { sourceObservationSessionId: lower.observation.id } });
+    await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: { in: [r.id, hidden.id] } } });
+    await prisma.connectedLibrary.deleteMany({ where: { id: { in: [r.id, hidden.id] } } });
+  });
+  const states = async () => new Map((await search.searchLibrary("invoice", [r.id], { includeAllVersionMatches: true })).map((row) => [row.relativePath, row.state]));
+  assert.equal((await states()).get(lower.file.relativePath), "Earlier document version");
+  assert.equal((await states()).get(higher.file.relativePath), "Provisional source evidence");
+  assert.equal((await states()).get(conflicting.file.relativePath), "Provisional source evidence");
+  const connection = await prisma.knowledgeConnection.create({ data: { sourceObservationSessionId: lower.observation.id,
+    targetObservationSessionId: higher.observation.id, relationshipKind: "PROBABLE_REVISION", generationVersion: documentSignalVersion,
+    sourceFileKey: fileKey.persistentFileKey(r.id, lower.file.relativePath), sourceChecksum: lower.file.checksum,
+    targetFileKey: fileKey.persistentFileKey(r.id, higher.file.relativePath), targetChecksum: higher.file.checksum,
+    status: "REJECTED", sharedTerms: [], reasoning: "Human separation" } });
+  await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: connection.id, action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+  assert.equal((await states()).get(lower.file.relativePath), "Provisional source evidence");
+  await prisma.knowledgeConnection.delete({ where: { id: connection.id } });
+  await prisma.knowledgeDocumentSignal.updateMany({ where: { connectedLibraryId: r.id, relativePath: higher.file.relativePath }, data: { checksum: lower.file.checksum! } });
+  await prisma.scannedFile.update({ where: { id: higher.file.id }, data: { checksum: lower.file.checksum! } });
+  await prisma.librarySearchEntry.updateMany({ where: { scannedFileId: higher.file.id }, data: { checksum: lower.file.checksum! } });
+  assert.equal((await states()).get(lower.file.relativePath), "Provisional source evidence");
+  const history = await search.searchLibrary("older invoice", [r.id], { includeAllVersionMatches: true });
+  assert.ok(history.some((row) => row.relativePath === historical.file.relativePath && row.state === "Historical scan"), "Retained indexed invoice remains historical");
+  assert.ok(history.some((row) => row.relativePath === higher.file.relativePath), "Scoped history includes current indexed invoice");
+  assert.ok(history.every((row) => row.rootName === r.displayName), "Foreign roots never enter scoped history");
+});
+
 test("exact file name ranks over conceptual matches", async () => {
   const r = await root("Exact Root"); const s = await session(r.id);
   const exact = await observedFile({ rootId: r.id, sessionId: s.id, path: "workshop.txt", evidence: evidence("A workshop agenda for participants"), concepts: ["workshops"] });
@@ -187,10 +314,11 @@ test("client identity search expands only shared resolved hashes", async () => {
   const r = await root("Client Root"); const s = await session(r.id);
   const a = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/intake.txt", evidence: evidence("Client: Alice; Client ID: C-001") });
   const b = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/followup.txt", evidence: evidence("Follow-up for the same client") });
+  const identityHash = extractDocumentSignals(a.working.sourceEvidenceText, r.id).find((signal) => signal.kind === "CLIENT")!.identityHash;
   await prisma.knowledgeDocumentSignal.createMany({ data: [a, b].map((item) => ({
     checksum: item.file.checksum!, connectedLibraryId: r.id,
     fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
-    generationVersion: documentSignalVersion, identityHash: "alice-identity", kind: "CLIENT",
+    generationVersion: documentSignalVersion, identityHash, kind: "CLIENT",
     observationSessionId: item.observation.id, relativePath: item.file.relativePath,
     signalKey: crypto.randomUUID(), sourceRanges: [],
   })) });
@@ -361,7 +489,7 @@ for (const [kind, query, label] of [
     } });
     await indexFiles(s.id, [item]);
     assert.ok((await search.searchLibrary(query, [r.id]))
-      .some((result) => result.relativePath === item.file.relativePath));
+      .some((result) => result.relativePath === item.file.relativePath), "Typed possessive name remains retrievable");
   });
 }
 
@@ -574,10 +702,10 @@ test("same-name clients have distinct identity hashes", async () => {
   const r = await root("Same Name Root"); const s = await session(r.id);
   const a = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/a.txt", evidence: evidence("Client: Alice; Client ID: C-111") });
   const b = await observedFile({ rootId: r.id, sessionId: s.id, path: "Alice/b.txt", evidence: evidence("Client: Alice; Client ID: C-222") });
-  await prisma.knowledgeDocumentSignal.createMany({ data: [a, b].map((item, i) => ({
+  await prisma.knowledgeDocumentSignal.createMany({ data: [a, b].map((item) => ({
     checksum: item.file.checksum!, connectedLibraryId: r.id,
     fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
-    generationVersion: documentSignalVersion, identityHash: `alice-${i}`, kind: "CLIENT",
+    generationVersion: documentSignalVersion, identityHash: extractDocumentSignals(item.working.sourceEvidenceText, r.id).find((signal) => signal.kind === "CLIENT")!.identityHash, kind: "CLIENT",
     observationSessionId: item.observation.id, relativePath: item.file.relativePath,
     signalKey: crypto.randomUUID(), sourceRanges: [],
   })) });
@@ -744,10 +872,10 @@ test("project query does not pull in a distinct project", async () => {
   const r = await root("Project Root"); const s = await session(r.id);
   const atlas = await observedFile({ rootId: r.id, sessionId: s.id, path: "Projects/atlas.txt", evidence: evidence("Project: Atlas; Project ID: P-100") });
   const beacon = await observedFile({ rootId: r.id, sessionId: s.id, path: "Projects/beacon.txt", evidence: evidence("Project: Beacon; Project ID: P-200") });
-  await prisma.knowledgeDocumentSignal.createMany({ data: [atlas, beacon].map((item, i) => ({
+  await prisma.knowledgeDocumentSignal.createMany({ data: [atlas, beacon].map((item) => ({
     checksum: item.file.checksum!, connectedLibraryId: r.id,
     fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
-    generationVersion: documentSignalVersion, identityHash: `project-${i}`, kind: "PROJECT",
+    generationVersion: documentSignalVersion, identityHash: extractDocumentSignals(item.working.sourceEvidenceText, r.id).find((signal) => signal.kind === "PROJECT")!.identityHash, kind: "PROJECT",
     observationSessionId: item.observation.id, relativePath: item.file.relativePath,
     signalKey: crypto.randomUUID(), sourceRanges: [],
   })) });
@@ -1775,7 +1903,8 @@ for (const [kind, wanted, other] of [["client", "Alice Smith", "Alice Jones"], [
       await prisma.knowledgeDocumentSignal.create({ data: {
         checksum: item.file.checksum!, connectedLibraryId: r.id,
         fileKey: fileKey.persistentFileKey(r.id, item.file.relativePath),
-        generationVersion: documentSignalVersion, identityHash: `multiword-${kind}-${index}`,
+        generationVersion: documentSignalVersion,
+        identityHash: extractDocumentSignals(item.working.sourceEvidenceText, r.id).find((signal) => signal.kind === kind.toUpperCase())!.identityHash,
         kind: kind.toUpperCase(), observationSessionId: item.observation.id,
         relativePath: item.file.relativePath, signalKey: crypto.randomUUID(), sourceRanges: [],
       } });
@@ -2315,7 +2444,7 @@ for (const actionType of ["MOVE_FILE", "RENAME_FILE"] as const) {
   });
 }
 
-test("exhaustive entity search remains linear with twenty thousand candidates and no separations", async () => {
+test("exhaustive entity search indexes twenty thousand version-bearing candidates without pairwise scans", async (t) => {
   const r = await root("Large Alice Root");
   const s = await session(r.id);
   await prisma.scanSession.update({ where: { id: s.id }, data: { searchIndexStatus: "COMPLETED" } });
@@ -2354,6 +2483,13 @@ test("exhaustive entity search remains linear with twenty thousand candidates an
     identityHash: "large-alice", sourceRanges: [], observationSessionId: observation.id,
     generationVersion: documentSignalVersion,
   })) });
+  await prisma.knowledgeDocumentSignal.createMany({ data: scannedFiles.map((file, index) => ({
+    signalKey: `large-version-signal-key-${index}`, connectedLibraryId: r.id,
+    fileKey: fileKey.persistentFileKey(r.id, file.relativePath), relativePath: file.relativePath,
+    checksum: file.checksum, kind: "DOCUMENT_FAMILY", identityHash: "large-version-family",
+    revisionNumber: String(index + 1), sourceRanges: [], observationSessionId: observation.id,
+    generationVersion: documentSignalVersion,
+  })) });
 
   // Exercise canonicalization with a root-scale move snapshot as well as a
   // root-scale current file set. None of these moves matches a current file,
@@ -2382,16 +2518,38 @@ test("exhaustive entity search remains linear with twenty thousand candidates an
     clusters: [], files: [], relationships: [], scanSessionId: s.id,
   }), 0);
 
+  const work: KnowledgeWork = {};
   const results = await search.searchLibrary("client Alice", [r.id], {
     includeEntityMatches: true, includeAllEntityMatches: true,
+    work,
   });
   assert.equal(results.filter((result) => result.kind === "FILE").length, count);
   assert.ok(results.every((result) => result.rootName === r.displayName));
+  assert.equal(results.filter((result) => result.state === "Earlier document version").length, count - 1);
+  assert.ok(work.versionVisits! >= count && work.versionVisits! < count * 80, JSON.stringify(work));
+  t.diagnostic(`20,000 version-bearing Search candidates: ${JSON.stringify(work)}`);
+  const groupWork: KnowledgeWork = {};
+  const groups = await fileKey.getPersistentIdentityGroups(groupWork);
+  const versionGroup = groups.find((group) => group.libraryName === r.displayName && group.kind === "DOCUMENT_FAMILY");
+  assert.ok(versionGroup);
+  assert.equal(versionGroup.latestKey, fileKey.persistentFileKey(r.id, scannedFiles.at(-1)!.relativePath));
+  assert.ok(groupWork.versionVisits! >= count && groupWork.versionVisits! < count * 80, JSON.stringify(groupWork));
+  t.diagnostic(`20,000 identity-group version members: ${JSON.stringify(groupWork)}`);
   const qa = await import("../../src/lib/library/qa/retrieve");
   const context = await qa.retrieveQuestionContext("client Alice", [r.id]);
   assert.equal(context.ambiguousEntity, false);
   assert.equal(context.sources.length, 8);
   await prisma.organizationPlan.delete({ where: { id: plan.id } });
+  // The same 20,000 endpoints must also remain eligible as retained evidence;
+  // one giant endpoint OR and repeated observation IDs exceed PG bind limits.
+  await prisma.knowledgeDocumentSignal.updateMany({ where: { connectedLibraryId: r.id }, data: { status: "SUPERSEDED", supersededAt: new Date() } });
+  await prisma.scanSession.create({ data: { connectedFolderId: r.id, status: "COMPLETED", searchIndexStatus: "COMPLETED",
+    startedAt: new Date(s.startedAt.getTime() + 60000) } });
+  const historical = await fileKey.getEffectiveDocumentSignals([r.id], { historicalEntries: scannedFiles.map((file) => ({
+    connectedLibraryId: r.id, fileKey: fileKey.persistentFileKey(r.id, file.relativePath), checksum: file.checksum, isCurrent: false,
+  })) });
+  assert.equal(historical.length, count * 2);
+  assert.equal(historical.filter((signal) => signal.kind === "CLIENT").length, count);
 });
 
 test("metadata search remains available if the derived index is unavailable", async () => {

@@ -2,7 +2,9 @@ import path from "node:path";
 
 import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 import { getPrismaClient } from "@/lib/db/prisma";
-import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/document-signals";
+import { documentSignalEntityLabels, documentSignalVersion } from "@/lib/bridge/document-signals";
+import { buildVersionStateIndex, versionEndpoint } from "@/lib/bridge/document-version-index";
+import type { KnowledgeWork } from "@/lib/bridge/knowledge-work";
 import {
   getDocumentVersionSignals,
   getEligibleDocumentSignals,
@@ -99,22 +101,12 @@ function signalEvidenceMatchesEntity(
   kind: "CLIENT" | "PROJECT",
   entityName: string,
   allowUnranged: boolean,
+  identity: { connectedLibraryId: string; identityHash: string },
 ) {
-  if (!Array.isArray(rangesValue)) return false;
-  const ranges = rangesValue.flatMap((range) => range && typeof range === "object" &&
-    !Array.isArray(range) && typeof range.start === "number" && typeof range.end === "number"
-    ? [{ start: range.start, end: range.end }] : []);
-  if (!ranges.length && !allowUnranged) return false;
-  const label = kind === "CLIENT" ? "client" : "project";
-  return validExcerpts(excerptsValue).some((excerpt) => {
-    const fields = excerpt.text.matchAll(/(?:^|[;\n])\s*(client|project)(?:\s*:\s*|\s+)([^;\n]{2,100})/gi);
-    return [...fields].some((field) => {
-      const fieldStart = excerpt.start + (field.index ?? 0);
-      const fieldEnd = fieldStart + field[0].length;
-      return field[1].toLowerCase() === label && matchesEntityPhrase(field[2], entityName) &&
-        (allowUnranged || ranges.some((range) => range.start < fieldEnd && range.end > fieldStart));
-    });
-  });
+  const evidence = validExcerpts(excerptsValue).map((excerpt) =>
+    `Source characters ${excerpt.start}-${excerpt.end}: ${JSON.stringify(excerpt.text)}`).join("\n");
+  return documentSignalEntityLabels(evidence, kind, rangesValue, allowUnranged, identity)
+    .some((label) => matchesEntityPhrase(label, entityName));
 }
 
 export function rankSearchEntry(entry: {
@@ -183,6 +175,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   /** Keep all ranked file candidates so Ask can assess complete version families before source truncation. */
   includeAllVersionMatches?: boolean;
   includeHistoryList?: boolean;
+  work?: KnowledgeWork;
 }): Promise<LibrarySearchResult[]> {
   const intent = parseSearchIntent(value);
   if (intent.query.length < 2) return [];
@@ -332,7 +325,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     if (!entry || !effectiveEndpoints.has(endpoint) || !signalEvidenceMatchesEntity(
       reviewedExcerptsByObservation.get(signal.observationSessionId) ?? entry.sourceExcerpts,
       signal.sourceRanges, intent.entityKind!, intent.entityName!,
-      rawSignalCountByEndpoint.get(endpoint) === 1,
+      rawSignalCountByEndpoint.get(endpoint) === 1 || reviewedExcerptsByObservation.has(signal.observationSessionId!),
+      signal,
     )) continue;
     const hashes = matchingRawHashesByEndpoint.get(endpoint) ?? new Set<string>();
     hashes.add(signal.identityHash);
@@ -458,6 +452,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     getDocumentVersionSignals([...candidateById.values()], intent.wantsHistory),
     getSeparatedRelationshipPairIdentities([...candidateById.values()], ["PROBABLE_REVISION"]),
   ]);
+  const versionState = buildVersionStateIndex(versions, separatedVersionPairs, knowledgeRelationshipPairKey, options?.work);
   const results: LibrarySearchResult[] = [];
   for (const entry of candidateById.values()) {
     const root = rootById.get(entry.connectedLibraryId);
@@ -471,15 +466,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
         ? { score: 1, reason: "Retained historical document", matchingExcerpt: null } : null);
     if (!ranked) continue;
     const category = mediaCategoryForFileType(entry.fileType);
-    const member = versions.find((signal) => signal.connectedLibraryId === entry.connectedLibraryId &&
-      signal.fileKey === entry.fileKey && signal.checksum === entry.checksum);
-    const supersededVersion = member && versions.some((other) =>
-      other.connectedLibraryId === member.connectedLibraryId &&
-      other.identityHash === member.identityHash &&
-      (other.fileKey !== member.fileKey || other.checksum !== member.checksum) &&
-      !separatedVersionPairs.has(knowledgeRelationshipPairKey(member, other)) &&
-      compareDocumentVersions(other, member) === 1,
-    );
+    const supersededVersion = versionState.superseded.has(versionEndpoint(entry));
     const state = !entry.isCurrent ? "Historical scan" : supersededVersion ? "Earlier document version" :
       category === "AUDIO" || category === "VIDEO" || category === "IMAGE"
         ? "Media evidence; check the source" :
@@ -510,7 +497,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   // Path-only metadata cannot bind a requested typed identity. Explicit entity
   // results must use the checksum-bound effective evidence checked above.
   // Ordinary metadata discovery still works before indexing.
-  const fallback = retainedHistoryList || intent.entityKind ? [] : await prisma.scannedFile.findMany({
+  const fallback = intent.wantsHistory || intent.entityKind ? [] : await prisma.scannedFile.findMany({
     take: 40,
     orderBy: [{ scanSession: { connectedFolderId: "asc" } }, { relativePath: "asc" }, { id: "asc" }],
     select: { fileType: true, id: true, relativePath: true, sessionId: true,

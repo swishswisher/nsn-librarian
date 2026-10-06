@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { compareDocumentVersions, extractDocumentSignals } from "../../src/lib/bridge/document-signals";
+import { versionDominanceCounts, buildVersionStateIndex } from "../../src/lib/bridge/document-version-index";
+import { RelationshipCandidatePool } from "../../src/lib/bridge/relationship-candidate-pool";
 
 function verified(text: string, start = 0) {
   return `Source characters ${start}-${start + text.length}: "${text}"`;
@@ -81,5 +83,33 @@ test("source markers retain only hashes and source ranges", () => {
   const signals = extractDocumentSignals(verified(text, 250), "root-a");
   const serialized = JSON.stringify(signals);
   assert.ok(!serialized.includes("Alex Lee") && !serialized.includes("C-101"));
-  assert.deepEqual(signals.find((item) => item.kind === "CLIENT")?.sourceRanges, [{ start: 250, end: 250 + text.length }]);
+  assert.deepEqual(signals.find((item) => item.kind === "CLIENT")?.sourceRanges,
+    [{ start: 250, end: 266 }, { start: 268, end: 250 + text.length }]);
+});
+
+test("dominance oracle agrees with comparator for missing, equivalent and conflicting markers", () => {
+  const members = [null, "0", "1", "1.0", "1.2", "2", "10", "10000000000000001000000000", "10000000000000002000000000"].flatMap((revisionNumber) =>
+    [null, "2026-01-01", "2026-02-01"].map((revisionDate, index) => ({
+      revisionNumber, revisionDate, checksum: `checksum-${index}`, fileKey: crypto.randomUUID(),
+      connectedLibraryId: "root", identityHash: "family", observationSessionId: crypto.randomUUID(),
+    })));
+  for (const ordered of [members, [...members].reverse()]) {
+    for (const older of [false, true]) {
+      const counts = versionDominanceCounts(ordered, undefined, older);
+      for (const row of ordered) assert.equal(counts.get(row), ordered.filter((other) =>
+        compareDocumentVersions(other, row) === (older ? -1 : 1)).length);
+    }
+    const state = buildVersionStateIndex(ordered, new Map(), () => "");
+    for (const row of ordered) assert.equal(state.superseded.has(`${row.connectedLibraryId}\0${row.fileKey}\0${row.checksum}`),
+      ordered.some((other) => other.checksum !== row.checksum && compareDocumentVersions(other, row) === 1));
+    const pool = new RelationshipCandidatePool(ordered, true);
+    const removed = new Set<number>();
+    for (const current of ordered) {
+      const excluded = new Set([0, 3]);
+      const expected = ordered.findIndex((other, index) => !removed.has(index) && !excluded.has(index) &&
+        other.observationSessionId !== current.observationSessionId && other.checksum !== current.checksum && compareDocumentVersions(other, current) !== null);
+      assert.equal(pool.first(current, excluded), expected < 0 ? undefined : expected);
+      if (expected >= 0) { pool.set(expected, false); removed.add(expected); }
+    }
+  }
 });

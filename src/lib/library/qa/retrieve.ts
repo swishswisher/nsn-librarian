@@ -4,6 +4,7 @@ import { getPrismaClient } from "@/lib/db/prisma";
 import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/document-signals";
 import { getDocumentVersionSignals, getEffectiveDocumentSignals, getSeparatedRelationshipPairIdentities, humanIdentityCorrectionVersion, knowledgeRelationshipPairKey, relationshipGenerationVersion } from "@/lib/bridge/persistent-knowledge";
 import { workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
+import { countKnowledgeWork, type KnowledgeWork } from "@/lib/bridge/knowledge-work";
 import { searchLibrary } from "@/lib/library/search";
 import { librarySearchIndexVersion } from "@/lib/library/search-index";
 import { getScannedFileExamineRoute, getScanSessionRoute } from "@/lib/library/routes";
@@ -137,7 +138,7 @@ const activeScanStatuses = [
   "PENDING", "SCANNING", "READING", "EXAMINING", "GENERATING_SUGGESTIONS",
 ] as const;
 
-export async function retrieveQuestionContext(question: string, permittedRootIds?: string[]): Promise<AnswerContext> {
+export async function retrieveQuestionContext(question: string, permittedRootIds?: string[], work?: KnowledgeWork): Promise<AnswerContext> {
   const route = routeLibraryQuestion(question);
   const prisma = getPrismaClient();
   const roots = await prisma.connectedLibrary.findMany({
@@ -193,9 +194,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
           observationSession: { status: { in: ["APPROVED", "MODIFIED"] } },
         } } },
       include: { searchSources: { select: { connectedLibraryId: true, observationSession: {
-        select: { status: true, libraryDocument: { select: { scannedFiles: {
-          select: { checksum: true, relativePath: true, scanSession: { select: { connectedFolderId: true } } },
-        } } } },
+        select: { status: true, libraryDocumentId: true },
       } } } },
     }),
     prisma.scannedFile.findMany({
@@ -208,6 +207,25 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
   let entries = loadedEntries;
   let entriesById = new Map(entries.map((entry) => [entry.id, entry]));
   const memoriesById = new Map(memories.map((entry) => [entry.id, entry]));
+  // A reviewed document can contribute Memory in many roots. Fetch its physical
+  // copies once, rather than returning/scanning the entire copy list per source.
+  const memoryDocumentIds = [...new Set(memories.flatMap((entry) => entry.searchSources.map((source) => source.observationSession.libraryDocumentId)))];
+  const memoryKeysByDocumentRoot = new Map<string, Set<string>>();
+  for (let offset = 0; offset < memoryDocumentIds.length; offset += 500) {
+    const files = await prisma.scannedFile.findMany({
+      where: { libraryDocumentId: { in: memoryDocumentIds.slice(offset, offset + 500) } },
+      select: { checksum: true, relativePath: true, libraryDocumentId: true,
+        scanSession: { select: { connectedFolderId: true } } },
+    });
+    for (const file of files) {
+      countKnowledgeWork(work, "memoryFileVisits");
+      const rootId = file.scanSession.connectedFolderId;
+      const key = `${file.libraryDocumentId}\0${rootId}`;
+      const keys = memoryKeysByDocumentRoot.get(key) ?? new Set<string>();
+      keys.add(file.checksum ? `sha256:${file.checksum}` : `${rootId}:${file.relativePath}`);
+      memoryKeysByDocumentRoot.set(key, keys);
+    }
+  }
   const metadataById = new Map(metadataFiles.map((file) => [file.id, file]));
   const eligibleMatchedEntries = results.flatMap((result) => {
     if (result.kind !== "FILE" || !requestedHashesByResultId.has(result.id)) return [];
@@ -358,6 +376,16 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
       if (!entry || !entry.searchSources.length || entry.searchSourceCount !== entry.searchSources.length ||
         entry.searchSources.some((source) => !rootById.has(source.connectedLibraryId) ||
           !["APPROVED", "MODIFIED"].includes(source.observationSession.status))) continue;
+      const documentRoots = new Set<string>();
+      for (const source of entry.searchSources) {
+        countKnowledgeWork(work, "memorySourceVisits");
+        documentRoots.add(`${source.observationSession.libraryDocumentId}\0${source.connectedLibraryId}`);
+      }
+      const corroborationKeys = new Set<string>();
+      for (const pair of documentRoots) {
+        countKnowledgeWork(work, "memoryPairVisits");
+        for (const key of memoryKeysByDocumentRoot.get(pair) ?? []) corroborationKeys.add(key);
+      }
       sources.push({ id: `S${sources.length + 1}`, sourceType: "APPROVED_MEMORY",
         title: entry.title.slice(0, 160), rootName: [...new Set(entry.searchSources.map((source) =>
           rootById.get(source.connectedLibraryId)!.displayName))].sort((left, right) =>
@@ -365,11 +393,7 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
         relativePath: null, href: "/admin/library/memory", trustState: "Human-approved Memory",
         timeState: "Active", text: `${entry.title}. ${entry.description}`.slice(0, 400),
         sourceRange: null, physicalIdentity: `memory:${entry.id}`,
-        corroborationKeys: [...new Set(entry.searchSources.flatMap((source) =>
-          source.observationSession.libraryDocument.scannedFiles
-            .filter((file) => file.scanSession.connectedFolderId === source.connectedLibraryId)
-            .map((file) => file.checksum ? `sha256:${file.checksum}` :
-              `${source.connectedLibraryId}:${file.relativePath}`)))],
+        corroborationKeys: [...corroborationKeys].sort(),
       });
       continue;
     }

@@ -5,6 +5,8 @@ import { after, before, test } from "node:test";
 import { PrismaClient } from "@prisma/client";
 import { formatOrganizationConcepts, organizationConceptsFromEvidence } from "../../src/lib/bridge/organization-concepts";
 import { documentSignalVersion, extractDocumentSignals } from "../../src/lib/bridge/document-signals";
+import { knowledgeScaleFixture } from "./knowledge-scale-fixtures";
+import type { KnowledgeWork } from "../../src/lib/bridge/knowledge-work";
 
 const schema = `phase_two_${process.pid}_${Date.now()}`;
 const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -134,6 +136,207 @@ function knowledgeIndex(sessionId: string, libraryId: string, left: { file: { id
     scanSessionId: sessionId,
   };
 }
+
+test("observation refresh indexes historical copies once and checks each affected root once", async (t) => {
+  const fixture = await knowledgeScaleFixture(prisma, "Review refresh root scale", 1, () => "Client ID: REFRESH");
+  t.after(fixture.dispose);
+  const count = 200;
+  const roots = Array.from({ length: count }, () => ({ id: crypto.randomUUID(), bridgeRootId: crypto.randomUUID(),
+    displayName: "Shared reviewed document", localPath: `bridge://review-refresh/${crypto.randomUUID()}`, platform: "MACOS" as const }));
+  await prisma.connectedLibrary.createMany({ data: roots });
+  t.after(async () => prisma.connectedLibrary.deleteMany({ where: { id: { in: roots.map((root) => root.id) } } }));
+  const scans = roots.map((root) => ({ root, old: crypto.randomUUID(), current: crypto.randomUUID() }));
+  await prisma.scanSession.createMany({ data: scans.flatMap(({ root, old, current }) => [
+    { id: old, connectedFolderId: root.id, status: "COMPLETED" as const, startedAt: new Date("2025-01-01") },
+    { id: current, connectedFolderId: root.id, status: "COMPLETED" as const, startedAt: new Date("2026-01-01") },
+  ]) });
+  for (const { root, old } of scans) await prisma.scannedFile.createMany({ data: Array.from({ length: 50 }, (_, index) => ({
+    sessionId: old, libraryDocumentId: fixture.rows[0].documentId, relativePath: `copy-${index}.txt`,
+    localPath: `bridge://${root.id}/copy-${index}.txt`, fileType: "TEXT", checksum: fixture.rows[0].checksum,
+  })) });
+  const work: KnowledgeWork = {};
+  await persistent.refreshApprovedObservationRelationships(fixture.rows[0].observationId, work);
+  assert.equal(work.rootFileVisits, count * 50 + 1);
+  assert.equal(work.rootMembershipChecks, count + 1);
+  assert.equal(await prisma.knowledgeDocumentSignal.count({ where: { connectedLibraryId: { in: roots.map((root) => root.id) } } }), 0);
+  t.diagnostic(`10,001 review copies / 201 roots: ${JSON.stringify(work)}`);
+});
+
+test("persistence chunks fifty thousand prior checksum invalidations below database bind limits", async (t) => {
+  const fixture = await knowledgeScaleFixture(prisma, "Bulk invalidation scale", 2, () => "Unrelated evidence");
+  t.after(fixture.dispose);
+  const [source, target] = fixture.rows;
+  const count = 50_000;
+  for (let offset = 0; offset < count; offset += 500) await prisma.knowledgeConnection.createMany({ data:
+    Array.from({ length: Math.min(500, count - offset) }, (_, index) => ({
+      sourceObservationSessionId: source.observationId, targetObservationSessionId: target.observationId,
+      relationshipKey: crypto.randomUUID(), relationshipKind: "SAME_CLIENT", generationVersion: documentSignalVersion,
+      sourceFileKey: source.fileKey, targetFileKey: target.fileKey,
+      sourceChecksum: `obsolete-${offset + index}`, targetChecksum: target.checksum,
+      sourceEvidence: { connectedLibraryId: fixture.root.id }, sharedTerms: [], reasoning: "Retained obsolete proposal",
+    })) });
+  await persistent.persistScanWorkingKnowledge({ ...fixture.index, files: [] });
+  assert.equal(await prisma.knowledgeConnection.count({ where: { sourceObservationSessionId: source.observationId,
+    status: "ARCHIVED", supersededAt: { not: null } } }), count);
+});
+
+test("correction index controls reject ambiguous targets and preserve unresolved project conversion", async (t) => {
+  const fixture = await knowledgeScaleFixture(prisma, "Project target ambiguity", 3, (index) => `Project: Project ${index}`);
+  t.after(fixture.dispose);
+  await fixture.seedSignals();
+  const [source, target, other] = fixture.rows;
+  const targetHash = extractDocumentSignals(target.evidence, fixture.root.id)[0].identityHash;
+  await prisma.knowledgeConnection.create({ data: { sourceObservationSessionId: source.observationId,
+    targetObservationSessionId: target.observationId, relationshipKey: crypto.randomUUID(),
+    relationshipKind: "BELONGS_TO_PROJECT", generationVersion: persistent.humanIdentityCorrectionVersion,
+    status: "CONFIRMED", sourceFileKey: source.fileKey, sourceChecksum: source.checksum,
+    targetFileKey: target.fileKey, targetChecksum: target.checksum, sharedTerms: [], reasoning: "Human project identity",
+    sourceEvidence: { connectedLibraryId: fixture.root.id, identityHash: targetHash } } });
+  const get = () => persistent.getEffectiveDocumentSignals([fixture.root.id]);
+  const converted = await get();
+  assert.ok(converted.some((row) => row.fileKey === source.fileKey && row.kind === "PROJECT" && row.identityHash === targetHash));
+  assert.ok(converted.some((row) => row.fileKey === target.fileKey && row.kind === "PROJECT"));
+  const ambiguous = await prisma.knowledgeDocumentSignal.create({ data: { connectedLibraryId: fixture.root.id,
+    fileKey: target.fileKey, checksum: target.checksum, relativePath: target.relativePath,
+    kind: "PROJECT", identityHash: "different-target", sourceRanges: [], signalKey: crypto.randomUUID(),
+    observationSessionId: target.observationId, generationVersion: documentSignalVersion } });
+  assert.ok(!(await get()).some((row) => row.fileKey === source.fileKey && row.kind === "PROJECT"));
+  await prisma.knowledgeDocumentSignal.delete({ where: { id: ambiguous.id } });
+  await prisma.knowledgeConnection.updateMany({ where: { sourceObservationSessionId: source.observationId },
+    data: { sourceEvidence: { connectedLibraryId: fixture.root.id, identityHash: "wrong-identity" } } });
+  assert.ok(!(await get()).some((row) => row.fileKey === source.fileKey && row.kind === "PROJECT"));
+  assert.ok((await get()).some((row) => row.fileKey === other.fileKey && row.kind === "UNRESOLVED_PROJECT"));
+});
+
+test("typed identity chunks visit each current signal once across more than fifty groups", async (t) => {
+  const fixture = await knowledgeScaleFixture(prisma, "Identity chunk visits", 200, (index) => `Project ID: GROUP-${Math.floor(index / 2)}`);
+  t.after(fixture.dispose);
+  const work: KnowledgeWork = {};
+  await persistent.persistScanWorkingKnowledge(fixture.index, work);
+  assert.equal(work.currentSignalVisits, 200);
+  assert.equal(await prisma.knowledgeConnection.count({ where: { sourceEvidence: { path: ["connectedLibraryId"], equals: fixture.root.id } } }), 100);
+});
+
+test("version pool controls retain comparable revisions and reject equal checksums and contradictory markers", async (t) => {
+  const texts = [
+    "Client ID: VC-1; Document ID: D1; Document Title: Comparable; Version: 1; Date: 2026-01-01",
+    "Client ID: VC-1; Document ID: D1; Document Title: Comparable; Version: 2; Date: 2026-02-01",
+    "Client ID: VC-2; Document ID: D2; Document Title: Conflict; Version: 1; Date: 2026-02-01",
+    "Client ID: VC-2; Document ID: D2; Document Title: Conflict; Version: 2; Date: 2026-01-01",
+    "Client ID: VC-3; Document ID: D3; Document Title: Copies; Version: 1",
+    "Client ID: VC-3; Document ID: D3; Document Title: Copies; Version: 2",
+  ];
+  const fixture = await knowledgeScaleFixture(prisma, "Version capacity controls", texts.length, (index) => texts[index]);
+  t.after(fixture.dispose);
+  await prisma.scannedFile.update({ where: { id: fixture.rows[5].id }, data: { checksum: fixture.rows[4].checksum } });
+  const where = { sourceEvidence: { path: ["connectedLibraryId"], equals: fixture.root.id }, relationshipKind: "PROBABLE_REVISION" };
+  await persistent.persistScanWorkingKnowledge(fixture.index);
+  const first = await prisma.knowledgeConnection.findMany({ where });
+  assert.equal(first.length, 1);
+  assert.deepEqual(new Set([first[0].sourceFileKey, first[0].targetFileKey]), new Set(fixture.rows.slice(0, 2).map((row) => row.fileKey)));
+  await persistent.persistScanWorkingKnowledge({ ...fixture.index, files: [...fixture.index.files].reverse() });
+  const repeated = await prisma.knowledgeConnection.findMany({ where });
+  assert.deepEqual(repeated.map((row) => [row.id, row.relationshipKey, row.status]), first.map((row) => [row.id, row.relationshipKey, row.status]));
+});
+
+test("typed capacity pools persist twenty thousand current candidates deterministically within a linear visit budget", async (t) => {
+  const count = 20_000;
+  const fixture = await knowledgeScaleFixture(prisma, "Capacity pool scale", count, () => "Client ID: CAP-20K; Client: Capacity");
+  t.after(fixture.dispose);
+  const where = { generationVersion: documentSignalVersion,
+    sourceEvidence: { path: ["connectedLibraryId"], equals: fixture.root.id } };
+  const firstWork: KnowledgeWork = {};
+  await persistent.persistScanWorkingKnowledge(fixture.index, firstWork);
+  const first = await prisma.knowledgeConnection.findMany({ where, orderBy: { relationshipKey: "asc" } });
+  assert.equal(first.length, count * 3 / 2);
+  const degrees = new Map<string, number>();
+  const pairs = new Set<string>();
+  for (const connection of first) {
+    assert.equal(connection.relationshipKind, "SAME_CLIENT");
+    assert.notEqual(connection.sourceObservationSessionId, connection.targetObservationSessionId);
+    const pair = persistent.knowledgeRelationshipPairKey({ fileKey: connection.sourceFileKey!, checksum: connection.sourceChecksum! },
+      { fileKey: connection.targetFileKey!, checksum: connection.targetChecksum! });
+    assert.ok(!pairs.has(pair)); pairs.add(pair);
+    for (const key of [connection.sourceFileKey!, connection.targetFileKey!]) degrees.set(key, (degrees.get(key) ?? 0) + 1);
+  }
+  assert.equal(degrees.size, count);
+  assert.ok([...degrees.values()].every((degree) => degree === 3));
+  assert.ok(firstWork.candidateVisits! <= count * 7 && firstWork.poolNodeVisits! <= count * 30, JSON.stringify(firstWork));
+  const repeatedWork: KnowledgeWork = {};
+  await persistent.persistScanWorkingKnowledge({ ...fixture.index, files: [...fixture.index.files].reverse() }, repeatedWork);
+  const repeated = await prisma.knowledgeConnection.findMany({ where, orderBy: { relationshipKey: "asc" } });
+  assert.deepEqual(repeated.map((row) => [row.id, row.relationshipKey, row.status, row.supersededAt]),
+    first.map((row) => [row.id, row.relationshipKey, row.status, row.supersededAt]));
+  assert.ok(repeatedWork.candidateVisits! <= count * 7 && repeatedWork.poolNodeVisits! <= count * 30, JSON.stringify(repeatedWork));
+  t.diagnostic(`20,000 current persistence candidates, initial ${JSON.stringify(firstWork)}, repeated/reversed ${JSON.stringify(repeatedWork)}`);
+});
+
+test("project correction indexes replay twenty thousand signals and corrections and cover persistence endpoint lookup", async (t) => {
+  const count = 20_000;
+  const fixture = await knowledgeScaleFixture(prisma, "Project replay scale", count, (index) => `Project ID: SCALE-${index}; Project: Indexed`);
+  t.after(fixture.dispose);
+  await fixture.seedSignals();
+  const target = fixture.rows[0];
+  const targetHash = extractDocumentSignals(target.evidence, fixture.root.id)[0].identityHash;
+  for (let offset = 0; offset < count; offset += 500) {
+    await prisma.knowledgeConnection.createMany({ data: fixture.rows.slice(offset, offset + 500).map((source, localIndex) => {
+      const index = offset + localIndex;
+      return { sourceObservationSessionId: source.observationId, targetObservationSessionId: target.observationId,
+        relationshipKey: crypto.randomUUID(), relationshipKind: "BELONGS_TO_PROJECT", generationVersion: persistent.humanIdentityCorrectionVersion,
+        status: "CONFIRMED", sourceFileKey: source.fileKey, sourceChecksum: index === count - 1 ? "wrong-source" : source.checksum,
+        targetFileKey: target.fileKey, targetChecksum: index === count - 2 ? "wrong-target" : target.checksum,
+        sourceEvidence: { connectedLibraryId: index === count - 3 ? "wrong-root" : fixture.root.id, identityHash: targetHash },
+        sharedTerms: [], reasoning: "Human project correction", createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, 0, index)) };
+    }) });
+  }
+  const source = fixture.rows[count - 4];
+  const separation = await prisma.knowledgeConnection.create({ data: {
+    sourceObservationSessionId: source.observationId, targetObservationSessionId: target.observationId,
+    generationVersion: documentSignalVersion, relationshipKind: "SAME_PROJECT", status: "REJECTED",
+    sourceFileKey: source.fileKey, sourceChecksum: source.checksum, targetFileKey: target.fileKey, targetChecksum: target.checksum,
+    sharedTerms: [], reasoning: "Keep these projects separate",
+  } });
+  await prisma.knowledgeConnectionDecision.create({ data: { knowledgeConnectionId: separation.id,
+    action: "SEPARATE", previousStatus: "NEW", nextStatus: "REJECTED" } });
+  const work: KnowledgeWork = {};
+  const effective = await persistent.getEffectiveDocumentSignals([fixture.root.id], undefined, work);
+  const effectiveProjects = effective.filter((row) => row.kind === "PROJECT");
+  assert.equal(new Set(effectiveProjects.filter((row) => row.identityHash === targetHash).map((row) => row.fileKey)).size, count - 4);
+  assert.equal(work.correctionLookups, count * 2);
+  const repeated = await persistent.getEffectiveDocumentSignals([fixture.root.id]);
+  assert.deepEqual(repeated.map((row) => [row.fileKey, row.kind, row.identityHash]), effective.map((row) => [row.fileKey, row.kind, row.identityHash]));
+  const persistenceWork: KnowledgeWork = {};
+  await persistent.persistScanWorkingKnowledge({ ...fixture.index, files: [] }, persistenceWork);
+  // Wrong-checksum corrections are superseded before persistence replays them.
+  assert.equal(persistenceWork.correctionLookups, (count - 2) * 2);
+  t.diagnostic(`20,000 project signals/corrections: replay ${JSON.stringify(work)}, persistence ${JSON.stringify(persistenceWork)}`);
+});
+
+test("client correction classes join twenty thousand endpoints without rescanning members or separation pairs", async (t) => {
+  const count = 20_000;
+  const fixture = await knowledgeScaleFixture(prisma, "Client union scale", count, (index) => `Client ID: UNION-${index}; Client: Indexed`);
+  t.after(fixture.dispose);
+  await fixture.seedSignals();
+  const hashes = fixture.rows.map((row) => extractDocumentSignals(row.evidence, fixture.root.id)[0].identityHash);
+  for (let offset = 1; offset < count; offset += 500) {
+    await prisma.knowledgeConnection.createMany({ data: fixture.rows.slice(offset, offset + 500).map((target, localIndex) => {
+      const index = offset + localIndex; const source = fixture.rows[index - 1];
+      return { sourceObservationSessionId: source.observationId, targetObservationSessionId: target.observationId,
+        relationshipKey: crypto.randomUUID(), relationshipKind: "SAME_CLIENT", generationVersion: persistent.humanIdentityCorrectionVersion,
+        status: "CONFIRMED", sourceFileKey: source.fileKey, sourceChecksum: source.checksum,
+        targetFileKey: target.fileKey, targetChecksum: target.checksum,
+        sourceEvidence: { connectedLibraryId: fixture.root.id, identityHash: hashes[index] },
+        sharedTerms: [], reasoning: "Ordered human joins", createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, 0, index)) };
+    }) });
+  }
+  const work: KnowledgeWork = {};
+  const effective = await persistent.getEffectiveDocumentSignals([fixture.root.id], undefined, work);
+  assert.equal(new Set(effective.map((row) => row.identityHash)).size, 1);
+  assert.equal(effective[0].identityHash, hashes.at(-1));
+  assert.equal(work.correctionLookups, (count - 1) * 2);
+  assert.ok(work.unionMoves! <= count * 16, JSON.stringify(work));
+  t.diagnostic(`20,000 client union endpoints: ${JSON.stringify(work)}`);
+});
 
 test("system-archived subject evidence reactivates the same relationship with current references and archive history", async (t) => {
   const library = await createLibrary("Returning subject evidence");
@@ -1320,7 +1523,7 @@ test("human observation corrections supersede provisional identity hashes and re
   } });
   const { extractDocumentSignals } = await import("../../src/lib/bridge/document-signals");
   assert.deepEqual(signals.map((signal) => signal.identityHash).sort(),
-    extractDocumentSignals(correction.editedSuggestion, library.id).map((signal) => signal.identityHash).sort());
+    extractDocumentSignals(correction.editedSuggestion, library.id, true).map((signal) => signal.identityHash).sort());
   assert.ok(signals.every((signal) => JSON.stringify(signal.sourceRanges) === "[]"));
   assert.equal(await prisma.knowledgeDocumentSignal.count({ where: {
     observationSessionId: left.observation.id, status: "SUPERSEDED", kind: { in: ["CLIENT", "PROJECT"] },

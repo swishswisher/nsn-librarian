@@ -37,7 +37,11 @@ test("encoded multiline identity evidence retains document signals and exact sou
   assert.ok(signals.some((signal) => signal.kind === "CLIENT"));
   assert.ok(signals.some((signal) => signal.kind === "PROJECT"));
   for (const signal of signals) {
-    assert.ok(signal.sourceRanges.every((range) => source.slice(range.start, range.end) === quote));
+    const fields = signal.kind === "CLIENT"
+      ? ["Client: Alice Smith", "Client ID: C-001"]
+      : ['Project: North "Star"', "Project ID: P-001", "Client: Alice Smith", "Client ID: C-001"];
+    assert.deepEqual(signal.sourceRanges, fields.map((field) => ({ start: source.indexOf(field), end: source.indexOf(field) + field.length })));
+    assert.deepEqual(signal.sourceRanges.map((range) => source.slice(range.start, range.end)), fields);
   }
   assert.deepEqual(extractDocumentSignals(`Source characters 3-${3 + quote.length}: "${quote}"`, "synthetic-root"), signals);
 });

@@ -3,7 +3,9 @@ import { execFileSync } from "node:child_process";
 import { after, before, test } from "node:test";
 
 import { PrismaClient } from "@prisma/client";
-import { documentSignalVersion } from "../../src/lib/bridge/document-signals";
+import { documentSignalVersion, extractDocumentSignals } from "../../src/lib/bridge/document-signals";
+import { knowledgeScaleFixture } from "./knowledge-scale-fixtures";
+import type { KnowledgeWork } from "../../src/lib/bridge/knowledge-work";
 
 const schema = `phase_three_b_${process.pid}_${Date.now()}`;
 const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -107,6 +109,82 @@ function model(claims: unknown[]) {
 function claim(text: string, sourceIds: string[], kind = "FACT") {
   return { text, sourceIds, kind };
 }
+
+for (const kind of ["CLIENT", "PROJECT"] as const) {
+  for (const modified of [false, true]) {
+    test(`${kind} Ask provenance rejects conflicting names and preserves unique binding and ambiguity for ${modified ? "MODIFIED" : "APPROVED"}`, async (t) => {
+      const r = await root(`${kind} Ask provenance`); const s = await scan(r.id);
+      t.after(async () => {
+        await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: r.id } });
+        await prisma.connectedLibrary.delete({ where: { id: r.id } });
+      });
+      const label = kind === "CLIENT" ? "Client" : "Project";
+      const add = async (id: string, names: string[]) => {
+        const text = `${label} ID: ${id}; ${names.map((name) => `${label}: ${name}`).join("; ")}`;
+        const evidence = `Source characters 0-${text.length}: ${JSON.stringify(text)}`;
+        const signal = extractDocumentSignals(evidence, r.id).find((row) => row.kind === kind)!;
+        const item = await file({ rootId: r.id, sessionId: s.id, relativePath: `${id}.txt`,
+          quote: modified ? `${label} ID: ORIGINAL; ${label}: Original Name` : text,
+          knowledgeState: "APPROVED", entityHashes: [signal.identityHash] });
+        if (modified) {
+          await prisma.observationSession.update({ where: { id: item.observation.id }, data: { status: "MODIFIED" } });
+          await prisma.humanDecision.create({ data: { observationSessionId: item.observation.id,
+            decisionType: "MODIFY", editedSuggestion: text } });
+        }
+        await prisma.knowledgeDocumentSignal.create({ data: { ...signal,
+          checksum: item.scanned.checksum!, connectedLibraryId: r.id, fileKey: item.index.fileKey,
+          generationVersion: documentSignalVersion, observationSessionId: item.observation.id,
+          relativePath: item.scanned.relativePath, signalKey: crypto.randomUUID(), sourceRanges: modified ? [] : signal.sourceRanges,
+        } });
+        return item;
+      };
+      await add("conflict", ["Morgan Stone", "Jamie Brook"]);
+      let calls = 0;
+      const ask = (name: string) => answer.answerLibraryQuestion(`${label} ${name}`, {
+        permittedRootIds: [r.id], model: async () => { calls++; return model([])(); },
+      });
+      for (const name of ["Morgan Stone", "Jamie Brook", "Unrelated Name"]) {
+        const result = await ask(name);
+        assert.equal(result.state, "NO_AUTHORIZED_MATCH"); assert.equal(result.sources.length, 0);
+      }
+      assert.equal(calls, 0);
+      const unique = await add("unique-one", ["Alison River"]);
+      const byId = await retrieve.retrieveQuestionContext(`${label} unique-one`, [r.id]);
+      assert.ok(byId.sources.some((source) => source.relativePath === unique.scanned.relativePath), "Ask retains exact resolved ID queries");
+      const correct = await ask("Alison River");
+      assert.equal(calls, 1);
+      assert.ok(correct.sources.some((source) => source.relativePath === unique.scanned.relativePath));
+      const wrong = await ask("Riverbank");
+      assert.equal(wrong.state, "NO_AUTHORIZED_MATCH"); assert.equal(calls, 1);
+      await add("unique-two", ["Alison River"]);
+      const ambiguous = await ask("Alison River");
+      assert.equal(ambiguous.state, "AMBIGUOUS_ENTITY"); assert.equal(calls, 1);
+    });
+  }
+}
+
+test("Ask history intent admits retained invoice evidence and never current-only metadata", async (t) => {
+  const r = await root("Invoice Ask history"); const old = await scan(r.id);
+  const retained = await file({ rootId: r.id, sessionId: old.id, relativePath: "retained-invoice.txt", quote: "Invoice for an older annual account", isCurrent: false });
+  const current = await scan(r.id);
+  await prisma.scanSession.update({ where: { id: current.id }, data: { startedAt: new Date(old.startedAt.getTime() + 60000) } });
+  const metadata = await file({ rootId: r.id, sessionId: current.id, relativePath: "invoices.pdf", quote: "" });
+  await prisma.librarySearchEntry.delete({ where: { id: metadata.index.id } });
+  const hidden = await root("Hidden retained invoice"); const hs = await scan(hidden.id);
+  await file({ rootId: hidden.id, sessionId: hs.id, relativePath: "older-invoices.txt", quote: "Invoice hidden account", isCurrent: false });
+  await prisma.connectedLibrary.update({ where: { id: hidden.id }, data: { readPermission: false } });
+  t.after(async () => prisma.connectedLibrary.deleteMany({ where: { id: { in: [r.id, hidden.id] } } }));
+  let calls = 0;
+  const ask = () => answer.answerLibraryQuestion("Show older invoices", { permittedRootIds: [r.id, hidden.id],
+    model: async (_question, context) => { calls++;
+      assert.deepEqual(context.sources.map((source) => source.relativePath), [retained.scanned.relativePath]);
+      assert.ok(context.sources.every((source) => source.sourceType !== "FILE_METADATA"));
+      return model([])();
+    } });
+  const authorized = await ask(); assert.equal(calls, 1); assert.equal(authorized.sources.length, 1);
+  await prisma.librarySearchEntry.delete({ where: { id: retained.index.id } });
+  const absent = await ask(); assert.equal(absent.state, "NO_AUTHORIZED_MATCH"); assert.equal(calls, 1);
+});
 
 for (const kind of ["CLIENT", "PROJECT"] as const) {
   test(`${kind.toLowerCase()} Ask rejects misleading unindexed metadata and preserves evidence and ambiguity gates`, async (t) => {
@@ -491,6 +569,49 @@ test("approved Memory contributes when its source root is authorized", async () 
     permittedRootIds: [r.id], model: model([claim("Gardenquartz is approved terminology", ["S1"])]) });
   assert.equal(result.state, "ANSWERED_FROM_SOURCES");
   assert.equal(result.sources[0]?.sourceType, "APPROVED_MEMORY");
+});
+
+test("Memory provenance indexes shared document copies once across many source roots", async (t) => {
+  const fixture = await knowledgeScaleFixture(prisma, "Memory copy scale", 1, () => "Approved source");
+  t.after(fixture.dispose);
+  await prisma.observationSession.update({ where: { id: fixture.rows[0].observationId }, data: { status: "APPROVED" } });
+  const roots = Array.from({ length: 200 }, (_, index) => ({ id: crypto.randomUUID(), bridgeRootId: crypto.randomUUID(),
+    displayName: `Memory root ${index}`, localPath: `bridge://memory-copies/${crypto.randomUUID()}`, platform: "MACOS" as const }));
+  await prisma.connectedLibrary.createMany({ data: roots });
+  t.after(async () => prisma.connectedLibrary.deleteMany({ where: { id: { in: roots.map((root) => root.id) } } }));
+  const scans = roots.map((root) => ({ id: crypto.randomUUID(), connectedFolderId: root.id,
+    status: "COMPLETED" as const, searchIndexStatus: "COMPLETED" }));
+  await prisma.scanSession.createMany({ data: scans });
+  for (const s of scans) await prisma.scannedFile.createMany({ data: Array.from({ length: 50 }, (_, index) => ({
+    sessionId: s.id, libraryDocumentId: fixture.rows[0].documentId, relativePath: `copy-${index}.txt`,
+    localPath: `bridge://${s.connectedFolderId}/copy-${index}.txt`, fileType: "TEXT", checksum: `memory-copy-${index}`,
+  })) });
+  const unbound = await root("Unbound copy root"); const us = await scan(unbound.id);
+  t.after(async () => prisma.connectedLibrary.delete({ where: { id: unbound.id } }));
+  await prisma.scannedFile.create({ data: { sessionId: us.id, libraryDocumentId: fixture.rows[0].documentId,
+    relativePath: "unbound.txt", localPath: "bridge://unbound/copy.txt", fileType: "TEXT", checksum: "unbound-copy" } });
+  const memory = await prisma.memoryEntry.create({ data: { memoryType: "NOTE", memoryKey: crypto.randomUUID(),
+    title: "mosaicquartz terminology", description: "Approved mosaicquartz terminology", evidence: [],
+    searchProvenanceComplete: true, searchSourceCount: roots.length + 1 } });
+  t.after(async () => prisma.memoryEntry.delete({ where: { id: memory.id } }));
+  const sourceRows = [fixture.root, ...roots].map((root) => ({ memoryEntryId: memory.id,
+    connectedLibraryId: root.id, observationSessionId: fixture.rows[0].observationId }));
+  await prisma.memorySearchSource.createMany({ data: sourceRows });
+  const permitted = [fixture.root.id, ...roots.map((root) => root.id)];
+  const work: KnowledgeWork = {};
+  const context = await retrieve.retrieveQuestionContext("mosaicquartz", permitted, work);
+  assert.equal(context.sources.length, 1);
+  assert.equal(context.sources[0].sourceType, "APPROVED_MEMORY");
+  assert.equal(context.sources[0].corroborationKeys.length, 51);
+  assert.ok(!context.sources[0].corroborationKeys.includes("sha256:unbound-copy"), "Unbound roots never corroborate Memory");
+  assert.equal(work.memoryFileVisits, 10002);
+  assert.equal(work.memorySourceVisits, 201);
+  assert.equal(work.memoryPairVisits, 201);
+  await prisma.memorySearchSource.deleteMany({ where: { memoryEntryId: memory.id } });
+  await prisma.memorySearchSource.createMany({ data: [...sourceRows].reverse() });
+  const repeated = await retrieve.retrieveQuestionContext("mosaicquartz", permitted);
+  assert.deepEqual(repeated.sources[0].corroborationKeys, context.sources[0].corroborationKeys);
+  t.diagnostic(`10,002 shared copies / 201 Memory sources: ${JSON.stringify(work)}`);
 });
 
 test("multi-root Memory answers survive provenance row reordering during generation", async () => {

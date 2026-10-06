@@ -46,15 +46,23 @@ function validDate(value: string) {
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
-function extractFields(sourceEvidenceText: string) {
+export function extractDocumentFields(sourceEvidenceText: string, humanReviewed = false, legacyNameLabels = false) {
   const fields = new Map<string, Field>();
   const conflicts = new Map<string, SourceRange[]>();
-  const excerpts = verifiedSourceExcerpts(sourceEvidenceText).slice(0, 24);
+  const legacyFields: Array<{ key: string; value: string; range: SourceRange }> = [];
+  const verified = verifiedSourceExcerpts(sourceEvidenceText).slice(0, 24);
+  const excerpts = verified.length || !humanReviewed ? verified : [{ start: 0, end: sourceEvidenceText.length, text: sourceEvidenceText }];
   for (const excerpt of excerpts) {
-    const range = { start: excerpt.start, end: excerpt.end };
-    for (const segment of excerpt.text.split(/[;\n]/)) {
-      const match = segment.trim().match(/^(client id|client|person|email|organization|company|domain|project id|project|year|workshop|event|date|document id|document title|title|version|revision)\s*:\s*(.{2,100})$/i);
-      if (!match) continue;
+    for (const segment of excerpt.text.matchAll(/[^;\n]+/g)) {
+      const text = segment[0].trim();
+      const match = text.match(/^(client id|client|person|email|organization|company|domain|project id|project|year|workshop|event|date|document id|document title|title|version|revision)\s*:\s*(.{2,100})$/i);
+      const start = excerpt.start + segment.index! + segment[0].indexOf(text);
+      const range = { start, end: start + text.length };
+      if (!match) {
+        const legacy = legacyNameLabels ? text.match(/^(client|project)\s+(.{2,100})$/i) : null;
+        if (legacy) legacyFields.push({ key: legacy[1].toLowerCase(), value: normalized(legacy[2]), range });
+        continue;
+      }
       const value = normalized(match[2]);
       const key = match[1].toLowerCase();
       const earlier = fields.get(key);
@@ -65,11 +73,20 @@ function extractFields(sourceEvidenceText: string) {
       }
     }
   }
+  // Legacy name-only signals used colonless labels. An explicit field always
+  // wins over narrative text such as "project files are current".
+  const explicitKeys = new Set(fields.keys());
+  for (const field of legacyFields) {
+    if (explicitKeys.has(field.key)) continue;
+    const earlier = fields.get(field.key);
+    if (earlier && earlier.value !== field.value) conflicts.set(field.key, [earlier.range, field.range]);
+    else if (!earlier) fields.set(field.key, field);
+  }
   return { conflicts, fields };
 }
 
-export function extractDocumentSignals(sourceEvidenceText: string, connectedLibraryId: string): ExtractedDocumentSignal[] {
-  const { conflicts, fields } = extractFields(sourceEvidenceText);
+export function extractDocumentSignals(sourceEvidenceText: string, connectedLibraryId: string, humanReviewed = false): ExtractedDocumentSignal[] {
+  const { conflicts, fields } = extractDocumentFields(sourceEvidenceText, humanReviewed);
   const get = (...keys: string[]) => keys.map((key) => conflicts.has(key) ? undefined : fields.get(key)).find(Boolean);
   const signals: ExtractedDocumentSignal[] = [];
   const add = (kind: DocumentSignalKind, identity: string, supporting: Array<Field | undefined>, supportHash: string | null = null, revisionNumber: string | null = null, revisionDate: string | null = null) => {
@@ -79,7 +96,7 @@ export function extractDocumentSignals(sourceEvidenceText: string, connectedLibr
       supportHash,
       revisionNumber,
       revisionDate,
-      sourceRanges: [...new Map(supporting.filter((item): item is Field => Boolean(item)).map((item) => [`${item.range.start}:${item.range.end}`, item.range])).values()].slice(0, 4),
+      sourceRanges: humanReviewed ? [] : [...new Map(supporting.filter((item): item is Field => Boolean(item)).map((item) => [`${item.range.start}:${item.range.end}`, item.range])).values()].slice(0, 4),
     });
   };
   const clientName = get("client");
@@ -127,6 +144,41 @@ export function extractDocumentSignals(sourceEvidenceText: string, connectedLibr
     add("DOCUMENT_FAMILY", `${documentId.value}:${title.value}:${projectHash ?? clientHash ?? ""}`, [documentId, title, version, date], projectHash ?? clientHash, parsedVersion, parsedDate);
   }
   return signals.slice(0, 8);
+}
+
+/** Use the resolver's fields, never an overlapping excerpt, to bind names/IDs.
+ * Old ranged, name-only signals can describe separate entities on one file.
+ * Explicit IDs and human edits instead require a unique name in the full evidence.
+ */
+export function documentSignalEntityLabels(sourceEvidenceText: string, kind: "CLIENT" | "PROJECT",
+  sourceRanges: unknown, allowUnranged: boolean, identity?: { connectedLibraryId: string; identityHash: string }) {
+  let parsed = extractDocumentFields(sourceEvidenceText);
+  const label = kind.toLowerCase();
+  if (!parsed.fields.has(label) && !parsed.conflicts.has(label) &&
+      !parsed.fields.has(`${label} id`) && !parsed.conflicts.has(`${label} id`)) {
+    parsed = extractDocumentFields(sourceEvidenceText, false, true);
+  }
+  if (identity) {
+    const resolved = extractDocumentSignals(sourceEvidenceText, identity.connectedLibraryId).find((signal) => signal.kind === kind);
+    if (resolved && resolved.identityHash !== identity.identityHash) return [];
+  }
+  if (!parsed.fields.has(`${label} id`) && !parsed.conflicts.has(`${label} id`) &&
+      Array.isArray(sourceRanges) && sourceRanges.length) {
+    const excerpts = verifiedSourceExcerpts(sourceEvidenceText);
+    const scoped = excerpts.flatMap((excerpt) => sourceRanges.flatMap((range) => {
+      if (!range || typeof range !== "object" || typeof range.start !== "number" || typeof range.end !== "number") return [];
+      const start = Math.max(excerpt.start, range.start);
+      const end = Math.min(excerpt.end, range.end);
+      return end > start ? [`Source characters ${start}-${end}: ${JSON.stringify(excerpt.text.slice(start - excerpt.start, end - excerpt.start))}`] : [];
+    })).join("\n");
+    parsed = extractDocumentFields(scoped, false, true);
+  } else if ((!Array.isArray(sourceRanges) || !sourceRanges.length) && !allowUnranged) return [];
+  // A non-conflicting ID remains searchable even when its optional names clash.
+  // Each label comes from the same fields used to resolve the exact identity.
+  return [`${label} id`, label].flatMap((key) => {
+    const field = parsed.conflicts.has(key) ? undefined : parsed.fields.get(key);
+    return field ? [field.value] : [];
+  });
 }
 
 export function compareDocumentVersions(left: Pick<ExtractedDocumentSignal, "revisionNumber" | "revisionDate">, right: Pick<ExtractedDocumentSignal, "revisionNumber" | "revisionDate">): -1 | 0 | 1 | null {
