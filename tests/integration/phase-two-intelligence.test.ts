@@ -1900,3 +1900,205 @@ test("persistent identity grouping stays linear for twenty thousand unrelated se
     });
   }
 });
+
+async function confirmedAuthorityFixture(kind: "CLIENT" | "PROJECT" | "DOCUMENT_FAMILY" = "CLIENT", count = 4) {
+  const text = (index: number) => kind === "DOCUMENT_FAMILY" ? `Client ID: FAMILY-101; Document ID: AUTH-101; Document Title: Authority; Version: ${String(index + 1).padStart(2, "0")}`
+    : `${kind === "CLIENT" ? "Client" : "Project"}: Authority; ${kind === "CLIENT" ? "Client" : "Project"} ID: AUTH-101`;
+  const fixture = await knowledgeScaleFixture(prisma, `Authority ${kind}`, count, text);
+  for (const row of fixture.rows) await prisma.observationSession.update({ data: {
+    status: "APPROVED", observations: [{ description: "Verified authority fixture", evidence: [row.evidence] }],
+  }, where: { id: row.observationId } });
+  await persistent.persistScanWorkingKnowledge(fixture.index);
+  const keys = fixture.rows.map((row) => row.fileKey);
+  if (kind === "DOCUMENT_FAMILY") {
+    // Review the client proposals as separate; version proposals now have capacity.
+    const clients = await prisma.knowledgeConnection.findMany({ where: { sourceFileKey: { in: keys }, relationshipKind: "SAME_CLIENT", status: "NEW" } });
+    for (const link of clients) await persistent.reviewPersistentRelationship(link.id, "SEPARATE", "Review lineage independently.");
+    await persistent.persistScanWorkingKnowledge(fixture.index);
+  }
+  const links = await prisma.knowledgeConnection.findMany({ where: { sourceFileKey: { in: keys }, targetFileKey: { in: keys },
+    relationshipKind: kind === "DOCUMENT_FAMILY" ? "PROBABLE_REVISION" : `SAME_${kind}`, status: "NEW" } });
+  return { ...fixture, links, kind, text };
+}
+
+async function addAuthorityMember(fixture: Awaited<ReturnType<typeof confirmedAuthorityFixture>>, text = fixture.text(10)) {
+  const minimum = fixture.rows.map((row) => row.fileKey).sort()[0];
+  let relativePath = "", key = "";
+  for (let index = 0; ; index++) {
+    relativePath = `new-${index}.txt`; key = persistent.persistentFileKey(fixture.root.id, relativePath);
+    if (key < minimum) break;
+  }
+  const extra = await createObservedFile({ checksum: "new-member-checksum", libraryId: fixture.root.id, relativePath, sessionId: fixture.scan.id });
+  const evidence = `Source characters 0-${text.length}: ${JSON.stringify(text)}`;
+  await prisma.observationSession.update({ data: { status: "APPROVED", observations: [{ description: "Current member", evidence: [evidence] }] }, where: { id: extra.observation.id } });
+  fixture.index.files.push({ ...fixture.index.files[0], id: extra.file.id, relativePath,
+    normalizedIdentity: `${fixture.root.id}/${relativePath}`, sourceEvidenceText: evidence });
+  return { extra, key };
+}
+
+for (const kind of ["CLIENT", "PROJECT", "DOCUMENT_FAMILY"] as const) {
+  test(`confirmed authority ${kind} survives sorted-member churn, consumes capacity and retains decisions`, async (t) => {
+    const fixture = await confirmedAuthorityFixture(kind);
+    t.after(fixture.dispose);
+    const sorted = [...fixture.rows].sort((left, right) => left.fileKey.localeCompare(right.fileKey));
+    const link = fixture.links.find((row) => new Set([row.sourceFileKey, row.targetFileKey]).has(sorted[2].fileKey) &&
+      new Set([row.sourceFileKey, row.targetFileKey]).has(sorted[3].fileKey));
+    assert.ok(link);
+    await persistent.reviewPersistentRelationship(link.id, "CONFIRM", "Keep this reviewed relationship.");
+    await addAuthorityMember(fixture);
+    for (const files of [fixture.index.files, [...fixture.index.files].reverse(), fixture.index.files]) {
+      await persistent.persistScanWorkingKnowledge({ ...fixture.index, files });
+      const confirmed = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: link.id }, include: { decisions: true } });
+      assert.equal(confirmed.status, "CONFIRMED"); assert.equal(confirmed.supersededAt, null);
+      assert.equal(confirmed.decisions.length, 1); assert.equal(confirmed.decisions[0].note, "Keep this reviewed relationship.");
+      const active = await prisma.knowledgeConnection.findMany({ where: { sourceEvidence: { path: ["connectedLibraryId"], equals: fixture.root.id },
+        status: { in: ["NEW", "CONFIRMED"] }, supersededAt: null } });
+      const degrees = new Map<string, number>();
+      for (const row of active) for (const key of [row.sourceFileKey!, row.targetFileKey!]) degrees.set(key, (degrees.get(key) ?? 0) + 1);
+      assert.ok([...degrees.values()].every((degree) => degree <= 3));
+    }
+    assert.ok(await prisma.knowledgeConnection.count({ where: { id: { in: fixture.links.filter((row) => row.id !== link.id).map((row) => row.id) }, status: "ARCHIVED" } }) > 0);
+  });
+}
+
+for (const invalidity of ["checksum", "separate", "rejected", "removed", "correction", "unavailable", "both-missing", "root"] as const) {
+  test(`confirmed authority supersedes true ${invalidity} invalidity without deleting history`, async (t) => {
+    const fixture = await confirmedAuthorityFixture(); t.after(fixture.dispose);
+    const link = fixture.links[0]; assert.ok(link);
+    await persistent.reviewPersistentRelationship(link.id, "CONFIRM", "Original human confirmation");
+    const row = fixture.rows.find((file) => file.fileKey === link.sourceFileKey)!;
+    if (invalidity === "checksum") await prisma.scannedFile.update({ data: { checksum: "changed-source" }, where: { id: row.id } });
+    if (invalidity === "unavailable") await prisma.scannedFile.update({ data: { sourceUnavailableAt: new Date() }, where: { id: row.id } });
+    if (invalidity === "root") await prisma.connectedLibrary.update({ data: { readPermission: false }, where: { id: fixture.root.id } });
+    if (invalidity === "both-missing") {
+      const missing = fixture.rows.filter((file) => [link.sourceFileKey, link.targetFileKey].includes(file.fileKey));
+      await prisma.scannedFile.deleteMany({ where: { id: { in: missing.map((file) => file.id) } } });
+      fixture.index.files = fixture.index.files.filter((file) => !missing.some((row) => row.id === file.id));
+    }
+    if (invalidity === "separate") await persistent.reviewPersistentRelationship(link.id, "SEPARATE", "Human separation");
+    if (invalidity === "rejected") {
+      const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+      await saveHumanDecision(row.observationId, { decisionType: "REJECT", note: "Wrong identity" });
+    }
+    if (invalidity === "removed") {
+      await prisma.observationSession.create({ data: { libraryDocumentId: row.documentId, observerType: "DETERMINISTIC", status: "APPROVED",
+        observations: [], interpretations: [], explanation: [], planSuggestions: [], warnings: [], createdAt: new Date(Date.now() + 1000) } });
+      fixture.index.files.find((file) => file.id === row.id)!.sourceEvidenceText = "";
+    }
+    if (invalidity === "correction") {
+      const { extra, key } = await addAuthorityMember(fixture, "Client: Other; Client ID: OTHER-201");
+      await persistent.persistScanWorkingKnowledge(fixture.index);
+      const source = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: { fileKey: row.fileKey, kind: "CLIENT", status: "ACTIVE" } });
+      const target = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: { fileKey: key, kind: "CLIENT", status: "ACTIVE", observationSessionId: extra.observation.id } });
+      await persistent.createIdentityCorrection({ kind: "SAME_CLIENT", sourceSignalId: source.id, targetSignalId: target.id, note: "Use the other client identity." });
+    }
+    for (let repeat = 0; repeat < 2; repeat++) await persistent.persistScanWorkingKnowledge(fixture.index);
+    const final = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: link.id }, include: { decisions: true } });
+    assert.equal(final.decisions[0].note, "Original human confirmation");
+    if (invalidity === "separate") assert.equal(final.status, "REJECTED");
+    else { assert.equal(final.status, "CONFIRMED"); assert.ok(final.supersededAt); }
+  });
+}
+
+test("confirmed authority preserves more than three historical confirmations and generates no extra hub proposals", async (t) => {
+  const fixture = await confirmedAuthorityFixture("CLIENT", 8); t.after(fixture.dispose);
+  const hub = fixture.rows[0];
+  const identityHash = extractDocumentSignals(hub.evidence, fixture.root.id)[0].identityHash;
+  const confirmations: string[] = [];
+  for (const target of fixture.rows.slice(1, 6)) {
+    const existing = fixture.links.find((row) => [row.sourceFileKey, row.targetFileKey].includes(hub.fileKey) &&
+      [row.sourceFileKey, row.targetFileKey].includes(target.fileKey));
+    const link = existing ?? await prisma.knowledgeConnection.create({ data: {
+      sourceObservationSessionId: hub.observationId, targetObservationSessionId: target.observationId,
+      sourceFileKey: hub.fileKey, targetFileKey: target.fileKey, sourceChecksum: hub.checksum, targetChecksum: target.checksum,
+      relationshipKey: crypto.randomUUID(), relationshipKind: "SAME_CLIENT", generationVersion: documentSignalVersion,
+      reasoning: "Historical reviewed link", sharedTerms: [], sourceEvidence: { connectedLibraryId: fixture.root.id, identityHash,
+        sourceRelativePath: hub.relativePath, targetRelativePath: target.relativePath },
+    } });
+    await persistent.reviewPersistentRelationship(link.id, "CONFIRM", "Historical confirmation"); confirmations.push(link.id);
+  }
+  for (const files of [fixture.index.files, [...fixture.index.files].reverse()]) await persistent.persistScanWorkingKnowledge({ ...fixture.index, files });
+  assert.equal(await prisma.knowledgeConnection.count({ where: { id: { in: confirmations }, status: "CONFIRMED", supersededAt: null } }), 5);
+  assert.equal(await prisma.knowledgeConnection.count({ where: { status: "NEW", supersededAt: null,
+    OR: [{ sourceFileKey: hub.fileKey }, { targetFileKey: hub.fileKey }] } }), 0);
+  assert.equal(await prisma.knowledgeConnectionDecision.count({ where: { knowledgeConnectionId: { in: confirmations } } }), 5);
+});
+
+test("confirmed authority RELATED_SUBJECT support survives bounded proposal churn", async () => {
+  const library = await createLibrary("Subject authority");
+  const scan = await prisma.scanSession.create({ data: { connectedFolderId: library.id, status: "COMPLETED" } });
+  const files = await Promise.all([0, 1, 2, 3, 4].map((index) => createObservedFile({ checksum: `subject-${index}`, libraryId: library.id,
+    relativePath: `${index}.txt`, sessionId: scan.id })));
+  const base = knowledgeIndex(scan.id, library.id, files[0], files[1]);
+  const subjectFiles = files.flatMap((file) => knowledgeIndex(scan.id, library.id, file, file).files.slice(0, 1));
+  const initial = { ...base, files: subjectFiles, relationships: [base.relationships[0]] };
+  await persistent.persistScanWorkingKnowledge(initial);
+  const link = await prisma.knowledgeConnection.findFirstOrThrow({ where: { generationVersion: persistent.relationshipGenerationVersion,
+    sourceEvidence: { path: ["connectedLibraryId"], equals: library.id } } });
+  // RELATED_SUBJECT has no product review action; retain the same stored decision/history form.
+  await prisma.knowledgeConnection.update({ data: { status: "CONFIRMED", decisions: { create: {
+    action: "CONFIRM", previousStatus: "NEW", nextStatus: "CONFIRMED", note: "Reviewed subject support" } } }, where: { id: link.id } });
+  for (const member of [subjectFiles, [...subjectFiles].reverse()]) {
+    await persistent.persistScanWorkingKnowledge({ ...initial, files: member, relationships: [] });
+    const row = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: link.id }, include: { decisions: true } });
+    assert.equal(row.supersededAt, null); assert.equal(row.decisions.length, 1);
+  }
+  await prisma.knowledgeConnection.update({ data: { status: "REJECTED", decisions: { create: {
+    action: "SEPARATE", previousStatus: "CONFIRMED", nextStatus: "REJECTED", note: "Separate these subjects" } } }, where: { id: link.id } });
+  const changedTopics = { ...initial, files: initial.files.map((file) => ({ ...file, supportingTopics: ["finance", "operations"] })),
+    relationships: initial.relationships.map((relationship) => ({ ...relationship, supportingTopics: ["finance", "operations"] })) };
+  await persistent.persistScanWorkingKnowledge(changedTopics);
+  assert.equal(await prisma.knowledgeConnection.count({ where: { sourceFileKey: link.sourceFileKey, targetFileKey: link.targetFileKey,
+    status: { in: ["NEW", "CONFIRMED"] }, supersededAt: null } }), 0);
+  await prisma.knowledgeConnection.update({ data: { status: "CONFIRMED" }, where: { id: link.id } });
+  await prisma.observationSession.update({ data: { status: "REJECTED" }, where: { id: files[0].observation.id } });
+  await persistent.persistScanWorkingKnowledge(initial);
+  assert.ok((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: link.id } })).supersededAt);
+});
+
+test("confirmed authority revision becomes historical when version markers cease to be comparable", async (t) => {
+  const fixture = await confirmedAuthorityFixture("DOCUMENT_FAMILY"); t.after(fixture.dispose);
+  const link = fixture.links[0]; await persistent.reviewPersistentRelationship(link.id, "CONFIRM", "Review lineage");
+  for (const key of [link.sourceFileKey, link.targetFileKey]) {
+    const row = fixture.rows.find((row) => row.fileKey === key)!;
+    const text = "Client ID: FAMILY-101; Document ID: AUTH-101; Document Title: Authority; Version: 01", evidence = `Source characters 0-${text.length}: ${JSON.stringify(text)}`;
+    await prisma.observationSession.update({ data: { observations: [{ description: "Equal version", evidence: [evidence] }] }, where: { id: row.observationId } });
+    fixture.index.files.find((file) => file.id === row.id)!.sourceEvidenceText = evidence;
+  }
+  await persistent.persistScanWorkingKnowledge(fixture.index);
+  assert.ok((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: link.id } })).supersededAt);
+});
+
+
+test("confirmed authority human modification retains an unchanged identity after proposal churn", async (t) => {
+  const fixture = await confirmedAuthorityFixture(); t.after(fixture.dispose);
+  const sorted = [...fixture.rows].sort((left, right) => left.fileKey.localeCompare(right.fileKey));
+  const link = fixture.links.find((row) => [row.sourceFileKey, row.targetFileKey].includes(sorted[2].fileKey) &&
+    [row.sourceFileKey, row.targetFileKey].includes(sorted[3].fileKey))!;
+  await persistent.reviewPersistentRelationship(link.id, "CONFIRM", "Human identity confirmation");
+  await addAuthorityMember(fixture);
+  const source = fixture.rows.find((row) => row.fileKey === link.sourceFileKey)!;
+  const { saveHumanDecision } = await import("../../src/lib/library/observation-sessions");
+  await saveHumanDecision(source.observationId, { decisionType: "MODIFY", editedSuggestion: fixture.text(0), note: "Identity remains valid" });
+  for (let repeat = 0; repeat < 2; repeat++) await persistent.persistScanWorkingKnowledge(fixture.index);
+  const confirmed = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: link.id }, include: { decisions: true } });
+  assert.equal(confirmed.status, "CONFIRMED"); assert.equal(confirmed.supersededAt, null);
+  assert.equal(confirmed.decisions.length, 1);
+});
+
+
+test("confirmed authority human correction links consume proposal capacity", async (t) => {
+  const fixture = await confirmedAuthorityFixture(); t.after(fixture.dispose);
+  const [left, right] = fixture.rows;
+  const source = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: { fileKey: left.fileKey, kind: "CLIENT", status: "ACTIVE" } });
+  const target = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: { fileKey: right.fileKey, kind: "CLIENT", status: "ACTIVE" } });
+  const correction = await persistent.createIdentityCorrection({ kind: "SAME_CLIENT", sourceSignalId: source.id,
+    targetSignalId: target.id, note: "Confirmed client identity" });
+  for (let repeat = 0; repeat < 2; repeat++) await persistent.persistScanWorkingKnowledge(fixture.index);
+  const active = await prisma.knowledgeConnection.findMany({ where: { status: { in: ["NEW", "CONFIRMED"] }, supersededAt: null,
+    sourceEvidence: { path: ["connectedLibraryId"], equals: fixture.root.id } } });
+  for (const file of [left, right]) assert.ok(active.filter((row) => [row.sourceFileKey, row.targetFileKey].includes(file.fileKey)).length <= 3);
+  assert.ok(active.some((row) => row.id === correction.id && row.status === "CONFIRMED"));
+  assert.equal(active.filter((row) => row.generationVersion === documentSignalVersion &&
+    [row.sourceFileKey, row.targetFileKey].includes(left.fileKey) && [row.sourceFileKey, row.targetFileKey].includes(right.fileKey)).length, 0);
+});

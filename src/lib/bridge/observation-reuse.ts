@@ -1,5 +1,6 @@
 import { getPrismaClient } from "@/lib/db/prisma";
 import { observationFingerprint } from "@/lib/ai/observation-processing";
+import { latestObservationOrder, usableObservation } from "./observation-authority";
 
 const reusableStages = ["EXAMINED", "SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"] as const;
 
@@ -57,12 +58,14 @@ export async function reuseCompletedObservationsForScan(input: {
         libraryDocument: {
           select: {
             observationSessions: {
-              select: { observerType: true, status: true },
+              orderBy: [...latestObservationOrder],
+              take: 1,
+              select: { observerType: true, status: true, observations: true },
             },
           },
         },
       },
-      orderBy: { createdAt: "desc" },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       where: {
         extractionStatus: "COMPLETED",
         libraryDocumentId: { not: null },
@@ -86,10 +89,9 @@ export async function reuseCompletedObservationsForScan(input: {
 
     for (const file of batch) {
       const candidate = latestByFingerprint.get(file.fingerprint);
-      const hasUsableObservation = candidate?.libraryDocument?.observationSessions.some(
-        (session) => session.observerType === "OPENAI" &&
-          ["AWAITING_REVIEW", "APPROVED", "MODIFIED"].includes(session.status),
-      );
+      const observation = candidate?.libraryDocument?.observationSessions[0];
+      const hasUsableObservation = observation?.observerType === "OPENAI" && usableObservation(observation) &&
+        Array.isArray(observation.observations) && observation.observations.length > 0;
 
       if (!candidate || !hasUsableObservation || !candidate.libraryDocumentId ||
           candidate.localPath !== file.localPath || candidate.sizeBytes !== file.sizeBytes ||

@@ -496,16 +496,15 @@ export async function knownExecutedMoves(connectedLibraryId: string): Promise<Ex
   })));
 }
 
-export function selectPersistentRelationships(index: ScanWorkingKnowledgeIndex) {
+export function selectPersistentRelationships(index: ScanWorkingKnowledgeIndex,
+  perFile = new Map<string, number>(), excludedPairs = new Set<string>()) {
   const fileById = new Map(index.files.map((file) => [file.id, file]));
-  const perFile = new Map<string, number>();
-
   return [...index.relationships]
     .filter((relationship) => {
       const left = fileById.get(relationship.leftFileId);
       const right = fileById.get(relationship.rightFileId);
       return Boolean(
-        left && right &&
+        left && right && !excludedPairs.has([left.id, right.id].sort().join("\0")) &&
         left.normalizedIdentity !== right.normalizedIdentity &&
         left.connectedLibraryId === right.connectedLibraryId &&
         (left.semanticPreview.trim() || left.sourceEvidenceText.trim() || left.trustedObservationEvidence.length > 0) &&
@@ -591,15 +590,26 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
     select: {
       connectedFolderId: true,
       status: true,
-      connectedFolder: { select: { isEnabled: true, readPermission: true, status: true } },
+      connectedFolder: { select: { isEnabled: true, readPermission: true, status: true, disconnectedAt: true,
+        hiddenFromActiveListAt: true, mergedAt: true, canonicalConnectedLibraryId: true } },
     },
     where: { id: index.scanSessionId },
   });
 
-  if (!session || !["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(session.status) ||
-      !session.connectedFolder.isEnabled || !session.connectedFolder.readPermission || session.connectedFolder.status === "DISCONNECTED") {
+  if (!session) return 0;
+  const rootActive = session.connectedFolder.isEnabled && session.connectedFolder.readPermission &&
+    session.connectedFolder.status === "CONNECTED" && !session.connectedFolder.disconnectedAt &&
+    !session.connectedFolder.hiddenFromActiveListAt && !session.connectedFolder.mergedAt &&
+    !session.connectedFolder.canonicalConnectedLibraryId;
+  if (!rootActive) {
+    await prisma.knowledgeConnection.updateMany({ data: { supersededAt: new Date() }, where: {
+      generationVersion: { in: [relationshipGenerationVersion, documentSignalVersion] },
+      status: "CONFIRMED", supersededAt: null,
+      sourceEvidence: { path: ["connectedLibraryId"], equals: session.connectedFolderId },
+    } });
     return 0;
   }
+  if (!["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(session.status)) return 0;
   const latestSnapshot = await prisma.scanSession.findFirst({
     orderBy: [{ startedAt: "desc" }, { id: "desc" }], select: { id: true },
     where: { ...usableScanSnapshotWhere, connectedFolderId: session.connectedFolderId },
@@ -608,7 +618,7 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
 
   const files = await prisma.scannedFile.findMany({
     select: {
-      checksum: true,
+      checksum: true, sourceUnavailableAt: true, readStatus: true, readingStatus: true, extractionStatus: true,
       id: true,
       libraryDocument: {
         select: {
@@ -647,6 +657,22 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
       OR: [{ sourceFileKey: { in: chunk } }, { targetFileKey: { in: chunk } }],
     } })) priorById.set(connection.id, connection);
   }
+  // Root-scoped pages also find missing endpoints and retained confirmations
+  // retired during human-edit reconciliation. Semantic support, not regeneration,
+  // decides whether a historical confirmation can become current again.
+  let confirmedCursor: string | undefined;
+  do {
+    const page = await prisma.knowledgeConnection.findMany({
+      ...(confirmedCursor ? { cursor: { id: confirmedCursor }, skip: 1 } : {}),
+      orderBy: { id: "asc" }, take: 500, where: {
+        status: "CONFIRMED",
+        generationVersion: { in: [relationshipGenerationVersion, documentSignalVersion] },
+        sourceEvidence: { path: ["connectedLibraryId"], equals: session.connectedFolderId },
+      },
+    });
+    for (const connection of page) priorById.set(connection.id, connection);
+    confirmedCursor = page.length === 500 ? page.at(-1)?.id : undefined;
+  } while (confirmedCursor);
   const prior = [...priorById.values()];
   const checksumByKey = new Map(files.map((file) => [
     keyFor(file),
@@ -655,27 +681,6 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
   const fileByKey = new Map(files.map((file) => [keyFor(file), file]));
   const currentRelationships = prior.filter((row) =>
     [relationshipGenerationVersion, documentSignalVersion, humanIdentityCorrectionVersion].includes(row.generationVersion ?? ""));
-  for (const connection of currentRelationships) {
-    const source = connection.sourceFileKey ? fileByKey.get(connection.sourceFileKey) : null;
-    const target = connection.targetFileKey ? fileByKey.get(connection.targetFileKey) : null;
-    const evidence = connection.sourceEvidence;
-    const sourceObservationId = source?.libraryDocument?.observationSessions[0]?.id;
-    const targetObservationId = target?.libraryDocument?.observationSessions[0]?.id;
-    if (!connection.relationshipKey || !source || !target || !sourceObservationId || !targetObservationId ||
-        source.checksum !== connection.sourceChecksum || target.checksum !== connection.targetChecksum ||
-        !evidence || Array.isArray(evidence) || typeof evidence !== "object" ||
-        evidence.connectedLibraryId !== session.connectedFolderId) continue;
-    const currentEvidence = { ...evidence };
-    delete currentEvidence.previousSnapshots;
-    await upsertCurrentRelationship({ ...connection, lastSeenAt: new Date(),
-      sharedTerms: connection.sharedTerms ?? Prisma.JsonNull,
-      sourceObservationSessionId: sourceObservationId, targetObservationSessionId: targetObservationId,
-      sourceEvidence: { ...currentEvidence, sourceRelativePath: source.relativePath,
-        targetRelativePath: target.relativePath,
-        ...("sourceScannedFileId" in currentEvidence ? { sourceScannedFileId: source.id } : {}),
-        ...("targetScannedFileId" in currentEvidence ? { targetScannedFileId: target.id } : {}) },
-      relationshipKey: connection.relationshipKey });
-  }
   const supersededIds = prior.filter((connection) => {
     const sourceCurrent = connection.sourceFileKey
       ? checksumByKey.get(connection.sourceFileKey)
@@ -683,8 +688,8 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
     const targetCurrent = connection.targetFileKey
       ? checksumByKey.get(connection.targetFileKey)
       : undefined;
-    return (sourceCurrent !== undefined && sourceCurrent !== connection.sourceChecksum) ||
-      (targetCurrent !== undefined && targetCurrent !== connection.targetChecksum);
+    return !connection.supersededAt && ((sourceCurrent !== undefined && sourceCurrent !== connection.sourceChecksum) ||
+      (targetCurrent !== undefined && targetCurrent !== connection.targetChecksum));
   }).map((connection) => connection.id);
   const updateConnections = async (ids: string[], status: Prisma.KnowledgeConnectionWhereInput["status"],
     data: Prisma.KnowledgeConnectionUpdateManyMutationInput) => {
@@ -700,74 +705,12 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
 
   let persisted = 0;
   const currentRelationshipKeys = new Set<string>();
-  for (const relationship of selectPersistentRelationships(currentIndex)) {
-    const left = byId.get(relationship.leftFileId);
-    const right = byId.get(relationship.rightFileId);
-    const leftObservationId = left?.libraryDocument?.observationSessions[0]?.id;
-    const rightObservationId = right?.libraryDocument?.observationSessions[0]?.id;
-    if (!left || !right || !leftObservationId || !rightObservationId ||
-        left.libraryDocument?.observationSessions[0]?.status === "REJECTED" ||
-        right.libraryDocument?.observationSessions[0]?.status === "REJECTED" ||
-        leftObservationId === rightObservationId || !left.checksum || !right.checksum) {
-      continue;
-    }
-
-    const ordered = [
-      { file: left, key: keyFor(left), observationId: leftObservationId },
-      { file: right, key: keyFor(right), observationId: rightObservationId },
-    ].sort((a, b) => a.key.localeCompare(b.key));
-    const [source, target] = ordered;
-    const relationshipKey = digest([
-      relationshipGenerationVersion,
-      source.key, source.file.checksum,
-      target.key, target.file.checksum,
-      ...relationship.supportingTopics.slice().sort(),
-    ].join("\0"));
-    currentRelationshipKeys.add(relationshipKey);
-    const evidence = {
-      connectedLibraryId: session.connectedFolderId,
-      evidenceKinds: relationship.evidenceKinds,
-      sourceScannedFileId: source.file.id,
-      sourceRelativePath: source.file.relativePath,
-      sourceRanges: verifiedRanges(
-        workingFileById.get(source.file.id)?.sourceEvidenceText ?? "",
-        relationship.sharedTerms,
-      ),
-      targetScannedFileId: target.file.id,
-      targetRelativePath: target.file.relativePath,
-      targetRanges: verifiedRanges(
-        workingFileById.get(target.file.id)?.sourceEvidenceText ?? "",
-        relationship.sharedTerms,
-      ),
-      supportingTopics: relationship.supportingTopics,
-    };
-    const data = {
-      confidence: relationship.confidence,
-      generationVersion: relationshipGenerationVersion,
-      lastSeenAt: new Date(),
-      reasoning: "These files appear related through independently supported subjects. Review the source observations before drawing a conclusion.",
-      relationshipKind: "RELATED_SUBJECT",
-      sharedTerms: relationship.sharedTerms.slice(0, 5),
-      similarityScore: relationship.confidence,
-      sourceChecksum: source.file.checksum,
-      sourceEvidence: evidence,
-      sourceFileKey: source.key,
-      targetChecksum: target.file.checksum,
-      targetFileKey: target.key,
-    };
-    await upsertCurrentRelationship({
-      ...data,
-      relationshipKey,
-      sourceObservationSessionId: source.observationId,
-      targetObservationSessionId: target.observationId,
-    });
-    persisted += 1;
-  }
   const signalRows = files.flatMap((file) => {
     const observation = file.libraryDocument?.observationSessions[0];
     const observationId = observation?.id;
     const workingFile = workingFileById.get(file.id);
-    if (!observationId || !file.checksum || !workingFile) return [];
+    if (!observationId || !file.checksum || !workingFile || file.sourceUnavailableAt || file.readStatus !== "SUPPORTED" ||
+        file.readingStatus !== "READ" || file.extractionStatus !== "COMPLETED") return [];
     const fileKey = keyFor(file);
     const canonicalEvidence = observation ? observationSourceEvidenceText(observation) : "";
     const extracted = observation?.status === "REJECTED" ? [] : extractDocumentSignals(
@@ -808,9 +751,34 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
     await prisma.knowledgeDocumentSignal.upsert({
       create: { ...signal, signalKey, connectedLibraryId: session.connectedFolderId, generationVersion: documentSignalVersion },
       update: { lastSeenAt: new Date(), relativePath: signal.relativePath, observationSessionId: signal.observationSessionId,
-        sourceRanges: signal.sourceRanges, status: "ACTIVE", supersededAt: null },
+        sourceRanges: signal.sourceRanges, revisionNumber: signal.revisionNumber, revisionDate: signal.revisionDate,
+        supportHash: signal.supportHash, status: "ACTIVE", supersededAt: null },
       where: { signalKey },
     });
+  }
+  const currentSignalKeysByFile = new Map<string, string[]>();
+  for (const signal of signalRows) {
+    const keys = currentSignalKeysByFile.get(signal.fileKey) ?? [];
+    keys.push(digest([documentSignalVersion, signal.fileKey, signal.checksum, signal.kind, signal.identityHash].join("\0")));
+    currentSignalKeysByFile.set(signal.fileKey, keys);
+  }
+  // Retire evidence displaced by a new authoritative observation or a human edit.
+  // Unchanged observation IDs may retain legacy ambiguous signals; a partial
+  // working index is not authority to erase untouched files' evidence.
+  for (let offset = 0; offset < files.length; offset += 50) {
+    const reviewed = files.slice(offset, offset + 50).filter((file) =>
+      workingFileById.has(file.id) || file.libraryDocument?.observationSessions[0]?.status === "REJECTED");
+    if (!reviewed.length) continue;
+    await prisma.knowledgeDocumentSignal.updateMany({ data: { status: "SUPERSEDED", supersededAt: new Date() }, where: {
+      connectedLibraryId: session.connectedFolderId, generationVersion: documentSignalVersion, status: "ACTIVE",
+      OR: reviewed.map((file) => {
+        const observation = file.libraryDocument?.observationSessions[0];
+        return { fileKey: keyFor(file), signalKey: { notIn: currentSignalKeysByFile.get(keyFor(file)) ?? [] },
+          ...(["REJECTED", "MODIFIED"].includes(observation?.status ?? "") ? {} :
+            { observationSessionId: { not: observation?.id } }),
+        };
+      }),
+    } });
   }
   const currentResolved = signalRows.filter((signal) => resolvedSignalKinds.includes(signal.kind))
     .sort((left, right) =>
@@ -845,6 +813,7 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
     return correctionIdentities.get(`${fileKey}\0${checksum}\0${kind}`) ?? new Set<string>();
   };
   const correctedIdentityByFile = new Map<string, string>();
+  const supportedCorrections: typeof activeCorrections = [];
   for (const correction of activeCorrections) {
     const kind = correction.relationshipKind === "SAME_CLIENT" ? "CLIENT" :
       correction.relationshipKind === "BELONGS_TO_PROJECT" ? "PROJECT" : null;
@@ -860,7 +829,184 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
         evidence.connectedLibraryId === session.connectedFolderId &&
         typeof evidence.identityHash === "string" && targetIdentities.has(evidence.identityHash)) {
       correctedIdentityByFile.set(`${correction.sourceFileKey}:${kind}`, evidence.identityHash);
+      supportedCorrections.push(correction);
     }
+  }
+  const generatedConfirmations = prior.filter((row) => row.status === "CONFIRMED" &&
+    [relationshipGenerationVersion, documentSignalVersion].includes(row.generationVersion ?? ""));
+  const effectiveSignals = generatedConfirmations.some((row) => row.generationVersion === documentSignalVersion)
+    ? await getEffectiveDocumentSignals([session.connectedFolderId]) : [];
+  const effectiveByIdentity = new Map(effectiveSignals.map((signal) =>
+    [`${signal.fileKey}\0${signal.checksum}\0${signal.kind}\0${signal.identityHash}`, signal]));
+  const separatedPairs = new Set(prior.filter((row) => row.status === "REJECTED" &&
+    row.sourceFileKey && row.sourceChecksum && row.targetFileKey && row.targetChecksum).map((row) =>
+    `${row.relationshipKind}\0${knowledgeRelationshipPairKey(
+      { fileKey: row.sourceFileKey!, checksum: row.sourceChecksum! },
+      { fileKey: row.targetFileKey!, checksum: row.targetChecksum! })}`));
+  const confirmedPairs = new Set<string>();
+  const confirmedSubjectPairs = new Set<string>();
+  // A subject separation remains authoritative even if the generated topics/key change.
+  for (const connection of prior) {
+    if (connection.status !== "REJECTED" || connection.relationshipKind !== "RELATED_SUBJECT" ||
+        !connection.sourceFileKey || !connection.targetFileKey) continue;
+    const source = fileByKey.get(connection.sourceFileKey), target = fileByKey.get(connection.targetFileKey);
+    if (source && target && source.checksum === connection.sourceChecksum && target.checksum === connection.targetChecksum)
+      confirmedSubjectPairs.add([source.id, target.id].sort().join("\0"));
+  }
+  const typedPerFile = new Map<string, number>();
+  const subjectPerFile = new Map<string, number>();
+  const supportedConfirmedKeys = new Set<string>();
+  const endpointUsable = (file: typeof files[number] | undefined, checksum: string | null) => Boolean(file &&
+    file.checksum === checksum && !file.sourceUnavailableAt && file.readStatus === "SUPPORTED" &&
+    file.readingStatus === "READ" && file.extractionStatus === "COMPLETED" &&
+    file.libraryDocument?.observationSessions[0] && file.libraryDocument.observationSessions[0].status !== "REJECTED");
+  for (const connection of generatedConfirmations) {
+    const source = fileByKey.get(connection.sourceFileKey ?? "");
+    const target = fileByKey.get(connection.targetFileKey ?? "");
+    const evidence = connection.sourceEvidence;
+    if (!connection.relationshipKey || !endpointUsable(source, connection.sourceChecksum) ||
+        !endpointUsable(target, connection.targetChecksum) || !source || !target ||
+        !evidence || Array.isArray(evidence) || typeof evidence !== "object" ||
+        evidence.connectedLibraryId !== session.connectedFolderId) continue;
+    const pair = `${connection.relationshipKind}\0${knowledgeRelationshipPairKey(
+      { fileKey: connection.sourceFileKey!, checksum: connection.sourceChecksum! },
+      { fileKey: connection.targetFileKey!, checksum: connection.targetChecksum! })}`;
+    if (separatedPairs.has(pair)) continue;
+    let supported = false;
+    if (connection.generationVersion === relationshipGenerationVersion && connection.relationshipKind === "RELATED_SUBJECT") {
+      const left = workingFileById.get(source.id), right = workingFileById.get(target.id);
+      const topics = evidence.supportingTopics;
+      supported = Boolean(left && right && left.normalizedIdentity !== right.normalizedIdentity &&
+        (left.semanticPreview.trim() || left.sourceEvidenceText.trim() || left.trustedObservationEvidence.length) &&
+        (right.semanticPreview.trim() || right.sourceEvidenceText.trim() || right.trustedObservationEvidence.length) &&
+        Array.isArray(topics) && topics.length && topics.every((topic) => typeof topic === "string" &&
+          left.supportingTopics.includes(topic) && right.supportingTopics.includes(topic)));
+    } else if (connection.generationVersion === documentSignalVersion && typeof evidence.identityHash === "string") {
+      const kind = connection.relationshipKind === "PROBABLE_REVISION" ? "DOCUMENT_FAMILY"
+        : connection.relationshipKind?.startsWith("SAME_") ? connection.relationshipKind.slice(5) : "";
+      const left = effectiveByIdentity.get(`${connection.sourceFileKey}\0${connection.sourceChecksum}\0${kind}\0${evidence.identityHash}`);
+      const right = effectiveByIdentity.get(`${connection.targetFileKey}\0${connection.targetChecksum}\0${kind}\0${evidence.identityHash}`);
+      supported = Boolean(left && right && (kind !== "DOCUMENT_FAMILY" ||
+        (left.checksum !== right.checksum && compareDocumentVersions(left, right) !== null)));
+    }
+    if (!supported) continue;
+    supportedConfirmedKeys.add(connection.relationshipKey);
+    currentRelationshipKeys.add(connection.relationshipKey);
+    confirmedPairs.add(pair);
+    if (connection.relationshipKind === "RELATED_SUBJECT") confirmedSubjectPairs.add([source.id, target.id].sort().join("\0"));
+    for (const file of [source, target]) {
+      const key = keyFor(file);
+      typedPerFile.set(key, (typedPerFile.get(key) ?? 0) + 1);
+      subjectPerFile.set(file.id, (subjectPerFile.get(file.id) ?? 0) + 1);
+    }
+  }
+  // Human identity corrections are confirmed links too. Charge their current,
+  // checksum-bound endpoints using the correction indexes already built above.
+  for (const correction of supportedCorrections) {
+    const source = fileByKey.get(correction.sourceFileKey!), target = fileByKey.get(correction.targetFileKey!);
+    if (!source || !target || source.id === target.id || !endpointUsable(source, correction.sourceChecksum) ||
+        !endpointUsable(target, correction.targetChecksum)) continue;
+    const kind = correction.relationshipKind === "BELONGS_TO_PROJECT" ? "SAME_PROJECT" : "SAME_CLIENT";
+    const pair = `${kind}\0${knowledgeRelationshipPairKey(
+      { fileKey: correction.sourceFileKey!, checksum: correction.sourceChecksum! },
+      { fileKey: correction.targetFileKey!, checksum: correction.targetChecksum! })}`;
+    if (separatedPairs.has(pair)) continue;
+    confirmedPairs.add(pair);
+    for (const file of [source, target]) {
+      const key = keyFor(file);
+      typedPerFile.set(key, (typedPerFile.get(key) ?? 0) + 1);
+      subjectPerFile.set(file.id, (subjectPerFile.get(file.id) ?? 0) + 1);
+    }
+  }
+  for (const connection of currentRelationships) {
+    if (connection.status === "CONFIRMED" &&
+        [relationshipGenerationVersion, documentSignalVersion].includes(connection.generationVersion ?? "") &&
+        !supportedConfirmedKeys.has(connection.relationshipKey ?? "")) continue;
+    const source = connection.sourceFileKey ? fileByKey.get(connection.sourceFileKey) : null;
+    const target = connection.targetFileKey ? fileByKey.get(connection.targetFileKey) : null;
+    const evidence = connection.sourceEvidence;
+    const sourceObservationId = source?.libraryDocument?.observationSessions[0]?.id;
+    const targetObservationId = target?.libraryDocument?.observationSessions[0]?.id;
+    if (!connection.relationshipKey || !source || !target || !sourceObservationId || !targetObservationId ||
+        source.checksum !== connection.sourceChecksum || target.checksum !== connection.targetChecksum ||
+        !evidence || Array.isArray(evidence) || typeof evidence !== "object" ||
+        evidence.connectedLibraryId !== session.connectedFolderId) continue;
+    const currentEvidence = { ...evidence };
+    delete currentEvidence.previousSnapshots;
+    await upsertCurrentRelationship({ ...connection, lastSeenAt: new Date(),
+      sharedTerms: connection.sharedTerms ?? Prisma.JsonNull,
+      sourceObservationSessionId: sourceObservationId, targetObservationSessionId: targetObservationId,
+      sourceEvidence: { ...currentEvidence, sourceRelativePath: source.relativePath,
+        targetRelativePath: target.relativePath,
+        ...("sourceScannedFileId" in currentEvidence ? { sourceScannedFileId: source.id } : {}),
+        ...("targetScannedFileId" in currentEvidence ? { targetScannedFileId: target.id } : {}) },
+      relationshipKey: connection.relationshipKey });
+  }
+  for (const relationship of selectPersistentRelationships(currentIndex, subjectPerFile, confirmedSubjectPairs)) {
+    const left = byId.get(relationship.leftFileId);
+    const right = byId.get(relationship.rightFileId);
+    const leftObservationId = left?.libraryDocument?.observationSessions[0]?.id;
+    const rightObservationId = right?.libraryDocument?.observationSessions[0]?.id;
+    if (!endpointUsable(left, left?.checksum ?? null) || !endpointUsable(right, right?.checksum ?? null) ||
+        !left || !right || !leftObservationId || !rightObservationId ||
+        left.libraryDocument?.observationSessions[0]?.status === "REJECTED" ||
+        right.libraryDocument?.observationSessions[0]?.status === "REJECTED" ||
+        leftObservationId === rightObservationId || !left.checksum || !right.checksum) {
+      continue;
+    }
+
+    const ordered = [
+      { file: left, key: keyFor(left), observationId: leftObservationId },
+      { file: right, key: keyFor(right), observationId: rightObservationId },
+    ].sort((a, b) => a.key.localeCompare(b.key));
+    const [source, target] = ordered;
+    const relationshipKey = digest([
+      relationshipGenerationVersion,
+      source.key, source.file.checksum,
+      target.key, target.file.checksum,
+      ...relationship.supportingTopics.slice().sort(),
+    ].join("\0"));
+    currentRelationshipKeys.add(relationshipKey);
+    typedPerFile.set(source.key, (typedPerFile.get(source.key) ?? 0) + 1);
+    typedPerFile.set(target.key, (typedPerFile.get(target.key) ?? 0) + 1);
+    const evidence = {
+      connectedLibraryId: session.connectedFolderId,
+      evidenceKinds: relationship.evidenceKinds,
+      sourceScannedFileId: source.file.id,
+      sourceRelativePath: source.file.relativePath,
+      sourceRanges: verifiedRanges(
+        workingFileById.get(source.file.id)?.sourceEvidenceText ?? "",
+        relationship.sharedTerms,
+      ),
+      targetScannedFileId: target.file.id,
+      targetRelativePath: target.file.relativePath,
+      targetRanges: verifiedRanges(
+        workingFileById.get(target.file.id)?.sourceEvidenceText ?? "",
+        relationship.sharedTerms,
+      ),
+      supportingTopics: relationship.supportingTopics,
+    };
+    const data = {
+      confidence: relationship.confidence,
+      generationVersion: relationshipGenerationVersion,
+      lastSeenAt: new Date(),
+      reasoning: "These files appear related through independently supported subjects. Review the source observations before drawing a conclusion.",
+      relationshipKind: "RELATED_SUBJECT",
+      sharedTerms: relationship.sharedTerms.slice(0, 5),
+      similarityScore: relationship.confidence,
+      sourceChecksum: source.file.checksum,
+      sourceEvidence: evidence,
+      sourceFileKey: source.key,
+      targetChecksum: target.file.checksum,
+      targetFileKey: target.key,
+    };
+    await upsertCurrentRelationship({
+      ...data,
+      relationshipKey,
+      sourceObservationSessionId: source.observationId,
+      targetObservationSessionId: target.observationId,
+    });
+    persisted += 1;
   }
   const currentByIdentity = new Map<string, typeof currentResolved>();
   for (const signal of currentResolved) {
@@ -870,7 +1016,6 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
     currentByIdentity.set(key, members);
   }
   const candidateKeys = [...currentByIdentity.values()].map((members) => members[0]);
-  const typedPerFile = new Map<string, number>();
   const seenPairs = new Set<string>();
   for (let offset = 0; offset < candidateKeys.length; offset += 50) {
     const chunk = candidateKeys.slice(offset, offset + 50);
@@ -891,7 +1036,8 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
         },
       });
       for (const candidate of candidates) {
-        if (checksumByKey.get(candidate.fileKey) !== candidate.checksum) continue;
+        const file = fileByKey.get(candidate.fileKey);
+        if (!endpointUsable(file, candidate.checksum)) continue;
         const key = `${candidate.kind}:${candidate.identityHash}`;
         const members = byIdentity.get(key) ?? [];
         members.push(candidate);
@@ -932,7 +1078,8 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
         const kind = current.kind === "DOCUMENT_FAMILY" ? "PROBABLE_REVISION" : `SAME_${current.kind}`;
         const relationshipKey = digest([documentSignalVersion, kind, current.identityHash,
           source.fileKey, source.checksum, target.fileKey, target.checksum].join("\0"));
-        if (seenPairs.has(relationshipKey)) continue;
+        const pair = `${kind}\0${knowledgeRelationshipPairKey(source, target)}`;
+        if (confirmedPairs.has(pair) || separatedPairs.has(pair) || seenPairs.has(relationshipKey)) continue;
         seenPairs.add(relationshipKey);
         currentRelationshipKeys.add(relationshipKey);
         const order = current.kind === "DOCUMENT_FAMILY" ? compareDocumentVersions(source, target) : null;
@@ -972,25 +1119,17 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
       }
     }
   }
-  const processedExplicitFileKinds = new Set(currentResolved.map((signal) => `${signal.fileKey}:${signal.kind}`));
-  const isProcessedExplicitConnection = (connection: typeof prior[number]) => {
-    if (connection.generationVersion !== documentSignalVersion) return false;
-    const kind = connection.relationshipKind === "PROBABLE_REVISION" ? "DOCUMENT_FAMILY"
-      : connection.relationshipKind?.startsWith("SAME_") ? connection.relationshipKind.slice(5) : null;
-    return Boolean(kind && (processedExplicitFileKinds.has(`${connection.sourceFileKey}:${kind}`) ||
-      processedExplicitFileKinds.has(`${connection.targetFileKey}:${kind}`)));
-  };
-  const noLongerSupported = prior.filter((connection) =>
-    (connection.generationVersion === relationshipGenerationVersion || isProcessedExplicitConnection(connection)) &&
-    connection.relationshipKey &&
-    connection.sourceFileKey && checksumByKey.has(connection.sourceFileKey) &&
-    connection.targetFileKey && checksumByKey.has(connection.targetFileKey) &&
-    !currentRelationshipKeys.has(connection.relationshipKey),
-  ).map((connection) => connection.id);
-  if (noLongerSupported.length > 0) {
-    await updateConnections(noLongerSupported, "NEW", { status: "ARCHIVED", supersededAt: new Date() });
-    await updateConnections(noLongerSupported, "CONFIRMED", { supersededAt: new Date() });
-  }
+  const generated = (connection: typeof prior[number]) =>
+    [relationshipGenerationVersion, documentSignalVersion].includes(connection.generationVersion ?? "");
+  const evaluatedKeys = new Set(files.filter((file) => workingFileById.has(file.id) ||
+    file.libraryDocument?.observationSessions[0]?.status === "REJECTED").map(keyFor));
+  const absentProposals = prior.filter((connection) => generated(connection) && connection.status === "NEW" &&
+    (evaluatedKeys.has(connection.sourceFileKey ?? "") || evaluatedKeys.has(connection.targetFileKey ?? "")) &&
+    connection.relationshipKey && !currentRelationshipKeys.has(connection.relationshipKey)).map((connection) => connection.id);
+  const invalidConfirmations = generatedConfirmations.filter((connection) =>
+    !connection.supersededAt && (!connection.relationshipKey || !supportedConfirmedKeys.has(connection.relationshipKey))).map((connection) => connection.id);
+  await updateConnections(absentProposals, "NEW", { status: "ARCHIVED", supersededAt: new Date() });
+  await updateConnections(invalidConfirmations, "CONFIRMED", { supersededAt: new Date() });
   return persisted;
 }
 

@@ -327,10 +327,11 @@ async function repeatCloudScan(root: Awaited<ReturnType<typeof createCloudBacked
   return { result, session };
 }
 
-async function withMockObserver(run: (requestCount: () => number) => Promise<void>, delayMs = 0, failFirstRequests = 0, incompleteFirstRequests = 0) {
+async function withMockObserver(run: (requestCount: () => number) => Promise<void>, delayMs = 0, failFirstRequests = 0, incompleteFirstRequests = 0, onRequest?: (number: number) => Promise<void>) {
   let requests = 0;
   const server = createServer(async (_request, response) => {
     requests += 1;
+    if (onRequest) await onRequest(requests);
     if (requests <= failFirstRequests) {
       response.writeHead(503, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: { message: "Local test failure" } }));
@@ -873,12 +874,19 @@ test("partial observations are not reused and simultaneous reports claim paid wo
       where: { id: secondFile.id },
     });
     const nativeResult = bridgeJson(await readBridgeRootFile(root.root.id, secondFile.relativePath));
-    const reports = await Promise.all([0, 1].map(() => prepareBridgeCommandReportForPersistence(
+    const reports = await Promise.allSettled([0, 1].map(() => prepareBridgeCommandReportForPersistence(
       root.device.bridgeDeviceId,
       { commandId: command.commandId, result: nativeResult, safeErrorCategory: null, status: "COMPLETED" },
     )));
     assert.equal(requestCount(), 2);
-    assert.equal(reports.some((report) => (report.result as Record<string, unknown>)?.observationPrepared === true), true);
+    assert.equal(reports.filter((report) => report.status === "fulfilled").length, 1);
+    const loser = reports.find((report) => report.status === "rejected");
+    assert.ok(loser && loser.reason.code === "OBSERVATION_IN_PROGRESS");
+    assert.notEqual((await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: command.commandId } })).status, "COMPLETED");
+    const retry = await prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId,
+      { commandId: command.commandId, result: nativeResult, safeErrorCategory: null, status: "COMPLETED" });
+    assert.equal((retry.result as Record<string, unknown>).observationReused, true);
+    await completeBridgeCloudCommand(root.device.bridgeDeviceId, retry);
     assert.equal(await prisma.observationSession.count({
       where: { libraryDocument: { scannedFiles: { some: { id: secondFile.id } } } },
     }), 1);
@@ -1226,3 +1234,168 @@ test("an incomplete provider response is reviewable but never reused as complete
     assert.equal(requestCount(), 1);
   }, 0, 0, 1);
 });
+
+async function observationLeaseFixture() {
+  const root = await createCloudBackedBridgeRoot("LEASE", new Map([["notes.txt", Buffer.from("Workshop facilitation notes.")]]));
+  const file = await scannedFile(root.session.id, "notes.txt");
+  const command = await readCommandFor(file.id);
+  assert.ok(command);
+  await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, command.commandId);
+  const report = { commandId: command.commandId, result: bridgeJson(await readBridgeRootFile(root.root.id, file.relativePath)),
+    safeErrorCategory: null, status: "COMPLETED" as const };
+  return { root, file, command, report };
+}
+
+test("observation lease recent abandoned claim stays retryable at prepare, completion and timeout boundaries", async () => {
+  const { root, file, command, report } = await observationLeaseFixture();
+  const lease = new Date();
+  await prisma.scannedFile.update({ data: { processingStage: "READ", readingStatus: "READ",
+    extractionStatus: "COMPLETED", observationClaimedAt: lease }, where: { id: file.id } });
+  await assert.rejects(prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report),
+    (error: unknown) => (error as { code: string }).code === "OBSERVATION_IN_PROGRESS");
+  await assert.rejects(completeBridgeCloudCommand(root.device.bridgeDeviceId, report),
+    (error: unknown) => (error as { code: string }).code === "OBSERVATION_IN_PROGRESS");
+  await prisma.bridgeCommand.update({ data: { expiresAt: new Date(Date.now() - 1) }, where: { commandId: command.commandId } });
+  await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId);
+  assert.equal((await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: command.commandId } })).status, "ACKNOWLEDGED");
+  const current = await scannedFile(root.session.id, file.relativePath);
+  assert.equal(current.processingStage, "READ");
+  assert.equal(current.observationClaimedAt?.getTime(), lease.getTime());
+  assert.equal(current.libraryDocumentId, null);
+  assert.equal(current.organizationSuggestions.length, 0);
+  assert.equal((await getBridgeScanSessionProgress(root.session.id))?.progress.remainingFiles, 1);
+});
+
+for (const interrupted of ["ACKNOWLEDGED", "COMPLETED", "FAILED"] as const) {
+  test(`observation lease restart recovers stale ${interrupted} command through bounded native read admission`, async () => {
+    const { root, file, command } = await observationLeaseFixture();
+    await prisma.scannedFile.update({ data: { processingStage: interrupted === "ACKNOWLEDGED" ? "READING" : "READ",
+      readingStatus: interrupted === "ACKNOWLEDGED" ? "NOT_READ" : "READ", extractionStatus: "COMPLETED",
+      observationClaimedAt: new Date(Date.now() - 11 * 60_000) }, where: { id: file.id } });
+    await prisma.bridgeCommand.update({ data: { status: interrupted }, where: { commandId: command.commandId } });
+    const recovered = await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId);
+    assert.equal(recovered.length, 1);
+    assert.notEqual(recovered[0].commandId, command.commandId);
+    assert.deepEqual((await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId)).map((row) => row.commandId),
+      recovered.map((row) => row.commandId));
+    await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, recovered[0].commandId);
+    const report = { commandId: recovered[0].commandId, result: bridgeJson(await readBridgeRootFile(root.root.id, file.relativePath)),
+      safeErrorCategory: null, status: "COMPLETED" as const };
+    const prepared = await prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report);
+    await completeBridgeCloudCommand(root.device.bridgeDeviceId, prepared);
+    const final = await scannedFile(root.session.id, file.relativePath);
+    assert.ok(["EXAMINED", "SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"].includes(final.processingStage));
+    assert.equal(final.observationClaimedAt, null);
+    assert.equal(await prisma.observationSession.count({ where: { libraryDocumentId: final.libraryDocumentId! } }), 1);
+    assert.equal((await getBridgeScanSessionProgress(root.session.id))?.progress.remainingFiles, 0);
+  });
+}
+
+test("observation lease publication failure is atomic, clears only its owner and permits retry", async () => {
+  const { root, file, report } = await observationLeaseFixture();
+  await prisma.$executeRawUnsafe(`CREATE FUNCTION "${testSchemaName}".fail_observation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected observation publication failure'; END $$`);
+  await prisma.$executeRawUnsafe(`CREATE TRIGGER fail_observation BEFORE INSERT ON "${testSchemaName}"."ObservationSession" FOR EACH ROW EXECUTE FUNCTION "${testSchemaName}".fail_observation()`);
+  try {
+    await assert.rejects(prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report), /injected observation publication failure/);
+    const failed = await scannedFile(root.session.id, file.relativePath);
+    assert.equal(failed.observationClaimedAt, null);
+    assert.equal(failed.processingStage, "EXAMINING");
+    assert.equal(await prisma.observationSession.count(), 0);
+  } finally {
+    await prisma.$executeRawUnsafe(`DROP TRIGGER fail_observation ON "${testSchemaName}"."ObservationSession"`);
+    await prisma.$executeRawUnsafe(`DROP FUNCTION "${testSchemaName}".fail_observation()`);
+  }
+  const prepared = await prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report);
+  await completeBridgeCloudCommand(root.device.bridgeDeviceId, prepared);
+  assert.equal((await scannedFile(root.session.id, file.relativePath)).observationClaimedAt, null);
+});
+
+test("observation lease expired worker cannot publish or clear replacement owner", async () => {
+  let enteredA!: () => void, enteredB!: () => void, releaseA!: () => void, releaseB!: () => void;
+  const entryA = new Promise<void>((resolve) => { enteredA = resolve; });
+  const entryB = new Promise<void>((resolve) => { enteredB = resolve; });
+  const gateA = new Promise<void>((resolve) => { releaseA = resolve; });
+  const gateB = new Promise<void>((resolve) => { releaseB = resolve; });
+  await withMockObserver(async () => {
+    const { root, file, report } = await observationLeaseFixture();
+    const first = prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report);
+    const rejected = assert.rejects(first, /lease ownership changed/);
+    await entryA;
+    await prisma.scannedFile.update({ data: { observationClaimedAt: new Date(Date.now() - 11 * 60_000) }, where: { id: file.id } });
+    const replacement = prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report);
+    await entryB;
+    const owned = (await scannedFile(root.session.id, file.relativePath)).observationClaimedAt;
+    assert.ok(owned);
+    releaseA(); await rejected;
+    assert.equal((await scannedFile(root.session.id, file.relativePath)).observationClaimedAt?.getTime(), owned.getTime());
+    assert.equal(await prisma.observationSession.count(), 0);
+    releaseB();
+    await completeBridgeCloudCommand(root.device.bridgeDeviceId, await replacement);
+    assert.equal(await prisma.observationSession.count(), 1);
+    assert.equal((await scannedFile(root.session.id, file.relativePath)).observationClaimedAt, null);
+  }, 0, 0, 0, async (number) => {
+    if (number === 1) { enteredA(); await gateA; }
+    if (number === 2) { enteredB(); await gateB; }
+  });
+});
+
+for (const scenario of ["approved-rejected", "rejected-approved", "approved-modified", "awaiting-rejected", "awaiting-control", "tie", "incomplete", "absent", "candidate", "fingerprint", "root", "path", "size"] as const) {
+  test(`authoritative reuse ${scenario} follows latest review and exact fingerprint guards`, async () => {
+    await withMockObserver(async () => {
+      const root = await createCloudBackedBridgeRoot("REUSE_AUTHORITY", new Map([["notes.txt", Buffer.from("Workshop facilitation notes.")]]));
+      const source = await scannedFile(root.session.id, "notes.txt");
+      await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId, bridgeRootId: root.root.id,
+        relativePath: source.relativePath, scannedFileId: source.id });
+      const file = await scannedFile(root.session.id, source.relativePath);
+      const original = await prisma.observationSession.findFirstOrThrow({ where: { libraryDocumentId: file.libraryDocumentId! } });
+      const status = scenario === "rejected-approved" ? "APPROVED" : scenario === "approved-modified" ? "MODIFIED" : "REJECTED";
+      await prisma.observationSession.update({ data: { status: ["awaiting-rejected", "awaiting-control"].includes(scenario) ? "AWAITING_REVIEW"
+        : scenario === "rejected-approved" ? "REJECTED" : "APPROVED", createdAt: new Date("2025-01-01") }, where: { id: original.id } });
+      if (["approved-rejected", "rejected-approved", "approved-modified", "awaiting-rejected", "tie", "incomplete", "candidate"].includes(scenario)) {
+        const latest = await prisma.observationSession.create({ data: {
+          id: scenario === "tie" ? "zz-latest-authority" : randomUUID(), libraryDocumentId: file.libraryDocumentId!,
+          observerType: "OPENAI", status: scenario === "incomplete" ? "AWAITING_REVIEW" : status,
+          observations: scenario === "incomplete" ? [] : bridgeJson(original.observations)!, interpretations: [],
+          explanation: [], planSuggestions: [], warnings: [], createdAt: new Date(scenario === "tie" ? "2025-01-01" : "2025-01-02"),
+        } });
+        if (scenario === "approved-modified") await prisma.humanDecision.create({ data: {
+          observationSessionId: latest.id, decisionType: "MODIFY", editedSuggestion: "Client: Corrected Alice; Client ID: C-901", note: "Authoritative correction" } });
+        if (scenario === "candidate") {
+          // The old eligible fingerprint exists, but the newest candidate's document is rejected.
+          const olderDocument = await prisma.libraryDocument.create({ data: { batchId: (await prisma.libraryDocument.findUniqueOrThrow({ where: { id: file.libraryDocumentId! } })).batchId,
+            normalizedFileName: "older.txt", originalFileName: "older.txt" } });
+          await prisma.observationSession.create({ data: { libraryDocumentId: olderDocument.id, observerType: "OPENAI", status: "APPROVED",
+            observations: bridgeJson(original.observations)!, interpretations: [], explanation: [], planSuggestions: [], warnings: [] } });
+          await prisma.scannedFile.create({ data: { checksum: file.checksum, extractionStatus: "COMPLETED", fileType: file.fileType,
+            libraryDocumentId: olderDocument.id, localPath: file.localPath, relativePath: file.relativePath, sessionId: file.sessionId,
+            observationFingerprint: file.observationFingerprint, observationOrigin: "NEW_AI", processingStage: "EXAMINED",
+            readingStatus: "READ", readStatus: "SUPPORTED", sizeBytes: file.sizeBytes, previewText: file.previewText,
+            characterCount: file.characterCount, createdAt: new Date("2024-01-01") } });
+        }
+      }
+      if (scenario === "absent") await prisma.observationSession.deleteMany({ where: { libraryDocumentId: file.libraryDocumentId! } });
+      if (scenario === "fingerprint") await prisma.scannedFile.update({ data: { observationFingerprint: "wrong" }, where: { id: file.id } });
+      if (scenario === "path") await prisma.scannedFile.update({ data: { localPath: "bridge://wrong/path" }, where: { id: file.id } });
+      if (scenario === "size") await prisma.scannedFile.update({ data: { sizeBytes: BigInt(999) }, where: { id: file.id } });
+      if (scenario === "root") {
+        const other = await createCloudBackedBridgeRoot("OTHER_REUSE_ROOT", new Map([["notes.txt", Buffer.from("Workshop facilitation notes.")]]));
+        const excluded = await scannedFile(other.session.id, "notes.txt");
+        assert.equal(excluded.libraryDocumentId, null); assert.equal(excluded.observationOrigin, null);
+        return;
+      }
+      const next = await repeatCloudScan(root);
+      const target = await scannedFile(next.session.id, file.relativePath);
+      const allowed = ["rejected-approved", "approved-modified", "awaiting-control"].includes(scenario);
+      assert.equal(target.observationOrigin === "REUSED_AI", allowed);
+      if (allowed) {
+        assert.equal(target.libraryDocumentId, file.libraryDocumentId);
+        if (scenario === "approved-modified") assert.ok((await loadScanWorkingKnowledge(next.session.id)).files
+          .some((item) => item.trustedObservationEvidence.some((evidence) => evidence.includes("Corrected Alice"))));
+      } else {
+        assert.equal(target.libraryDocumentId, null);
+        assert.equal(target.processingStage, "READING");
+        assert.ok(!(await loadScanWorkingKnowledge(next.session.id)).files.some((item) => item.sourceEvidenceText.includes("Possible workshop notes")));
+      }
+    });
+  });
+}

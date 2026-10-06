@@ -1,3 +1,5 @@
+import { latestObservationOrder, observationLeaseMs, usableObservation } from "./observation-authority";
+import { recoverAbandonedObservationFilesForDevice } from "./observation-recovery";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
@@ -297,7 +299,20 @@ export async function markRemoteReadFailure(input: {
   const unsupported = category === "UNSUPPORTED_FILE_TYPE";
   const sourceMissing = category === "FILE_NOT_FOUND";
   const message = remoteReadFailureMessageFor(category, file.relativePath);
-  const updated = await prisma.scannedFile.update({
+  return prisma.$transaction(async (tx) => {
+    // Lock before reading completion/lease authority; failure reports do not own an observation lease.
+    await tx.scannedFile.updateMany({ data: { observationClaimedAt: null },
+      where: { id: input.scannedFileId, observationClaimedAt: null } });
+    const current = await tx.scannedFile.findUniqueOrThrow({ where: { id: input.scannedFileId },
+      include: { libraryDocument: { select: { observationSessions: {
+        orderBy: [...latestObservationOrder], take: 1, select: { status: true },
+      } } } },
+    });
+    if (usableObservation(current.libraryDocument?.observationSessions[0]) &&
+        ["EXAMINED", "SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"].includes(current.processingStage)) return current;
+    if (current.observationClaimedAt) throw new BridgeCloudError(
+      "Observation preparation owns this file. Retry this report.", 503, "OBSERVATION_IN_PROGRESS");
+    return tx.scannedFile.update({
     data: {
       extractedAt: new Date(),
       extractionErrorCategory: category,
@@ -317,7 +332,7 @@ export async function markRemoteReadFailure(input: {
     },
   });
 
-  return updated;
+  });
 }
 
 export async function queueRemoteReadCommand(input: RemoteReadCommandInput, prisma?: Prisma.TransactionClient) {
@@ -765,11 +780,13 @@ async function finalizeRemoteReadSessionIfComplete(sessionId: string) {
 export async function expireRemoteReadCommandsForSession(
   sessionId: string,
   now = new Date(),
+  recoverObservations = true,
 ) {
   const prisma = getPrismaClient();
   const commands = await prisma.bridgeCommand.findMany({
     where: {
       commandType: "READ_FILE_TEMPORARILY",
+      payload: { path: ["scanSessionId"], equals: sessionId },
       expiresAt: {
         lte: now,
       },
@@ -787,6 +804,10 @@ export async function expireRemoteReadCommandsForSession(
     );
   });
 
+  if (recoverObservations) for (const deviceId of new Set(expiredCommands.map((command) => command.bridgeDeviceId))) {
+    await recoverAbandonedObservationFilesForDevice(deviceId, now);
+  }
+  let expired = 0;
   for (const command of expiredCommands) {
     const payload = objectValue(command.payload);
     const scannedFileId =
@@ -796,28 +817,37 @@ export async function expireRemoteReadCommandsForSession(
       continue;
     }
 
-    await prisma.bridgeCommand.update({
+    const currentCommand = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: command.commandId } });
+    if (!activeReadCommandStatuses.includes(currentCommand.status as typeof activeReadCommandStatuses[number])) continue;
+    const currentFile = await prisma.scannedFile.findUnique({ where: { id: scannedFileId } });
+    if (currentFile?.observationClaimedAt ||
+        ["READ", "EXAMINING", "OBSERVING"].includes(currentFile?.processingStage ?? "")) continue;
+    let settledFile;
+    try {
+      settledFile = await markRemoteReadFailure({ safeErrorCategory: "READ_COMMAND_TIMEOUT", scanSessionId: sessionId, scannedFileId });
+    } catch (error) {
+      if (error instanceof BridgeCloudError && error.code === "OBSERVATION_IN_PROGRESS") continue;
+      throw error;
+    }
+    const settled = settledFile && ["EXAMINED", "SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"].includes(settledFile.processingStage);
+    await prisma.bridgeCommand.updateMany({
       data: {
         completedAt: now,
-        safeErrorCategory: "READ_COMMAND_TIMEOUT",
-        status: "EXPIRED",
+        safeErrorCategory: settled ? null : "READ_COMMAND_TIMEOUT",
+        status: settled ? "COMPLETED" : "EXPIRED",
       },
       where: {
-        commandId: command.commandId,
+        commandId: command.commandId, status: { in: [...activeReadCommandStatuses] },
       },
     });
-    await markRemoteReadFailure({
-      safeErrorCategory: "READ_COMMAND_TIMEOUT",
-      scanSessionId: sessionId,
-      scannedFileId,
-    });
+    expired++;
   }
 
   if (expiredCommands.length > 0) {
     await finalizeRemoteReadSessionIfComplete(sessionId);
   }
 
-  return expiredCommands.length;
+  return expired;
 }
 
 export async function queueRemoteReadRetryForScannedFile(scannedFileId: string) {
@@ -847,6 +877,9 @@ export async function queueRemoteReadRetryForScannedFile(scannedFileId: string) 
     );
   }
 
+  if (scannedFile.observationClaimedAt && scannedFile.observationClaimedAt.getTime() > Date.now() - observationLeaseMs) {
+    throw new BridgeCloudError("Observation preparation is still in progress. Retry later.", 503, "OBSERVATION_IN_PROGRESS");
+  }
   const library = scannedFile.scanSession.connectedFolder;
 
   if (!library.bridgeDeviceId) {

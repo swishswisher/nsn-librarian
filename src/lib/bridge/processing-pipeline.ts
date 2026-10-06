@@ -1,3 +1,4 @@
+import { latestObservationOrder, usableObservation } from "./observation-authority";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { ObservationSessionError } from "@/lib/library/observation-sessions";
 
@@ -179,7 +180,7 @@ function fileNeedsProcessing(
   file: {
     extractionStatus: string;
     libraryDocument: {
-      observationSessions: { id: string }[];
+      observationSessions: { id: string; status: string }[];
     } | null;
     organizationSuggestions: { id: string; suggestionType: string }[];
     processedAt: Date | null;
@@ -189,7 +190,7 @@ function fileNeedsProcessing(
   options: ProcessingOptions,
 ) {
   const hasObservation =
-    (file.libraryDocument?.observationSessions.length ?? 0) > 0;
+    usableObservation(file.libraryDocument?.observationSessions[0]);
   const hasCurrentRecommendations = file.organizationSuggestions.length > 0;
 
   if (file.processingStage === "FAILED") {
@@ -238,8 +239,9 @@ async function nextSupportedFileForProcessing(
       libraryDocument: {
         select: {
           observationSessions: {
+            orderBy: [...latestObservationOrder],
             select: {
-              id: true,
+              id: true, status: true,
             },
             take: 1,
           },
@@ -297,8 +299,9 @@ async function fileAlreadyExamined(scannedFileId: string) {
       libraryDocument: {
         select: {
           observationSessions: {
+            orderBy: [...latestObservationOrder],
             select: {
-              id: true,
+              id: true, status: true,
             },
             take: 1,
           },
@@ -310,7 +313,7 @@ async function fileAlreadyExamined(scannedFileId: string) {
     },
   });
 
-  return (file?.libraryDocument?.observationSessions.length ?? 0) > 0;
+  return usableObservation(file?.libraryDocument?.observationSessions[0]);
 }
 
 async function processOneScannedFile(sessionId: string, scannedFileId: string) {

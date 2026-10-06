@@ -472,6 +472,8 @@ export async function createObservationSessionFromReadableDocument(
   document: ReadableObservationDocument,
   source: MindInput["source"] = "READING_ROOM",
   readWarnings: string[] = [],
+  persist?: (data: Prisma.ObservationSessionCreateInput,
+    observed: Awaited<ReturnType<typeof observeWithOpenAIOrFallback>>) => Promise<{ id: string }>,
 ) {
   if (!document.rawText || document.rawText.trim().length === 0) {
     throw new ObservationSessionError(unreadObservationMessage, 409);
@@ -488,22 +490,19 @@ export async function createObservationSessionFromReadableDocument(
     warnings: [...result.warnings, ...readWarnings.slice(0, 20)],
   };
 
-  const session = await prisma.observationSession.create({
-    data: {
-      libraryDocumentId: document.id,
-      observerType,
-      status: "AWAITING_REVIEW",
-      observations: toJsonInput(observedResult.observations),
-      interpretations: toJsonInput(observedResult.interpretations),
-      explanation: toJsonInput(observedResult.explanation),
-      planSuggestions: toJsonInput(observedResult.planSuggestions),
-      confidence: observedResult.overallConfidence,
-      warnings: toJsonInput(observedResult.warnings),
-    },
-    select: {
-      id: true,
-    },
-  });
+  const data: Prisma.ObservationSessionCreateInput = {
+    libraryDocument: { connect: { id: document.id } },
+    observerType,
+    status: "AWAITING_REVIEW",
+    observations: toJsonInput(observedResult.observations),
+    interpretations: toJsonInput(observedResult.interpretations),
+    explanation: toJsonInput(observedResult.explanation),
+    planSuggestions: toJsonInput(observedResult.planSuggestions),
+    confidence: observedResult.overallConfidence,
+    warnings: toJsonInput(observedResult.warnings),
+  };
+  const session = persist ? await persist(data, observed) :
+    await prisma.observationSession.create({ data, select: { id: true } });
   const connectionCount = await createKnowledgeConnectionsForSession(session.id);
 
   return {

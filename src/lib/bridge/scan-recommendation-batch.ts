@@ -1,3 +1,4 @@
+import { latestObservationOrder, usableObservation } from "./observation-authority";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { recordScanSessionNotebookEntry } from "@/lib/library/notebook";
 import { indexScanKnowledge } from "@/lib/library/search-index";
@@ -106,10 +107,13 @@ export async function generateScanRecommendationBatch(
 ) {
   const prisma = getPrismaClient();
   const workingKnowledge = await loadScanWorkingKnowledge(sessionId);
-  const files = await prisma.scannedFile.findMany({
+  const candidates = await prisma.scannedFile.findMany({
     orderBy: { relativePath: "asc" },
     select: {
       fileType: true,
+      libraryDocument: { select: { observationSessions: {
+        orderBy: [...latestObservationOrder], take: 1, select: { status: true },
+      } } },
       id: true,
       previewText: true,
       relativePath: true,
@@ -122,6 +126,7 @@ export async function generateScanRecommendationBatch(
       sessionId,
     },
   });
+  const files = candidates.filter((file) => usableObservation(file.libraryDocument?.observationSessions[0]));
   let createdCount = 0;
   let existingCount = 0;
   let failedCount = 0;

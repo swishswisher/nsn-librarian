@@ -1,3 +1,4 @@
+import { latestScannedFileObservation, observationLeaseMs, usableObservation, withOwnedObservationLease } from "./observation-authority";
 import path from "node:path";
 
 import type {
@@ -541,8 +542,8 @@ function remoteReadResult(value: unknown) {
 async function storeRemoteReadAudioMetadata(
   scannedFileId: string,
   metadata: RemoteAudioReadMetadata,
+  prisma: Prisma.TransactionClient = getPrismaClient(),
 ) {
-  const prisma = getPrismaClient();
   const data = {
     audioFingerprint: metadata.audioFingerprint,
     bitrateKbps: metadata.bitrateKbps,
@@ -581,8 +582,8 @@ async function storeRemoteReadAudioMetadata(
 async function storeRemoteReadVideoMetadata(
   scannedFileId: string,
   metadata: RemoteVideoReadMetadata,
+  prisma: Prisma.TransactionClient = getPrismaClient(),
 ) {
-  const prisma = getPrismaClient();
   const data = {
     bitrateKbps: metadata.bitrateKbps,
     chapterSuggestions: jsonInput(metadata.chapterSuggestions),
@@ -627,17 +628,18 @@ async function storeRemoteReadVideoMetadata(
 async function storeRemoteReadMediaMetadata(
   scannedFileId: string,
   result: ReturnType<typeof remoteReadResult>,
+  prisma: Prisma.TransactionClient = getPrismaClient(),
 ) {
   if (result.audioMetadata) {
-    await storeRemoteReadAudioMetadata(scannedFileId, result.audioMetadata);
+    await storeRemoteReadAudioMetadata(scannedFileId, result.audioMetadata, prisma);
   }
 
   if (result.videoMetadata) {
-    await storeRemoteReadVideoMetadata(scannedFileId, result.videoMetadata);
+    await storeRemoteReadVideoMetadata(scannedFileId, result.videoMetadata, prisma);
   }
 
   if (result.fileType.startsWith("IMAGE_")) {
-    await getPrismaClient().imageAssetMetadata.upsert({
+    await prisma.imageAssetMetadata.upsert({
       create: {
         format: result.fileType.replace("IMAGE_", "").toLowerCase(),
         humanLabels: jsonInput([]),
@@ -720,108 +722,71 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown): 
     } satisfies BridgeJson;
   }
 
-  await prisma.scannedFile.update({
-    data: {
-      characterCount: result.characterCount,
-      extractedAt: new Date(),
-      extractionErrorCategory: null,
-      extractionStatus: "COMPLETED",
-      previewText: result.extractedText.slice(0, 2_000),
-      processingErrorCategory: null,
-      processingStage: "READ",
-      readingStatus: "READ",
-    },
-    where: { id: scannedFileId },
-  });
-  await storeRemoteReadMediaMetadata(scannedFileId, result);
-  const detail = await getBridgeScanSessionDetail(scanSessionId);
-  const file = detail?.scannedFiles.find((item) => item.id === scannedFileId);
-
-  if (!file) {
-    throw new BridgeCloudError(
-      "The Librarian could not refresh the scanned file.",
-      404,
-    );
-  }
-
-  const readResult: BridgeReadFileApiSuccess = {
-    file,
-    ok: true,
-    preview: {
-      characterCount: result.characterCount,
-      extractedText: result.extractedText,
-      fileName: result.fileName,
-      fileType: result.fileType,
-      relativePath: result.relativePath,
-      scannedFileId,
-      sourceChecksum: result.sourceChecksum,
-      warnings: result.warnings,
-    },
-  };
-  const observationReused = file.hasObservation;
-
-  if (observationReused) {
-    await prisma.scannedFile.update({
-      data: {
-        processedAt: new Date(),
-        processingErrorCategory: null,
-        processingStage: "EXAMINED",
-      },
-      where: {
-        id: scannedFileId,
-      },
-    });
-  } else {
-    const claimedAt = new Date();
+  const existing = await latestScannedFileObservation(scannedFileId);
+  let observationReused = usableObservation(existing?.libraryDocument?.observationSessions[0]);
+  let claimedAt: Date | undefined;
+  if (!observationReused) {
+    claimedAt = new Date();
     const claim = await prisma.scannedFile.updateMany({
       data: { observationClaimedAt: claimedAt },
-      where: {
-        id: scannedFileId,
-        OR: [
-          { observationClaimedAt: null },
-          { observationClaimedAt: { lt: new Date(claimedAt.getTime() - 10 * 60_000) } },
-        ],
-        sessionId: scanSessionId,
-      },
+      where: { id: scannedFileId, sessionId: scanSessionId, OR: [
+        { observationClaimedAt: null },
+        { observationClaimedAt: { lte: new Date(claimedAt.getTime() - observationLeaseMs) } },
+      ] },
     });
-
-    if (claim.count === 0) {
-      return {
-        characterCount: result.characterCount,
-        observationPrepared: false,
-        observationReused: false,
-        scannedFileId,
-        suggestionsCreated: 0,
-        suggestionsReused: 0,
-      } satisfies BridgeJson;
+    const current = await latestScannedFileObservation(scannedFileId);
+    observationReused = usableObservation(current?.libraryDocument?.observationSessions[0]);
+    if (!claim.count && !observationReused) {
+      // The Bridge keeps this report in its durable outbox and retries it normally.
+      // An active lease is not proof of a durable observation or command completion.
+      throw new BridgeCloudError("Observation preparation is still in progress. Retry this report.",
+        503, "OBSERVATION_IN_PROGRESS");
     }
+    if (!claim.count) claimedAt = undefined;
+  }
 
-    try {
-      const current = await prisma.scannedFile.findUnique({
-        select: {
-          libraryDocument: {
-            select: { observationSessions: { select: { id: true }, take: 1 } },
-          },
-        },
-        where: { id: scannedFileId },
+  if (observationReused) {
+    const current = await latestScannedFileObservation(scannedFileId);
+    await withOwnedObservationLease(scannedFileId, current?.observationClaimedAt ?? null, async (tx) => {
+      const authoritative = await tx.scannedFile.findUniqueOrThrow({
+        select: { processingStage: true, libraryDocument: { select: { observationSessions: {
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1, select: { status: true },
+        } } } }, where: { id: scannedFileId },
       });
-
-      if (current?.libraryDocument?.observationSessions.length) {
-        await prisma.scannedFile.update({
-          data: { observationClaimedAt: null, processingStage: "EXAMINED" },
-          where: { id: scannedFileId },
-        });
-      } else {
-        await createObservationSessionForScannedFileReadResult(
-          scannedFileId,
-          readResult,
-        );
+      if (!usableObservation(authoritative.libraryDocument?.observationSessions[0])) {
+        throw new BridgeCloudError("Observation state changed. Retry this report.", 503, "OBSERVATION_IN_PROGRESS");
       }
-    } catch (error) {
-      await prisma.scannedFile.updateMany({
-        data: { observationClaimedAt: null },
-        where: { id: scannedFileId, observationClaimedAt: claimedAt },
+      await tx.scannedFile.update({ data: {
+        characterCount: result.characterCount, extractedAt: new Date(), extractionErrorCategory: null,
+        extractionStatus: "COMPLETED", readingStatus: "READ", processedAt: new Date(),
+        processingErrorCategory: null, observationClaimedAt: null,
+        processingStage: ["SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"].includes(authoritative.processingStage)
+          ? undefined : "EXAMINED",
+      }, where: { id: scannedFileId } });
+    });
+  } else {
+    const owner = claimedAt!;
+    try {
+      await withOwnedObservationLease(scannedFileId, owner, async (tx) => {
+        await tx.scannedFile.update({ data: {
+          characterCount: result.characterCount, extractedAt: new Date(), extractionErrorCategory: null,
+          extractionStatus: "COMPLETED", previewText: result.extractedText.slice(0, 2_000),
+          processingErrorCategory: null, processingStage: "READ", readingStatus: "READ",
+        }, where: { id: scannedFileId } });
+        await storeRemoteReadMediaMetadata(scannedFileId, result, tx);
       });
+      const detail = await getBridgeScanSessionDetail(scanSessionId);
+      const file = detail?.scannedFiles.find((item) => item.id === scannedFileId);
+      if (!file) throw new BridgeCloudError("The Librarian could not refresh the scanned file.", 404);
+      const readResult: BridgeReadFileApiSuccess = { file, ok: true, preview: {
+        characterCount: result.characterCount, extractedText: result.extractedText,
+        fileName: result.fileName, fileType: result.fileType, relativePath: result.relativePath,
+        scannedFileId, sourceChecksum: result.sourceChecksum, warnings: result.warnings,
+      } };
+      await createObservationSessionForScannedFileReadResult(scannedFileId, readResult, owner);
+    } catch (error) {
+      await prisma.scannedFile.updateMany({ data: { observationClaimedAt: null },
+        where: { id: scannedFileId, observationClaimedAt: owner } });
       throw error;
     }
   }
@@ -1098,6 +1063,8 @@ export async function prepareBridgeCommandReportForPersistence(
   if (!command || command.bridgeDeviceId !== bridgeDeviceId) {
     throw new BridgeCloudError("That Bridge command could not be found.", 404);
   }
+
+  if (["COMPLETED", "FAILED", "REJECTED", "EXPIRED"].includes(command.status)) return report;
 
   if (command.commandType === "READ_FILE_TEMPORARILY") {
     if (report.status === "COMPLETED") {

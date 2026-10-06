@@ -480,12 +480,19 @@ async function queueRemoteReadBatch(input: {
   });
 
   for (const file of files) {
+    const previous = await prisma.bridgeCommand.findFirst({
+      select: { commandId: true }, orderBy: [{ issuedAt: "desc" }, { id: "desc" }],
+      where: { bridgeDeviceId: input.bridgeDeviceId, commandType: "READ_FILE_TEMPORARILY",
+        AND: [{ payload: { path: ["scannedFileId"], equals: file.id } },
+          { payload: { path: ["scanSessionId"], equals: input.scanSessionId } }],
+      },
+    });
     try {
       await queueRemoteReadCommand({
         bridgeDeviceId: input.bridgeDeviceId,
         bridgeRootId: input.bridgeRootId,
         connectedLibraryId: input.connectedLibraryId,
-        idempotencyKey: `read-file:${input.scanSessionId}:${file.id}:${file.checksum ?? "no-checksum"}`,
+        idempotencyKey: `read-file:${input.scanSessionId}:${file.id}:${file.checksum ?? "no-checksum"}:${previous?.commandId ?? "initial"}`,
         relativePath: file.relativePath,
         scanSessionId: input.scanSessionId,
         scannedFileId: file.id,

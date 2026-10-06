@@ -21,6 +21,7 @@ import {
 import { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
+import { latestScannedFileObservation, usableObservation } from "./observation-authority";
 
 const defaultOwnerId = "deanne";
 const activePairingCodeLimit = 5;
@@ -163,6 +164,7 @@ async function expirePendingCommands(now = new Date()) {
       status: "EXPIRED",
     },
     where: {
+      commandType: { not: "READ_FILE_TEMPORARILY" },
       expiresAt: {
         lte: now,
       },
@@ -783,7 +785,7 @@ export async function completeBridgeCloudCommand(
     throw new BridgeCloudError("That Bridge command could not be found.", 404);
   }
 
-  if (row.status === "COMPLETED" || row.status === "FAILED") {
+  if (["COMPLETED", "FAILED", "REJECTED", "EXPIRED"].includes(row.status)) {
     return commandEnvelopeFromRow(row);
   }
 
@@ -794,7 +796,21 @@ export async function completeBridgeCloudCommand(
     );
   }
 
-  const completed = await prisma.bridgeCommand.update({
+  if (row.commandType === "READ_FILE_TEMPORARILY" && report.status === "COMPLETED") {
+    const payload = row.payload;
+    const fileId = payload && !Array.isArray(payload) && typeof payload === "object" &&
+      typeof payload.scannedFileId === "string" ? payload.scannedFileId : null;
+    const file = fileId ? await latestScannedFileObservation(fileId) : null;
+    if (!file || !payload || Array.isArray(payload) || typeof payload !== "object" ||
+        file.sessionId !== payload.scanSessionId || file.readingStatus !== "READ" ||
+        file.extractionStatus !== "COMPLETED" || !usableObservation(file.libraryDocument?.observationSessions[0]) ||
+        !["EXAMINED", "SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"].includes(file.processingStage)) {
+      throw new BridgeCloudError("The observation is not durably complete. Retry this report.",
+        503, "OBSERVATION_IN_PROGRESS");
+    }
+  }
+
+  const completion = await prisma.bridgeCommand.updateMany({
     data: {
       completedAt: new Date(),
       result: prismaJson(report.result ?? null),
@@ -802,9 +818,11 @@ export async function completeBridgeCloudCommand(
       status: report.status,
     },
     where: {
-      commandId: report.commandId,
+      commandId: report.commandId, status: { in: ["ACKNOWLEDGED", "RUNNING"] },
     },
   });
+  const completed = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: report.commandId } });
+  if (!completion.count) return commandEnvelopeFromRow(completed);
 
   await prisma.bridgeAuditEntry.create({
     data: {

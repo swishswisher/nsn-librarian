@@ -8,6 +8,7 @@ import { getPrismaClient } from "@/lib/db/prisma";
 import { recordBridgeHeartbeat } from "./cloud-coordinator";
 import { queueNextRemoteReadBatchForDevice } from "./remote-scan-queue";
 import { expireRemoteReadCommandsForSession } from "./remote-read-commands";
+import { recoverAbandonedObservationFilesForDevice } from "./observation-recovery";
 
 function bridgeJson(value: unknown): BridgeJson {
   return JSON.parse(JSON.stringify(value)) as BridgeJson;
@@ -48,6 +49,7 @@ export async function fetchRecoverableBridgeCommands(bridgeDeviceId: string) {
   const now = new Date();
 
   await recordBridgeHeartbeat(bridgeDeviceId).catch(() => undefined);
+  await recoverAbandonedObservationFilesForDevice(bridgeDeviceId, now);
   const expiredReads = await prisma.bridgeCommand.findMany({
     select: { payload: true },
     where: {
@@ -69,7 +71,7 @@ export async function fetchRecoverableBridgeCommands(bridgeDeviceId: string) {
   }
 
   for (const sessionId of expiredSessions) {
-    await expireRemoteReadCommandsForSession(sessionId);
+    await expireRemoteReadCommandsForSession(sessionId, now, false);
   }
 
   await queueNextRemoteReadBatchForDevice(bridgeDeviceId).catch(() => undefined);
@@ -77,6 +79,7 @@ export async function fetchRecoverableBridgeCommands(bridgeDeviceId: string) {
     data: { status: "EXPIRED" },
     where: {
       bridgeDeviceId,
+      commandType: { not: "READ_FILE_TEMPORARILY" },
       expiresAt: { lte: now },
       status: { in: ["PENDING", "ACKNOWLEDGED", "RUNNING"] },
     },
