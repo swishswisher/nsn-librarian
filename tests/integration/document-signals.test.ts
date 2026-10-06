@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { compareDocumentVersions, extractDocumentSignals } from "../../src/lib/bridge/document-signals";
+import { compareDocumentVersions, extractDocumentSignals, resolveDocumentEvidence, documentSignalEntityLabels } from "../../src/lib/bridge/document-signals";
 import { versionDominanceCounts, buildVersionStateIndex } from "../../src/lib/bridge/document-version-index";
 import { RelationshipCandidatePool } from "../../src/lib/bridge/relationship-candidate-pool";
 
@@ -113,3 +113,46 @@ test("dominance oracle agrees with comparator for missing, equivalent and confli
     }
   }
 });
+
+for (const kind of ["CLIENT", "PROJECT"] as const) {
+  test(`canonical typed provenance ${kind} shares signals and bindings across evidence boundaries and ordering`, () => {
+    const label = kind === "CLIENT" ? "Client" : "Project";
+    for (const position of [9, 23, 24]) for (const conflict of [false, true]) {
+      const texts = Array.from({ length: 24 }, (_, index) => `Note: filler ${index}`);
+      texts[0] = `${label} ID: PARITY-101${conflict ? `; ${label}: Alison River` : ""}`;
+      texts[position - 1] = `${label}: ${conflict ? "Jamie Brook" : "Alison River"}`;
+      const encode = (ordered: string[]) => ordered.map((text, index) => verified(text, index * 200)).join("\n");
+      const canonical = encode(texts);
+      const resolution = resolveDocumentEvidence(canonical, "root-a");
+      const signal = resolution.signals.find((row) => row.kind === kind)!;
+      const entity = resolution.entities.find((row) => row.kind === kind)!;
+      assert.equal(entity.nameConflicting, conflict);
+      assert.deepEqual(entity.labels, conflict ? ["parity-101"] : ["parity-101", "alison river"]);
+      assert.deepEqual(extractDocumentSignals(canonical, "root-a"), resolution.signals);
+      assert.deepEqual(documentSignalEntityLabels(resolution, kind, signal.sourceRanges, false, { ...signal, connectedLibraryId: "root-a" }), entity.labels);
+      assert.deepEqual(documentSignalEntityLabels(resolution, kind, signal.sourceRanges, false, { ...signal, connectedLibraryId: "other-root" }), []);
+      const reversed = resolveDocumentEvidence(encode([...texts].reverse()), "root-a");
+      assert.deepEqual(reversed.entities.map((row) => [row.kind, row.identityHash, row.labels, row.nameConflicting]),
+        resolution.entities.map((row) => [row.kind, row.identityHash, row.labels, row.nameConflicting]));
+    }
+    for (const conflict of [false, true]) {
+      const edited = `${label} ID: EDIT-101; ${label}: Alison River${conflict ? `; ${label}: Jamie Brook` : ""}; Note: ${"x".repeat(240)}`;
+      assert.ok(edited.length > 280 && edited.length < 400);
+      const resolution = resolveDocumentEvidence(edited, "root-a", true);
+      const signal = resolution.signals.find((row) => row.kind === kind)!;
+      assert.deepEqual(signal.sourceRanges, []);
+      assert.deepEqual(documentSignalEntityLabels(resolution, kind, [], false, { ...signal, connectedLibraryId: "root-a" }),
+        conflict ? ["edit-101"] : ["edit-101", "alison river"]);
+    }
+    // Only the first 24 verified excerpts are canonical; their ordering defines
+    // window membership, while reordering within that window leaves semantics intact.
+    const outside = Array.from({ length: 25 }, (_, index) => verified(index === 0 ? `${label} ID: WINDOW-101` :
+      index === 24 ? `${label}: Outside Name` : `Note: filler ${index}`, index * 200)).join("\n");
+    assert.deepEqual(resolveDocumentEvidence(outside, "root-a").entities.find((row) => row.kind === kind)!.labels, ["window-101"]);
+    const text = `${label}: Alison River`;
+    const legacy = resolveDocumentEvidence(verified(text, 50), "root-a");
+    const legacyIdentity = { connectedLibraryId: "root-a", identityHash: "legacy-name-only" };
+    assert.deepEqual(documentSignalEntityLabels(legacy, kind, [{ start: 50, end: 50 + text.length }], false, legacyIdentity), ["alison river"]);
+    assert.deepEqual(documentSignalEntityLabels(legacy, kind, [{ start: 50, end: 49 + text.length }], false, legacyIdentity), []);
+  });
+}

@@ -408,15 +408,16 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
       const physicalIdentity = entry.checksum ? `sha256:${entry.checksum}` : entry.fileKey;
       if (physicalSeen.has(physicalIdentity)) continue;
       physicalSeen.add(physicalIdentity);
-      const excerpt = bestExcerpt(entry.sourceExcerpts, workingKnowledgeTerms(route.searchQuery));
+      const excerpt = result.entitySourceExcerpt ?? bestExcerpt(entry.sourceExcerpts, workingKnowledgeTerms(route.searchQuery));
+      const corrected = result.humanReviewedEvidence;
       const source: AnswerContextSource = { id: `S${sources.length + 1}`,
-        sourceType: excerpt ? "SOURCE_EXCERPT" : "FILE_METADATA",
+        sourceType: corrected || excerpt ? "SOURCE_EXCERPT" : "FILE_METADATA",
         title: path.posix.basename(entry.relativePath), rootName: root.displayName,
         relativePath: entry.relativePath, href: result.href,
-        trustState: entry.knowledgeState === "APPROVED" ? "Human reviewed" : "Provisional source evidence",
+        trustState: corrected ? "Human-corrected evidence" : entry.knowledgeState === "APPROVED" ? "Human reviewed" : "Provisional source evidence",
         timeState: entry.isCurrent ? "Current scan" : "Historical scan",
-        text: excerpt?.text ?? `File name: ${path.posix.basename(entry.relativePath)}`,
-        sourceRange: excerpt ? { start: excerpt.start, end: excerpt.end } : null,
+        text: corrected ?? excerpt?.text ?? `File name: ${path.posix.basename(entry.relativePath)}`,
+        sourceRange: !corrected && excerpt ? { start: excerpt.start, end: excerpt.end } : null,
         physicalIdentity, corroborationKeys: [physicalIdentity] };
       sources.push(source);
       sourceEntryById.set(source.id, entry);

@@ -5,7 +5,8 @@ import path from "node:path";
 import { after, before, mock, test } from "node:test";
 
 import { PrismaClient, type KnowledgeDocumentSignal } from "@prisma/client";
-import { documentSignalVersion, extractDocumentSignals } from "../../src/lib/bridge/document-signals";
+import { documentSignalVersion, extractDocumentSignals, resolveDocumentEvidence } from "../../src/lib/bridge/document-signals";
+import { verifiedSourceExcerpts } from "../../src/lib/ai/source-evidence";
 import { runSearchPreparationBatches } from "../../src/lib/library/search-preparation";
 import { workingKnowledgeTerms } from "../../src/lib/bridge/scan-working-knowledge";
 import type { KnowledgeWork } from "../../src/lib/bridge/knowledge-work";
@@ -83,7 +84,9 @@ async function observedFile(input: {
   } });
   const observation = await prisma.observationSession.create({ data: {
     confidence: 0.7, explanation: [], interpretations: [], libraryDocumentId: document.id,
-    observations: [], observerType: "OPENAI", planSuggestions: [], warnings: [],
+    observations: input.evidence ? [{ label: "SOURCE", evidence: verifiedSourceExcerpts(input.evidence).map((excerpt) =>
+      `Source characters ${excerpt.start}-${excerpt.end}: ${JSON.stringify(excerpt.text)}`) }] : [],
+    observerType: "OPENAI", planSuggestions: [], warnings: [],
     status: input.status ?? "AWAITING_REVIEW",
   } });
   const file = await prisma.scannedFile.create({ data: {
@@ -191,6 +194,86 @@ for (const kind of ["CLIENT", "PROJECT"] as const) {
       await prisma.knowledgeDocumentSignal.update({ where: { id: resolved.id }, data: { checksum: files[0].file.checksum!, connectedLibraryId: "wrong-root" } });
       assert.deepEqual(await search.searchLibrary(`${label} Alison River`, [r.id]), []);
       await prisma.knowledgeDocumentSignal.delete({ where: { id: resolved.id } });
+    });
+  }
+}
+
+
+function canonicalExcerpts(label: string, position: number, conflict: boolean) {
+  const texts = Array.from({ length: 24 }, (_, index) => `Note: filler ${index}`);
+  texts[conflict ? 0 : position === 23 ? 23 : 22] = `${label} ID: CANONICAL-101${conflict ? `; ${label}: Alison River` : ""}`;
+  texts[position - 1] = `${label}: ${conflict ? "Jamie Brook" : "Alison River"}`;
+  return texts.map((text, index) => `Source characters ${index * 200}-${index * 200 + text.length}: ${JSON.stringify(text)}`).join("\n");
+}
+
+for (const kind of ["CLIENT", "PROJECT"] as const) {
+  const label = kind === "CLIENT" ? "Client" : "Project";
+  for (const position of [9, 23, 24]) for (const conflict of [false, true]) {
+    test(`canonical typed provenance ${kind} Search ${conflict ? "conflict" : "unique name"} at excerpt ${position}`, async (t) => {
+      const r = await root(`${kind} canonical ${position} ${conflict}`); const s = await session(r.id);
+      t.after(async () => {
+        await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: r.id } });
+        await prisma.connectedLibrary.delete({ where: { id: r.id } });
+      });
+      const canonical = canonicalExcerpts(label, position, conflict);
+      const item = await observedFile({ rootId: r.id, sessionId: s.id, path: "canonical-record.txt", evidence: canonical, status: "APPROVED" });
+      await fileKey.persistScanWorkingKnowledge({ clusters: [], relationships: [], files: [item.working], scanSessionId: s.id });
+      await indexFiles(s.id, [item]);
+      const signal = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: { connectedLibraryId: r.id, kind } });
+      assert.equal(signal.identityHash, extractDocumentSignals(canonical, r.id).find((row) => row.kind === kind)!.identityHash);
+      const resolution = resolveDocumentEvidence(canonical, r.id);
+      assert.equal(resolution.entities.find((entity) => entity.kind === kind)!.nameConflicting, conflict);
+      const projected = (await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: item.file.id } })).sourceExcerpts as Array<{ text: string }>;
+      assert.equal(projected.length, 8); assert.ok(projected.every((excerpt) => excerpt.text.length <= 240));
+      assert.equal((signal.sourceRanges as unknown[]).length, conflict ? 1 : 2);
+      const results = await search.searchLibrary(`${label} Alison River`, [r.id], { includeEntityMatches: true });
+      assert.deepEqual(results.map((row) => row.relativePath), conflict ? [] : [item.file.relativePath]);
+      if (!conflict) {
+        assert.equal(results[0].excerpt, `${label}: Alison River`);
+        assert.deepEqual(results[0].sourceRange, { start: (position - 1) * 200, end: (position - 1) * 200 + `${label}: Alison River`.length });
+      }
+      if (conflict) assert.deepEqual(await search.searchLibrary(`${label} Jamie Brook`, [r.id]), []);
+      assert.deepEqual((await search.searchLibrary(`${label} CANONICAL-101`, [r.id])).map((row) => row.relativePath), [item.file.relativePath]);
+      await prisma.observationSession.update({ where: { id: item.observation.id }, data: { observations: [{ label: "SOURCE",
+        evidence: verifiedSourceExcerpts(canonical).reverse().map((excerpt) => `Source characters ${excerpt.start}-${excerpt.end}: ${JSON.stringify(excerpt.text)}`) }] } });
+      assert.deepEqual((await search.searchLibrary(`${label} Alison River`, [r.id])).map((row) => row.relativePath), conflict ? [] : [item.file.relativePath]);
+      if (position === 9) {
+        await prisma.observationSession.update({ where: { id: item.observation.id }, data: { status: "MODIFIED" } });
+        await prisma.humanDecision.create({ data: { observationSessionId: item.observation.id, decisionType: "MODIFY", editedSuggestion: canonical } });
+        await fileKey.persistScanWorkingKnowledge({ clusters: [], relationships: [], files: [item.working], scanSessionId: s.id });
+        await indexFiles(s.id, [item]);
+        assert.deepEqual((await prisma.knowledgeDocumentSignal.findUniqueOrThrow({ where: { id: signal.id } })).sourceRanges, []);
+        assert.deepEqual((await search.searchLibrary(`${label} Alison River`, [r.id])).map((row) => row.relativePath), conflict ? [] : [item.file.relativePath]);
+      }
+      if (position === 24 && !conflict) {
+        const current = await session(r.id);
+        await prisma.scanSession.update({ where: { id: current.id }, data: { startedAt: new Date(s.startedAt.getTime() + 60000) } });
+        await prisma.librarySearchEntry.updateMany({ where: { connectedLibraryId: r.id }, data: { isCurrent: false } });
+        await prisma.knowledgeDocumentSignal.updateMany({ where: { connectedLibraryId: r.id }, data: { status: "SUPERSEDED", supersededAt: new Date() } });
+        assert.deepEqual(await search.searchLibrary(`${label} Alison River`, [r.id]), []);
+        assert.deepEqual((await search.searchLibrary(`${label} Alison River history`, [r.id])).map((row) => row.relativePath), [item.file.relativePath]);
+      }
+    });
+  }
+  for (const conflict of [false, true]) {
+    test(`canonical typed provenance ${kind} Search long MODIFIED ${conflict ? "conflict" : "unique name"}`, async (t) => {
+      const r = await root(`${kind} long modified ${conflict}`); const s = await session(r.id);
+      t.after(async () => {
+        await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: r.id } });
+        await prisma.connectedLibrary.delete({ where: { id: r.id } });
+      });
+      const edited = `${label} ID: EDIT-101; ${label}: Alison River${conflict ? `; ${label}: Jamie Brook` : ""}; Note: ${"x".repeat(240)}`;
+      assert.ok(edited.length > 280 && edited.length < 400);
+      const item = await observedFile({ rootId: r.id, sessionId: s.id, path: "modified-record.txt", evidence: evidence(`${label} ID: ORIGINAL; ${label}: Original Name`), status: "MODIFIED" });
+      await prisma.humanDecision.create({ data: { observationSessionId: item.observation.id, decisionType: "MODIFY", editedSuggestion: edited } });
+      await fileKey.persistScanWorkingKnowledge({ clusters: [], relationships: [], files: [item.working], scanSessionId: s.id });
+      await indexFiles(s.id, [item]);
+      const signal = await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: { connectedLibraryId: r.id, kind, status: "ACTIVE" } });
+      assert.deepEqual(signal.sourceRanges, []);
+      assert.equal(signal.identityHash, extractDocumentSignals(edited, r.id, true).find((row) => row.kind === kind)!.identityHash);
+      assert.deepEqual((await search.searchLibrary(`${label} Alison River`, [r.id])).map((row) => row.relativePath), conflict ? [] : [item.file.relativePath]);
+      assert.deepEqual(await search.searchLibrary(`${label} Jamie Brook`, [r.id]), []);
+      assert.deepEqual(await search.searchLibrary(`${label} Original Name`, [r.id]), []);
     });
   }
 }
@@ -2454,7 +2537,7 @@ test("exhaustive entity search indexes twenty thousand version-bearing candidate
   } });
   const observation = await prisma.observationSession.create({ data: {
     confidence: 0.9, explanation: [], interpretations: [], libraryDocumentId: document.id,
-    observations: [], observerType: "DETERMINISTIC", planSuggestions: [], warnings: [],
+    observations: [{ label: "SOURCE", evidence: [evidence("Client: Alice")] }], observerType: "OPENAI", planSuggestions: [], warnings: [],
   } });
   const count = 20_000;
   const scannedFiles = Array.from({ length: count }, (_, index) => ({

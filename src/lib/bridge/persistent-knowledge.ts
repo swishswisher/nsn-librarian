@@ -614,7 +614,7 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
         select: {
           observationSessions: {
             orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-            select: { id: true, status: true, humanDecisions: {
+            select: { id: true, status: true, observerType: true, observations: true, humanDecisions: {
               where: { decisionType: "MODIFY" }, orderBy: [{ createdAt: "desc" }, { id: "desc" }],
               select: { editedSuggestion: true }, take: 1,
             } },
@@ -769,8 +769,10 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
     const workingFile = workingFileById.get(file.id);
     if (!observationId || !file.checksum || !workingFile) return [];
     const fileKey = keyFor(file);
+    const canonicalEvidence = observation ? observationSourceEvidenceText(observation) : "";
     const extracted = observation?.status === "REJECTED" ? [] : extractDocumentSignals(
-      observation?.status === "MODIFIED" ? observation.humanDecisions[0]?.editedSuggestion ?? "" : workingFile.sourceEvidenceText,
+      observation?.status === "MODIFIED" ? observation.humanDecisions[0]?.editedSuggestion ?? "" :
+        canonicalEvidence || workingFile.sourceEvidenceText,
       session.connectedFolderId,
       observation?.status === "MODIFIED",
     ).map((signal) => ({ ...signal, sourceRanges: observation?.status === "MODIFIED" ? [] : signal.sourceRanges }));

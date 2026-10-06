@@ -49,6 +49,7 @@ function validDate(value: string) {
 export function extractDocumentFields(sourceEvidenceText: string, humanReviewed = false, legacyNameLabels = false) {
   const fields = new Map<string, Field>();
   const conflicts = new Map<string, SourceRange[]>();
+  const candidates: Array<Field & { key: string }> = [];
   const legacyFields: Array<{ key: string; value: string; range: SourceRange }> = [];
   const verified = verifiedSourceExcerpts(sourceEvidenceText).slice(0, 24);
   const excerpts = verified.length || !humanReviewed ? verified : [{ start: 0, end: sourceEvidenceText.length, text: sourceEvidenceText }];
@@ -65,6 +66,7 @@ export function extractDocumentFields(sourceEvidenceText: string, humanReviewed 
       }
       const value = normalized(match[2]);
       const key = match[1].toLowerCase();
+      candidates.push({ key, value, range });
       const earlier = fields.get(key);
       if (value && earlier && earlier.value !== value) {
         conflicts.set(key, [...(conflicts.get(key) ?? [earlier.range]), range]);
@@ -78,15 +80,17 @@ export function extractDocumentFields(sourceEvidenceText: string, humanReviewed 
   const explicitKeys = new Set(fields.keys());
   for (const field of legacyFields) {
     if (explicitKeys.has(field.key)) continue;
+    candidates.push(field);
     const earlier = fields.get(field.key);
     if (earlier && earlier.value !== field.value) conflicts.set(field.key, [earlier.range, field.range]);
     else if (!earlier) fields.set(field.key, field);
   }
-  return { conflicts, fields };
+  return { conflicts, fields, candidates };
 }
 
-export function extractDocumentSignals(sourceEvidenceText: string, connectedLibraryId: string, humanReviewed = false): ExtractedDocumentSignal[] {
-  const { conflicts, fields } = extractDocumentFields(sourceEvidenceText, humanReviewed);
+/** Canonical semantic interpretation; retrieval/display excerpt bounds do not apply here. */
+export function resolveDocumentEvidence(sourceEvidenceText: string, connectedLibraryId: string, humanReviewed = false) {
+  const { conflicts, fields, candidates } = extractDocumentFields(sourceEvidenceText, humanReviewed);
   const get = (...keys: string[]) => keys.map((key) => conflicts.has(key) ? undefined : fields.get(key)).find(Boolean);
   const signals: ExtractedDocumentSignal[] = [];
   const add = (kind: DocumentSignalKind, identity: string, supporting: Array<Field | undefined>, supportHash: string | null = null, revisionNumber: string | null = null, revisionDate: string | null = null) => {
@@ -143,36 +147,61 @@ export function extractDocumentSignals(sourceEvidenceText: string, connectedLibr
   if (documentId && title && (projectHash || clientHash)) {
     add("DOCUMENT_FAMILY", `${documentId.value}:${title.value}:${projectHash ?? clientHash ?? ""}`, [documentId, title, version, date], projectHash ?? clientHash, parsedVersion, parsedDate);
   }
-  return signals.slice(0, 8);
+  const resolvedSignals = signals.slice(0, 8);
+  const entities = resolvedSignals.flatMap((signal) => {
+    if (!["CLIENT", "PROJECT", "UNRESOLVED_CLIENT", "UNRESOLVED_PROJECT"].includes(signal.kind)) return [];
+    const label = signal.kind.replace(/^UNRESOLVED_/, "").toLowerCase();
+    return [{ kind: signal.kind, identityHash: signal.identityHash,
+      nameConflicting: conflicts.has(label),
+      labels: [`${label} id`, label].flatMap((key) => {
+        const field = conflicts.has(key) ? undefined : fields.get(key);
+        return field ? [field.value] : [];
+      }) }];
+  });
+  return { connectedLibraryId, sourceEvidenceText, humanReviewed, fields, conflicts, candidates, signals: resolvedSignals, entities };
+}
+
+export function extractDocumentSignals(sourceEvidenceText: string, connectedLibraryId: string, humanReviewed = false): ExtractedDocumentSignal[] {
+  return resolveDocumentEvidence(sourceEvidenceText, connectedLibraryId, humanReviewed).signals;
 }
 
 /** Use the resolver's fields, never an overlapping excerpt, to bind names/IDs.
  * Old ranged, name-only signals can describe separate entities on one file.
  * Explicit IDs and human edits instead require a unique name in the full evidence.
  */
-export function documentSignalEntityLabels(sourceEvidenceText: string, kind: "CLIENT" | "PROJECT",
+export function documentSignalEntityLabels(resolution: ReturnType<typeof resolveDocumentEvidence>, kind: "CLIENT" | "PROJECT",
   sourceRanges: unknown, allowUnranged: boolean, identity?: { connectedLibraryId: string; identityHash: string }) {
-  let parsed = extractDocumentFields(sourceEvidenceText);
+  const { sourceEvidenceText, humanReviewed } = resolution;
+  let parsed = { fields: resolution.fields, conflicts: resolution.conflicts, candidates: resolution.candidates };
   const label = kind.toLowerCase();
   if (!parsed.fields.has(label) && !parsed.conflicts.has(label) &&
       !parsed.fields.has(`${label} id`) && !parsed.conflicts.has(`${label} id`)) {
-    parsed = extractDocumentFields(sourceEvidenceText, false, true);
+    parsed = extractDocumentFields(sourceEvidenceText, humanReviewed, true);
   }
   if (identity) {
-    const resolved = extractDocumentSignals(sourceEvidenceText, identity.connectedLibraryId).find((signal) => signal.kind === kind);
+    if (identity.connectedLibraryId !== resolution.connectedLibraryId) return [];
+    const resolved = resolution.entities.find((signal) => signal.kind === kind);
     if (resolved && resolved.identityHash !== identity.identityHash) return [];
+    if (humanReviewed && !resolution.entities.some((signal) =>
+      signal.identityHash === identity.identityHash && [kind, `UNRESOLVED_${kind}`].includes(signal.kind))) return [];
+    const explicitIdentity = parsed.fields.has(`${label} id`) || parsed.conflicts.has(`${label} id`) ||
+      parsed.fields.has(kind === "CLIENT" ? "email" : "year");
+    if (!resolved && explicitIdentity && !resolution.entities.some((signal) =>
+      signal.kind === `UNRESOLVED_${kind}` && signal.identityHash === identity.identityHash)) return [];
+    if (resolved) {
+      if (!humanReviewed && (!Array.isArray(sourceRanges) || !sourceRanges.length) && !allowUnranged) return [];
+      return resolved.labels;
+    }
   }
-  if (!parsed.fields.has(`${label} id`) && !parsed.conflicts.has(`${label} id`) &&
+  if (!humanReviewed && !parsed.fields.has(`${label} id`) && !parsed.conflicts.has(`${label} id`) &&
       Array.isArray(sourceRanges) && sourceRanges.length) {
-    const excerpts = verifiedSourceExcerpts(sourceEvidenceText);
-    const scoped = excerpts.flatMap((excerpt) => sourceRanges.flatMap((range) => {
-      if (!range || typeof range !== "object" || typeof range.start !== "number" || typeof range.end !== "number") return [];
-      const start = Math.max(excerpt.start, range.start);
-      const end = Math.min(excerpt.end, range.end);
-      return end > start ? [`Source characters ${start}-${end}: ${JSON.stringify(excerpt.text.slice(start - excerpt.start, end - excerpt.start))}`] : [];
-    })).join("\n");
-    parsed = extractDocumentFields(scoped, false, true);
-  } else if ((!Array.isArray(sourceRanges) || !sourceRanges.length) && !allowUnranged) return [];
+    // Legacy independent name-only signals need exact field containment, never
+    // reparsing an overlapping/clipped quotation into a new name.
+    const labels = new Set(parsed.candidates.filter((field) => field.key === label && sourceRanges.some((range) =>
+      range && typeof range === "object" && typeof range.start === "number" && typeof range.end === "number" &&
+      range.start <= field.range.start && range.end >= field.range.end)).map((field) => field.value));
+    return labels.size === 1 ? [...labels] : [];
+  } else if (!humanReviewed && (!Array.isArray(sourceRanges) || !sourceRanges.length) && !allowUnranged) return [];
   // A non-conflicting ID remains searchable even when its optional names clash.
   // Each label comes from the same fields used to resolve the exact identity.
   return [`${label} id`, label].flatMap((key) => {

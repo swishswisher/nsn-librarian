@@ -4,6 +4,7 @@ import { after, before, test } from "node:test";
 
 import { PrismaClient } from "@prisma/client";
 import { documentSignalVersion, extractDocumentSignals } from "../../src/lib/bridge/document-signals";
+import { verifiedSourceExcerpts } from "../../src/lib/ai/source-evidence";
 import { knowledgeScaleFixture } from "./knowledge-scale-fixtures";
 import type { KnowledgeWork } from "../../src/lib/bridge/knowledge-work";
 
@@ -76,8 +77,9 @@ async function file(input: {
     originalFileName: input.relativePath,
   } });
   const observation = await prisma.observationSession.create({ data: {
-    libraryDocumentId: document.id, observerType: "DETERMINISTIC",
-    observations: [], interpretations: [], explanation: [], planSuggestions: [], warnings: [],
+    libraryDocumentId: document.id, observerType: "OPENAI",
+    observations: input.quote ? [{ label: "SOURCE", evidence: [`Source characters 0-${input.quote.length}: ${JSON.stringify(input.quote)}`] }] : [],
+    interpretations: [], explanation: [], planSuggestions: [], warnings: [],
     status: input.knowledgeState === "APPROVED" ? "APPROVED" : "AWAITING_REVIEW",
   } });
   const scanned = await prisma.scannedFile.create({ data: {
@@ -161,6 +163,148 @@ for (const kind of ["CLIENT", "PROJECT"] as const) {
       assert.equal(ambiguous.state, "AMBIGUOUS_ENTITY"); assert.equal(calls, 1);
     });
   }
+}
+
+
+function canonicalQaEvidence(label: string, position: number, conflict: boolean, id = "CANONICAL-101", earlyId = false) {
+  const texts = Array.from({ length: 24 }, (_, index) => `Note: filler ${index}`);
+  texts[conflict || earlyId ? 0 : position === 23 ? 23 : 22] = `${label} ID: ${id}${conflict ? `; ${label}: Alison River` : ""}`;
+  texts[position - 1] = `${label}: ${conflict ? "Jamie Brook" : "Alison River"}`;
+  return texts.map((text, index) => `Source characters ${index * 200}-${index * 200 + text.length}: ${JSON.stringify(text)}`).join("\n");
+}
+
+async function canonicalQaRecord(rootId: string, sessionId: string, label: string, canonical: string, modified: boolean, path = "canonical-record.txt") {
+  const original = `${label} ID: ORIGINAL; ${label}: Original Name`;
+  const item = await file({ rootId, sessionId, relativePath: path, quote: original, knowledgeState: "APPROVED" });
+  await prisma.observationSession.update({ where: { id: item.observation.id }, data: {
+    status: modified ? "MODIFIED" : "APPROVED", observerType: "OPENAI",
+    ...(!modified ? { observations: [{ label: "SOURCE", evidence: verifiedSourceExcerpts(canonical).map((excerpt) =>
+      `Source characters ${excerpt.start}-${excerpt.end}: ${JSON.stringify(excerpt.text)}`) }] } : {}),
+  } });
+  if (modified) {
+    await prisma.humanDecision.create({ data: { observationSessionId: item.observation.id,
+      decisionType: "MODIFY", editedSuggestion: `${label} ID: OLDER; ${label}: Older Name`, createdAt: new Date("2026-01-01T00:00:00Z") } });
+    await prisma.humanDecision.create({ data: { observationSessionId: item.observation.id,
+      decisionType: "MODIFY", editedSuggestion: canonical, createdAt: new Date("2026-01-02T00:00:00Z") } });
+  }
+  const working = { approvedMemoryEvidence: [], connectedLibraryId: rootId, fileName: path, fileType: "TEXT", id: item.scanned.id,
+    normalizedIdentity: `${rootId}/${path}`, provisionalWorkingEvidence: [], relativePath: path, semanticPreview: "", semanticTerms: [],
+    sourceEvidenceText: modified ? `Source characters 0-${original.length}: ${JSON.stringify(original)}` : canonical,
+    supportingTopics: [], trustedObservationEvidence: [] };
+  const index = { clusters: [], relationships: [], files: [working], scanSessionId: sessionId };
+  await identity.persistScanWorkingKnowledge(index);
+  await prisma.librarySearchEntry.delete({ where: { id: item.index.id } });
+  await (await import("../../src/lib/library/search-index")).indexScanKnowledge(index);
+  return { ...item, canonical, modified, workingIndex: index, signal: await prisma.knowledgeDocumentSignal.findFirstOrThrow({ where: {
+    connectedLibraryId: rootId, fileKey: item.index.fileKey, kind: label.toUpperCase(), status: "ACTIVE" } }) };
+}
+
+async function canonicalQaGuards(rootId: string, label: string, item: Awaited<ReturnType<typeof canonicalQaRecord>>, ask: (name: string) => ReturnType<typeof answer.answerLibraryQuestion>) {
+  assert.notEqual(item.signal.identityHash, extractDocumentSignals(item.canonical, "other-root", item.modified).find((row) => row.kind === label.toUpperCase())!.identityHash);
+  await prisma.connectedLibrary.update({ where: { id: rootId }, data: { readPermission: false } });
+  assert.equal((await ask("Alison River")).state, "NO_AUTHORIZED_MATCH");
+  await prisma.connectedLibrary.update({ where: { id: rootId }, data: { readPermission: true } });
+  await prisma.knowledgeDocumentSignal.update({ where: { id: item.signal.id }, data: { checksum: "wrong-checksum" } });
+  assert.equal((await ask("Alison River")).state, "NO_AUTHORIZED_MATCH");
+  await prisma.knowledgeDocumentSignal.update({ where: { id: item.signal.id }, data: { checksum: item.scanned.checksum!, status: "SUPERSEDED", supersededAt: new Date() } });
+  assert.equal((await ask("Alison River")).state, "NO_AUTHORIZED_MATCH");
+  await prisma.knowledgeDocumentSignal.update({ where: { id: item.signal.id }, data: { status: "ACTIVE", supersededAt: null, connectedLibraryId: "wrong-root" } });
+  assert.equal((await ask("Alison River")).state, "NO_AUTHORIZED_MATCH");
+  await prisma.knowledgeDocumentSignal.update({ where: { id: item.signal.id }, data: { connectedLibraryId: rootId } });
+}
+
+for (const kind of ["CLIENT", "PROJECT"] as const) {
+  const label = kind === "CLIENT" ? "Client" : "Project";
+  for (const position of [9, 23, 24]) for (const conflict of [false, true]) {
+    test(`canonical typed provenance ${kind} Ask ${conflict ? "conflict" : "unique name"} at excerpt ${position}`, async (t) => {
+      const r = await root(`${kind} Ask canonical ${position} ${conflict}`); const s = await scan(r.id);
+      t.after(async () => {
+        await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: r.id } });
+        await prisma.connectedLibrary.delete({ where: { id: r.id } });
+      });
+      const canonical = canonicalQaEvidence(label, position, conflict);
+      const item = await canonicalQaRecord(r.id, s.id, label, canonical, false);
+      let calls = 0;
+      const ask = (name: string) => answer.answerLibraryQuestion(`${label} ${name}`, { permittedRootIds: [r.id],
+        model: async (_question, context) => {
+          calls++; assert.ok(context.sources.length <= 8);
+          assert.deepEqual(context.sources.map((source) => source.relativePath), [item.scanned.relativePath]);
+          assert.ok(context.sources.every((source) => source.rootName === r.displayName && source.text.length <= 240));
+          assert.ok(context.sources.every((source) => /Alison River/i.test(source.text)));
+          return model([])();
+        } });
+      const result = await ask("Alison River");
+      if (conflict) {
+        assert.equal(result.state, "NO_AUTHORIZED_MATCH"); assert.equal(result.sources.length, 0);
+        assert.equal((await ask("Jamie Brook")).state, "NO_AUTHORIZED_MATCH"); assert.equal(calls, 0);
+      } else {
+        assert.equal(calls, 1);
+        assert.deepEqual(result.sources[0].sourceRange, { start: (position - 1) * 200, end: (position - 1) * 200 + `${label}: Alison River`.length });
+        await canonicalQaGuards(r.id, label, item, ask); assert.equal(calls, 1);
+      }
+      if (position === 9) {
+        await prisma.observationSession.update({ where: { id: item.observation.id }, data: { status: "MODIFIED" } });
+        await prisma.humanDecision.create({ data: { observationSessionId: item.observation.id, decisionType: "MODIFY", editedSuggestion: canonical } });
+        await identity.persistScanWorkingKnowledge(item.workingIndex);
+        await (await import("../../src/lib/library/search-index")).indexScanKnowledge(item.workingIndex);
+        assert.deepEqual((await prisma.knowledgeDocumentSignal.findUniqueOrThrow({ where: { id: item.signal.id } })).sourceRanges, []);
+        const modified = await ask("Alison River");
+        if (conflict) { assert.equal(modified.state, "NO_AUTHORIZED_MATCH"); assert.equal(calls, 0); }
+        else { assert.equal(calls, 2); assert.ok(modified.sources.every((source) => source.sourceRange === null)); }
+      }
+      if (position === 24 && !conflict) {
+        const current = await scan(r.id);
+        await prisma.scanSession.update({ where: { id: current.id }, data: { startedAt: new Date(s.startedAt.getTime() + 60000) } });
+        await prisma.librarySearchEntry.updateMany({ where: { connectedLibraryId: r.id }, data: { isCurrent: false } });
+        await prisma.knowledgeDocumentSignal.updateMany({ where: { connectedLibraryId: r.id }, data: { status: "SUPERSEDED", supersededAt: new Date() } });
+        assert.equal((await ask("Alison River")).state, "NO_AUTHORIZED_MATCH");
+        const historical = await ask("Alison River history");
+        assert.equal(calls, 2); assert.ok(historical.sources.every((source) => source.timeState === "Historical scan"));
+      }
+    });
+  }
+  for (const conflict of [false, true]) {
+    test(`canonical typed provenance ${kind} Ask long MODIFIED ${conflict ? "conflict" : "unique name"}`, async (t) => {
+      const r = await root(`${kind} Ask long modified ${conflict}`); const s = await scan(r.id);
+      t.after(async () => {
+        await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: r.id } });
+        await prisma.connectedLibrary.delete({ where: { id: r.id } });
+      });
+      const canonical = `${label} ID: EDIT-101; ${label}: Alison River${conflict ? `; ${label}: Jamie Brook` : ""}; Note: ${"x".repeat(240)}`;
+      assert.ok(canonical.length > 280 && canonical.length < 400);
+      const item = await canonicalQaRecord(r.id, s.id, label, canonical, true);
+      assert.deepEqual(item.signal.sourceRanges, []);
+      let calls = 0;
+      const ask = (name: string) => answer.answerLibraryQuestion(`${label} ${name}`, { permittedRootIds: [r.id],
+        model: async (_question, context) => {
+          calls++; assert.ok(context.sources.length <= 8);
+          assert.deepEqual(context.sources.map((source) => source.relativePath), [item.scanned.relativePath]);
+          assert.ok(context.sources.every((source) => source.text.length <= 240 && source.text !== canonical && source.sourceRange === null));
+          assert.ok(context.sources.every((source) => source.trustState === "Human-corrected evidence"));
+          assert.ok(context.sources.every((source) => /Alison River/i.test(source.text)));
+          return model([])();
+        } });
+      const result = await ask("Alison River");
+      if (conflict) {
+        assert.equal(result.state, "NO_AUTHORIZED_MATCH"); assert.equal(result.sources.length, 0);
+        assert.equal((await ask("Jamie Brook")).state, "NO_AUTHORIZED_MATCH"); assert.equal(calls, 0);
+      } else {
+        assert.equal(calls, 1); await canonicalQaGuards(r.id, label, item, ask); assert.equal(calls, 1);
+      }
+    });
+  }
+  test(`canonical typed provenance ${kind} Ask distinguishes authorized identities sharing a name`, async (t) => {
+    const r = await root(`${kind} canonical ambiguity`); const s = await scan(r.id);
+    t.after(async () => {
+      await prisma.knowledgeDocumentSignal.deleteMany({ where: { connectedLibraryId: r.id } });
+      await prisma.connectedLibrary.delete({ where: { id: r.id } });
+    });
+    await canonicalQaRecord(r.id, s.id, label, canonicalQaEvidence(label, 9, false, "DISTINCT-1", true), false, "first.txt");
+    await canonicalQaRecord(r.id, s.id, label, canonicalQaEvidence(label, 24, false, "DISTINCT-2"), false, "second.txt");
+    let calls = 0;
+    const result = await answer.answerLibraryQuestion(`${label} Alison River`, { permittedRootIds: [r.id], model: async () => { calls++; return model([])(); } });
+    assert.equal(result.state, "AMBIGUOUS_ENTITY"); assert.equal(calls, 0);
+  });
 }
 
 test("Ask history intent admits retained invoice evidence and never current-only metadata", async (t) => {

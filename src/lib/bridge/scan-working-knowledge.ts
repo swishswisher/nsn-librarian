@@ -580,8 +580,10 @@ function deterministicPurposeTerms(observations: unknown) {
 }
 
 export function observationSourceEvidenceText(observation: { observerType: string; observations: unknown }) {
+  // Canonical document semantics use the resolver's evidence window. Search
+  // excerpts and working/ranking previews keep their independent eight-item cap.
   const excerpts = observation.observerType === "OPENAI"
-    ? verifiedObservationExcerpts(observation.observations).slice(0, 8) : [];
+    ? verifiedObservationExcerpts(observation.observations).slice(0, 24) : [];
   const terms = observation.observerType === "DETERMINISTIC"
     ? deterministicPurposeTerms(observation.observations).slice(0, 8) : [];
   return [...excerpts, ...terms].join(" ");
