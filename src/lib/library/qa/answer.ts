@@ -3,7 +3,7 @@ import { getPrismaClient } from "@/lib/db/prisma";
 import { OpenAIProviderError } from "@/lib/ai/openai-client";
 import { runLibraryAnswerModel } from "./model";
 import { retrieveQuestionContext } from "./retrieve";
-import { libraryAnswerVersion, type AnswerClaim, type AnswerContext,
+import { libraryAnswerVersion, maxAnswerClaims, type AnswerClaim, type AnswerContext,
   type AnswerModelResult, type AnswerSource, type LibraryAnswer } from "./types";
 
 type AnswerDependencies = {
@@ -161,21 +161,22 @@ function latestVersionClaims(context: AnswerContext): { claims: AnswerClaim[]; r
         sourceIds: [newer.id, older.id] });
     }
     if (familyClaims.length) {
-      if (claims.length < 3) {
+      if (claims.length < maxAnswerClaims) {
         claims.push(familyClaims[0]);
         representedFamilies += 1;
       }
       supplemental.push(...familyClaims.slice(1));
     }
   }
-  claims.push(...supplemental.slice(0, Math.max(0, 3 - claims.length)));
+  claims.push(...supplemental.slice(0, Math.max(0, maxAnswerClaims - claims.length)));
   return { claims, representedFamilies };
 }
 
 export function validateAnswerClaims(output: unknown, context: AnswerContext): AnswerClaim[] {
   if (!output || typeof output !== "object" || !Array.isArray((output as { claims?: unknown }).claims)) return [];
   const sourceById = new Map(context.sources.map((source) => [source.id, source]));
-  return (output as { claims: unknown[] }).claims.slice(0, 6).flatMap((value): AnswerClaim[] => {
+  // Ignore excess submissions before validation so work stays bounded even for mocked providers.
+  return (output as { claims: unknown[] }).claims.slice(0, maxAnswerClaims).flatMap((value): AnswerClaim[] => {
     if (!value || typeof value !== "object") return [];
     const candidate = value as Record<string, unknown>;
     if (typeof candidate.text !== "string" || candidate.text.trim().length < 4 ||
@@ -264,17 +265,19 @@ export async function answerLibraryQuestion(question: string, dependencies: Answ
   const lineage = context.route.kind === "VERSION"
     ? latestVersionClaims(context) : { claims: [], representedFamilies: 0 };
   const lineageClaims = lineage.claims;
-  const claims = [...lineageClaims, ...modelClaims];
+  const claims = [...lineageClaims, ...modelClaims].slice(0, maxAnswerClaims);
   if (!claims.length) return emptyAnswer(context, "INSUFFICIENT_EVIDENCE",
     "The available source evidence is not strong enough for a supported answer.",
     context.indexIncomplete ? "Search preparation is incomplete for part of this library." : null, usage);
-  const submittedClaims = Array.isArray((response.output as { claims?: unknown }).claims)
-    ? (response.output as { claims: unknown[] }).claims.length : 0;
+  // Only rejection inside the inspected window is partial evidence. Deliberately omitted
+  // excess submissions and model claims displaced by verified lineage are output budgeting.
+  const inspectedClaims = Array.isArray((response.output as { claims?: unknown }).claims)
+    ? Math.min((response.output as { claims: unknown[] }).claims.length, maxAnswerClaims) : 0;
   const incompleteVersionCoverage = context.route.kind === "VERSION" &&
     (context.versionAssessmentComplete === false ||
       (context.versionFamilyCount ?? lineage.representedFamilies) > lineage.representedFamilies);
   const state: LibraryAnswer["state"] = claims.some((claim) => claim.kind === "CONFLICT")
-    ? "CONFLICTING_SOURCES" : context.indexIncomplete || modelClaims.length < submittedClaims ||
+    ? "CONFLICTING_SOURCES" : context.indexIncomplete || modelClaims.length < inspectedClaims ||
       incompleteVersionCoverage ||
       (context.route.kind === "VERSION" && !modelClaims.length && /\b(changed|difference|different)\b/i.test(safeQuestion))
       ? "PARTIALLY_ANSWERED" : "ANSWERED_FROM_SOURCES";

@@ -1,12 +1,12 @@
 import { OpenAIProviderError, requestOpenAIJson } from "@/lib/ai/openai-client";
 import { libraryAnswerInstructions } from "./prompts";
-import type { AnswerContext, AnswerModelResult } from "./types";
+import { maxAnswerClaims, type AnswerContext, type AnswerModelResult } from "./types";
 
 const answerSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
-    claims: { type: "array", maxItems: 6, items: { type: "object", additionalProperties: false,
+    claims: { type: "array", maxItems: maxAnswerClaims, items: { type: "object", additionalProperties: false,
       properties: {
         text: { type: "string" },
         kind: { type: "string", enum: ["FACT", "SYNTHESIS", "INFERENCE", "CONFLICT"] },
@@ -18,7 +18,8 @@ const answerSchema = {
   required: ["claims"],
 };
 
-export async function runLibraryAnswerModel(question: string, context: AnswerContext): Promise<AnswerModelResult> {
+export async function runLibraryAnswerModel(question: string, context: AnswerContext,
+  request: typeof requestOpenAIJson = requestOpenAIJson): Promise<AnswerModelResult> {
   const input = JSON.stringify({
     question: question.slice(0, 500),
     scope: context.route.kind,
@@ -32,7 +33,7 @@ export async function runLibraryAnswerModel(question: string, context: AnswerCon
     versions: context.versions,
     indexIncomplete: context.indexIncomplete,
   });
-  const response = await requestOpenAIJson({
+  const response = await request({
     model: process.env.OPENAI_QA_MODEL?.trim() || undefined,
     instructions: libraryAnswerInstructions,
     input, maxOutputTokens: 700, schema: answerSchema,

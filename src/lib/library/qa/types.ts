@@ -1,5 +1,6 @@
 export const libraryAnswerVersion = "library-answer-v1";
 export const maxAnswerSources = 8;
+export const maxAnswerClaims = 3;
 export const maxAnswerExcerptsPerFile = 1;
 
 export type QuestionRoute = {

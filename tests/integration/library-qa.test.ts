@@ -7,6 +7,7 @@ import { documentSignalVersion, extractDocumentSignals } from "../../src/lib/bri
 import { verifiedSourceExcerpts } from "../../src/lib/ai/source-evidence";
 import { knowledgeScaleFixture } from "./knowledge-scale-fixtures";
 import type { KnowledgeWork } from "../../src/lib/bridge/knowledge-work";
+import type { AnswerClaim, AnswerContext } from "../../src/lib/library/qa/types";
 
 const schema = `phase_three_b_${process.pid}_${Date.now()}`;
 const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -111,6 +112,175 @@ function model(claims: unknown[]) {
 function claim(text: string, sourceIds: string[], kind = "FACT") {
   return { text, sourceIds, kind };
 }
+
+const claimBoundTexts = ["Alison confirms attendance", "Alison approves attendance",
+  "Alison accepts attendance", "Alison schedules attendance", "Alison completes attendance",
+  "Alison arranges attendance"];
+const claimBoundQuote = `Client ID: 123; Client: Alison River; ${claimBoundTexts.join("; ")}`;
+
+function claimBoundContext(kind: AnswerContext["route"]["kind"] = "BROAD", lineageCount = 0): AnswerContext {
+  const sources: AnswerContext["sources"] = Array.from({ length: lineageCount + 1 }, (_, i) => ({
+    id: `S${i + 1}`, sourceType: "SOURCE_EXCERPT", title: `attendance-${i + 1}.txt`,
+    rootName: "Authorized claim fixture", relativePath: `attendance-${i + 1}.txt`,
+    href: `/library/claim-fixture-${i + 1}`, trustState: "Human reviewed", timeState: "Current scan",
+    text: claimBoundQuote, sourceRange: { start: 0, end: claimBoundQuote.length },
+    physicalIdentity: `claim-fixture-${i + 1}`, corroborationKeys: [`claim-fixture-${i + 1}`],
+  }));
+  return { route: { kind, entityKind: null, searchQuery: "attendance", wantsHistory: kind === "HISTORY",
+    entityName: null }, sources, relationships: [],
+    versions: sources.slice(1).map((source) => ({ leftSourceId: "S1", rightSourceId: source.id,
+      newerSourceId: "S1", ordering: "ORDERED" })),
+    versionFamilyCount: lineageCount ? 1 : 0, versionAssessmentComplete: true,
+    indexIncomplete: false, ambiguousEntity: false };
+}
+
+async function boundedAnswer(claims: unknown[], context = claimBoundContext()) {
+  let modelCalls = 0;
+  const result = await answer.answerLibraryQuestion("Summarize attendance", {
+    retrieve: async () => context, recordUsage: async () => undefined,
+    model: async () => { modelCalls++; return model(claims)(); },
+  });
+  assert.equal(modelCalls, 1);
+  assert.ok(result.claims.length <= 3, "Global claim limit must apply at the application boundary");
+  if (result.claims.length) assert.equal(result.answer, result.claims.map((item) => item.text).join(" "));
+  return result;
+}
+
+test("claim bound ordinary six valid claims uses authorized production retrieval", async () => {
+  const allowed = await root("Claim Bound Allowed"); const s = await scan(allowed.id);
+  await file({ rootId: allowed.id, sessionId: s.id, relativePath: "attendance.txt", quote: claimBoundQuote });
+  const blocked = await root("Claim Bound Blocked"); const other = await scan(blocked.id);
+  await file({ rootId: blocked.id, sessionId: other.id, relativePath: "attendance-private.txt",
+    quote: "Attendance private forbidden claim material" });
+  let calls = 0;
+  const result = await answer.answerLibraryQuestion("attendance", {
+    permittedRootIds: [allowed.id], model: async (_question, context) => {
+      calls++;
+      assert.equal(context.sources.length, 1);
+      assert.equal(context.sources[0].rootName, allowed.displayName);
+      assert.ok(context.sources[0].text.length <= 240);
+      assert.ok(!JSON.stringify(context).includes("forbidden"));
+      return model(claimBoundTexts.map((text) => claim(text, [context.sources[0].id])))();
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  assert.equal(result.claims.length, 3);
+  assert.deepEqual(result.claims.map((item) => item.text), claimBoundTexts.slice(0, 3));
+  assert.equal(result.answer, result.claims.map((item) => item.text).join(" "));
+  for (const omitted of claimBoundTexts.slice(3)) assert.ok(!result.answer.includes(omitted));
+  assert.equal(result.sources.length, 1);
+  assert.equal(result.sources[0].rootName, allowed.displayName);
+  assert.ok(result.claims.every((item) => item.sourceIds.every((id) => result.sources.some((source) => source.id === id))));
+});
+
+test("claim bound model provider receives the three-claim schema contract", async () => {
+  const provider = await import("../../src/lib/library/qa/model");
+  let calls = 0;
+  await provider.runLibraryAnswerModel("attendance", claimBoundContext(), async (request) => {
+    calls++;
+    const properties = request.schema.properties as { claims: { maxItems: number } };
+    assert.equal(properties.claims.maxItems, 3);
+    assert.match(request.instructions, /at most 3 claims/i);
+    assert.equal(request.schemaName, "library_answer");
+    return { responseId: "claim-schema-mock", model: "mock-qa", output: { claims: [] },
+      warnings: [], httpAttempts: 0, completed: true, inputTokens: 0, outputTokens: 0 };
+  });
+  assert.equal(calls, 1);
+});
+
+for (const count of [0, 1, 3, 4, 6]) {
+  test(`claim bound production probe model submits ${count}`, async () => {
+    const submitted = claimBoundTexts.slice(0, count).map((text) => claim(text, ["S1"]));
+    const result = await boundedAnswer(submitted);
+    assert.equal(result.claims.length, Math.min(count, 3));
+    assert.equal(result.state, count ? "ANSWERED_FROM_SOURCES" : "INSUFFICIENT_EVIDENCE");
+    assert.deepEqual(result.claims, submitted.slice(0, 3));
+    for (const omitted of submitted.slice(3)) assert.ok(!result.answer.includes(omitted.text));
+    assert.deepEqual(answer.validateAnswerClaims({ claims: submitted }, claimBoundContext()), submitted.slice(0, 3));
+  });
+}
+
+for (const kind of ["BROAD", "CLIENT", "PROJECT", "DOCUMENT", "TOPIC", "MEMORY", "HISTORY"] as const) {
+  test(`claim bound adversarial schema bypass remains bounded for ${kind}`, async () => {
+    const result = await boundedAnswer(claimBoundTexts.map((text) => claim(text, ["S1"])), claimBoundContext(kind));
+    assert.equal(result.claims.length, 3);
+    assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  });
+}
+
+for (const lineageCount of [1, 3]) {
+  test(`claim bound VERSION lineage ${lineageCount} plus model three keeps lineage priority`, async () => {
+    const context = claimBoundContext("VERSION", lineageCount);
+    const result = await boundedAnswer(claimBoundTexts.slice(0, 3).map((text) => claim(text, ["S1"])), context);
+    const lineage: AnswerClaim[] = context.sources.slice(1).map((source) => ({ kind: "FACT",
+      text: `${context.sources[0].title} is newer than ${source.title} according to recorded version markers.`,
+      sourceIds: ["S1", source.id] }));
+    assert.equal(result.claims.length, 3);
+    assert.deepEqual(result.claims.slice(0, lineageCount), lineage);
+    assert.deepEqual(result.claims.slice(lineageCount).map((item) => item.text), claimBoundTexts.slice(0, 3 - lineageCount));
+    assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+    for (const omitted of claimBoundTexts.slice(3 - lineageCount)) assert.ok(!result.answer.includes(omitted));
+  });
+}
+
+test("claim bound invalid claims inside the validation window preserve partial semantics", async () => {
+  const invalids = [claim("Alison confirms attendance", ["MISSING"]),
+    claim("Alison confirms attendance 999", ["S1"]),
+    claim("Alison attendance is newer", ["S1"]),
+    claim("Alison confirms attendance", ["S1"], "SYNTHESIS"),
+    claim("Alison confirms attendance", ["S1"], "CONFLICT"), null];
+  for (const invalid of invalids) {
+    const valid = claimBoundTexts.slice(0, 2).map((text) => claim(text, ["S1"]));
+    const result = await boundedAnswer([valid[0], invalid, valid[1], ...claimBoundTexts.slice(2).map((text) => claim(text, ["S1"]))]);
+    assert.deepEqual(result.claims, valid);
+    assert.equal(result.state, "PARTIALLY_ANSWERED");
+  }
+});
+
+test("claim bound surplus outside the validation window does not cause partial status", async () => {
+  const result = await boundedAnswer([...claimBoundTexts.slice(0, 3).map((text) => claim(text, ["S1"])),
+    claim("Unsupported excess claim", ["MISSING"])]);
+  assert.equal(result.claims.length, 3);
+  assert.equal(result.state, "ANSWERED_FROM_SOURCES");
+  assert.ok(!result.answer.includes("Unsupported excess claim"));
+});
+
+test("claim bound retained valid conflict still produces conflicting sources", async () => {
+  const context = claimBoundContext("BROAD", 1);
+  context.versions = [];
+  context.sources[0].text = "Decision status approved";
+  context.sources[1].text = "Decision status rejected";
+  const retained = [claim("Decision status approved", ["S1"]), claim("Decision status rejected", ["S2"]),
+    claim("Decision status approved conflicts with rejected status", ["S1", "S2"], "CONFLICT")];
+  const result = await boundedAnswer([...retained, ...retained], context);
+  assert.deepEqual(result.claims, retained);
+  assert.equal(result.state, "CONFLICTING_SOURCES");
+});
+
+test("claim bound VERSION model ordering is rejected while structured lineage survives", async () => {
+  const context = claimBoundContext("VERSION", 1);
+  const result = await boundedAnswer([claim("attendance-2.txt is newer than attendance-1.txt", ["S1", "S2"]),
+    claim(claimBoundTexts[0], ["S1"])], context);
+  assert.equal(result.claims.length, 2);
+  assert.equal(result.state, "PARTIALLY_ANSWERED");
+  assert.match(result.claims[0].text, /^attendance-1.txt is newer than attendance-2.txt/);
+  assert.ok(!result.answer.includes("attendance-2.txt is newer"));
+});
+
+test("claim bound source revalidation discards even capped adversarial output", async () => {
+  let reads = 0;
+  const context = claimBoundContext();
+  const result = await answer.answerLibraryQuestion("attendance", {
+    retrieve: async () => ++reads === 1 ? context : { ...context, sources: [] },
+    recordUsage: async () => undefined,
+    model: model(claimBoundTexts.map((text) => claim(text, ["S1"]))),
+  });
+  assert.equal(result.state, "SOURCE_CHANGED");
+  assert.deepEqual(result.claims, []);
+  assert.deepEqual(result.sources, []);
+  for (const text of claimBoundTexts) assert.ok(!result.answer.includes(text));
+});
 
 for (const kind of ["CLIENT", "PROJECT"] as const) {
   for (const modified of [false, true]) {
