@@ -8,7 +8,7 @@ import { getPrismaClient } from "@/lib/db/prisma";
 import { compareDocumentVersions, documentSignalVersion, extractDocumentSignals } from "./document-signals";
 import { RelationshipCandidatePool } from "./relationship-candidate-pool";
 import { countKnowledgeWork, type KnowledgeWork } from "./knowledge-work";
-import { versionDominanceCounts, versionEndpoint } from "./document-version-index";
+import { semanticVersionMembers, versionDominanceCounts, versionEndpoint } from "./document-version-index";
 import { normalizePhysicalRelativePath } from "./physical-file-identity";
 import { loadScanWorkingKnowledge, observationSourceEvidenceText, type ScanWorkingKnowledgeIndex } from "./scan-working-knowledge";
 
@@ -1682,6 +1682,73 @@ export type HistoricalDocumentSignalEntry = {
   isCurrent: boolean;
 };
 
+/** One root-scoped adjacency index serves refresh and targeted signal resolution.
+ * Every edge is loaded once in bounded pages; every reachable endpoint is queued
+ * once, regardless of database order, cycles or correction direction. */
+export async function getIdentityCorrectionComponent(seeds: HistoricalDocumentSignalEntry[], work?: KnowledgeWork) {
+  const prisma = getPrismaClient();
+  const rootIds = [...new Set(seeds.map((entry) => entry.connectedLibraryId))].sort();
+  const allowed = new Set<string>();
+  for (let offset = 0; offset < rootIds.length; offset += 500) {
+    for (const root of await prisma.connectedLibrary.findMany({ select: { id: true }, where: {
+      id: { in: rootIds.slice(offset, offset + 500) }, isEnabled: true, readPermission: true,
+      status: "CONNECTED", disconnectedAt: null, hiddenFromActiveListAt: null,
+      mergedAt: null, canonicalConnectedLibraryId: null,
+    } })) allowed.add(root.id);
+  }
+  const endpoints = new Map<string, HistoricalDocumentSignalEntry>();
+  const adjacency = new Map<string, Set<string>>();
+  const roots = [...allowed].sort();
+  for (let offset = 0; offset < roots.length; offset += 500) {
+    let cursor: string | undefined;
+    do {
+      countKnowledgeWork(work, "correctionGraphQueries");
+      const corrections = await prisma.knowledgeConnection.findMany({
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}), orderBy: { id: "asc" }, take: 500,
+        select: { id: true, sourceChecksum: true, sourceFileKey: true, sourceEvidence: true,
+          targetChecksum: true, targetFileKey: true },
+        where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null,
+          relationshipKind: { in: ["SAME_CLIENT", "BELONGS_TO_PROJECT"] },
+          OR: roots.slice(offset, offset + 500).map((connectedLibraryId) => ({
+            sourceEvidence: { path: ["connectedLibraryId"], equals: connectedLibraryId },
+          })),
+        },
+      });
+      for (const correction of corrections) {
+        countKnowledgeWork(work, "correctionGraphRows");
+        const evidence = correction.sourceEvidence;
+        const rootId = evidence && !Array.isArray(evidence) && typeof evidence === "object" &&
+          typeof evidence.connectedLibraryId === "string" ? evidence.connectedLibraryId : null;
+        if (!rootId || !allowed.has(rootId) || !correction.sourceFileKey || !correction.sourceChecksum ||
+            !correction.targetFileKey || !correction.targetChecksum) continue;
+        const left = { connectedLibraryId: rootId, fileKey: correction.sourceFileKey,
+          checksum: correction.sourceChecksum, isCurrent: true };
+        const right = { connectedLibraryId: rootId, fileKey: correction.targetFileKey,
+          checksum: correction.targetChecksum, isCurrent: true };
+        const a = versionEndpoint(left), b = versionEndpoint(right);
+        endpoints.set(a, left); endpoints.set(b, right);
+        const neighborsA = adjacency.get(a) ?? new Set<string>();
+        const neighborsB = adjacency.get(b) ?? new Set<string>();
+        neighborsA.add(b); neighborsB.add(a);
+        adjacency.set(a, neighborsA); adjacency.set(b, neighborsB);
+      }
+      cursor = corrections.length === 500 ? corrections.at(-1)?.id : undefined;
+    } while (cursor);
+  }
+  const component = new Map(seeds.filter((entry) => allowed.has(entry.connectedLibraryId))
+    .map((entry) => [versionEndpoint(entry), entry]));
+  const queue = [...component.keys()];
+  for (let index = 0; index < queue.length; index++) {
+    countKnowledgeWork(work, "correctionGraphEndpoints");
+    for (const neighbor of adjacency.get(queue[index]) ?? []) {
+      countKnowledgeWork(work, "correctionGraphNeighbors");
+      if (component.has(neighbor)) continue;
+      component.set(neighbor, endpoints.get(neighbor)!); queue.push(neighbor);
+    }
+  }
+  return [...component.values()].sort((left, right) => versionEndpoint(left).localeCompare(versionEndpoint(right)));
+}
+
 /** Load original signals eligible for the current or explicitly retained snapshots. */
 export async function getEligibleDocumentSignals(permittedRootIds?: string[], options?: {
   historicalEntries: HistoricalDocumentSignalEntry[];
@@ -1707,7 +1774,7 @@ export async function getEligibleDocumentSignals(permittedRootIds?: string[], op
   };
   // Load current roots once and exact retained/scoped endpoints in bounded
   // chunks. Root and endpoint chunking must not form a cross-product query loop.
-  if (!scopedEntries.length) for (let offset = 0; offset < libraryIds.length; offset += 500) {
+  if (options?.scopedEntries === undefined) for (let offset = 0; offset < libraryIds.length; offset += 500) {
     await collect({ connectedLibraryId: { in: libraryIds.slice(offset, offset + 500) }, status: "ACTIVE", supersededAt: null });
   }
   const endpointFilters: Prisma.KnowledgeDocumentSignalWhereInput[] = [
@@ -1752,41 +1819,10 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
 }, work?: KnowledgeWork) {
   const prisma = getPrismaClient();
   let scopedEntries = options?.scopedEntries;
-  const permittedRoots = new Set(permittedRootIds);
   if (scopedEntries?.length) {
-    const scopedByEndpoint = new Map(scopedEntries.map((entry) =>
-      [`${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`, entry]));
-    let frontier = [...scopedEntries];
-    while (frontier.length) {
-      const fileKeys = [...new Set(frontier.map((entry) => entry.fileKey))];
-      const corrections = await prisma.knowledgeConnection.findMany({
-        select: { sourceChecksum: true, sourceEvidence: true, sourceFileKey: true,
-          targetChecksum: true, targetFileKey: true },
-        where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED",
-          supersededAt: null, OR: [{ sourceFileKey: { in: fileKeys } }, { targetFileKey: { in: fileKeys } }] },
-      });
-      const next: HistoricalDocumentSignalEntry[] = [];
-      for (const correction of corrections) {
-        const evidence = correction.sourceEvidence;
-        const connectedLibraryId = evidence && !Array.isArray(evidence) && typeof evidence === "object" &&
-          typeof evidence.connectedLibraryId === "string" ? evidence.connectedLibraryId : null;
-        if (!connectedLibraryId || !permittedRoots.has(connectedLibraryId)) continue;
-        for (const endpoint of [
-          { fileKey: correction.sourceFileKey, checksum: correction.sourceChecksum },
-          { fileKey: correction.targetFileKey, checksum: correction.targetChecksum },
-        ]) {
-          if (!endpoint.fileKey || !endpoint.checksum) continue;
-          const key = `${connectedLibraryId}\0${endpoint.fileKey}\0${endpoint.checksum}`;
-          if (scopedByEndpoint.has(key)) continue;
-          const entry = { connectedLibraryId, fileKey: endpoint.fileKey,
-            checksum: endpoint.checksum, isCurrent: true };
-          scopedByEndpoint.set(key, entry);
-          next.push(entry);
-        }
-      }
-      frontier = next;
-    }
-    scopedEntries = [...scopedByEndpoint.values()];
+    const permittedRoots = permittedRootIds ? new Set(permittedRootIds) : null;
+    scopedEntries = await getIdentityCorrectionComponent(scopedEntries.filter((entry) =>
+      !permittedRoots || permittedRoots.has(entry.connectedLibraryId)), work);
   }
   const rows = await getEligibleDocumentSignals(permittedRootIds,
     options ? { ...options, scopedEntries } : undefined);
@@ -1966,9 +2002,11 @@ export async function getPersistentIdentityGroups(work?: KnowledgeWork) {
       : [];
     let latestKey: string | null = null;
     if (isVersionFamily && distinctChecksums.size > 1) {
-      // One row per file; strict dominance also rejects conflicting markers.
-      const olderCounts = versionDominanceCounts(members, work, true);
-      const candidate = members.find((member) => olderCounts.get(member) === members.length - 1);
+      // Keep physical members in the group, but identical semantic revisions
+      // must not compete for its latest label. Conflicting copy metadata fails closed.
+      const revisions = semanticVersionMembers(members) ?? [];
+      const olderCounts = versionDominanceCounts(revisions, work, true);
+      const candidate = revisions.find((member) => olderCounts.get(member) === revisions.length - 1);
       latestKey = candidate?.fileKey ?? null;
     }
     return {

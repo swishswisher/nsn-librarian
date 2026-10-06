@@ -5,6 +5,7 @@ import { compareDocumentVersions, documentSignalVersion } from "@/lib/bridge/doc
 import { getDocumentVersionSignals, getEffectiveDocumentSignals, getSeparatedRelationshipPairIdentities, humanIdentityCorrectionVersion, knowledgeRelationshipPairKey, relationshipGenerationVersion } from "@/lib/bridge/persistent-knowledge";
 import { workingKnowledgeTerms } from "@/lib/bridge/scan-working-knowledge";
 import { countKnowledgeWork, type KnowledgeWork } from "@/lib/bridge/knowledge-work";
+import { numericRevision as normalizedRevision, semanticVersionMembers } from "@/lib/bridge/document-version-index";
 import { searchLibrary } from "@/lib/library/search";
 import { librarySearchIndexVersion } from "@/lib/library/search-index";
 import { getScannedFileExamineRoute, getScanSessionRoute } from "@/lib/library/routes";
@@ -14,13 +15,6 @@ import { maxAnswerSources, type AnswerContext, type AnswerContextSource, type An
 type StoredExcerpt = { start: number; end: number; text: string };
 
 type VersionSignal = Awaited<ReturnType<typeof getDocumentVersionSignals>>[number];
-
-function normalizedRevision(value: string | null) {
-  if (!value) return null;
-  const parts = value.split(".").map(Number);
-  while (parts.length > 1 && parts.at(-1) === 0) parts.pop();
-  return parts;
-}
 
 function familyHasAmbiguousPair(family: VersionSignal[]) {
   const groups = new Map<string, VersionSignal[]>();
@@ -82,23 +76,26 @@ export function assessDocumentVersionFamily(
   family: VersionSignal[],
   separated: boolean,
 ) {
-  if (separated || family.length < 2 || familyHasAmbiguousPair(family)) {
+  // Keep physical endpoints through discovery, completeness and separation checks.
+  // Only the semantic assessment collapses exact root/family/checksum/marker/date copies.
+  const members = semanticVersionMembers(family);
+  if (separated || family.length < 2 || !members || familyHasAmbiguousPair(members)) {
     return { maximum: null, olderSignals: [], safe: false, separated, family };
   }
 
   // A complete family can contain every file in a scan. Never materialize its
   // pairwise comparison graph: retain one candidate, then verify that candidate
   // against the complete family. This is linear in both work and memory.
-  let maximum = family[0];
-  for (let index = 1; index < family.length; index += 1) {
-    const order = compareDocumentVersions(maximum, family[index]);
+  let maximum = members[0];
+  for (let index = 1; index < members.length; index += 1) {
+    const order = compareDocumentVersions(maximum, members[index]);
     if (order === null) {
       return { maximum: null, olderSignals: [], safe: false, separated: false, family };
     }
-    if (order === -1) maximum = family[index];
+    if (order === -1) maximum = members[index];
   }
   const olderSignals: VersionSignal[] = [];
-  for (const signal of family) {
+  for (const signal of members) {
     if (signal === maximum) continue;
     if (compareDocumentVersions(maximum, signal) !== 1) {
       return { maximum: null, olderSignals: [], safe: false, separated: false, family };
@@ -477,18 +474,18 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     if (older?.timeState === "Current scan") older.timeState = "Earlier document version";
   }
 
-  const documentIds = fileEntries.flatMap((entry) => entry.scannedFile.libraryDocumentId
-    ? [entry.scannedFile.libraryDocumentId] : []);
-  const observations = documentIds.length ? await prisma.observationSession.findMany({
-    where: { libraryDocumentId: { in: documentIds } },
-    select: { id: true, libraryDocumentId: true, status: true }, take: 80,
-    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-  }) : [];
+  const documentIds = [...new Set(fileEntries.flatMap((entry) => entry.scannedFile.libraryDocumentId
+    ? [entry.scannedFile.libraryDocumentId] : []))].slice(0, maxAnswerSources);
+  const observations = await Promise.all(documentIds.map((libraryDocumentId) => {
+    countKnowledgeWork(work, "latestObservationQueries");
+    return prisma.observationSession.findFirst({
+      where: { libraryDocumentId }, select: { id: true, libraryDocumentId: true, status: true },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    });
+  }));
   const latestObservationByDocument = new Map<string, { id: string; status: string }>();
   for (const observation of observations) {
-    if (!latestObservationByDocument.has(observation.libraryDocumentId)) {
-      latestObservationByDocument.set(observation.libraryDocumentId, observation);
-    }
+    if (observation) latestObservationByDocument.set(observation.libraryDocumentId, observation);
   }
   const sourceIdByObservation = new Map([...latestObservationByDocument].flatMap(([documentId, observation]) =>
     observation.status === "REJECTED" ? [] :

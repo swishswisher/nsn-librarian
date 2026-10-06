@@ -10,6 +10,7 @@ import { verifiedSourceExcerpts } from "../../src/lib/ai/source-evidence";
 import { runSearchPreparationBatches } from "../../src/lib/library/search-preparation";
 import { workingKnowledgeTerms } from "../../src/lib/bridge/scan-working-knowledge";
 import type { KnowledgeWork } from "../../src/lib/bridge/knowledge-work";
+import { knowledgeScaleFixture } from "./knowledge-scale-fixtures";
 
 const schema = `phase_three_${process.pid}_${Date.now()}`;
 const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -2633,6 +2634,131 @@ test("exhaustive entity search indexes twenty thousand version-bearing candidate
   })) });
   assert.equal(historical.length, count * 2);
   assert.equal(historical.filter((signal) => signal.kind === "CLIENT").length, count);
+});
+
+async function seedCorrectionRefreshEntries(fixture: Awaited<ReturnType<typeof knowledgeScaleFixture>>) {
+  for (let offset = 0; offset < fixture.rows.length; offset += 500) {
+    await prisma.librarySearchEntry.createMany({ data: fixture.rows.slice(offset, offset + 500).map((row) => ({
+      entryKey: crypto.randomUUID(), fileKey: row.fileKey, connectedLibraryId: fixture.root.id,
+      scannedFileId: row.id, scanSessionId: fixture.scan.id, relativePath: row.relativePath,
+      fileName: row.relativePath, checksum: row.checksum, fileType: "TEXT", indexVersion: "library-search-v1",
+      fingerprint: "before-refresh", knowledgeState: "PROVISIONAL", sourceExcerpts: [],
+      sourceTerms: [], reviewedTerms: [], concepts: [], entityHashes: ["stale-projection"],
+    })) });
+  }
+}
+
+function correctionRefreshEdge(fixture: Awaited<ReturnType<typeof knowledgeScaleFixture>>, left: number, right: number, id: string) {
+  const source = fixture.rows[left], target = fixture.rows[right];
+  return { id, sourceObservationSessionId: source.observationId, targetObservationSessionId: target.observationId,
+    sourceFileKey: source.fileKey, sourceChecksum: source.checksum, targetFileKey: target.fileKey, targetChecksum: target.checksum,
+    relationshipKind: "SAME_CLIENT", generationVersion: fileKey.humanIdentityCorrectionVersion,
+    status: "CONFIRMED" as const, reasoning: "Human correction refresh fixture", sharedTerms: [],
+    sourceEvidence: { connectedLibraryId: fixture.root.id,
+      identityHash: extractDocumentSignals(target.evidence, fixture.root.id)[0].identityHash } };
+}
+
+for (const order of ["forward", "reverse"] as const) {
+  test(`correction refresh twenty thousand ${order} chain indexes edges and entry hashes once with bounded SQL`, async (t) => {
+    const links = 20_000;
+    const fixture = await knowledgeScaleFixture(prisma, `Refresh ${order}`, links + 3,
+      () => "Client ID: REFRESH-001; Client: Refresh");
+    t.after(fixture.dispose);
+    await fixture.seedSignals();
+    await seedCorrectionRefreshEntries(fixture);
+    const edges = Array.from({ length: links }, (_, index) => correctionRefreshEdge(fixture, index, index + 1,
+      `${fixture.root.id}-chain-${String(order === "forward" ? index : links - index).padStart(5, "0")}`));
+    edges.push(correctionRefreshEdge(fixture, links + 1, links + 2, `${fixture.root.id}-unrelated`));
+    for (let offset = 0; offset < edges.length; offset += 500) {
+      await prisma.knowledgeConnection.createMany({ data: edges.slice(offset, offset + 500) });
+    }
+    await prisma.knowledgeDocumentSignal.create({ data: { signalKey: crypto.randomUUID(), kind: "FILE_ANCHOR",
+      identityHash: "anchor-must-not-project", connectedLibraryId: fixture.root.id, generationVersion: documentSignalVersion,
+      fileKey: fixture.rows[0].fileKey, checksum: fixture.rows[0].checksum, relativePath: fixture.rows[0].relativePath,
+      observationSessionId: fixture.rows[0].observationId, sourceRanges: [] } });
+    const expectedHash = extractDocumentSignals(fixture.rows[0].evidence, fixture.root.id)[0].identityHash;
+    const work: KnowledgeWork = {};
+    await indexer.refreshSearchForIdentityRelationship(edges[0].id, work);
+    assert.equal(work.correctionGraphRows, links + 1);
+    assert.equal(work.correctionGraphEndpoints, links + 1);
+    assert.equal(work.correctionGraphNeighbors, links * 2);
+    assert.equal(work.correctionGraphQueries, Math.ceil(edges.length / 500));
+    assert.equal(work.searchRefreshQueries, Math.ceil((links + 1) / 500));
+    assert.equal(work.searchRefreshEntries, links + 1);
+    assert.equal(work.searchRefreshUpdates, links + 1);
+    assert.equal(work.searchRefreshUpdateQueries, Math.ceil((links + 1) / 500));
+    assert.ok(work.searchRefreshSignals! <= fixture.rows.length * 3 + 1);
+    const snapshot = () => prisma.librarySearchEntry.findMany({ where: { connectedLibraryId: fixture.root.id },
+      orderBy: { id: "asc" }, select: { fileKey: true, entityHashes: true, fingerprint: true, indexedAt: true } });
+    const first = await snapshot();
+    const reachable = new Set(fixture.rows.slice(0, links + 1).map((row) => row.fileKey));
+    for (const entry of first) {
+      assert.deepEqual(entry.entityHashes, reachable.has(entry.fileKey) ? [expectedHash] : ["stale-projection"]);
+      assert.equal(entry.fingerprint, reachable.has(entry.fileKey) ? "" : "before-refresh");
+    }
+    const repeated: KnowledgeWork = {};
+    await indexer.refreshSearchForIdentityRelationship(edges[0].id, repeated);
+    assert.equal(repeated.searchRefreshUpdates ?? 0, 0);
+    assert.equal(repeated.searchRefreshUpdateQueries ?? 0, 0);
+    assert.deepEqual(await snapshot(), first);
+    // The adjacent targeted resolver shares the same indexed walk, rather than
+    // making one database frontier request for each link in this long chain.
+    const scopedWork: KnowledgeWork = {};
+    const scoped = await fileKey.getEffectiveDocumentSignals([fixture.root.id], { historicalEntries: [],
+      scopedEntries: [{ connectedLibraryId: fixture.root.id, fileKey: fixture.rows[0].fileKey,
+        checksum: fixture.rows[0].checksum, isCurrent: true }] }, scopedWork);
+    assert.equal(scopedWork.correctionGraphRows, links + 1);
+    assert.equal(scopedWork.correctionGraphEndpoints, links + 1);
+    assert.equal(scopedWork.correctionGraphNeighbors, links * 2);
+    assert.equal(scopedWork.correctionGraphQueries, Math.ceil(edges.length / 500));
+    assert.equal(new Set(scoped.map((signal) => `${signal.fileKey}\0${signal.checksum}`)).size, links + 1);
+    console.log("correction refresh work", order, JSON.stringify(work), JSON.stringify(scopedWork));
+  });
+}
+
+test("correction refresh cycle and branch preserve checksum, root, status, history and authorization controls", async (t) => {
+  const fixture = await knowledgeScaleFixture(prisma, "Refresh controls", 8, () => "Client ID: CONTROL-001; Client: Control");
+  const other = await knowledgeScaleFixture(prisma, "Other refresh root", 1, () => "Client ID: OTHER-001; Client: Other");
+  t.after(fixture.dispose); t.after(other.dispose);
+  await fixture.seedSignals(); await other.seedSignals();
+  await seedCorrectionRefreshEntries(fixture); await seedCorrectionRefreshEntries(other);
+  const [a, b, c, d] = [0, 1, 2, 3].map((index) => fixture.rows[index]);
+  const edges = [[0, 1], [1, 2], [2, 0], [1, 3]].map(([left, right], index) =>
+    correctionRefreshEdge(fixture, left, right, `${fixture.root.id}-active-${index}`));
+  edges[3].relationshipKind = "BELONGS_TO_PROJECT";
+  const wrong = { ...correctionRefreshEdge(fixture, 0, 4, `${fixture.root.id}-wrong-checksum`), sourceChecksum: "wrong-checksum" };
+  const superseded = { ...correctionRefreshEdge(fixture, 0, 5, `${fixture.root.id}-superseded`), supersededAt: new Date() };
+  const unconfirmed = { ...correctionRefreshEdge(fixture, 0, 6, `${fixture.root.id}-new`), status: "NEW" as const };
+  const rejected = { ...correctionRefreshEdge(fixture, 0, 7, `${fixture.root.id}-rejected`), status: "REJECTED" as const };
+  const crossRoot = { ...correctionRefreshEdge(fixture, 0, 4, `${fixture.root.id}-cross-root`),
+    sourceEvidence: { connectedLibraryId: other.root.id, identityHash: "other-root" } };
+  await prisma.knowledgeConnection.createMany({ data: [...edges, wrong, superseded, unconfirmed, rejected, crossRoot] });
+  const original = await prisma.librarySearchEntry.findFirstOrThrow({ where: { scannedFileId: a.id } });
+  const { id: originalEntryId, ...entryData } = original;
+  await prisma.librarySearchEntry.createMany({ data: [
+    { ...entryData, entryKey: `${originalEntryId}-wrong-checksum`, checksum: "wrong-checksum" },
+    { ...entryData, entryKey: `${originalEntryId}-historical`, isCurrent: false },
+  ] });
+  // A lookalike fileKey in another root cannot be admitted by an endpoint-only query.
+  await prisma.librarySearchEntry.updateMany({ where: { connectedLibraryId: other.root.id }, data: { fileKey: a.fileKey } });
+  const protectedWhere = { OR: [{ connectedLibraryId: other.root.id }, { isCurrent: false }, { checksum: "wrong-checksum" },
+    { fileKey: { in: fixture.rows.slice(4).map((row) => row.fileKey) } }] };
+  const protectedBefore = await prisma.librarySearchEntry.findMany({ where: protectedWhere, orderBy: { id: "asc" } });
+  const work: KnowledgeWork = {};
+  await indexer.refreshSearchForIdentityRelationship(edges[0].id, work);
+  assert.equal(work.correctionGraphEndpoints, 4); assert.equal(work.correctionGraphNeighbors, 8);
+  assert.equal(work.searchRefreshEntries, 4);
+  assert.deepEqual(await prisma.librarySearchEntry.findMany({ where: protectedWhere, orderBy: { id: "asc" } }), protectedBefore);
+  const expected = extractDocumentSignals(a.evidence, fixture.root.id)[0].identityHash;
+  assert.equal(await prisma.librarySearchEntry.count({ where: { connectedLibraryId: fixture.root.id,
+    fileKey: { in: [a, b, c, d].map((row) => row.fileKey) }, checksum: { not: "wrong-checksum" },
+    isCurrent: true, entityHashes: { equals: [expected] }, fingerprint: "" } }), 4);
+  await prisma.connectedLibrary.update({ where: { id: fixture.root.id }, data: { readPermission: false } });
+  const beforeRevoked = await prisma.librarySearchEntry.findMany({ where: { connectedLibraryId: fixture.root.id }, orderBy: { id: "asc" } });
+  await indexer.refreshSearchForIdentityRelationship(edges[0].id);
+  assert.deepEqual(await prisma.librarySearchEntry.findMany({ where: { connectedLibraryId: fixture.root.id }, orderBy: { id: "asc" } }), beforeRevoked);
+  assert.deepEqual(await fileKey.getEffectiveDocumentSignals([other.root.id], { historicalEntries: [],
+    scopedEntries: [{ connectedLibraryId: fixture.root.id, fileKey: a.fileKey, checksum: a.checksum, isCurrent: true }] }), []);
 });
 
 test("metadata search remains available if the derived index is unavailable", async () => {

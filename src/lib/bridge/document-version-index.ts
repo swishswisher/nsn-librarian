@@ -17,6 +17,25 @@ export function numericRevision(value: string | null) {
   return parts;
 }
 
+/** Collapse physical copies only for semantic assessment, after root/family
+ * discovery and separation checks. Contradictory metadata on identical bytes
+ * invalidates the assessment instead of being hidden by deduplication. */
+export function semanticVersionMembers<T extends IndexedVersion>(family: T[]) {
+  const copies = new Map<string, { markers: string; signal: T }>();
+  for (const signal of family) {
+    const revision = numericRevision(signal.revisionNumber);
+    if (revision?.some((part) => !Number.isFinite(part))) return null;
+    const key = `${signal.connectedLibraryId}\0${signal.identityHash}\0${signal.checksum}`;
+    const markers = JSON.stringify([revision, signal.revisionDate]);
+    const copy = copies.get(key);
+    if (copy && copy.markers !== markers) return null;
+    if (!copy || versionEndpoint(signal).localeCompare(versionEndpoint(copy.signal)) < 0) {
+      copies.set(key, { markers, signal });
+    }
+  }
+  return [...copies.values()].map((copy) => copy.signal);
+}
+
 export function compareNumericRevision(left: number[], right: number[]) {
   for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
     if ((left[index] ?? 0) !== (right[index] ?? 0)) return (left[index] ?? 0) - (right[index] ?? 0);

@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { Prisma } from "@prisma/client";
 import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { workingKnowledgeTerms, type ScanWorkingKnowledgeIndex } from "@/lib/bridge/scan-working-knowledge";
-import { fileKeyAfterKnownMoves, getEffectiveDocumentSignals, humanIdentityCorrectionVersion, knownExecutedMoves, usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
+import { fileKeyAfterKnownMoves, getEffectiveDocumentSignals, getIdentityCorrectionComponent, knownExecutedMoves, usableScanSnapshotWhere } from "@/lib/bridge/persistent-knowledge";
+import { versionEndpoint } from "@/lib/bridge/document-version-index";
+import { countKnowledgeWork, type KnowledgeWork } from "@/lib/bridge/knowledge-work";
 import { loadScanWorkingKnowledge } from "@/lib/bridge/scan-working-knowledge";
 
 export const librarySearchIndexVersion = "library-search-v1";
@@ -189,7 +192,7 @@ export async function refreshSearchForObservation(observationSessionId: string) 
   }
 }
 
-export async function refreshSearchForIdentityRelationship(relationshipId: string) {
+export async function refreshSearchForIdentityRelationship(relationshipId: string, work?: KnowledgeWork) {
   const prisma = getPrismaClient();
   const relationship = await prisma.knowledgeConnection.findUnique({ where: { id: relationshipId } });
   if (!relationship) return;
@@ -197,48 +200,62 @@ export async function refreshSearchForIdentityRelationship(relationshipId: strin
   const connectedLibraryId = evidence && !Array.isArray(evidence) && typeof evidence === "object" &&
     typeof evidence.connectedLibraryId === "string" ? evidence.connectedLibraryId : null;
   if (!connectedLibraryId) return;
-  // Corrections are an undirected equivalence graph. Walk both incoming and
-  // outgoing edges so changing A also refreshes B in B→A→C.
-  const corrections = await prisma.knowledgeConnection.findMany({
-    select: { sourceChecksum: true, sourceFileKey: true, targetChecksum: true, targetFileKey: true },
-    where: { generationVersion: humanIdentityCorrectionVersion, status: "CONFIRMED", supersededAt: null,
-      sourceEvidence: { path: ["connectedLibraryId"], equals: connectedLibraryId } },
-  });
-  const affected = new Set<string>();
-  const addEndpoint = (fileKey: string | null, checksum: string | null) => {
-    if (fileKey && checksum) affected.add(`${fileKey}\0${checksum}`);
-  };
-  addEndpoint(relationship.sourceFileKey, relationship.sourceChecksum);
-  addEndpoint(relationship.targetFileKey, relationship.targetChecksum);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const correction of corrections) {
-      if (!correction.sourceFileKey || !correction.sourceChecksum ||
-          !correction.targetFileKey || !correction.targetChecksum) continue;
-      const source = `${correction.sourceFileKey}\0${correction.sourceChecksum}`;
-      const target = `${correction.targetFileKey}\0${correction.targetChecksum}`;
-      if (!affected.has(source) && !affected.has(target)) continue;
-      if (!affected.has(source)) { affected.add(source); changed = true; }
-      if (!affected.has(target)) { affected.add(target); changed = true; }
-    }
-  }
-  const entries = await prisma.librarySearchEntry.findMany({
-    select: { id: true, connectedLibraryId: true, fileKey: true, checksum: true },
+  const affected = await getIdentityCorrectionComponent([
+    { fileKey: relationship.sourceFileKey, checksum: relationship.sourceChecksum },
+    { fileKey: relationship.targetFileKey, checksum: relationship.targetChecksum },
+  ].flatMap((entry) => entry.fileKey && entry.checksum ? [{ ...entry,
+    fileKey: entry.fileKey, checksum: entry.checksum, connectedLibraryId, isCurrent: true }] : []), work);
+  const entries = [];
+  for (let offset = 0; offset < affected.length; offset += 500) {
+    countKnowledgeWork(work, "searchRefreshQueries");
+    entries.push(...await prisma.librarySearchEntry.findMany({
+    orderBy: { id: "asc" },
+    select: { id: true, connectedLibraryId: true, fileKey: true, checksum: true, entityHashes: true, fingerprint: true },
     where: { isCurrent: true, connectedLibraryId,
       connectedLibrary: { isEnabled: true, readPermission: true, status: "CONNECTED",
         disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null },
-      OR: [...affected].map((endpoint) => {
-        const [fileKey, checksum] = endpoint.split("\0");
-        return { fileKey, checksum };
-      }) },
-  });
+      OR: affected.slice(offset, offset + 500).map(({ fileKey, checksum }) => ({ fileKey, checksum })) },
+    }));
+  }
+  if (!entries.length) return;
   const signals = await getEffectiveDocumentSignals([...new Set(entries.map((entry) => entry.connectedLibraryId))]);
+  const hashesByEndpoint = new Map<string, Set<string>>();
+  for (const signal of signals) {
+    countKnowledgeWork(work, "searchRefreshSignals");
+    if (signal.kind === "FILE_ANCHOR") continue;
+    const key = versionEndpoint(signal);
+    const hashes = hashesByEndpoint.get(key) ?? new Set<string>();
+    hashes.add(signal.identityHash); hashesByEndpoint.set(key, hashes);
+  }
+  const changedEntries = [];
   for (const entry of entries) {
-    const entityHashes = [...new Set(signals.filter((signal) => signal.fileKey === entry.fileKey &&
-      signal.checksum === entry.checksum && signal.kind !== "FILE_ANCHOR").map((signal) => signal.identityHash))];
-    await prisma.librarySearchEntry.update({ where: { id: entry.id },
-      // Force normal indexing to recompute its fingerprint after this targeted derived-field refresh.
-      data: { entityHashes, fingerprint: "", indexedAt: new Date() } });
+    countKnowledgeWork(work, "searchRefreshEntries");
+    const entityHashes = [...(hashesByEndpoint.get(versionEndpoint(entry)) ?? [])].sort();
+    if (entry.fingerprint === "" && JSON.stringify(entry.entityHashes) === JSON.stringify(entityHashes)) continue;
+    countKnowledgeWork(work, "searchRefreshUpdates");
+    changedEntries.push({ ...entry, entityHashes });
+  }
+  const indexedAt = new Date();
+  for (let offset = 0; offset < changedEntries.length; offset += 500) {
+    countKnowledgeWork(work, "searchRefreshUpdateQueries");
+    const values = Prisma.join(changedEntries.slice(offset, offset + 500).map((entry) =>
+      Prisma.sql`(${entry.id}, ${entry.fileKey}, ${entry.checksum},
+        ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(entry.entityHashes)}::jsonb)))`));
+    // Parameterized bulk projection avoids one write query per endpoint. Recheck
+    // root authority and exact current bytes on every bounded write as well.
+    // Empty fingerprint makes normal indexing recompute the derived fields.
+    await prisma.$executeRaw(Prisma.sql`
+      UPDATE "LibrarySearchEntry" AS entry
+      SET "entityHashes" = projection.hashes, "fingerprint" = '', "indexedAt" = ${indexedAt}
+      FROM (VALUES ${values}) AS projection(id, "fileKey", checksum, hashes)
+      WHERE entry.id = projection.id AND entry."isCurrent" = true
+        AND entry."connectedLibraryId" = ${connectedLibraryId}
+        AND entry."fileKey" = projection."fileKey" AND entry.checksum = projection.checksum
+        AND EXISTS (SELECT 1 FROM "ConnectedFolder" AS root
+          WHERE root.id = entry."connectedLibraryId" AND root.enabled = true
+            AND root."readPermission" = true AND root.status = 'CONNECTED'
+            AND root."disconnectedAt" IS NULL AND root."hiddenFromActiveListAt" IS NULL
+            AND root."mergedAt" IS NULL AND root."canonicalConnectedLibraryId" IS NULL)
+    `);
   }
 }

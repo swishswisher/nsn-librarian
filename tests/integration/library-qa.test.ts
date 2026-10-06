@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { after, before, test } from "node:test";
 
@@ -2234,3 +2235,123 @@ test("routing distinguishes client, project, version, topic and Memory intent", 
   );
   assert.equal(routing.routeLibraryQuestion("Show client O'Connor invoices").entityName, "O'Connor");
 });
+
+for (const scenario of ["starvation", "multiple busy", "eight-source bound", "rejected", "modified", "timestamp tie", "absent"] as const) {
+  test(`per-document latest QA observations preserve ${scenario} relationship evidence`, async () => {
+    const r = await root(`Latest observations ${scenario}`); const s = await scan(r.id);
+    const counts = scenario === "eight-source bound" ? Array(9).fill(81) : scenario === "multiple busy" ? [81, 81, 81]
+      : scenario === "starvation" ? [81, 0] : [0, scenario === "timestamp tie" ? 2 : 1];
+    const records = [];
+    for (const [index, count] of counts.entries()) {
+      const item = await file({ rootId: r.id, sessionId: s.id, relativePath: `lookup-${index}.txt`,
+        quote: `Lookupgarden evidence ${index}`, knowledgeState: "APPROVED" });
+      const history = Array.from({ length: count }, (_, row) => ({
+        id: `${r.id}-doc-${index}-${row === count - 1 ? "zz" : "aa"}-${row}`,
+        libraryDocumentId: item.document.id, observerType: "OPENAI" as const, status: "APPROVED" as const,
+        observations: [], interpretations: [], explanation: [], planSuggestions: [], warnings: [],
+        createdAt: new Date(Date.UTC(2040, 0, 1) + index * 100_000 + (scenario === "timestamp tie" ? 0 : row)),
+      }));
+      if (history.length) await prisma.observationSession.createMany({ data: history });
+      records.push({ ...item, latestId: history.at(-1)?.id ?? item.observation.id });
+    }
+    if (scenario === "rejected" || scenario === "modified") await prisma.observationSession.update({
+      where: { id: records[1].latestId }, data: { status: scenario === "rejected" ? "REJECTED" : "MODIFIED" },
+    });
+    const links = [];
+    for (let index = 1; index < records.length; index++) {
+      const left = records[index - 1], right = records[index];
+      const reasoning = `Latest lookup ${index - 1} to ${index}`;
+      await prisma.knowledgeConnection.create({ data: {
+        sourceObservationSessionId: left.latestId,
+        targetObservationSessionId: scenario === "rejected" ? right.observation.id : right.latestId,
+        sourceChecksum: left.scanned.checksum, targetChecksum: right.scanned.checksum,
+        generationVersion: identity.relationshipGenerationVersion, status: "CONFIRMED", sharedTerms: [], reasoning,
+      } });
+      links.push({ left: left.scanned.relativePath, right: right.scanned.relativePath, reasoning });
+    }
+    if (scenario === "absent") await prisma.observationSession.deleteMany({ where: { libraryDocumentId: records[1].document.id } });
+    const work: KnowledgeWork = {};
+    const context = await retrieve.retrieveQuestionContext("lookupgarden", [r.id], work);
+    assert.equal(context.sources.length, Math.min(records.length, 8));
+    assert.equal(work.latestObservationQueries, Math.min(records.length, 8));
+    const selected = new Set(context.sources.map((source) => source.relativePath));
+    const expected = ["rejected", "absent"].includes(scenario) ? [] : links.filter((link) => selected.has(link.left) && selected.has(link.right)).map((link) => link.reasoning).sort();
+    assert.deepEqual(context.relationships.map((relationship) => relationship.explanation).sort(), expected);
+    if (!["rejected", "absent"].includes(scenario)) assert.ok(context.relationships.length > 0);
+    assert.ok(context.relationships.length <= 24);
+  });
+}
+
+for (const scenario of ["identical", "normalized marker", "no dates", "different bytes", "conflicting marker", "conflicting date", "separated", "cross-root"] as const) {
+  test(`semantic version copies ${scenario} preserve complete production Ask assessment`, async () => {
+    const r = await root(`Version copies ${scenario}`); const s = await scan(r.id);
+    const text = ["Copygarden plan version one", "Copygarden plan version two"];
+    const checksums = text.map((value) => createHash("sha256").update(value).digest("hex"));
+    const first = await file({ rootId: r.id, sessionId: s.id, relativePath: "plan-v1.txt", quote: text[0], checksum: checksums[0] });
+    const latest = await file({ rootId: r.id, sessionId: s.id, relativePath: "plan-v2.txt", quote: text[1], checksum: checksums[1] });
+    const copyRoot = scenario === "cross-root" ? await root("Independent copied version root") : r;
+    const copyScan = scenario === "cross-root" ? await scan(copyRoot.id) : s;
+    const backup = await file({ rootId: copyRoot.id, sessionId: copyScan.id, relativePath: "backup/plan-v2.txt", quote: text[1],
+      checksum: scenario === "different bytes" ? createHash("sha256").update("different version two bytes").digest("hex") : checksums[1] });
+    const family = "copygarden-family";
+    const records = [first, latest, backup];
+    for (const [index, item] of records.entries()) {
+      await prisma.knowledgeDocumentSignal.create({ data: {
+        signalKey: crypto.randomUUID(), connectedLibraryId: index === 2 ? copyRoot.id : r.id,
+        fileKey: item.index.fileKey, checksum: item.scanned.checksum!, relativePath: item.scanned.relativePath,
+        kind: "DOCUMENT_FAMILY", identityHash: family, sourceRanges: [], observationSessionId: item.observation.id,
+        generationVersion: documentSignalVersion,
+        revisionNumber: index === 0 ? "1" : index === 2 && scenario === "normalized marker" ? "2.0"
+          : index === 2 && scenario === "conflicting marker" ? "3" : "2",
+        revisionDate: scenario === "no dates" ? null : index === 0 ? "2026-01-01"
+          : index === 2 && scenario === "conflicting date" ? "2026-03-01" : "2026-02-01",
+      } });
+    }
+    if (scenario === "separated") {
+      const link = await prisma.knowledgeConnection.create({ data: {
+        sourceObservationSessionId: latest.observation.id, targetObservationSessionId: backup.observation.id,
+        sourceFileKey: latest.index.fileKey, targetFileKey: backup.index.fileKey,
+        sourceChecksum: latest.scanned.checksum, targetChecksum: backup.scanned.checksum,
+        generationVersion: documentSignalVersion, relationshipKind: "PROBABLE_REVISION",
+        sourceEvidence: { connectedLibraryId: r.id, identityHash: family,
+          sourceRelativePath: latest.scanned.relativePath, targetRelativePath: backup.scanned.relativePath },
+        sharedTerms: [], reasoning: "Review copy lineage",
+      } });
+      await identity.reviewPersistentRelationship(link.id, "SEPARATE", "Keep the version endpoints separated");
+    }
+    const permittedRoots = [r.id, copyRoot.id];
+    const question = "Which copygarden plan version is latest?";
+    const context = await retrieve.retrieveQuestionContext(question, permittedRoots);
+    const safe = ["identical", "normalized marker", "no dates", "cross-root"].includes(scenario);
+    assert.equal(context.versionAssessmentComplete, safe);
+    const identityGroup = (await identity.getPersistentIdentityGroups()).find((group) =>
+      group.kind === "DOCUMENT_FAMILY" && group.libraryName === r.displayName);
+    if (scenario === "separated") assert.equal(identityGroup, undefined);
+    else {
+      assert.ok(identityGroup);
+      const latestCopies = scenario === "cross-root" ? [latest] : [latest, backup];
+      const expectedLatest = [...latestCopies].sort((left, right) => left.index.fileKey.localeCompare(right.index.fileKey))[0];
+      assert.equal(identityGroup.latestKey, safe ? expectedLatest.index.fileKey : null);
+      assert.equal(identityGroup.members.length, scenario === "cross-root" ? 2 : 3);
+    }
+    const result = await answer.answerLibraryQuestion(question, { permittedRootIds: permittedRoots, model: model([]) });
+    assert.equal(result.state, safe ? "ANSWERED_FROM_SOURCES" : "INSUFFICIENT_EVIDENCE");
+    if (safe) {
+      assert.equal(context.versions.length, 1);
+      assert.equal(context.versions[0].ordering, "ORDERED");
+      const newer = context.sources.find((source) => source.id === context.versions[0].newerSourceId)!;
+      assert.equal(newer.physicalIdentity, `sha256:${checksums[1]}`);
+      assert.equal(context.sources.find((source) => source.physicalIdentity === `sha256:${checksums[0]}`)?.timeState, "Earlier document version");
+      assert.equal(context.sources.filter((source) => source.physicalIdentity === `sha256:${checksums[1]}`).length, 1);
+      assert.equal(result.claims.length, 1);
+      const signals = await identity.getDocumentVersionSignals(records.map((item) => item.index), false, true);
+      const families = retrieve.groupDocumentVersionSignalsByFamily(signals);
+      const assessed = retrieve.assessDocumentVersionFamily(families.get(`${r.id}\0${family}`)!, false);
+      assert.equal(assessed.safe, true); assert.equal(assessed.maximum?.checksum, checksums[1]);
+      assert.deepEqual(assessed.olderSignals.map((signal) => signal.checksum), [checksums[0]]);
+      if (scenario === "cross-root") assert.equal(families.size, 2);
+    } else {
+      assert.equal(result.claims.length, 0);
+    }
+  });
+}
