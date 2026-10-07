@@ -1064,8 +1064,9 @@ export function buildScanWorkingKnowledge(input: {
 export async function loadScanWorkingKnowledge(
   scanSessionId: string,
   onlyFileIds?: string[],
+  publicationTx?: Prisma.TransactionClient,
 ): Promise<ScanWorkingKnowledgeIndex> {
-  const prisma = getPrismaClient();
+  const prisma = publicationTx ?? getPrismaClient();
   const session = await prisma.scanSession.findFirst({
     select: { id: true },
     where: { id: scanSessionId, connectedFolder: {

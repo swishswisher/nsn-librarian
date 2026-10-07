@@ -1,11 +1,10 @@
 import { latestObservationOrder, usableObservation } from "./observation-authority";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { recordScanSessionNotebookEntry } from "@/lib/library/notebook";
-import { indexScanKnowledge } from "@/lib/library/search-index";
+import { publishScanDerivedKnowledge } from "./scan-publication";
 
 import { generateOrganizationSuggestionsForScannedFileWithText } from "./organization-suggestions";
 import { loadScanWorkingKnowledge } from "./scan-working-knowledge";
-import { persistScanWorkingKnowledge } from "./persistent-knowledge";
 
 type BatchOptions = {
   recordNotebook?: boolean;
@@ -71,6 +70,7 @@ async function markRecommendationFailure(scannedFileId: string, error: unknown) 
 
 async function completeSession(sessionId: string, recordNotebook: boolean) {
   const prisma = getPrismaClient();
+  const publicationGeneration = `NOT_ATTEMPTED@${crypto.randomUUID()}`;
   const failedFiles = await prisma.scannedFile.count({
     where: {
       OR: [
@@ -88,6 +88,10 @@ async function completeSession(sessionId: string, recordNotebook: boolean) {
       completedAt: new Date(),
       failedFiles,
       status: failedFiles > 0 ? "COMPLETED_WITH_ERRORS" : "COMPLETED",
+      // Completion of a fresh primary cycle also durably records its derived
+      // work. Reprocessing this same session cannot reuse an older success.
+      knowledgePersistenceStatus: publicationGeneration,
+      searchIndexStatus: publicationGeneration,
     },
     where: { id: sessionId },
   });
@@ -154,30 +158,7 @@ export async function generateScanRecommendationBatch(
 
   await completeSession(sessionId, options.recordNotebook ?? false);
 
-  // Publish current knowledge only after the new snapshot has finished processing.
-  try {
-    await persistScanWorkingKnowledge(workingKnowledge);
-    await prisma.scanSession.update({
-      data: { knowledgePersistenceStatus: "COMPLETED" },
-      where: { id: sessionId },
-    });
-  } catch {
-    await prisma.scanSession.update({
-      data: { knowledgePersistenceStatus: "INCOMPLETE" },
-      where: { id: sessionId },
-    });
-    // Partial knowledge must not stop current-scan recommendations.
-  }
-  try {
-    await indexScanKnowledge(workingKnowledge);
-    await prisma.scanSession.update({
-      data: { searchIndexStatus: "COMPLETED" }, where: { id: sessionId },
-    });
-  } catch {
-    await prisma.scanSession.update({
-      data: { searchIndexStatus: "INCOMPLETE" }, where: { id: sessionId },
-    });
-  }
+  await publishScanDerivedKnowledge(sessionId);
 
   return {
     createdCount,

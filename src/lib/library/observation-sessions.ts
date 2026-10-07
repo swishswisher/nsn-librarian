@@ -677,7 +677,10 @@ export async function saveHumanDecision(
       latestDecision.editedSuggestion === editedSuggestion &&
       (!intendedStatus || existingSession.status === intendedStatus)
     ) {
-      await reconcileObservationKnowledge(tx, sessionId);
+      // The identical decision's authority and reconciliation committed together.
+      // Reconcile only a new decision; replaying an edit would retire derived
+      // relationships published since that edit. Pending publication is resumed
+      // below without regenerating the human decision or invalidating success.
       return {
         decisionId: latestDecision.id,
         status: existingSession.status as ObservationSessionStatus,
@@ -727,7 +730,9 @@ export async function saveHumanDecision(
       reapproved: nextStatus === "APPROVED" && ["MODIFIED", "REJECTED"].includes(existingSession.status),
     };
   });
-  if (result.reapproved) await refreshApprovedObservationRelationships(sessionId);
+  if (["APPROVED", "MODIFIED", "REJECTED"].includes(result.status)) {
+    await refreshApprovedObservationRelationships(sessionId);
+  }
   if (result.status === "REJECTED") await buildMemoryFromApprovedSession(sessionId);
   return result;
 }

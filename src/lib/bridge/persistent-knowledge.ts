@@ -6,6 +6,8 @@ import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 import { getPrismaClient } from "@/lib/db/prisma";
 
 import { compareDocumentVersions, documentSignalVersion, extractDocumentSignals } from "./document-signals";
+import { currentKnowledgeFile, latestKnowledgeSnapshot, readableKnowledgeRoot } from "./current-knowledge-query";
+import { invalidateDocumentScanPublications, publishScanDerivedKnowledge } from "./scan-publication";
 import { RelationshipCandidatePool } from "./relationship-candidate-pool";
 import { countKnowledgeWork, type KnowledgeWork } from "./knowledge-work";
 import { semanticVersionMembers, versionDominanceCounts, versionEndpoint } from "./document-version-index";
@@ -305,13 +307,14 @@ export async function getSeparatedRelationshipPairIdentities(
 
 export async function reconcileObservationKnowledge(tx: Prisma.TransactionClient, observationSessionId: string) {
   const observation = await tx.observationSession.findUnique({
-    select: { status: true, observerType: true, observations: true, humanDecisions: {
+    select: { libraryDocumentId: true, status: true, observerType: true, observations: true, humanDecisions: {
       orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       select: { decisionType: true, editedSuggestion: true },
     } },
     where: { id: observationSessionId },
   });
   if (!observation || !["REJECTED", "MODIFIED", "APPROVED"].includes(observation.status)) return;
+  await invalidateDocumentScanPublications(tx, observation.libraryDocumentId);
   if (observation.status === "APPROVED" && !observation.humanDecisions.some((decision) =>
     decision.decisionType === "REJECT" || decision.decisionType === "MODIFY")) return;
   const rows = await tx.knowledgeDocumentSignal.findMany({ where: { observationSessionId } });
@@ -389,7 +392,7 @@ export async function refreshApprovedObservationRelationships(observationSession
     }
   }
   for (const sessionId of latestByRoot.values()) {
-    await persistScanWorkingKnowledge(await loadScanWorkingKnowledge(sessionId), work);
+    await publishScanDerivedKnowledge(sessionId, "SEARCH", work);
   }
 }
 
@@ -464,8 +467,8 @@ export function fileKeyAfterKnownMoves(
   return persistentFileKey(libraryId, sourcePath);
 }
 
-export async function knownExecutedMoves(connectedLibraryId: string): Promise<ExecutedMoveIndex> {
-  const prisma = getPrismaClient();
+export async function knownExecutedMoves(connectedLibraryId: string, publicationTx?: Prisma.TransactionClient): Promise<ExecutedMoveIndex> {
+  const prisma = publicationTx ?? getPrismaClient();
   const actions: Array<{ id: string; destinationChecksumAfter: string | null;
     destinationRelativePath: string; sourceChecksumBefore: string | null;
     sourceRelativePath: string; undoActions: Array<{ status: string }> }> = [];
@@ -540,9 +543,8 @@ function verifiedRanges(sourceEvidenceText: string, sharedTerms: string[]) {
     .map((excerpt) => ({ start: excerpt.start, end: excerpt.end }));
 }
 
-async function upsertCurrentRelationship(data: Prisma.KnowledgeConnectionUncheckedCreateInput & { relationshipKey: string }) {
-  const prisma = getPrismaClient();
-  return prisma.$transaction(async (tx) => {
+async function upsertCurrentRelationship(data: Prisma.KnowledgeConnectionUncheckedCreateInput & { relationshipKey: string }, publicationTx?: Prisma.TransactionClient) {
+  const run = async (tx: Prisma.TransactionClient) => {
     const existing = await tx.knowledgeConnection.findUnique({
       include: { decisions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { nextStatus: true }, take: 1 } },
       where: { relationshipKey: data.relationshipKey },
@@ -581,11 +583,12 @@ async function upsertCurrentRelationship(data: Prisma.KnowledgeConnectionUncheck
         targetObservationSessionId: data.targetObservationSessionId },
       where: { relationshipKey: data.relationshipKey },
     });
-  }, { isolationLevel: "Serializable" });
+  };
+  return publicationTx ? run(publicationTx) : getPrismaClient().$transaction(run, { isolationLevel: "Serializable" });
 }
 
-export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeIndex, work?: KnowledgeWork) {
-  const prisma = getPrismaClient();
+export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeIndex, work?: KnowledgeWork, publicationTx?: Prisma.TransactionClient) {
+  const prisma = publicationTx ?? getPrismaClient();
   const session = await prisma.scanSession.findUnique({
     select: {
       connectedFolderId: true,
@@ -639,9 +642,9 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
   const byId = new Map(files.map((file) => [file.id, file]));
   // A review can finish after a batch computed its index; do not republish superseded claims.
   const currentIndex = files.some((file) => ["REJECTED", "MODIFIED"].includes(file.libraryDocument?.observationSessions[0]?.status ?? ""))
-    ? await loadScanWorkingKnowledge(index.scanSessionId) : index;
+    ? await loadScanWorkingKnowledge(index.scanSessionId, undefined, publicationTx) : index;
   const workingFileById = new Map(currentIndex.files.map((file) => [file.id, file]));
-  const moves = await knownExecutedMoves(session.connectedFolderId);
+  const moves = await knownExecutedMoves(session.connectedFolderId, publicationTx);
   const keyFor = (file: typeof files[number]) =>
     fileKeyAfterKnownMoves(session.connectedFolderId, file.relativePath, file.checksum, moves);
   const fileKeys = files.map(keyFor);
@@ -835,7 +838,7 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
   const generatedConfirmations = prior.filter((row) => row.status === "CONFIRMED" &&
     [relationshipGenerationVersion, documentSignalVersion].includes(row.generationVersion ?? ""));
   const effectiveSignals = generatedConfirmations.some((row) => row.generationVersion === documentSignalVersion)
-    ? await getEffectiveDocumentSignals([session.connectedFolderId]) : [];
+    ? await getEffectiveDocumentSignals([session.connectedFolderId], undefined, undefined, publicationTx) : [];
   const effectiveByIdentity = new Map(effectiveSignals.map((signal) =>
     [`${signal.fileKey}\0${signal.checksum}\0${signal.kind}\0${signal.identityHash}`, signal]));
   const separatedPairs = new Set(prior.filter((row) => row.status === "REJECTED" &&
@@ -940,7 +943,7 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
         targetRelativePath: target.relativePath,
         ...("sourceScannedFileId" in currentEvidence ? { sourceScannedFileId: source.id } : {}),
         ...("targetScannedFileId" in currentEvidence ? { targetScannedFileId: target.id } : {}) },
-      relationshipKey: connection.relationshipKey });
+      relationshipKey: connection.relationshipKey }, publicationTx);
   }
   for (const relationship of selectPersistentRelationships(currentIndex, subjectPerFile, confirmedSubjectPairs)) {
     const left = byId.get(relationship.leftFileId);
@@ -1005,7 +1008,7 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
       relationshipKey,
       sourceObservationSessionId: source.observationId,
       targetObservationSessionId: target.observationId,
-    });
+    }, publicationTx);
     persisted += 1;
   }
   const currentByIdentity = new Map<string, typeof currentResolved>();
@@ -1111,7 +1114,7 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
           targetChecksum: target.checksum,
           targetFileKey: target.fileKey,
           targetObservationSessionId: target.observationSessionId,
-        });
+        }, publicationTx);
         typedPerFile.set(current.fileKey, (typedPerFile.get(current.fileKey) ?? 0) + 1);
         typedPerFile.set(other.fileKey, (typedPerFile.get(other.fileKey) ?? 0) + 1);
         if (typedPerFile.get(other.fileKey)! >= maxRelationshipsPerFile) pool.set(candidate, false);
@@ -1141,11 +1144,12 @@ export async function earlierRelationshipContext(input: {
 }) {
   if (!input.checksum) return [];
   const prisma = getPrismaClient();
-  const library = await prisma.connectedLibrary.findUnique({
-    select: { isEnabled: true, status: true },
-    where: { id: input.connectedLibraryId },
+  const library = await prisma.connectedLibrary.findFirst({
+    select: { id: true },
+    where: { id: input.connectedLibraryId, isEnabled: true, readPermission: true, status: "CONNECTED",
+      disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null },
   });
-  if (!library?.isEnabled || library.status === "DISCONNECTED") return [];
+  if (!library) return [];
   const moveCandidate = await prisma.executionAction.findFirst({
     select: { id: true },
     where: {
@@ -1168,6 +1172,7 @@ export async function earlierRelationshipContext(input: {
       generationVersion: { in: [relationshipGenerationVersion, documentSignalVersion] },
       status: { in: ["NEW", "CONFIRMED"] },
       supersededAt: null,
+      sourceEvidence: { path: ["connectedLibraryId"], equals: input.connectedLibraryId },
       OR: [
         { sourceFileKey: fileKey, sourceChecksum: input.checksum },
         { targetFileKey: fileKey, targetChecksum: input.checksum },
@@ -1189,53 +1194,101 @@ export async function earlierRelationshipContext(input: {
   }).slice(0, 3);
 }
 
+type KnowledgePageCursor = { id: string; lastSeenAt: Date | null };
+
+function knowledgePageAfter(cursor: KnowledgePageCursor | undefined, alias: "connection" | "candidates") {
+  if (!cursor) return Prisma.sql`true`;
+  const id = Prisma.raw(`${alias}.id`);
+  const date = Prisma.raw(`${alias}."lastSeenAt"`);
+  // Prisma DateTime columns are timestamp without time zone. Bind the UTC text
+  // explicitly as timestamp; raw Date parameters use timestamptz and otherwise
+  // compare in the PostgreSQL server's timezone, repeating/omitting a page.
+  const timestamp = cursor.lastSeenAt ? Prisma.sql`${cursor.lastSeenAt.toISOString()}::timestamp` : Prisma.sql`NULL`;
+  return cursor.lastSeenAt === null ? Prisma.sql`${date} IS NULL AND ${id} < ${cursor.id}` :
+    Prisma.sql`(${date} < ${timestamp} OR ${date} IS NULL OR
+      (${date} = ${timestamp} AND ${id} < ${cursor.id}))`;
+}
+
+// Batch moves for every root on a page, rather than issuing one query for every
+// relationship/candidate. Root/checksum/path eligibility is already in SQL;
+// this final exact fileKey check retains executed move/Undo identity semantics.
+async function pageExecutedMoves(rootIds: string[], cache: Map<string, ExecutedMoveIndex>) {
+  const missing = rootIds.filter((id) => !cache.has(id));
+  if (!missing.length) return cache;
+  const prisma = getPrismaClient();
+  const actionsByRoot = new Map<string, ExecutedMoveAlias[]>();
+  let cursor: string | undefined;
+  do {
+    const page = await prisma.executionAction.findMany({
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      orderBy: [{ completedAt: "desc" }, { id: "desc" }], take: 500,
+      select: { id: true, destinationChecksumAfter: true, destinationRelativePath: true,
+        sourceChecksumBefore: true, sourceRelativePath: true,
+        executionRun: { select: { connectedLibraryId: true } }, undoActions: { select: { status: true } } },
+      where: { executionRun: { connectedLibraryId: { in: missing } },
+        actionType: { in: ["MOVE_FILE", "RENAME_FILE"] }, status: "COMPLETED" },
+    });
+    for (const action of page) {
+      const root = action.executionRun.connectedLibraryId;
+      const actions = actionsByRoot.get(root) ?? [];
+      actions.push({ actionId: action.id, checksum: action.destinationChecksumAfter ?? action.sourceChecksumBefore,
+        destinationRelativePath: action.destinationRelativePath, sourceRelativePath: action.sourceRelativePath,
+        undone: action.undoActions.some((undo) => undo.status === "COMPLETED") });
+      actionsByRoot.set(root, actions);
+    }
+    cursor = page.length === 500 ? page.at(-1)?.id : undefined;
+  } while (cursor);
+  for (const id of missing) cache.set(id, buildExecutedMoveIndex(actionsByRoot.get(id) ?? []));
+  return cache;
+}
+
 export async function getRecentPersistentFileRelationships() {
   const prisma = getPrismaClient();
-  const rows = await prisma.knowledgeConnection.findMany({
-    orderBy: { lastSeenAt: "desc" },
-    select: {
-      id: true,
-      generationVersion: true,
-      lastSeenAt: true,
-      relationshipKind: true,
-      sourceChecksum: true,
-      sourceEvidence: true,
-      targetChecksum: true,
-      status: true,
-      supersededAt: true,
-      decisions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { action: true, createdAt: true, note: true }, take: 8 },
-    },
-    take: 30,
-    where: { generationVersion: { in: [relationshipGenerationVersion, documentSignalVersion, humanIdentityCorrectionVersion] } },
-  });
-  const snapshotCandidates = rows.flatMap((row) => {
-    const evidence = row.sourceEvidence;
-    if (!evidence || Array.isArray(evidence) || typeof evidence !== "object" ||
-        typeof evidence.connectedLibraryId !== "string") return [];
-    return [
-      ...(typeof evidence.sourceRelativePath === "string" && row.sourceChecksum
-        ? [{ connectedLibraryId: evidence.connectedLibraryId, checksum: row.sourceChecksum, relativePath: evidence.sourceRelativePath }]
-        : []),
-      ...(typeof evidence.targetRelativePath === "string" && row.targetChecksum
-        ? [{ connectedLibraryId: evidence.connectedLibraryId, checksum: row.targetChecksum, relativePath: evidence.targetRelativePath }]
-        : []),
-    ];
-  });
-  const current = await currentSnapshotSignals(snapshotCandidates);
-  const currentFiles = new Set(current.map((item) => `${item.connectedLibraryId}\0${normalizePhysicalRelativePath(item.relativePath)}\0${item.checksum}`));
-  const libraryIds = rows.flatMap((row) => {
-    const evidence = row.sourceEvidence;
-    return evidence && !Array.isArray(evidence) && typeof evidence === "object" && typeof evidence.connectedLibraryId === "string"
-      ? [evidence.connectedLibraryId]
-      : [];
-  });
-  const libraries = await prisma.connectedLibrary.findMany({
-    select: { displayName: true, id: true },
-    where: { id: { in: libraryIds }, isEnabled: true, readPermission: true,
-      status: "CONNECTED", disconnectedAt: null, hiddenFromActiveListAt: null,
-      mergedAt: null, canonicalConnectedLibraryId: null },
-  });
-  const byLibraryId = new Map(libraries.map((library) => [library.id, library]));
+  type Candidate = KnowledgePageCursor & { libraryId: string; displayName: string;
+    sourceFileKey: string | null; targetFileKey: string | null; sourceChecksum: string | null; targetChecksum: string | null;
+    sourcePath: string; targetPath: string };
+  const eligible: Candidate[] = [];
+  const movesByRoot = new Map<string, ExecutedMoveIndex>();
+  let cursor: KnowledgePageCursor | undefined;
+  do {
+    const page = await prisma.$queryRaw<Candidate[]>(Prisma.sql`
+    SELECT connection.id, connection."lastSeenAt", root.id AS "libraryId", root."displayName",
+      connection."sourceFileKey", connection."targetFileKey", connection."sourceChecksum", connection."targetChecksum",
+      connection."sourceEvidence"->>'sourceRelativePath' AS "sourcePath",
+      connection."sourceEvidence"->>'targetRelativePath' AS "targetPath"
+    FROM "KnowledgeConnection" connection
+    JOIN "ConnectedFolder" root ON root.id = connection."sourceEvidence"->>'connectedLibraryId'
+    ${latestKnowledgeSnapshot}
+    WHERE ${readableKnowledgeRoot}
+      AND connection."generationVersion" IN (${Prisma.join([relationshipGenerationVersion, documentSignalVersion, humanIdentityCorrectionVersion])})
+      AND connection."supersededAt" IS NULL AND connection.status IN ('NEW', 'CONFIRMED', 'REJECTED')
+      AND jsonb_typeof(connection."sourceEvidence"->'sourceRelativePath') = 'string'
+      AND jsonb_typeof(connection."sourceEvidence"->'targetRelativePath') = 'string'
+      AND ${currentKnowledgeFile(Prisma.sql`connection."sourceEvidence"->>'sourceRelativePath'`, Prisma.sql`connection."sourceChecksum"`)}
+      AND ${currentKnowledgeFile(Prisma.sql`connection."sourceEvidence"->>'targetRelativePath'`, Prisma.sql`connection."targetChecksum"`)}
+      AND ${knowledgePageAfter(cursor, "connection")}
+    ORDER BY connection."lastSeenAt" DESC NULLS LAST, connection.id DESC LIMIT 100
+    `);
+    const moves = await pageExecutedMoves([...new Set(page.map((row) => row.libraryId))], movesByRoot);
+    for (const row of page) {
+      if (row.sourceFileKey !== fileKeyAfterKnownMoves(row.libraryId, row.sourcePath, row.sourceChecksum, moves.get(row.libraryId)!) ||
+          row.targetFileKey !== fileKeyAfterKnownMoves(row.libraryId, row.targetPath, row.targetChecksum, moves.get(row.libraryId)!)) continue;
+      eligible.push(row);
+      if (eligible.length === 30) break;
+    }
+    const next = page.length === 100 ? page.at(-1) : undefined;
+    if (next && next.id === cursor?.id && next.lastSeenAt?.getTime() === cursor.lastSeenAt?.getTime()) {
+      throw new Error("Relationship candidate pagination did not advance.");
+    }
+    cursor = next;
+  } while (eligible.length < 30 && cursor);
+  const rowsById = new Map((await prisma.knowledgeConnection.findMany({
+    include: { decisions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      select: { action: true, createdAt: true, note: true }, take: 8 } },
+    where: { id: { in: eligible.map((row) => row.id) } },
+  })).map((row) => [row.id, row]));
+  const rows = eligible.flatMap((row) => rowsById.get(row.id) ?? []);
+  const byLibraryId = new Map(eligible.map((row) => [row.libraryId, row]));
   return rows.flatMap((row) => {
     const evidence = row.sourceEvidence;
     if (!evidence || Array.isArray(evidence) || typeof evidence !== "object" ||
@@ -1245,10 +1298,8 @@ export async function getRecentPersistentFileRelationships() {
     const library = typeof evidence.connectedLibraryId === "string"
       ? byLibraryId.get(evidence.connectedLibraryId) : null;
     if (!library) return [];
-    const sourceCurrent = typeof evidence.connectedLibraryId === "string" && row.sourceChecksum &&
-      currentFiles.has(`${evidence.connectedLibraryId}\0${normalizePhysicalRelativePath(evidence.sourceRelativePath)}\0${row.sourceChecksum}`);
-    const targetCurrent = typeof evidence.connectedLibraryId === "string" && row.targetChecksum &&
-      currentFiles.has(`${evidence.connectedLibraryId}\0${normalizePhysicalRelativePath(evidence.targetRelativePath)}\0${row.targetChecksum}`);
+    const sourceCurrent = true;
+    const targetCurrent = true;
     return [{
       evidenceKinds: Array.isArray(evidence.evidenceKinds)
         ? evidence.evidenceKinds.filter((item): item is string => typeof item === "string")
@@ -1288,9 +1339,9 @@ export class RelationshipReviewError extends Error {
   }
 }
 
-async function currentSnapshotSignals<T extends { connectedLibraryId: string; checksum: string; relativePath: string }>(signals: T[]) {
+async function currentSnapshotSignals<T extends { connectedLibraryId: string; checksum: string; relativePath: string }>(signals: T[], publicationTx?: Prisma.TransactionClient) {
   if (signals.length === 0) return signals;
-  const prisma = getPrismaClient();
+  const prisma = publicationTx ?? getPrismaClient();
   const libraries = [...new Set(signals.map((signal) => signal.connectedLibraryId))];
   const latestDates = await prisma.scanSession.groupBy({
     by: ["connectedFolderId"],
@@ -1414,36 +1465,57 @@ export async function reviewPersistentRelationship(id: string, action: "CONFIRM"
 
 export async function getIdentityCorrectionCandidates() {
   const prisma = getPrismaClient();
-  const select = { checksum: true, connectedLibraryId: true, id: true, kind: true, relativePath: true } as const;
-  const [identities, anchors] = await Promise.all([
-    prisma.knowledgeDocumentSignal.findMany({
-      orderBy: { lastSeenAt: "desc" },
-      select,
-      take: 200,
-      where: { status: "ACTIVE", supersededAt: null, generationVersion: documentSignalVersion,
-        kind: { in: ["CLIENT", "UNRESOLVED_CLIENT", "PROJECT", "UNRESOLVED_PROJECT", "PERSON", "ORGANIZATION", "WORKSHOP", "DOCUMENT_FAMILY"] } },
-    }),
-    prisma.knowledgeDocumentSignal.findMany({
-      orderBy: { lastSeenAt: "desc" },
-      select,
-      take: 200,
-      where: { status: "ACTIVE", supersededAt: null, generationVersion: documentSignalVersion,
-        kind: "FILE_ANCHOR" },
-    }),
-  ]);
-  const signals = [...identities, ...anchors];
-  const currentSignals = await currentSnapshotSignals(signals);
-  const libraries = await prisma.connectedLibrary.findMany({
-    select: { displayName: true, id: true },
-    where: { id: { in: [...new Set(currentSignals.map((signal) => signal.connectedLibraryId))] },
-      isEnabled: true, readPermission: true, status: "CONNECTED", disconnectedAt: null,
-      hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null },
-  });
-  const names = new Map(libraries.map((library) => [library.id, library.displayName]));
-  return currentSignals.flatMap((signal) => {
-    const libraryName = names.get(signal.connectedLibraryId);
-    return libraryName ? [{ connectedLibraryId: signal.connectedLibraryId, id: signal.id, kind: signal.kind, libraryName, relativePath: signal.relativePath }] : [];
-  });
+  // Each category owns its semantic 200-file budget. Irrelevant kinds, obsolete
+  // checksums and unreadable roots never enter that budget. Equivalent signals
+  // for one endpoint occupy one slot, using the newest row and stable id tie-break.
+  const categories = [["CLIENT", "UNRESOLVED_CLIENT"], ["PROJECT"], ["FILE_ANCHOR"]];
+  const movesByRoot = new Map<string, ExecutedMoveIndex>();
+  type Candidate = KnowledgePageCursor & {
+    checksum: string; fileKey: string; connectedLibraryId: string; kind: string; libraryName: string; relativePath: string;
+  };
+  const groups = await Promise.all(categories.map(async (kinds) => {
+    const eligible: Candidate[] = [];
+    let cursor: KnowledgePageCursor | undefined;
+    do {
+      const page = await prisma.$queryRaw<Candidate[]>(Prisma.sql`
+    SELECT "connectedLibraryId", id, kind, "libraryName", "relativePath", "fileKey", checksum, "lastSeenAt" FROM (
+      SELECT signal.*, root."displayName" AS "libraryName",
+        row_number() OVER (PARTITION BY signal."connectedLibraryId", signal."fileKey", signal.checksum
+          ORDER BY signal."lastSeenAt" DESC, signal.id DESC) AS rank
+      FROM "KnowledgeDocumentSignal" signal
+      JOIN "ConnectedFolder" root ON root.id = signal."connectedLibraryId"
+      ${latestKnowledgeSnapshot}
+      WHERE ${readableKnowledgeRoot}
+        AND signal.status = 'ACTIVE' AND signal."supersededAt" IS NULL
+        AND signal."generationVersion" = ${documentSignalVersion}
+        AND signal.kind IN (${Prisma.join(kinds)})
+        AND ${currentKnowledgeFile(Prisma.sql`signal."relativePath"`, Prisma.sql`signal.checksum`)}
+        AND (SELECT count(DISTINCT other."identityHash") FROM "KnowledgeDocumentSignal" other
+          WHERE other."connectedLibraryId" = signal."connectedLibraryId"
+            AND other."fileKey" = signal."fileKey" AND other.checksum = signal.checksum
+            AND other.status = 'ACTIVE' AND other."supersededAt" IS NULL
+            AND other."generationVersion" = ${documentSignalVersion}
+            AND other.kind IN (${Prisma.join(kinds.includes("CLIENT") ?
+              ["CLIENT", "UNRESOLVED_CLIENT"] : ["PROJECT", "UNRESOLVED_PROJECT"])})) <= 1
+    ) candidates WHERE rank = 1 AND ${knowledgePageAfter(cursor, "candidates")}
+    ORDER BY "lastSeenAt" DESC NULLS LAST, id DESC LIMIT 200
+      `);
+      const moves = await pageExecutedMoves([...new Set(page.map((row) => row.connectedLibraryId))], movesByRoot);
+      for (const row of page) {
+        if (row.fileKey !== fileKeyAfterKnownMoves(row.connectedLibraryId, row.relativePath, row.checksum, moves.get(row.connectedLibraryId)!)) continue;
+        eligible.push(row);
+        if (eligible.length === 200) break;
+      }
+      const next = page.length === 200 ? page.at(-1) : undefined;
+      if (next && next.id === cursor?.id && next.lastSeenAt?.getTime() === cursor.lastSeenAt?.getTime()) {
+        throw new Error("Correction candidate pagination did not advance.");
+      }
+      cursor = next;
+    } while (eligible.length < 200 && cursor);
+    return eligible.map(({ connectedLibraryId, id, kind, libraryName, relativePath }) =>
+      ({ connectedLibraryId, id, kind, libraryName, relativePath }));
+  }));
+  return groups.flat();
 }
 
 export async function createIdentityCorrection(input: {
@@ -1753,8 +1825,8 @@ export async function getIdentityCorrectionComponent(seeds: HistoricalDocumentSi
 export async function getEligibleDocumentSignals(permittedRootIds?: string[], options?: {
   historicalEntries: HistoricalDocumentSignalEntry[];
   scopedEntries?: HistoricalDocumentSignalEntry[];
-}) {
-  const prisma = getPrismaClient();
+}, publicationTx?: Prisma.TransactionClient) {
+  const prisma = publicationTx ?? getPrismaClient();
   const libraries = await prisma.connectedLibrary.findMany({
     select: { id: true },
     where: { ...(permittedRootIds ? { id: { in: permittedRootIds } } : {}),
@@ -1789,7 +1861,7 @@ export async function getEligibleDocumentSignals(permittedRootIds?: string[], op
   ];
   for (let offset = 0; offset < endpointFilters.length; offset += 500) await collect({ OR: endpointFilters.slice(offset, offset + 500) });
   const candidateRows = [...candidateById.values()].sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime() || a.id.localeCompare(b.id));
-  const currentRows = await currentSnapshotSignals(candidateRows);
+  const currentRows = await currentSnapshotSignals(candidateRows, publicationTx);
   const currentKeys = new Set(currentRows.map((row) => `${row.connectedLibraryId}\0${row.fileKey}\0${row.checksum}\0${row.id}`));
   const historicalKeys = new Set(historicalEntries.map((entry) =>
     `${entry.connectedLibraryId}\0${entry.fileKey}\0${entry.checksum}`));
@@ -1816,8 +1888,8 @@ export async function getEligibleDocumentSignals(permittedRootIds?: string[], op
 export async function getEffectiveDocumentSignals(permittedRootIds?: string[], options?: {
   historicalEntries: HistoricalDocumentSignalEntry[];
   scopedEntries?: HistoricalDocumentSignalEntry[];
-}, work?: KnowledgeWork) {
-  const prisma = getPrismaClient();
+}, work?: KnowledgeWork, publicationTx?: Prisma.TransactionClient) {
+  const prisma = publicationTx ?? getPrismaClient();
   let scopedEntries = options?.scopedEntries;
   if (scopedEntries?.length) {
     const permittedRoots = permittedRootIds ? new Set(permittedRootIds) : null;
@@ -1825,7 +1897,7 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
       !permittedRoots || permittedRoots.has(entry.connectedLibraryId)), work);
   }
   const rows = await getEligibleDocumentSignals(permittedRootIds,
-    options ? { ...options, scopedEntries } : undefined);
+    options ? { ...options, scopedEntries } : undefined, publicationTx);
   const fileKeys = [...new Set(rows.map((row) => row.fileKey))];
   const fileKeySet = new Set(fileKeys);
   const fileKeyChunks = Array.from({ length: Math.ceil(fileKeys.length / 500) }, (_, index) =>

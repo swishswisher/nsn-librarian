@@ -1635,7 +1635,7 @@ test("returned system-archived identities and versions become current and review
     const archived = await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: row.id } });
     assert.equal(archived.status, "ARCHIVED");
     assert.ok(archived.supersededAt);
-    assert.equal((await fileKey.getRecentPersistentFileRelationships()).find((item) => item.id === row.id)?.reviewable, false);
+    assert.equal((await fileKey.getRecentPersistentFileRelationships()).find((item) => item.id === row.id), undefined);
   }
   const restored = await snapshot(true);
   const ui = await fileKey.getRecentPersistentFileRelationships();
@@ -1937,8 +1937,7 @@ test("exact copies stay distinct and untracked renames cannot inherit canonical 
   assert.ok(!(await qa.retrieveQuestionContext("What do we have about client Alice?", [fixture.r.id]))
     .sources.some((source) => source.relativePath === external.entry.relativePath));
   const oldRelationship = (await fileKey.getRecentPersistentFileRelationships()).find((row) => row.id === fixture.revision.id);
-  assert.equal(oldRelationship?.reviewable, false);
-  assert.equal(oldRelationship?.status, "ARCHIVED");
+  assert.equal(oldRelationship, undefined);
   assert.equal(await prisma.bridgeCommand.count(), 0);
 });
 

@@ -8,6 +8,7 @@ import { getPrismaClient } from "@/lib/db/prisma";
 import { recordBridgeHeartbeat } from "./cloud-coordinator";
 import { queueNextRemoteReadBatchForDevice } from "./remote-scan-queue";
 import { expireRemoteReadCommandsForSession } from "./remote-read-commands";
+import { recoverScanPublicationsForDevice } from "./scan-publication";
 import { recoverAbandonedObservationFilesForDevice } from "./observation-recovery";
 
 function bridgeJson(value: unknown): BridgeJson {
@@ -50,6 +51,7 @@ export async function fetchRecoverableBridgeCommands(bridgeDeviceId: string) {
 
   await recordBridgeHeartbeat(bridgeDeviceId).catch(() => undefined);
   await recoverAbandonedObservationFilesForDevice(bridgeDeviceId, now);
+  await recoverScanPublicationsForDevice(bridgeDeviceId, now);
   const expiredReads = await prisma.bridgeCommand.findMany({
     select: { payload: true },
     where: {

@@ -39,8 +39,8 @@ export function searchEntryFingerprint(input: {
 export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyFileIds?: string[], stats?: {
   reused: number;
   resolvedSignals?: number;
-}) {
-  const prisma = getPrismaClient();
+}, publicationTx?: Prisma.TransactionClient) {
+  const prisma = publicationTx ?? getPrismaClient();
   const session = await prisma.scanSession.findUnique({
     select: {
       connectedFolderId: true,
@@ -72,7 +72,7 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
     where: { sessionId: index.scanSessionId, ...(onlyFileIds ? { id: { in: onlyFileIds } } : {}) },
   });
   const workingById = new Map(index.files.map((file) => [file.id, file]));
-  const moves = await knownExecutedMoves(session.connectedFolderId);
+  const moves = await knownExecutedMoves(session.connectedFolderId, publicationTx);
   const signalScope = files.flatMap((file) => file.checksum ? [{
     checksum: file.checksum,
     connectedLibraryId: session.connectedFolderId,
@@ -83,7 +83,7 @@ export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyF
   // endpoints as one Prisma OR would exceed PostgreSQL's bind-parameter limit;
   // targeted/backfill indexing keeps the exact endpoint scope.
   const effectiveSignals = await getEffectiveDocumentSignals([session.connectedFolderId],
-    onlyFileIds ? { historicalEntries: [], scopedEntries: signalScope } : undefined);
+    onlyFileIds ? { historicalEntries: [], scopedEntries: signalScope } : undefined, undefined, publicationTx);
   if (stats) stats.resolvedSignals = effectiveSignals.length;
   const entityHashesByEndpoint = new Map<string, Set<string>>();
   for (const signal of effectiveSignals) {

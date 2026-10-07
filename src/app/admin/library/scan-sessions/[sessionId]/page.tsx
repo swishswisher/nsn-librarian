@@ -182,7 +182,7 @@ export default async function ScanSessionDetailPage({
           </div>
         </NsnPageHeader>
 
-        {session.knowledgePersistenceStatus === "INCOMPLETE" ? (
+        {session.knowledgePersistenceStatus.startsWith("INCOMPLETE") ? (
           <p className="border-l-4 border-[var(--nsn-gold)] pl-3 text-sm leading-6 text-[var(--nsn-slate)]" role="status">
             Some related-knowledge notes could not be saved during this scan. File recommendations may still be available for review.
           </p>

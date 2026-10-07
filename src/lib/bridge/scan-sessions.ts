@@ -3,6 +3,7 @@ import path from "node:path";
 import type { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
+import { recoverPendingScanPublications } from "./scan-publication";
 
 import { audioMetadataSummary } from "./audio-metadata";
 import { imageMetadataSummary } from "./image-metadata";
@@ -967,6 +968,7 @@ export async function createBridgeScanSessionForConnectedLibrary(
 export async function getBridgeScanSessions(
   take = 20,
 ): Promise<BridgeScanSessionSummary[]> {
+  await recoverPendingScanPublications();
   const prisma = getPrismaClient();
   const sessions = await prisma.scanSession.findMany({
     include: {
@@ -1124,6 +1126,7 @@ export function summarizeScanAIUsage(files: BridgeScannedFileSummary[]) {
 }
 
 export async function getBridgeScanSessionProgress(sessionId: string) {
+  await recoverPendingScanPublications({ sessionId });
   const prisma = getPrismaClient();
   const session = await prisma.scanSession.findUnique({
     include: {

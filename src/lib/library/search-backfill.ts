@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { loadScanWorkingKnowledge } from "@/lib/bridge/scan-working-knowledge";
+import { publishScanDerivedKnowledge } from "@/lib/bridge/scan-publication";
 import { indexScanKnowledge, librarySearchIndexVersion } from "./search-index";
 
 export const searchBackfillBatchSize = 20;
@@ -76,6 +77,10 @@ export async function prepareSearchBatch(
   processFile: (sessionId: string, fileId: string) => Promise<"INDEXED" | "REUSED"> = indexOneFile,
 ) {
   const prisma = getPrismaClient();
+  if (!await publishScanDerivedKnowledge(sessionId, "KNOWLEDGE")) {
+    const progress = await getSearchBackfillProgress(sessionId);
+    return { ...progress, completed: false, claimedFiles: 0, processedFiles: 0, waitingForClaims: true };
+  }
   await prisma.scanSession.update({ data: { searchIndexStatus: "PREPARING" }, where: { id: sessionId } });
   const files = await prisma.scannedFile.findMany({
     take: searchBackfillBatchSize * 3, orderBy: { id: "asc" }, select: { id: true },

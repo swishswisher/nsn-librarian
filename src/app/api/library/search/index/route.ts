@@ -64,7 +64,8 @@ export async function POST(request: Request) {
     const progress = await prepareSearchBatch(session.id, retryFailed);
     return NextResponse.json({ ok: true, progress }, { headers: { "Cache-Control": "no-store" } });
   } catch {
-    await getPrismaClient().scanSession.update({ data: { searchIndexStatus: "INCOMPLETE" }, where: { id: session.id } });
+    await getPrismaClient().scanSession.updateMany({ data: { searchIndexStatus: "INCOMPLETE" },
+      where: { id: session.id, searchIndexStatus: { not: "COMPLETED" } } });
     return NextResponse.json({ ok: false, error: "Search preparation could not finish. You can try again." }, { status: 503 });
   }
 }

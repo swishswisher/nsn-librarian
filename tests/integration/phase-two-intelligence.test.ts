@@ -495,7 +495,7 @@ test("known moves and Undo refresh subject relationship references without losin
   assert.equal(restored.status, "CONFIRMED");
   assert.equal(await prisma.knowledgeConnection.count({ where: { relationshipKey: original.relationshipKey } }), 1);
   await nextSnapshot("External/untracked-invoice.txt");
-  assert.equal((await persistent.getRecentPersistentFileRelationships()).find((row) => row.id === original.id)?.status, "ARCHIVED");
+  assert.equal((await persistent.getRecentPersistentFileRelationships()).find((row) => row.id === original.id), undefined);
   assert.equal((await prisma.knowledgeConnection.findUniqueOrThrow({ where: { id: original.id } })).status, "CONFIRMED");
   assert.equal(await prisma.bridgeCommand.count(), 0);
 });
@@ -834,8 +834,8 @@ test("a file absent from the latest scan makes its old identity link historical 
   withVerifiedFields(latestIndex, repeated.file.id, "Client ID: C-1");
   await persistent.persistScanWorkingKnowledge(latestIndex);
   const displayed = (await persistent.getRecentPersistentFileRelationships()).find((item) => item.id === link.id);
-  assert.equal(displayed?.status, "ARCHIVED");
-  assert.equal(displayed?.reviewable, false);
+  assert.equal(displayed, undefined);
+  assert.equal(displayed?.reviewable, undefined);
   await assert.rejects(persistent.reviewPersistentRelationship(link.id, "CONFIRM"));
   assert.equal((await persistent.getPersistentIdentityGroups()).some((group) => group.libraryName === library.displayName &&
     group.members.some((member) => member.relativePath === "two.txt")), false);
@@ -1713,7 +1713,7 @@ test("incomplete and failed snapshots cannot replace completed identities, searc
   await prisma.scanSession.update({ data: { status: "COMPLETED_WITH_ERRORS" }, where: { id: next.id } });
   await persistent.persistScanWorkingKnowledge(nextIndex);
   await indexer.indexScanKnowledge(nextIndex);
-  assert.equal((await persistent.getRecentPersistentFileRelationships()).find((item) => item.id === link.id)?.status, "ARCHIVED");
+  assert.equal((await persistent.getRecentPersistentFileRelationships()).find((item) => item.id === link.id), undefined);
   assert.equal((await persistent.getPersistentIdentityGroups()).some((group) => group.libraryName === library.displayName &&
     group.members.some((file) => file.relativePath === right.file.relativePath)), false);
   assert.equal((await searchLibrary("followup.txt", [library.id])).length, 0);
