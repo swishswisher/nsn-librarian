@@ -1,6 +1,8 @@
+import { executeLocalPhysicalRun, localPhysicalPermission } from "./local-physical-recovery";
+import { isCurrentReadableRoot } from "./current-readable-root";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat, readdir, rmdir, rename } from "node:fs/promises";
+import { lstat, readdir } from "node:fs/promises";
 import path from "node:path";
 
 import { Prisma } from "@prisma/client";
@@ -11,14 +13,12 @@ import { recordUndoNotebookEntry } from "@/lib/library/notebook";
 import { validateConnectedLibraryPath } from "./connected-libraries";
 import { summarizeExecutionRun } from "./executor";
 import {
-  executeLocalBridgeUndoActions,
   previewLocalBridgeUndo,
   type LocalBridgeUndoActionInput,
 } from "./local-bridge-client";
 import type {
   BridgeExecutionIssue,
   BridgeExecutionIssueCategory,
-  BridgeExecutionRunSummary,
   BridgeUndoActionType,
   BridgeUndoPreview,
   BridgeUndoPreviewAction,
@@ -45,16 +45,6 @@ export class BridgeUndoError extends Error {
   }
 }
 
-class BridgeUndoActionError extends Error {
-  category: BridgeExecutionIssueCategory;
-
-  constructor(category: BridgeExecutionIssueCategory, message: string) {
-    super(message);
-    this.name = "BridgeUndoActionError";
-    this.category = category;
-  }
-}
-
 type StoredExecutionActionForUndo = {
   id: string;
   actionType: string;
@@ -66,6 +56,9 @@ type StoredExecutionActionForUndo = {
   safeErrorCategory: string | null;
   sequence: number;
   createdFilesystemItem: boolean;
+  sourceChecksumBefore: string | null;
+  destinationChecksumAfter: string | null;
+  sourceScannedFileId: string | null;
 };
 
 type StoredUndoActionForUndo = {
@@ -163,10 +156,6 @@ const removableExecutionActionTypes = new Set([
   "MOVE_AND_RENAME_FILE",
 ]);
 const invalidPathCharacters = /[<>:"\\|?*\u0000]/;
-
-function toJsonInput(value: unknown): Prisma.InputJsonValue {
-  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
-}
 
 function normalizeUndoStatus(value: string): UndoStatus {
   return undoStatuses.has(value as UndoStatus)
@@ -328,10 +317,6 @@ function issue(
   };
 }
 
-function firstBlockingIssue(issues: BridgeExecutionIssue[]) {
-  return issues.find((item) => item.severity === "BLOCKING") ?? issues[0] ?? null;
-}
-
 function classifyUndoIssues(issues: BridgeExecutionIssue[]) {
   const conflicts = issues.filter(
     (item) =>
@@ -420,7 +405,8 @@ function localBridgeUndoActionFor(
     actionType: action.actionType,
     destinationRelativePath: action.destinationRelativePath,
     id: action.originalAction.id,
-    sourceChecksum: action.scannedFileChecksum,
+    sourceChecksum: action.originalAction.destinationChecksumAfter ?? action.originalAction.sourceChecksumBefore,
+    originalExecutionActionId: action.originalAction.id,
     sourceLastModified: action.scannedFileLastModified?.toISOString() ?? null,
     sourceRelativePath: action.sourceRelativePath,
     sourceSizeBytes: action.scannedFileSizeBytes?.toString() ?? null,
@@ -591,7 +577,7 @@ function undoActionForBridgeExecutionAction(
     destinationPath: action.sourceRelativePath,
     destinationRelativePath: action.sourceRelativePath,
     originalAction: action,
-    scannedFileChecksum: scannedFile?.checksum ?? null,
+    scannedFileChecksum: action.destinationChecksumAfter ?? action.sourceChecksumBefore,
     scannedFileLastModified: scannedFile?.lastModified ?? null,
     scannedFileSizeBytes: scannedFile?.sizeBytes ?? null,
     sequence,
@@ -698,10 +684,10 @@ async function validateFileUndoAction(
     return;
   }
 
-  if (scannedFile.checksum) {
+  if (action.originalAction.destinationChecksumAfter ?? action.originalAction.sourceChecksumBefore) {
     const currentChecksum = await checksumFile(action.sourcePath);
 
-    if (currentChecksum !== scannedFile.checksum) {
+    if (currentChecksum !== (action.originalAction.destinationChecksumAfter ?? action.originalAction.sourceChecksumBefore)) {
       issues.push(
         issue(
           "CHANGED_SOURCE",
@@ -924,6 +910,8 @@ async function undoRootFor(
   issues: BridgeExecutionIssue[],
 ) {
   const library = run.organizationPlan.scanSession.connectedFolder;
+  const binding = await getPrismaClient().executionRun.findUniqueOrThrow({ where: { id: run.id }, select: { connectedLibrary: true } });
+  if (!isCurrentReadableRoot(binding.connectedLibrary)) issues.push(issue("PERMISSION_DENIED", "This root is not currently authorized", "Reconnect and authorize the canonical connected folder before Undo."));
 
   if (!library.isEnabled || library.status === "DISCONNECTED") {
     issues.push(
@@ -1074,187 +1062,6 @@ export async function previewExecutionUndo(executionRunId: string) {
   return (await buildUndoPreview(run)).preview;
 }
 
-function safeUndoErrorCategory(error: unknown): BridgeExecutionIssueCategory {
-  if (error instanceof BridgeUndoActionError) {
-    return error.category;
-  }
-
-  if (error instanceof BridgeUndoError) {
-    return "VALIDATION_FAILED";
-  }
-
-  if (error instanceof Error && error.message.includes("not empty")) {
-    return "FOLDER_NOT_EMPTY";
-  }
-
-  return "FILESYSTEM_OPERATION_FAILED";
-}
-
-async function assertUndoActionStillSafe(
-  rootPath: string,
-  run: StoredExecutionRunForUndo,
-  action: UndoActionDraft,
-) {
-  const issues: BridgeExecutionIssue[] = [];
-
-  await validateUndoActions(rootPath, run, [action], issues);
-
-  const blockingIssue = firstBlockingIssue(issues);
-
-  if (blockingIssue) {
-    throw new BridgeUndoActionError(
-      blockingIssue.category,
-      blockingIssue.description,
-    );
-  }
-}
-
-async function executeUndoAction(action: UndoActionDraft) {
-  if (action.actionType === "REMOVE_FOLDER") {
-    await rmdir(action.sourcePath);
-    return;
-  }
-
-  if (await pathExists(action.destinationPath)) {
-    throw new BridgeUndoActionError(
-      "DESTINATION_CONFLICT",
-      "The original location is occupied.",
-    );
-  }
-
-  await rename(action.sourcePath, action.destinationPath);
-}
-
-async function updateScannedFileAfterUndo(
-  run: StoredExecutionRunForUndo,
-  action: UndoActionDraft,
-) {
-  if (action.actionType === "REMOVE_FOLDER") {
-    return;
-  }
-
-  const scannedFile = scannedFileForAction(run, action.originalAction);
-
-  if (!scannedFile) {
-    return;
-  }
-
-  const prisma = getPrismaClient();
-  const stats = await lstat(action.destinationPath);
-  const checksum = scannedFile.checksum
-    ? await checksumFile(action.destinationPath)
-    : scannedFile.checksum;
-
-  await prisma.scannedFile.update({
-    data: {
-      checksum,
-      lastModified: stats.mtime,
-      localPath: action.destinationPath,
-      relativePath: action.destinationRelativePath,
-      sizeBytes: BigInt(stats.size),
-    },
-    where: {
-      id: scannedFile.id,
-    },
-  });
-}
-
-async function updateScannedFileAfterBridgeUndo(
-  run: StoredExecutionRunForUndo,
-  action: UndoActionDraft,
-  result: {
-    destinationChecksumAfter: string | null;
-    lastModified: string | null;
-    sizeBytes: string | null;
-  },
-  bridgeRootId: string,
-) {
-  if (action.actionType === "REMOVE_FOLDER") {
-    return;
-  }
-
-  const scannedFile = scannedFileForAction(run, action.originalAction);
-
-  if (!scannedFile) {
-    return;
-  }
-
-  const prisma = getPrismaClient();
-
-  await prisma.scannedFile.update({
-    data: {
-      checksum: result.destinationChecksumAfter ?? scannedFile.checksum,
-      lastModified: result.lastModified
-        ? new Date(result.lastModified)
-        : scannedFile.lastModified,
-      localPath: `bridge://${bridgeRootId}/${action.destinationRelativePath}`,
-      relativePath: action.destinationRelativePath,
-      sizeBytes:
-        result.sizeBytes === null ? scannedFile.sizeBytes : BigInt(result.sizeBytes),
-    },
-    where: {
-      id: scannedFile.id,
-    },
-  });
-}
-
-function finalUndoStatus(completedActions: number, failedActions: number) {
-  if (failedActions === 0) {
-    return "COMPLETED" as const;
-  }
-
-  return completedActions > 0 ? "PARTIALLY_COMPLETED" : "FAILED";
-}
-
-async function appendUndoHistory(
-  executionRunId: string,
-  status: UndoStatus,
-) {
-  const prisma = getPrismaClient();
-  const plan = await prisma.organizationPlan.findFirst({
-    select: {
-      history: true,
-      id: true,
-    },
-    where: {
-      executionRuns: {
-        some: {
-          id: executionRunId,
-        },
-      },
-    },
-  });
-
-  if (!plan) {
-    return;
-  }
-
-  const now = new Date().toISOString();
-  const existing = Array.isArray(plan.history) ? plan.history : [];
-
-  await prisma.organizationPlan.update({
-    data: {
-      history: toJsonInput(
-        [
-          ...existing,
-          {
-            at: now,
-            detail:
-              status === "COMPLETED"
-                ? "The Bridge restored the completed file and folder changes from an execution run."
-                : "The Bridge attempted to restore execution changes and stopped safely before completing every action.",
-            id: `history-undo-${now.replace(/[^a-z0-9]+/gi, "-")}`,
-            label: status === "COMPLETED" ? "Execution undone" : "Undo stopped",
-          },
-        ].slice(-20),
-      ),
-    },
-    where: {
-      id: plan.id,
-    },
-  });
-}
-
 export async function executeExecutionUndo(
   executionRunId: string,
   confirmation: string,
@@ -1276,7 +1083,7 @@ export async function executeExecutionUndo(
     );
   }
 
-  const { actions, preview, rootPath } = await buildUndoPreview(existingRun);
+  const { actions, preview } = await buildUndoPreview(existingRun);
 
   if (!preview.canUndo) {
     throw new BridgeUndoError(
@@ -1289,6 +1096,14 @@ export async function executeExecutionUndo(
   const undoStartedAt = new Date();
   const undoRun = await prisma.$transaction(
     async (transaction) => {
+      const binding = await transaction.executionRun.findUniqueOrThrow({ where: { id: executionRunId } });
+      await transaction.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id = ${binding.connectedLibraryId} FOR SHARE`);
+      await transaction.$queryRaw(Prisma.sql`SELECT id FROM "ExecutionRun" WHERE id = ${executionRunId} FOR UPDATE`);
+      const root = await transaction.connectedLibrary.findUniqueOrThrow({ where: { id: binding.connectedLibraryId } });
+      if (actions.some((action) => !localPhysicalPermission(root, action.actionType)))
+        throw new BridgeUndoError("Current root authority does not permit these reversals.", 403);
+      const retired = await transaction.undoAction.count({ where: { status: "COMPLETED", originalExecutionActionId: { in: actions.map((action) => action.originalAction.id) } } });
+      if (retired) throw new BridgeUndoError("These actions were already restored. Refresh Undo history.", 409);
       const existingUndo = await transaction.undoRun.findFirst({
         where: {
           executionRunId,
@@ -1327,6 +1142,7 @@ export async function executeExecutionUndo(
             })),
           },
           executionRunId,
+          physicalRootRevision: root.nativeConnectionRevision,
           startedAt: undoStartedAt,
           status: "RUNNING",
           totalActions: actions.length,
@@ -1341,266 +1157,14 @@ export async function executeExecutionUndo(
       });
     },
     {
-      isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+      timeout: 120_000,
     },
   );
-  const undoRecordsBySequence = new Map(
-    undoRun.actions.map((action) => [action.sequence, action]),
-  );
-  let completedActions = 0;
-  let failedActions = 0;
-  let safeRunErrorCategory: BridgeExecutionIssueCategory | null = null;
-  const bridgeRootId = existingRun.organizationPlan.scanSession.connectedFolder.bridgeRootId;
-
-  if (bridgeRootId) {
-    try {
-      const bridgeUndo = await executeLocalBridgeUndoActions(
-        bridgeRootId,
-        actions.map(localBridgeUndoActionFor),
-      );
-      const resultByActionId = new Map(
-        bridgeUndo.actions.map((action) => [action.actionId, action]),
-      );
-
-      for (const action of actions) {
-        const actionRecord = undoRecordsBySequence.get(action.sequence);
-        const result = resultByActionId.get(action.originalAction.id);
-
-        if (!actionRecord || !result || result.status === "PENDING") {
-          continue;
-        }
-
-        await prisma.undoAction.update({
-          data: {
-            completedAt: new Date(),
-            safeErrorCategory: result.safeErrorCategory,
-            startedAt: new Date(),
-            status: result.status,
-          },
-          where: {
-            id: actionRecord.id,
-          },
-        });
-
-        if (result.status === "COMPLETED") {
-          await updateScannedFileAfterBridgeUndo(
-            existingRun,
-            action,
-            result,
-            bridgeRootId,
-          );
-        }
-      }
-
-      completedActions = bridgeUndo.completedActions;
-      failedActions = bridgeUndo.failedActions;
-      safeRunErrorCategory =
-        (bridgeUndo.actions.find((action) => action.safeErrorCategory)
-          ?.safeErrorCategory as BridgeExecutionIssueCategory | undefined) ??
-        null;
-    } catch {
-      failedActions = actions.length;
-      safeRunErrorCategory = "FILESYSTEM_OPERATION_FAILED";
-
-      await prisma.undoAction.updateMany({
-        data: {
-          completedAt: new Date(),
-          safeErrorCategory: safeRunErrorCategory,
-          startedAt: new Date(),
-          status: "FAILED",
-        },
-        where: {
-          undoRunId: undoRun.id,
-        },
-      });
-    }
-
-    const completedAt = new Date();
-    const status = finalUndoStatus(completedActions, failedActions);
-    const durationMs = Math.max(
-      0,
-      completedAt.getTime() - undoStartedAt.getTime(),
-    );
-    const [updatedUndoRun, updatedExecutionRun] = await prisma.$transaction([
-      prisma.undoRun.update({
-        data: {
-          completedActions,
-          completedAt,
-          durationMs,
-          failedActions,
-          safeErrorCategory: safeRunErrorCategory,
-          status,
-        },
-        include: {
-          actions: {
-            orderBy: {
-              sequence: "asc",
-            },
-          },
-        },
-        where: {
-          id: undoRun.id,
-        },
-      }),
-      prisma.executionRun.findUniqueOrThrow({
-        include: {
-          actions: {
-            orderBy: {
-              sequence: "asc",
-            },
-          },
-          undoRuns: {
-            include: {
-              actions: {
-                orderBy: {
-                  sequence: "asc",
-                },
-              },
-            },
-            orderBy: {
-              startedAt: "desc",
-            },
-          },
-        },
-        where: {
-          id: executionRunId,
-        },
-      }),
-    ]);
-
-    await appendUndoHistory(executionRunId, status);
-
-    try {
-      await recordUndoNotebookEntry(updatedUndoRun.id);
-    } catch {
-      // Notebook reflections should never block undo results.
-    }
-
-    const executionRun: BridgeExecutionRunSummary =
-      summarizeExecutionRun(updatedExecutionRun);
-
-    return {
-      executionRun,
-      preview,
-      run: summarizeUndoRun(updatedUndoRun),
-      scanSessionId: existingRun.organizationPlan.scanSessionId,
-    };
-  }
-
-  for (const action of actions) {
-    const actionRecord = undoRecordsBySequence.get(action.sequence);
-
-    if (!actionRecord) {
-      continue;
-    }
-
-    await prisma.undoAction.update({
-      data: {
-        startedAt: new Date(),
-        status: "RUNNING",
-      },
-      where: {
-        id: actionRecord.id,
-      },
-    });
-
-    try {
-      await assertUndoActionStillSafe(rootPath, existingRun, action);
-      await executeUndoAction(action);
-      await updateScannedFileAfterUndo(existingRun, action);
-
-      completedActions += 1;
-      await prisma.undoAction.update({
-        data: {
-          completedAt: new Date(),
-          status: "COMPLETED",
-        },
-        where: {
-          id: actionRecord.id,
-        },
-      });
-    } catch (error) {
-      failedActions += 1;
-      safeRunErrorCategory = safeUndoErrorCategory(error);
-      await prisma.undoAction.update({
-        data: {
-          completedAt: new Date(),
-          safeErrorCategory: safeRunErrorCategory,
-          status: "FAILED",
-        },
-        where: {
-          id: actionRecord.id,
-        },
-      });
-      break;
-    }
-  }
-
-  const completedAt = new Date();
-  const status = finalUndoStatus(completedActions, failedActions);
-  const durationMs = Math.max(0, completedAt.getTime() - undoStartedAt.getTime());
-  const [updatedUndoRun, updatedExecutionRun] = await prisma.$transaction([
-    prisma.undoRun.update({
-      data: {
-        completedActions,
-        completedAt,
-        durationMs,
-        failedActions,
-        safeErrorCategory: safeRunErrorCategory,
-        status,
-      },
-      include: {
-        actions: {
-          orderBy: {
-            sequence: "asc",
-          },
-        },
-      },
-      where: {
-        id: undoRun.id,
-      },
-    }),
-    prisma.executionRun.findUniqueOrThrow({
-      include: {
-        actions: {
-          orderBy: {
-            sequence: "asc",
-          },
-        },
-        undoRuns: {
-          include: {
-            actions: {
-              orderBy: {
-                sequence: "asc",
-              },
-            },
-          },
-          orderBy: {
-            startedAt: "desc",
-          },
-        },
-      },
-      where: {
-        id: executionRunId,
-      },
-    }),
-  ]);
-
-  await appendUndoHistory(executionRunId, status);
-
-  try {
-    await recordUndoNotebookEntry(updatedUndoRun.id);
-  } catch {
-    // Notebook reflections should never block undo results.
-  }
-
-  const executionRun: BridgeExecutionRunSummary =
-    summarizeExecutionRun(updatedExecutionRun);
-
-  return {
-    executionRun,
-    preview,
-    run: summarizeUndoRun(updatedUndoRun),
-    scanSessionId: existingRun.organizationPlan.scanSessionId,
-  };
+  await executeLocalPhysicalRun(undoRun.id, true);
+  const stored = await prisma.executionRun.findUniqueOrThrow({ where: { id: executionRunId },
+    include: { actions: { orderBy: { sequence: "asc" } }, undoRuns: { include: { actions: { orderBy: { sequence: "asc" } } }, orderBy: [{ startedAt: "desc" }, { id: "desc" }] } } });
+  const updatedUndo = stored.undoRuns.find((run) => run.id === undoRun.id)!;
+  try { await recordUndoNotebookEntry(updatedUndo.id); } catch { /* Derived reflection does not outrank durable history. */ }
+  return { executionRun: summarizeExecutionRun(stored), preview, run: summarizeUndoRun(updatedUndo), scanSessionId: existingRun.organizationPlan.scanSessionId };
 }

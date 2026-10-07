@@ -195,13 +195,12 @@ async function preferenceFixture(t: TestContext, name: string) {
   return { ...data, decisions, preference };
 }
 
-for (const mode of ["regeneration", "single reset", "bulk reset", "automatic replacement"] as const) {
+for (const mode of ["regeneration", "single reset", "bulk reset"] as const) {
   test(`Preference ${mode} rolls back at derived fault, then converges with one dispute history`, async (t) => {
     const data = await preferenceFixture(t, mode);
     const invoke = () => mode === "regeneration" ? suggestions.prepareOrganizationRecommendationRegeneration(data.scan.id, { confirmedReviewedDecisions: true }) :
       mode === "single reset" ? suggestions.resetOrganizationSuggestionDecision(data.decisions[0].id, data.scan.id) :
-      mode === "bulk reset" ? suggestions.resetOrganizationSuggestionDecisionsForScanSession(data.scan.id) :
-      suggestions.generateOrganizationSuggestionsForScannedFileWithText(data.rows[0].id, data.rows[0].text);
+      suggestions.resetOrganizationSuggestionDecisionsForScanSession(data.scan.id);
     await prisma.$executeRawUnsafe(`CREATE OR REPLACE FUNCTION "${schema}".preference_fault() RETURNS trigger AS $$
       BEGIN IF NEW.id = '${data.preference.id}' THEN RAISE EXCEPTION 'derived invalidation fault'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql`);
     await prisma.$executeRawUnsafe(`CREATE TRIGGER preference_fault BEFORE UPDATE ON "OrganizationPreference" FOR EACH ROW EXECUTE FUNCTION "${schema}".preference_fault()`);
@@ -225,6 +224,20 @@ for (const mode of ["regeneration", "single reset", "bulk reset", "automatic rep
       mode === "bulk reset" ? "PENDING" : "APPROVED");
   });
 }
+
+test("Preference automatic replacement preserves reviewed decisions and their approved support", async (t) => {
+  const data = await preferenceFixture(t, "human authority over automatic replacement");
+  const before = await prisma.organizationSuggestion.findMany({ where: { scanSessionId: data.scan.id }, orderBy: { id: "asc" } });
+  const preferenceBefore = await prisma.organizationPreference.findUniqueOrThrow({ where: { id: data.preference.id } });
+  for (let retry = 0; retry < 2; retry++) {
+    await suggestions.generateOrganizationSuggestionsForScannedFileWithText(data.rows[0].id, data.rows[0].text);
+    assert.deepEqual(await prisma.organizationSuggestion.findMany({ where: { scanSessionId: data.scan.id }, orderBy: { id: "asc" } }), before);
+    assert.deepEqual(await prisma.organizationPreference.findUniqueOrThrow({ where: { id: data.preference.id } }), preferenceBefore);
+    assert.equal((await preferences.applicableApprovedPreferences({ connectedLibraryId: data.root.id, contentText: "cobalt garden" })).length, 1);
+    assert.equal(await prisma.organizationSuggestionDecisionEvent.count({ where: { scanSessionId: data.scan.id } }), 0);
+    assert.equal(await prisma.organizationPreferenceRevision.count({ where: { preferenceId: data.preference.id, action: "DISPUTE" } }), 0);
+  }
+});
 
 for (const [name, mutation] of [
   ["revoked read", { readPermission: false }], ["hidden", { hiddenFromActiveListAt: new Date() }],

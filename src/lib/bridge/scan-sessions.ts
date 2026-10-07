@@ -1,4 +1,6 @@
 import path from "node:path";
+import { lockMonitoringBatch, monitoringLeaseMs, type MonitoringOwner } from "./monitoring-authority";
+import { isCurrentReadableRoot } from "./current-readable-root";
 
 import type { Prisma } from "@prisma/client";
 
@@ -423,6 +425,14 @@ export function scannedFileSummary(
   };
 }
 
+export async function getScannedFileSummary(scannedFileId: string, sessionId?: string) {
+  const file = await getPrismaClient().scannedFile.findFirst({ where: { id: scannedFileId, ...(sessionId ? { sessionId } : {}) },
+    include: { audioMetadata: true, imageMetadata: true, videoMetadata: true,
+      libraryDocument: { select: { observationSessions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1, select: { status: true } } } },
+      organizationSuggestions: { select: { status: true, suggestionType: true }, where: { invalidatedAt: null, recommendationGenerationVersion: currentRecommendationGenerationVersion } } } });
+  return file ? scannedFileSummary(file) : null;
+}
+
 function initialReadingStatusFor(
   file: BridgeScannedFileDraft,
 ): Prisma.ScannedFileCreateManyInput["readingStatus"] {
@@ -543,8 +553,8 @@ function videoMetadataWriteData(
 async function storeAudioMetadata(
   sessionId: string,
   files: BridgeScannedFileDraft[],
+  prisma: Prisma.TransactionClient = getPrismaClient(),
 ) {
-  const prisma = getPrismaClient();
   const audioDrafts = files.filter((file) => file.audioMetadata);
 
   if (audioDrafts.length === 0) {
@@ -569,34 +579,18 @@ async function storeAudioMetadata(
       },
     });
 
-    for (const storedFile of storedFiles) {
+    await prisma.audioRecordingMetadata.createMany({ data: storedFiles.flatMap((storedFile) => {
       const metadata = draftsByPath.get(storedFile.relativePath);
-
-      if (!metadata) {
-        continue;
-      }
-
-      const data = audioMetadataWriteData(metadata);
-
-      await prisma.audioRecordingMetadata.upsert({
-        create: {
-          ...data,
-          scannedFileId: storedFile.id,
-        },
-        update: data,
-        where: {
-          scannedFileId: storedFile.id,
-        },
-      });
-    }
+      return metadata ? [{ ...audioMetadataWriteData(metadata), scannedFileId: storedFile.id }] : [];
+    }) });
   }
 }
 
 async function storeVideoMetadata(
   sessionId: string,
   files: BridgeScannedFileDraft[],
+  prisma: Prisma.TransactionClient = getPrismaClient(),
 ) {
-  const prisma = getPrismaClient();
   const videoDrafts = files.filter((file) => file.videoMetadata);
 
   if (videoDrafts.length === 0) {
@@ -621,34 +615,18 @@ async function storeVideoMetadata(
       },
     });
 
-    for (const storedFile of storedFiles) {
+    await prisma.videoRecordingMetadata.createMany({ data: storedFiles.flatMap((storedFile) => {
       const metadata = draftsByPath.get(storedFile.relativePath);
-
-      if (!metadata) {
-        continue;
-      }
-
-      const data = videoMetadataWriteData(metadata);
-
-      await prisma.videoRecordingMetadata.upsert({
-        create: {
-          ...data,
-          scannedFileId: storedFile.id,
-        },
-        update: data,
-        where: {
-          scannedFileId: storedFile.id,
-        },
-      });
-    }
+      return metadata ? [{ ...videoMetadataWriteData(metadata), scannedFileId: storedFile.id }] : [];
+    }) });
   }
 }
 
 async function storeScannedFiles(
   sessionId: string,
   files: BridgeScannedFileDraft[],
+  prisma: Prisma.TransactionClient,
 ) {
-  const prisma = getPrismaClient();
 
   for (let index = 0; index < files.length; index += scanCreateChunkSize) {
     const chunk = files.slice(index, index + scanCreateChunkSize);
@@ -658,8 +636,8 @@ async function storeScannedFiles(
     });
   }
 
-  await storeAudioMetadata(sessionId, files);
-  await storeVideoMetadata(sessionId, files);
+  await storeAudioMetadata(sessionId, files, prisma);
+  await storeVideoMetadata(sessionId, files, prisma);
 }
 
 export async function createBridgeScanSessionFromScan(
@@ -667,6 +645,8 @@ export async function createBridgeScanSessionFromScan(
   options: {
     allowReusableSession?: boolean;
     connectedLibraryId?: string;
+    monitoringOwner?: MonitoringOwner;
+    executionReconciliationOwner?: import("./execution-reconciliation").ExecutionReconciliationOwner;
   } = {},
 ) {
   const prisma = getPrismaClient();
@@ -675,35 +655,31 @@ export async function createBridgeScanSessionFromScan(
     options.connectedLibraryId,
   );
   const allowReusableSession = options.allowReusableSession ?? true;
-  const reusableSession = allowReusableSession
-    ? await reusableScanSessionFor(connectedFolder.id, scan)
-    : null;
-
-  if (reusableSession) {
-    await prisma.connectedLibrary.update({
-      data: {
-        lastScanAt: new Date(),
-      },
-      where: {
-        id: connectedFolder.id,
-      },
-    });
-    await recordChecksumDuplicateSuggestionsForSession(reusableSession.id);
-
-    return scanSessionSummary(reusableSession);
-  }
-
-  const session = await prisma.scanSession.create({
+  const updatedSession = await prisma.$transaction(async (tx) => {
+  await tx.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE id = ${connectedFolder.id} FOR SHARE`;
+  const root = await tx.connectedLibrary.findUnique({ where: { id: connectedFolder.id } });
+  if (!root || !isCurrentReadableRoot(root)) throw new ConnectedLibraryError("This connected folder no longer authorizes scan import.", 403);
+  await (await import("./execution-reconciliation")).assertInventoryAfterPhysicalOutcomes(tx, connectedFolder.id, scan.physicalInventoryGeneration ?? 0);
+  if (scan.rootConnectionRevision !== undefined && scan.rootConnectionRevision !== root.nativeConnectionRevision) throw new ConnectedLibraryError("Inventory belongs to an older connection.", 409);
+  if (options.monitoringOwner) await lockMonitoringBatch(tx, options.monitoringOwner);
+  if (options.executionReconciliationOwner) await (await import("./execution-reconciliation")).lockExecutionReconciliation(tx, options.executionReconciliationOwner, connectedFolder.id);
+  const reusableSession = allowReusableSession ? await reusableScanSessionFor(connectedFolder.id, scan, tx) : null;
+  if (reusableSession) return reusableSession;
+  const session = await tx.scanSession.create({
     data: {
       connectedFolderId: connectedFolder.id,
-      startedAt: scan.startedAt,
+      startedAt: scan.startedAt, inventoryGeneration: root.physicalInventoryGeneration,
       status: "SCANNING",
     },
   });
 
-  try {
-    await storeScannedFiles(session.id, scan.files);
-    await recordChecksumDuplicateSuggestionsForSession(session.id);
+    await storeScannedFiles(session.id, scan.files, tx);
+    if (options.executionReconciliationOwner) await (await import("./execution-reconciliation")).bindExecutionReconciliation(tx, options.executionReconciliationOwner, session.id);
+    if (options.monitoringOwner) {
+      await tx.monitoringBatch.update({ where: { id: options.monitoringOwner.batchId }, data: {
+        scanSessionId: session.id, processingLeaseUntil: new Date(Date.now() + monitoringLeaseMs) } });
+      await tx.monitoringEvent.updateMany({ where: { batchId: options.monitoringOwner.batchId, processingStatus: "PROCESSING" }, data: { scanSessionId: session.id } });
+    }
 
     const terminalStatus =
       scan.supportedFiles > 0
@@ -711,8 +687,7 @@ export async function createBridgeScanSessionFromScan(
         : scan.failedFiles > 0
           ? "COMPLETED_WITH_ERRORS"
           : "COMPLETED";
-    const [updatedSession] = await prisma.$transaction([
-      prisma.scanSession.update({
+    const updatedSession = await tx.scanSession.update({
         data: {
           completedAt: scan.supportedFiles > 0 ? null : scan.completedAt,
           failedFiles: scan.failedFiles,
@@ -732,35 +707,19 @@ export async function createBridgeScanSessionFromScan(
         where: {
           id: session.id,
         },
-      }),
-      prisma.connectedLibrary.update({
+      });
+      await tx.connectedLibrary.update({
         data: {
           lastScanAt: new Date(),
         },
         where: {
           id: connectedFolder.id,
         },
-      }),
-    ]);
-
-    return scanSessionSummary(updatedSession);
-  } catch (error) {
-    await prisma.scanSession.update({
-      data: {
-        completedAt: new Date(),
-        failedFiles: scan.failedFiles,
-        filesScanned: scan.totalFiles,
-        status: "FAILED",
-        supportedFiles: scan.supportedFiles,
-        unsupportedFiles: scan.unsupportedFiles,
-      },
-      where: {
-        id: session.id,
-      },
-    });
-
-    throw error;
-  }
+      });
+    return updatedSession;
+  }, { timeout: 120_000 });
+  await recordChecksumDuplicateSuggestionsForSession(updatedSession.id);
+  return scanSessionSummary(updatedSession);
 }
 
 async function connectedFolderFor(
@@ -789,9 +748,7 @@ async function connectedFolderFor(
     return prisma.connectedLibrary.update({
       data: {
         displayName: library.displayName,
-        isEnabled: true,
         lastScanAt: new Date(),
-        status: "CONNECTED",
       },
       where: {
         id: library.id,
@@ -902,8 +859,9 @@ function scanMatchesStoredSession(
 async function reusableScanSessionFor(
   connectedFolderId: string,
   scan: BridgeFolderScanResult,
+  tx?: Prisma.TransactionClient,
 ) {
-  const prisma = getPrismaClient();
+  const prisma = tx ?? getPrismaClient();
   const candidates = await prisma.scanSession.findMany({
     include: {
       connectedFolder: {
@@ -932,7 +890,7 @@ async function reusableScanSessionFor(
     },
     take: 5,
     where: {
-      connectedFolderId,
+      connectedFolderId, inventoryGeneration: scan.physicalInventoryGeneration ?? 0,
       status: {
         in: reusableBridgeScanStatuses,
       },
@@ -1014,95 +972,6 @@ export function isActiveBridgeScanStatus(status: BridgeScanSessionSummary["statu
   return activeBridgeScanStatuses.includes(status);
 }
 
-function latestDate(left: Date, right: Date | null) {
-  if (!right) {
-    return left;
-  }
-
-  return right > left ? right : left;
-}
-
-function scanProgressForSession(
-  session: StoredScanSession & {
-    scannedFiles: StoredScannedFile[];
-  },
-): BridgeScanProcessingProgress {
-  const fileSummaries = session.scannedFiles.map(scannedFileSummary);
-  const filesRead = fileSummaries.filter(
-    (file) => file.readingStatus === "READ",
-  ).length;
-  const filesExamined = fileSummaries.filter(
-    (file) => file.hasObservation,
-  ).length;
-  const filesWithSuggestions = fileSummaries.filter(
-    (file) => file.organizationSuggestionCounts.total > 0,
-  ).length;
-  const fileHasCurrentRecommendations = (file: BridgeScannedFileSummary) =>
-    file.organizationSuggestionCounts.total > 0;
-  const fileNeedsAttention = (file: BridgeScannedFileSummary) =>
-    file.processingStage === "FAILED" ||
-    file.readStatus === "FAILED" ||
-    file.readingStatus === "FAILED" ||
-    file.extractionStatus === "FAILED";
-  const filesProcessed = fileSummaries.filter(
-    (file) =>
-      fileNeedsAttention(file) ||
-      file.processingStage === "UNSUPPORTED" ||
-      file.readStatus === "UNSUPPORTED" ||
-      (isRecommendationTerminalStage(file.processingStage) &&
-        fileHasCurrentRecommendations(file)),
-  ).length;
-  const suggestionsGenerated = fileSummaries.reduce(
-    (total, file) => total + file.organizationSuggestionCounts.total,
-    0,
-  );
-  const pendingSuggestions = fileSummaries.reduce(
-    (total, file) => total + file.organizationSuggestionCounts.pending,
-    0,
-  );
-  const failedFiles = fileSummaries.filter(
-    (file) => fileNeedsAttention(file),
-  ).length;
-  const summary = scanSessionSummary({
-    ...session,
-    failedFiles,
-  });
-  const lastActivityAt = session.scannedFiles.reduce(
-    (latest, file) =>
-      latestDate(
-        latestDate(latest, file.processedAt),
-        file.extractedAt,
-      ),
-    session.startedAt,
-  );
-  const isActive = isActiveBridgeScanStatus(summary.status);
-  const isStale =
-    isActive && Date.now() - lastActivityAt.getTime() > staleScanSessionThresholdMs;
-
-  return {
-    aiUsage: summarizeScanAIUsage(fileSummaries),
-    completedAt: summary.completedAt,
-    currentStage: summary.status,
-    failedFiles,
-    filesDiscovered: summary.totalFiles,
-    filesExamined,
-    filesProcessed,
-    filesRead,
-    filesWithSuggestions,
-    folderDisplayName: summary.folderDisplayName,
-    isActive,
-    isStale,
-    lastActivityAt: lastActivityAt.toISOString(),
-    pendingSuggestions,
-    remainingFiles: Math.max(0, summary.totalFiles - filesProcessed),
-    sessionId: summary.id,
-    startedAt: summary.startedAt,
-    suggestionsGenerated,
-    supportedFiles: summary.supportedFiles,
-    unsupportedFiles: summary.unsupportedFiles,
-  };
-}
-
 export function summarizeScanAIUsage(files: BridgeScannedFileSummary[]) {
   const documents = files.filter((file) => !/^(?:IMAGE|AUDIO|VIDEO)_/.test(file.fileType) && file.readStatus === "SUPPORTED");
 
@@ -1128,53 +997,19 @@ export function summarizeScanAIUsage(files: BridgeScannedFileSummary[]) {
 export async function getBridgeScanSessionProgress(sessionId: string) {
   await recoverPendingScanPublications({ sessionId });
   const prisma = getPrismaClient();
-  const session = await prisma.scanSession.findUnique({
-    include: {
-      connectedFolder: {
-        select: {
-          displayName: true,
-        },
-      },
-      scannedFiles: {
-        include: {
-          audioMetadata: true,
-          imageMetadata: true,
-          videoMetadata: true,
-          libraryDocument: {
-            select: {
-              observationSessions: {
-                select: {
-                  status: true,
-                },
-              },
-            },
-          },
-          organizationSuggestions: {
-            select: {
-              status: true,
-              suggestionType: true,
-            },
-            where: {
-              invalidatedAt: null,
-              recommendationGenerationVersion: currentRecommendationGenerationVersion,
-            },
-          },
-        },
-      },
-    },
-    where: {
-      id: sessionId,
-    },
-  });
-
-  if (!session) {
-    return null;
-  }
-
-  return {
-    progress: scanProgressForSession(session),
-    session: scanSessionSummary(session),
-  };
+  const session = await prisma.scanSession.findUnique({ include: { connectedFolder: { select: { displayName: true } } }, where: { id: sessionId } });
+  if (!session) return null;
+  const counts = await (await import("./scan-progress")).scanProgressCounts(sessionId);
+  const summary = scanSessionSummary({ ...session, failedFiles: counts.failedFiles });
+  const lastActivityAt = counts.lastActivityAt && counts.lastActivityAt > session.startedAt ? counts.lastActivityAt : session.startedAt;
+  const isActive = isActiveBridgeScanStatus(summary.status);
+  const progress: BridgeScanProcessingProgress = { ...counts, lastActivityAt: lastActivityAt.toISOString(),
+    completedAt: summary.completedAt, currentStage: summary.status, filesDiscovered: summary.totalFiles,
+    folderDisplayName: summary.folderDisplayName, isActive,
+    isStale: isActive && Date.now() - lastActivityAt.getTime() > staleScanSessionThresholdMs,
+    remainingFiles: Math.max(0, summary.totalFiles - counts.filesProcessed), sessionId: summary.id,
+    startedAt: summary.startedAt, supportedFiles: summary.supportedFiles, unsupportedFiles: summary.unsupportedFiles };
+  return { progress, session: summary };
 }
 
 export async function getActiveBridgeScanSessionProgress() {
@@ -1228,6 +1063,7 @@ export async function getBridgeScanSessionDetail(
           libraryDocument: {
             select: {
               observationSessions: {
+                orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1,
                 select: {
                   status: true,
                 },

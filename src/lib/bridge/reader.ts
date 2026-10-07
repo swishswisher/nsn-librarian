@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import { getPrismaClient } from "@/lib/db/prisma";
+import { getLocalReadClient as getPrismaClient, withLocalReadAuthority, withVerifiedLocalRead } from "./local-read-authority";
 import { readDocument } from "@/lib/reading-room/read-document";
 import { sanitizeReadingWarning } from "@/lib/reading-room/utils";
 
@@ -224,6 +224,10 @@ async function extractPreviewFromScannedFile(
 }
 
 export async function readScannedFileTransient(scannedFileId: string) {
+  return withVerifiedLocalRead(scannedFileId, () => readScannedFileTransientVerified(scannedFileId));
+}
+
+async function readScannedFileTransientVerified(scannedFileId: string) {
   const scannedFile = await scannedFileForRead(scannedFileId);
 
   if (!scannedFile) {
@@ -300,7 +304,11 @@ export async function readScannedFileTransient(scannedFileId: string) {
   return extractPreviewFromScannedFile(scannedFile);
 }
 
-export async function readScannedFile(
+export async function readScannedFile(scannedFileId: string, owner?: Date): Promise<BridgeReadFileApiSuccess> {
+  return withLocalReadAuthority(scannedFileId, () => readScannedFileOwned(scannedFileId), owner);
+}
+
+async function readScannedFileOwned(
   scannedFileId: string,
 ): Promise<BridgeReadFileApiSuccess> {
   const prisma = getPrismaClient();

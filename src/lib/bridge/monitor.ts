@@ -1,10 +1,13 @@
-import { createHash } from "node:crypto";
+import { currentReadableRootWhere } from "./current-readable-root";
+import { lockMonitoringBatch, monitoringLeaseMs, renewMonitoringBatch, type MonitoringOwner } from "./monitoring-authority";
+import { createBridgeCloudCommand } from "./cloud-coordinator";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, constants as fsConstants, watch } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { access, lstat } from "node:fs/promises";
 import path from "node:path";
 
-import type { Prisma } from "@prisma/client";
+import { Prisma, type MonitoringEvent } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { ensureKnowledgeGraphBackfill } from "@/lib/knowledge/queries";
@@ -22,7 +25,6 @@ import { extractAudioMetadata } from "./audio-metadata";
 import { extractVideoMetadata } from "./video-metadata";
 import { classifyBridgeFileType } from "./file-classifier";
 import {
-  BridgeScannerError,
   getConfiguredBridgeTestFolder,
   isDevelopmentBridgeScannerEnabled,
 } from "./scanner";
@@ -38,7 +40,6 @@ import {
 } from "./local-bridge-client";
 import type { LocalBridgeChangeEvent } from "./local-bridge-client";
 import type {
-  BridgeFolderScanResult,
   BridgeMonitoringBatchStatus,
   BridgeMonitoringDashboard,
   BridgeMonitoringEventSummary,
@@ -93,6 +94,7 @@ type BaselineFile = {
 };
 
 type MonitoringEventInput = {
+  expectedRootRevision?: number;
   checksumAfter?: string | null;
   checksumBefore?: string | null;
   connectedFolderId: string;
@@ -110,24 +112,7 @@ type MonitoringEventInput = {
   sizeBefore?: bigint | null;
 };
 
-type QueuedMonitoringEvent = {
-  id: string;
-  checksumAfter: string | null;
-  checksumBefore: string | null;
-  currentRelativePath: string | null;
-  eventType: string;
-  modifiedAtAfter: Date | null;
-  modifiedAtBefore: Date | null;
-  previousRelativePath: string | null;
-  retryCount: number;
-  safeErrorCategory: string | null;
-  scanSessionId: string | null;
-  sizeAfter: bigint | null;
-  sizeBefore: bigint | null;
-};
-
 const globalForBridgeMonitor = globalThis as unknown as {
-  nsnBridgeMonitorProcessing?: boolean;
   nsnBridgeMonitorWatchers?: Map<string, WatchHandle>;
 };
 
@@ -137,6 +122,7 @@ const watcherRegistry =
 
 globalForBridgeMonitor.nsnBridgeMonitorWatchers = watcherRegistry;
 
+const staleProcessingThresholdMs = 5 * 60 * 1000;
 const ignoredFolderNames = new Set([
   "$recycle.bin",
   "system volume information",
@@ -154,7 +140,6 @@ const ignoredSystemFileNames = new Set([
 ]);
 const stabilizationDelayMs = 700;
 const watchDebounceMs = 900;
-const staleProcessingThresholdMs = 5 * 60 * 1000;
 const monitoringQueueLimit = 25;
 
 export class BridgeMonitoringError extends Error {
@@ -222,14 +207,7 @@ function toJsonInput(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 }
 
-function isUniqueConstraintError(error: unknown) {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: string }).code === "P2002"
-  );
-}
+
 
 function displayNameForFolder(folderPath: string) {
   return path.basename(folderPath) || folderPath;
@@ -397,22 +375,6 @@ function safeResolveRelativePath(rootPath: string, relativePath: string) {
   }
 
   return resolvedPath;
-}
-
-function isBridgeRootPath(rootPath: string) {
-  return rootPath.startsWith("bridge://");
-}
-
-function draftLocalPath(rootPath: string, relativePath: string) {
-  if (isBridgeRootPath(rootPath)) {
-    const normalizedRelativePath = normalizeIncomingRelativePath(relativePath);
-
-    return normalizedRelativePath
-      ? `${rootPath.replace(/\/$/, "")}/${normalizedRelativePath}`
-      : rootPath;
-  }
-
-  return safeResolveRelativePath(rootPath, relativePath);
 }
 
 function classifyFileType(relativePath: string) {
@@ -730,8 +692,12 @@ function toBatchSummary(batch: {
   };
 }
 
-async function latestBaselineFiles(connectedFolderId: string) {
+async function latestBaselineFiles(connectedFolderId: string, relativePath?: string) {
   const prisma = getPrismaClient();
+  const scan = await prisma.scanSession.findFirst({ select: { id: true },
+    where: { connectedFolderId, status: { in: ["READING", "EXAMINING", "GENERATING_SUGGESTIONS", "COMPLETED", "COMPLETED_WITH_ERRORS"] } },
+    orderBy: [{ startedAt: "desc" }, { id: "desc" }] });
+  if (!scan) return [];
   const files = await prisma.scannedFile.findMany({
     orderBy: {
       createdAt: "desc",
@@ -748,9 +714,7 @@ async function latestBaselineFiles(connectedFolderId: string) {
       sourceUnavailableAt: true,
     },
     where: {
-      scanSession: {
-        connectedFolderId,
-      },
+      sessionId: scan.id, relativePath, sourceUnavailableAt: null,
     },
   });
   const byPath = new Map<string, BaselineFile>();
@@ -833,13 +797,19 @@ function eventIdentityKey(input: MonitoringEventInput) {
   ].join("\u001f");
 }
 
-async function enqueueMonitoringEvent(input: MonitoringEventInput) {
-  const prisma = getPrismaClient();
+async function enqueueMonitoringEvent(input: MonitoringEventInput, client?: Prisma.TransactionClient): Promise<MonitoringEvent> {
+  if (!client) return getPrismaClient().$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE id = ${input.connectedFolderId} FOR SHARE`;
+    if (!await tx.connectedLibrary.count({ where: { id: input.connectedFolderId, ...currentReadableRootWhere,
+      watchPermission: true, nativeConnectionRevision: input.expectedRootRevision } }))
+      throw new BridgeMonitoringError("The root no longer authorizes this watcher.", 409, "WATCH_AUTHORITY_CHANGED");
+    return enqueueMonitoringEvent(input, tx);
+  });
+  const prisma = client;
   const eventKey = eventIdentityKey(input);
 
-  try {
-    return await prisma.monitoringEvent.create({
-      data: {
+    return prisma.monitoringEvent.upsert({
+      create: {
         checksumAfter: input.checksumAfter ?? null,
         checksumBefore: input.checksumBefore ?? null,
         connectedFolderId: input.connectedFolderId,
@@ -857,14 +827,7 @@ async function enqueueMonitoringEvent(input: MonitoringEventInput) {
         sizeBefore: input.sizeBefore ?? null,
         stabilizedAt: new Date(),
       },
-    });
-  } catch (error) {
-    if (!isUniqueConstraintError(error)) {
-      throw error;
-    }
-
-    return prisma.monitoringEvent.update({
-      data: {
+      update: {
         detectedAt: input.detectedAt ?? new Date(),
         safeErrorCategory: input.safeErrorCategory ?? null,
         stabilizedAt: new Date(),
@@ -873,17 +836,15 @@ async function enqueueMonitoringEvent(input: MonitoringEventInput) {
         eventKey,
       },
     });
-  }
 }
 
 function eventFromSnapshot(
   connectedFolderId: string,
   snapshot: Extract<StablePathSnapshot, { kind: "file" }>,
   baselineFiles: BaselineFile[],
+  lookup?: { paths: Map<string, BaselineFile>; checksums: Map<string, BaselineFile> },
 ): MonitoringEventInput | null {
-  const samePath = baselineFiles.find(
-    (file) => file.relativePath === snapshot.relativePath,
-  );
+  const samePath = lookup ? lookup.paths.get(snapshot.relativePath) : baselineFiles.find((file) => file.relativePath === snapshot.relativePath);
 
   if (samePath) {
     if (sameMetadata(samePath, snapshot)) {
@@ -905,7 +866,7 @@ function eventFromSnapshot(
   }
 
   const checksumMatch = snapshot.checksum
-    ? baselineFiles.find((file) => file.checksum === snapshot.checksum)
+    ? (lookup ? lookup.checksums.get(snapshot.checksum) : baselineFiles.find((file) => file.checksum === snapshot.checksum))
     : null;
 
   if (checksumMatch) {
@@ -1002,9 +963,11 @@ async function enqueueLocalBridgeChange(
   folder: {
     bridgeRootId: string | null;
     id: string;
+    nativeConnectionRevision: number;
   },
   event: LocalBridgeChangeEvent,
   baselineFiles: BaselineFile[],
+  lookup: { paths: Map<string, BaselineFile>; checksums: Map<string, BaselineFile> },
 ) {
   if (!folder.bridgeRootId || event.rootId !== folder.bridgeRootId) {
     return;
@@ -1018,7 +981,7 @@ async function enqueueLocalBridgeChange(
 
   if (event.eventType.startsWith("FOLDER_")) {
     await enqueueMonitoringEvent({
-      connectedFolderId: folder.id,
+      connectedFolderId: folder.id, expectedRootRevision: folder.nativeConnectionRevision,
       currentRelativePath:
         event.eventType === "FOLDER_DELETED" ? null : relativePath,
       eventType: monitoringEventType(event.eventType),
@@ -1037,13 +1000,11 @@ async function enqueueLocalBridgeChange(
   }
 
   if (event.eventType === "FILE_DELETED") {
-    const previous = baselineFiles.find(
-      (file) => file.relativePath === relativePath,
-    );
+    const previous = lookup.paths.get(relativePath);
 
     await enqueueMonitoringEvent({
       checksumBefore: previous?.checksum ?? null,
-      connectedFolderId: folder.id,
+      connectedFolderId: folder.id, expectedRootRevision: folder.nativeConnectionRevision,
       eventType: "FILE_DELETED",
       modifiedAtBefore:
         previous?.lastModified ?? safeEventDate(event.detectedAt),
@@ -1059,22 +1020,21 @@ async function enqueueLocalBridgeChange(
       folder.id,
       snapshot,
       baselineFiles,
+      lookup,
     );
 
     if (monitoringEvent) {
-      await enqueueMonitoringEvent(monitoringEvent);
+      await enqueueMonitoringEvent({ ...monitoringEvent, expectedRootRevision: folder.nativeConnectionRevision });
     }
   } catch (error) {
     const category = localBridgeEventErrorCategory(error);
 
     if (category === "ROOT_UNAVAILABLE") {
-      const previous = baselineFiles.find(
-        (file) => file.relativePath === relativePath,
-      );
+      const previous = lookup.paths.get(relativePath);
 
       await enqueueMonitoringEvent({
         checksumBefore: previous?.checksum ?? null,
-        connectedFolderId: folder.id,
+        connectedFolderId: folder.id, expectedRootRevision: folder.nativeConnectionRevision,
         eventType: "FILE_DELETED",
         modifiedAtBefore:
           previous?.lastModified ?? safeEventDate(event.detectedAt),
@@ -1085,7 +1045,7 @@ async function enqueueLocalBridgeChange(
     }
 
     await enqueueMonitoringEvent({
-      connectedFolderId: folder.id,
+      connectedFolderId: folder.id, expectedRootRevision: folder.nativeConnectionRevision,
       currentRelativePath: relativePath,
       eventType: monitoringEventType(event.eventType),
       processingStatus: "NEEDS_ATTENTION",
@@ -1103,10 +1063,8 @@ async function drainLocalBridgeWatcherEvents(connectedFolderId?: string) {
         not: null,
       },
       id: connectedFolderId,
-      isEnabled: true,
+      ...currentReadableRootWhere,
       monitoringState: "WATCHING",
-      readPermission: true,
-      status: "CONNECTED",
       watchPermission: true,
     },
   });
@@ -1121,12 +1079,14 @@ async function drainLocalBridgeWatcherEvents(connectedFolderId?: string) {
     try {
       const events = await takeLocalBridgeWatcherEvents(bridgeRootId);
       const baselineFiles = await latestBaselineFiles(folder.id);
+      const lookup = { paths: new Map(baselineFiles.map((file) => [file.relativePath, file])), checksums: new Map<string, BaselineFile>() };
+      for (const file of baselineFiles) if (file.checksum && !lookup.checksums.has(file.checksum)) lookup.checksums.set(file.checksum, file);
 
       for (const event of events) {
-        await enqueueLocalBridgeChange(folder, event, baselineFiles);
+        await enqueueLocalBridgeChange(folder, event, baselineFiles, lookup);
       }
 
-      await prisma.connectedLibrary.update({
+      await prisma.connectedLibrary.updateMany({
         data: {
           monitoringErrorCategory: null,
           monitoringHeartbeatAt: new Date(),
@@ -1134,20 +1094,20 @@ async function drainLocalBridgeWatcherEvents(connectedFolderId?: string) {
           monitoringState: "WATCHING",
         },
         where: {
-          id: folder.id,
+          id: folder.id, ...currentReadableRootWhere, watchPermission: true, monitoringState: "WATCHING", nativeConnectionRevision: folder.nativeConnectionRevision,
         },
       });
     } catch (error) {
       const category = localBridgeEventErrorCategory(error);
 
-      await prisma.connectedLibrary.update({
+      await prisma.connectedLibrary.updateMany({
         data: {
           monitoringErrorCategory: category,
           monitoringLastCheckAt: new Date(),
           monitoringState: "NEEDS_ATTENTION",
         },
         where: {
-          id: folder.id,
+          id: folder.id, ...currentReadableRootWhere, watchPermission: true, monitoringState: "WATCHING", nativeConnectionRevision: folder.nativeConnectionRevision,
         },
       });
     }
@@ -1235,6 +1195,7 @@ function cloudWatchRelativePath(value: unknown) {
 export async function ingestBridgeWatchEvents(
   bridgeDeviceId: string,
   input: unknown,
+  expectedPublicKey?: string,
 ) {
   const rawEvents = Array.isArray(input) ? input : [];
 
@@ -1246,7 +1207,10 @@ export async function ingestBridgeWatchEvents(
     );
   }
 
-  const prisma = getPrismaClient();
+  return getPrismaClient().$transaction(async (prisma) => {
+  await prisma.$queryRaw`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${bridgeDeviceId} FOR SHARE`;
+  const device = await prisma.bridgeDevice.findFirst({ where: { bridgeDeviceId, status: { not: "REVOKED" }, revokedAt: null, publicKey: expectedPublicKey } });
+  if (!device) throw new BridgeMonitoringError("This device key no longer authorizes watch events.", 401, "WATCH_AUTHORITY_CHANGED");
   const acceptedEventIds: string[] = [];
   const duplicateEventIds: string[] = [];
   const now = new Date();
@@ -1283,14 +1247,14 @@ export async function ingestBridgeWatchEvents(
       );
     }
 
+    await prisma.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE "bridgeDeviceId" = ${bridgeDeviceId} AND "bridgeRootId" = ${bridgeRootId} FOR UPDATE`;
     const folder = await prisma.connectedLibrary.findFirst({
       where: {
         bridgeDeviceId,
         bridgeRootId,
-        isEnabled: true,
-        status: {
-          not: "DISCONNECTED",
-        },
+        ...currentReadableRootWhere,
+        watchPermission: true,
+        monitoringState: "WATCHING",
       },
     });
 
@@ -1337,9 +1301,9 @@ export async function ingestBridgeWatchEvents(
           ? relativePath
           : null,
       processingStatus: "QUEUED",
-    });
+    }, prisma);
 
-    await prisma.connectedLibrary.update({
+    await prisma.connectedLibrary.updateMany({
       data: {
         lastMonitoringAt: detectedAt,
         monitoringErrorCategory: null,
@@ -1350,9 +1314,8 @@ export async function ingestBridgeWatchEvents(
         monitoringStartedAt:
           folder.monitoringStartedAt ??
           (folder.monitoringState === "WATCHING" ? now : undefined),
-        monitoringState: "WATCHING",
       },
-      where: { id: folder.id },
+      where: { id: folder.id, ...currentReadableRootWhere, watchPermission: true, monitoringState: "WATCHING" },
     });
 
     if (existed) {
@@ -1366,6 +1329,7 @@ export async function ingestBridgeWatchEvents(
     acceptedEventIds,
     duplicateEventIds,
   };
+  }, { timeout: 120_000 });
 }
 
 async function enqueuePathChange(
@@ -1379,18 +1343,20 @@ async function enqueuePathChange(
 
   const prisma = getPrismaClient();
 
-  await prisma.connectedLibrary.update({
+  const folder = await prisma.connectedLibrary.findFirst({ where: { id: connectedFolderId, ...currentReadableRootWhere, watchPermission: true, monitoringState: "WATCHING" } });
+  if (!folder) return;
+  await prisma.connectedLibrary.updateMany({
     data: {
       monitoringHeartbeatAt: new Date(),
       monitoringLastCheckAt: new Date(),
     },
     where: {
-      id: connectedFolderId,
+      id: connectedFolderId, ...currentReadableRootWhere, watchPermission: true, monitoringState: "WATCHING", nativeConnectionRevision: folder.nativeConnectionRevision,
     },
   });
 
   try {
-    const baselineFiles = await latestBaselineFiles(connectedFolderId);
+    const baselineFiles = await latestBaselineFiles(connectedFolderId, normalizeIncomingRelativePath(relativePath));
     const snapshot = await stablePathSnapshot(rootPath, relativePath);
 
     if (snapshot.kind === "missing") {
@@ -1400,7 +1366,7 @@ async function enqueuePathChange(
 
       if (!previous) {
         await enqueueMonitoringEvent({
-          connectedFolderId,
+          connectedFolderId, expectedRootRevision: folder.nativeConnectionRevision,
           eventType: "FOLDER_DELETED",
           previousRelativePath: normalizeIncomingRelativePath(relativePath),
         });
@@ -1409,7 +1375,7 @@ async function enqueuePathChange(
 
       await enqueueMonitoringEvent({
         checksumBefore: previous.checksum,
-        connectedFolderId,
+        connectedFolderId, expectedRootRevision: folder.nativeConnectionRevision,
         eventType: "FILE_DELETED",
         modifiedAtBefore: previous.lastModified,
         previousRelativePath: previous.relativePath,
@@ -1420,7 +1386,7 @@ async function enqueuePathChange(
 
     if (snapshot.kind === "directory") {
       await enqueueMonitoringEvent({
-        connectedFolderId,
+        connectedFolderId, expectedRootRevision: folder.nativeConnectionRevision,
         currentRelativePath: snapshot.relativePath,
         eventType: "FOLDER_ADDED",
         modifiedAtAfter: snapshot.lastModified,
@@ -1432,10 +1398,10 @@ async function enqueuePathChange(
     const event = eventFromSnapshot(connectedFolderId, snapshot, baselineFiles);
 
     if (event) {
-      await enqueueMonitoringEvent(event);
+      await enqueueMonitoringEvent({ ...event, expectedRootRevision: folder.nativeConnectionRevision });
     }
   } catch (error) {
-    await prisma.connectedLibrary.update({
+    await prisma.connectedLibrary.updateMany({
       data: {
         monitoringErrorCategory:
           error instanceof BridgeMonitoringError
@@ -1444,7 +1410,7 @@ async function enqueuePathChange(
         monitoringState: "NEEDS_ATTENTION",
       },
       where: {
-        id: connectedFolderId,
+        id: connectedFolderId, ...currentReadableRootWhere, watchPermission: true, monitoringState: "WATCHING", nativeConnectionRevision: folder.nativeConnectionRevision,
       },
     });
   }
@@ -1530,6 +1496,8 @@ async function reconcileConnectedFolder(connectedFolderId: string) {
   const baselineByPath = new Map(
     baselineFiles.map((file) => [file.relativePath, file]),
   );
+  const baselineByChecksum = new Map<string, BaselineFile>();
+  for (const file of baselineFiles) if (file.checksum && !baselineByChecksum.has(file.checksum)) baselineByChecksum.set(file.checksum, file);
   const matchedBaselineIds = new Set<string>();
   const scan = folder.bridgeRootId
     ? await scanLocalBridgeRoot(folder.bridgeRootId)
@@ -1555,7 +1523,7 @@ async function reconcileConnectedFolder(connectedFolderId: string) {
       sizeBytes: file.sizeBytes ?? BigInt(0),
       videoMetadata: file.videoMetadata,
     };
-    const event = eventFromSnapshot(folder.id, snapshot, baselineFiles);
+    const event = eventFromSnapshot(folder.id, snapshot, baselineFiles, { paths: baselineByPath, checksums: baselineByChecksum });
 
     if (!event) {
       const baseline = baselineByPath.get(file.relativePath);
@@ -1578,12 +1546,13 @@ async function reconcileConnectedFolder(connectedFolderId: string) {
     await enqueueMonitoringEvent(event);
   }
 
+  const currentPaths = new Set(scan.files.map((file) => file.relativePath));
   for (const baseline of baselineFiles) {
     if (matchedBaselineIds.has(baseline.id)) {
       continue;
     }
 
-    if (scan.files.some((file) => file.relativePath === baseline.relativePath)) {
+    if (currentPaths.has(baseline.relativePath)) {
       continue;
     }
 
@@ -1612,27 +1581,11 @@ async function reconcileConnectedFolder(connectedFolderId: string) {
 async function restoreMonitoringAfterRestart() {
   const prisma = getPrismaClient();
   const now = new Date();
-  const staleBefore = new Date(now.getTime() - staleProcessingThresholdMs);
-
-  await prisma.monitoringEvent.updateMany({
-    data: {
-      processingStatus: "QUEUED",
-      safeErrorCategory: "RESUMED_AFTER_RESTART",
-    },
-    where: {
-      processingStatus: "PROCESSING",
-      updatedAt: {
-        lt: staleBefore,
-      },
-    },
-  });
-
   const watchingFolders = await prisma.connectedLibrary.findMany({
     where: {
+      ...currentReadableRootWhere,
       bridgeDeviceId: null,
-      isEnabled: true,
       monitoringState: "WATCHING",
-      status: "CONNECTED",
       watchPermission: true,
     },
   });
@@ -1873,14 +1826,14 @@ export async function startMonitoringForConnectedLibrary(folderId: string) {
         "WATCHER_START_FAILED",
       );
 
-      await prisma.connectedLibrary.update({
+      await prisma.connectedLibrary.updateMany({
         data: {
           monitoringErrorCategory: monitoringError.category,
           monitoringLastCheckAt: new Date(),
           monitoringState: "NEEDS_ATTENTION",
         },
         where: {
-          id: folder.id,
+          id: folder.id, ...currentReadableRootWhere, watchPermission: true, nativeConnectionRevision: folder.nativeConnectionRevision,
         },
       });
       throw monitoringError;
@@ -1888,7 +1841,7 @@ export async function startMonitoringForConnectedLibrary(folderId: string) {
 
     const now = new Date();
 
-    await prisma.connectedLibrary.update({
+    await prisma.connectedLibrary.updateMany({
       data: {
         lastMonitoringAt: now,
         monitoringErrorCategory: null,
@@ -1901,7 +1854,7 @@ export async function startMonitoringForConnectedLibrary(folderId: string) {
         monitoringStoppedAt: null,
       },
       where: {
-        id: folder.id,
+        id: folder.id, ...currentReadableRootWhere, watchPermission: true, nativeConnectionRevision: folder.nativeConnectionRevision,
       },
     });
 
@@ -1914,7 +1867,7 @@ export async function startMonitoringForConnectedLibrary(folderId: string) {
     folderId,
     "watch this folder",
   );
-  const updatedFolder = await prisma.connectedLibrary.update({
+  const changed = await prisma.connectedLibrary.updateMany({
     data: {
       monitoringErrorCategory: null,
       monitoringGeneration: {
@@ -1929,10 +1882,12 @@ export async function startMonitoringForConnectedLibrary(folderId: string) {
       monitoringStoppedAt: null,
     },
     where: {
-      id: folder.id,
+      id: folder.id, ...currentReadableRootWhere, watchPermission: true, nativeConnectionRevision: folder.nativeConnectionRevision,
     },
   });
 
+  if (!changed.count) throw new BridgeMonitoringError("Watcher authority changed.", 409, "WATCH_AUTHORITY_CHANGED");
+  const updatedFolder = await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: folder.id } });
   startWatcherForFolder({
     ...updatedFolder,
     localPath: rootPath,
@@ -2015,14 +1970,14 @@ export async function resumeMonitoringForFolder(folderId: string) {
         "WATCHER_START_FAILED",
       );
 
-      await prisma.connectedLibrary.update({
+      await prisma.connectedLibrary.updateMany({
         data: {
           monitoringErrorCategory: monitoringError.category,
           monitoringLastCheckAt: new Date(),
           monitoringState: "NEEDS_ATTENTION",
         },
         where: {
-          id: folder.id,
+          id: folder.id, ...currentReadableRootWhere, watchPermission: true, nativeConnectionRevision: folder.nativeConnectionRevision,
         },
       });
       throw monitoringError;
@@ -2030,7 +1985,7 @@ export async function resumeMonitoringForFolder(folderId: string) {
 
     const now = new Date();
 
-    await prisma.connectedLibrary.update({
+    await prisma.connectedLibrary.updateMany({
       data: {
         monitoringErrorCategory: null,
         monitoringHeartbeatAt: now,
@@ -2042,7 +1997,7 @@ export async function resumeMonitoringForFolder(folderId: string) {
         monitoringStoppedAt: null,
       },
       where: {
-        id: folderId,
+        id: folderId, ...currentReadableRootWhere, watchPermission: true, nativeConnectionRevision: folder.nativeConnectionRevision,
       },
     });
 
@@ -2056,7 +2011,7 @@ export async function resumeMonitoringForFolder(folderId: string) {
     "watch this folder",
   );
 
-  const updatedFolder = await prisma.connectedLibrary.update({
+  const changed = await prisma.connectedLibrary.updateMany({
     data: {
       monitoringErrorCategory: null,
       monitoringGeneration: {
@@ -2070,10 +2025,12 @@ export async function resumeMonitoringForFolder(folderId: string) {
       monitoringStoppedAt: null,
     },
     where: {
-      id: folderId,
+      id: folderId, ...currentReadableRootWhere, watchPermission: true, nativeConnectionRevision: folder.nativeConnectionRevision,
     },
   });
 
+  if (!changed.count) throw new BridgeMonitoringError("Watcher authority changed.", 409, "WATCH_AUTHORITY_CHANGED");
+  const updatedFolder = await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: folder.id } });
   startWatcherForFolder({
     ...updatedFolder,
     localPath: rootPath,
@@ -2132,214 +2089,6 @@ export async function reconcileMonitoringForFolder(folderId: string) {
   return getMonitoringDashboardData();
 }
 
-async function draftFromMonitoringEvent(
-  rootPath: string,
-  event: QueuedMonitoringEvent,
-): Promise<BridgeScannedFileDraft | null> {
-  if (
-    event.eventType !== "FILE_ADDED" &&
-    event.eventType !== "FILE_MODIFIED"
-  ) {
-    return null;
-  }
-
-  if (!event.currentRelativePath) {
-    return null;
-  }
-
-  const fileType = classifyFileType(event.currentRelativePath);
-  const localPath = draftLocalPath(rootPath, event.currentRelativePath);
-  const failed = Boolean(event.safeErrorCategory);
-  const readStatus = failed
-    ? "FAILED"
-    : fileType === "UNSUPPORTED"
-      ? "UNSUPPORTED"
-      : "SUPPORTED";
-  let audioMetadata: BridgeScannedFileDraft["audioMetadata"] = null;
-  let videoMetadata: BridgeScannedFileDraft["videoMetadata"] = null;
-
-  if (!failed && !isBridgeRootPath(rootPath) && fileType.startsWith("AUDIO_")) {
-    try {
-      const stats = await lstat(localPath);
-      audioMetadata = await extractAudioMetadata(
-        localPath,
-        event.currentRelativePath,
-        stats,
-      );
-    } catch {
-      audioMetadata = null;
-    }
-  }
-
-  if (!failed && !isBridgeRootPath(rootPath) && fileType.startsWith("VIDEO_")) {
-    try {
-      const stats = await lstat(localPath);
-      videoMetadata = await extractVideoMetadata(
-        localPath,
-        event.currentRelativePath,
-        stats,
-      );
-    } catch {
-      videoMetadata = null;
-    }
-  }
-
-  return {
-    audioMetadata,
-    checksum: event.checksumAfter,
-    fileType,
-    lastModified: event.modifiedAtAfter,
-    localPath,
-    readStatus,
-    relativePath: event.currentRelativePath,
-    scanError: failed
-      ? "The Librarian could not inspect this changed file safely."
-      : undefined,
-    sourceCreatedAt:
-      audioMetadata?.sourceCreatedAt ?? videoMetadata?.sourceCreatedAt ?? null,
-    sizeBytes: event.sizeAfter,
-    videoMetadata,
-  };
-}
-
-function scanResultForDrafts(
-  folderDisplayName: string,
-  rootPath: string,
-  files: BridgeScannedFileDraft[],
-): BridgeFolderScanResult {
-  const startedAt = new Date();
-  const supportedFiles = files.filter(
-    (file) => file.readStatus === "SUPPORTED",
-  ).length;
-  const unsupportedFiles = files.filter(
-    (file) => file.readStatus === "UNSUPPORTED",
-  ).length;
-  const failedFiles = files.filter((file) => file.readStatus === "FAILED").length;
-
-  return {
-    completedAt: new Date(),
-    failedFiles,
-    files,
-    folderDisplayName,
-    rootPath,
-    startedAt,
-    supportedFiles,
-    totalFiles: files.length,
-    unsupportedFiles,
-  };
-}
-
-function normalizeFileName(fileName: string) {
-  const parsed = path.parse(fileName);
-  const safeName = parsed.name
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/(^-|-$)/g, "");
-  const safeExtension = parsed.ext.toLowerCase().replace(/[^a-z0-9.]/g, "");
-
-  return `${safeName || "document"}${safeExtension}`;
-}
-
-async function markSourceUnavailable(
-  connectedFolderId: string,
-  relativePath: string,
-) {
-  const prisma = getPrismaClient();
-
-  await prisma.scannedFile.updateMany({
-    data: {
-      sourceUnavailableAt: new Date(),
-      sourceUnavailableReason:
-        "The file was no longer present when the watched folder was checked.",
-    },
-    where: {
-      relativePath,
-      scanSession: {
-        connectedFolderId,
-      },
-    },
-  });
-}
-
-async function updatePathReferences(
-  connectedFolderId: string,
-  rootPath: string,
-  event: QueuedMonitoringEvent,
-) {
-  if (!event.previousRelativePath || !event.currentRelativePath) {
-    return;
-  }
-
-  const prisma = getPrismaClient();
-  const matchingFiles = await prisma.scannedFile.findMany({
-    select: {
-      id: true,
-      libraryDocumentId: true,
-    },
-    where: {
-      checksum: event.checksumBefore ?? undefined,
-      relativePath: event.previousRelativePath,
-      scanSession: {
-        connectedFolderId,
-      },
-    },
-  });
-  const fileIds = matchingFiles.map((file) => file.id);
-  const documentIds = matchingFiles
-    .map((file) => file.libraryDocumentId)
-    .filter((id): id is string => Boolean(id));
-
-  if (fileIds.length === 0) {
-    return;
-  }
-
-  const newLocalPath = draftLocalPath(rootPath, event.currentRelativePath);
-  const extension =
-    path.posix.extname(event.currentRelativePath).replace(".", "").toLowerCase() ||
-    null;
-
-  await prisma.$transaction([
-    prisma.scannedFile.updateMany({
-      data: {
-        lastModified: event.modifiedAtAfter,
-        localPath: newLocalPath,
-        relativePath: event.currentRelativePath,
-        sizeBytes: event.sizeAfter,
-        sourceUnavailableAt: null,
-        sourceUnavailableReason: null,
-      },
-      where: {
-        id: {
-          in: fileIds,
-        },
-      },
-    }),
-    prisma.organizationSuggestion.updateMany({
-      data: {
-        currentRelativePath: event.currentRelativePath,
-      },
-      where: {
-        scannedFileId: {
-          in: fileIds,
-        },
-      },
-    }),
-    prisma.libraryDocument.updateMany({
-      data: {
-        extension,
-        normalizedFileName: normalizeFileName(event.currentRelativePath),
-        originalFileName: event.currentRelativePath,
-      },
-      where: {
-        id: {
-          in: documentIds,
-        },
-      },
-    }),
-  ]);
-}
-
 function batchNotification({
   failedEvents,
   fileEvents,
@@ -2366,8 +2115,9 @@ function batchNotification({
   };
 }
 
-async function finalizeMonitoringBatch(batchId: string) {
-  const prisma = getPrismaClient();
+async function finalizeMonitoringBatch(batchId: string, owner: MonitoringOwner) {
+  const batch = await getPrismaClient().$transaction(async (prisma) => {
+  await lockMonitoringBatch(prisma, owner);
   const events = await prisma.monitoringEvent.findMany({
     where: {
       batchId,
@@ -2409,6 +2159,7 @@ async function finalizeMonitoringBatch(batchId: string) {
   const batch = await prisma.monitoringBatch.update({
     data: {
       completedAt: new Date(),
+      processingLeaseUntil: null,
       failedEvents,
       fileEvents,
       folderEvents,
@@ -2431,11 +2182,14 @@ async function finalizeMonitoringBatch(batchId: string) {
     },
   });
 
+  return batch;
+  }, { timeout: 120_000 });
+
   try {
     const notebookEntry = await recordMonitoringBatchNotebookEntry(batch.id);
 
     if (notebookEntry) {
-      await prisma.monitoringBatch.update({
+      await getPrismaClient().monitoringBatch.update({
         data: {
           notebookEntryId: notebookEntry.id,
         },
@@ -2455,333 +2209,147 @@ async function finalizeMonitoringBatch(batchId: string) {
   }
 }
 
-async function markEventCompleted(eventId: string) {
-  const prisma = getPrismaClient();
 
-  await prisma.monitoringEvent.update({
-    data: {
-      processedAt: new Date(),
-      processingStatus: "COMPLETED",
-      safeErrorCategory: null,
-    },
-    where: {
-      id: eventId,
-    },
-  });
+const activeMonitoringScanStatuses = ["PENDING", "SCANNING", "READING", "EXAMINING", "GENERATING_SUGGESTIONS"] as const;
+
+async function claimMonitoringRoot(rootId: string, retryAttention: boolean) {
+  return getPrismaClient().$transaction(async (tx) => {
+    const binding = await tx.connectedLibrary.findUniqueOrThrow({ where: { id: rootId } });
+    if (binding.bridgeDeviceId) await tx.$queryRaw(Prisma.sql`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${binding.bridgeDeviceId} FOR SHARE`);
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id = ${rootId} FOR UPDATE`);
+    const folder = await tx.connectedLibrary.findFirst({ where: { id: rootId, ...currentReadableRootWhere, watchPermission: true, monitoringState: "WATCHING" } });
+    if (!folder) return null;
+    const now = new Date(), generation = randomUUID();
+    const existing = await tx.monitoringBatch.findFirst({ where: { connectedFolderId: rootId, status: "PROCESSING" }, orderBy: [{ startedAt: "asc" }, { id: "asc" }] });
+    if (existing?.processingLeaseUntil && existing.processingLeaseUntil > now) return null;
+    if (existing && (existing.rootConnectionRevision ?? 0) === folder.nativeConnectionRevision) {
+      const batch = await tx.monitoringBatch.update({ where: { id: existing.id }, data: { processingGeneration: generation,
+        rootConnectionRevision: folder.nativeConnectionRevision, processingLeaseUntil: new Date(now.getTime() + monitoringLeaseMs) } });
+      return { batch, folder, owner: { batchId: batch.id, generation } };
+    }
+    if (existing) {
+      if (existing.scanSessionId) await tx.scanSession.updateMany({ where: { id: existing.scanSessionId, status: { in: [...activeMonitoringScanStatuses] } },
+        data: { status: "FAILED", completedAt: now, recommendationGeneration: null, recommendationLeaseUntil: null } });
+      await tx.monitoringBatch.update({ where: { id: existing.id }, data: { status: "COMPLETED_WITH_ERRORS", completedAt: now, processingLeaseUntil: null } });
+      await tx.monitoringEvent.updateMany({ where: { batchId: existing.id, processingStatus: "PROCESSING" }, data: { batchId: null, processingStatus: "QUEUED", scanSessionId: null } });
+    }
+    if (await tx.scanSession.count({ where: { connectedFolderId: rootId, status: { in: [...activeMonitoringScanStatuses] } } })) return null;
+    const events = await tx.monitoringEvent.findMany({ select: { id: true }, take: monitoringQueueLimit,
+      orderBy: [{ detectedAt: "asc" }, { id: "asc" }], where: { connectedFolderId: rootId,
+        processingStatus: { in: retryAttention ? ["QUEUED", "NEEDS_ATTENTION", "FAILED"] : ["QUEUED"] } } });
+    if (!events.length) return null;
+    const batch = await tx.monitoringBatch.create({ data: { connectedFolderId: rootId, status: "PROCESSING", processingGeneration: generation,
+      processingLeaseUntil: new Date(now.getTime() + monitoringLeaseMs), rootConnectionRevision: folder.nativeConnectionRevision,
+      summary: toJsonInput({ eventIds: events.map((event) => event.id), reconciliation: "FULL_CURRENT_INVENTORY" }) } });
+    await tx.monitoringEvent.updateMany({ where: { id: { in: events.map((event) => event.id) } }, data: { batchId: batch.id,
+      processingStatus: "PROCESSING", retryCount: { increment: retryAttention ? 1 : 0 } } });
+    return { batch, folder, owner: { batchId: batch.id, generation } };
+  }, { timeout: 120_000 });
 }
 
-async function markEventSkipped(eventId: string) {
-  const prisma = getPrismaClient();
-
-  await prisma.monitoringEvent.update({
-    data: {
-      processedAt: new Date(),
-      processingStatus: "SKIPPED",
-      safeErrorCategory: null,
-    },
-    where: {
-      id: eventId,
-    },
-  });
+async function finishMonitoringSnapshot(owner: MonitoringOwner) {
+  const ready = await getPrismaClient().$transaction(async (tx) => {
+    const batch = await lockMonitoringBatch(tx, owner);
+    if (!batch.scanSessionId) return false;
+    const scan = await tx.scanSession.findUniqueOrThrow({ where: { id: batch.scanSessionId } });
+    if (activeMonitoringScanStatuses.includes(scan.status as typeof activeMonitoringScanStatuses[number])) return false;
+    const events = await tx.monitoringEvent.findMany({ where: { batchId: batch.id, processingStatus: "PROCESSING" } });
+    const files = await tx.scannedFile.findMany({ select: { relativePath: true, processingStage: true, readStatus: true }, where: { sessionId: scan.id } });
+    const byPath = new Map(files.map((file) => [file.relativePath, file]));
+    for (const event of events) {
+      const file = event.currentRelativePath ? byPath.get(event.currentRelativePath) : null;
+      const failed = scan.status === "FAILED" || file?.processingStage === "FAILED" || file?.readStatus === "FAILED";
+      await tx.monitoringEvent.updateMany({ where: { id: event.id, batchId: batch.id, processingStatus: "PROCESSING" },
+        data: { processedAt: new Date(), processingStatus: failed ? "NEEDS_ATTENTION" : "COMPLETED", safeErrorCategory: failed ? "PROCESSING_FAILED" : null } });
+    }
+    return true;
+  }, { timeout: 120_000 });
+  if (ready) await finalizeMonitoringBatch(owner.batchId, owner);
+  return ready;
 }
 
-async function markEventNeedsAttention(eventId: string, category: string) {
-  const prisma = getPrismaClient();
-
-  await prisma.monitoringEvent.update({
-    data: {
-      processedAt: new Date(),
-      processingStatus: "NEEDS_ATTENTION",
-      safeErrorCategory: category,
-    },
-    where: {
-      id: eventId,
-    },
-  });
-}
-
-async function processMonitoringEventsForBatch(
-  batchId: string,
-  connectedFolderId: string,
-  rootPath: string,
-  folderDisplayName: string,
-  events: QueuedMonitoringEvent[],
-) {
-  const prisma = getPrismaClient();
-  const scanDrafts: BridgeScannedFileDraft[] = [];
-  const scanEventIds = new Set<string>();
-  const renameOrMovePreviousPaths = new Set(
-    events
-      .filter(
-        (event) =>
-          event.eventType === "FILE_RENAMED" ||
-          event.eventType === "FILE_MOVED",
-      )
-      .map((event) => event.previousRelativePath)
-      .filter((value): value is string => Boolean(value)),
-  );
-
-  for (const event of events) {
-    if (event.eventType === "FILE_DELETED" && event.previousRelativePath) {
-      if (renameOrMovePreviousPaths.has(event.previousRelativePath)) {
-        await markEventSkipped(event.id);
-        continue;
-      }
-
-      await markSourceUnavailable(connectedFolderId, event.previousRelativePath);
-      await markEventCompleted(event.id);
-      continue;
-    }
-
-    if (
-      (event.eventType === "FILE_RENAMED" ||
-        event.eventType === "FILE_MOVED") &&
-      event.currentRelativePath
-    ) {
-      await updatePathReferences(connectedFolderId, rootPath, event);
-      await markEventCompleted(event.id);
-      continue;
-    }
-
-    if (event.eventType.startsWith("FOLDER_")) {
-      await markEventCompleted(event.id);
-      continue;
-    }
-
-    const draft = await draftFromMonitoringEvent(rootPath, event);
-
-    if (!draft) {
-      await markEventNeedsAttention(event.id, "UNSUPPORTED_MONITORING_EVENT");
-      continue;
-    }
-
-    scanDrafts.push(draft);
-    scanEventIds.add(event.id);
+async function runMonitoringSnapshot(admitted: NonNullable<Awaited<ReturnType<typeof claimMonitoringRoot>>>) {
+  const { batch, folder, owner } = admitted;
+  let scanSessionId = batch.scanSessionId;
+  if (!scanSessionId && folder.bridgeDeviceId && folder.bridgeRootId) {
+    await getPrismaClient().$transaction(async (tx) => {
+      // Keep device -> root -> batch lock order through cloud command creation.
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${folder.bridgeDeviceId} FOR SHARE`);
+      await lockMonitoringBatch(tx, owner);
+      const currentRoot = await tx.connectedLibrary.findUniqueOrThrow({ where: { id: folder.id } });
+      const scan = await tx.scanSession.create({ data: { connectedFolderId: folder.id, inventoryGeneration: currentRoot.physicalInventoryGeneration, status: "SCANNING" } });
+      await createBridgeCloudCommand({ bridgeDeviceId: folder.bridgeDeviceId!, bridgeRootId: folder.bridgeRootId,
+        connectedLibraryId: folder.id, commandType: "RECONCILE_LIBRARY", idempotencyKey: `monitor-reconcile:${batch.id}:${owner.generation}`,
+        authorizationContext: { initiatedBy: "Deanne", purpose: "Reconcile read-only watch hints against a full current inventory." }, payload: { scanSessionId: scan.id } }, tx);
+      await tx.monitoringBatch.update({ where: { id: batch.id }, data: { scanSessionId: scan.id } });
+      await tx.monitoringEvent.updateMany({ where: { batchId: batch.id, processingStatus: "PROCESSING" }, data: { scanSessionId: scan.id } });
+    }, { timeout: 120_000 });
+    return; // Queued is not the same as reconciled or ready for review.
   }
-
-  if (scanDrafts.length === 0) {
-    return;
-  }
-
-  const scan = scanResultForDrafts(folderDisplayName, rootPath, scanDrafts);
-  const scanSession = await createBridgeScanSessionFromScan(scan, {
-    allowReusableSession: false,
-    connectedLibraryId: connectedFolderId,
-  });
-
-  await prisma.$transaction([
-    prisma.monitoringBatch.update({
-      data: {
-        scanSessionId: scanSession.id,
-      },
-      where: {
-        id: batchId,
-      },
-    }),
-    prisma.monitoringEvent.updateMany({
-      data: {
-        scanSessionId: scanSession.id,
-      },
-      where: {
-        id: {
-          in: [...scanEventIds],
-        },
-      },
-    }),
-  ]);
-
-  if (scan.supportedFiles > 0) {
-    await processBridgeScanSession(scanSession.id, {
-      recordNotebook: false,
-    });
-  }
-
-  const scannedFiles = await prisma.scannedFile.findMany({
-    select: {
-      processingStage: true,
-      readStatus: true,
-      relativePath: true,
-    },
-    where: {
-      sessionId: scanSession.id,
-    },
-  });
-  const filesByPath = new Map(
-    scannedFiles.map((file) => [file.relativePath, file]),
-  );
-
-  for (const event of events) {
-    if (!scanEventIds.has(event.id)) {
-      continue;
-    }
-
-    const file = event.currentRelativePath
-      ? filesByPath.get(event.currentRelativePath)
-      : null;
-
-    if (
-      !file ||
-      file.processingStage === "FAILED" ||
-      file.readStatus === "FAILED"
-    ) {
-      await markEventNeedsAttention(event.id, "PROCESSING_FAILED");
-    } else {
-      await markEventCompleted(event.id);
-    }
-  }
-}
-
-export async function processMonitoringQueue(options: {
-  connectedFolderId?: string;
-  retryAttention?: boolean;
-} = {}) {
-  if (globalForBridgeMonitor.nsnBridgeMonitorProcessing) {
-    return getMonitoringDashboardData();
-  }
-
-  globalForBridgeMonitor.nsnBridgeMonitorProcessing = true;
-
-  try {
-    await drainLocalBridgeWatcherEvents(options.connectedFolderId);
-
-    const prisma = getPrismaClient();
-    const processableStatuses: BridgeMonitoringProcessingStatus[] =
-      options.retryAttention
-        ? ["QUEUED", "NEEDS_ATTENTION", "FAILED"]
-        : ["QUEUED"];
-    const firstEvent = await prisma.monitoringEvent.findFirst({
-      include: {
-        connectedFolder: true,
-      },
-      orderBy: {
-        detectedAt: "asc",
-      },
-      where: {
-        connectedFolderId: options.connectedFolderId,
-        processingStatus: {
-          in: processableStatuses,
-        },
-      },
-    });
-
-    if (!firstEvent) {
-      return getMonitoringDashboardData();
-    }
-
-    const { folder, rootPath } = await monitoringContextForFolder(
-      firstEvent.connectedFolderId,
-      "watch this folder",
-    );
-    const activeScanSession = await prisma.scanSession.findFirst({
-      select: {
-        id: true,
-      },
-      where: {
-        status: {
-          in: [
-            "PENDING",
-            "SCANNING",
-            "READING",
-            "EXAMINING",
-            "GENERATING_SUGGESTIONS",
-          ],
-        },
-      },
-    });
-
-    if (activeScanSession) {
-      return getMonitoringDashboardData();
-    }
-
-    const events = await prisma.monitoringEvent.findMany({
-      orderBy: {
-        detectedAt: "asc",
-      },
-      select: {
-        checksumAfter: true,
-        checksumBefore: true,
-        currentRelativePath: true,
-        eventType: true,
-        id: true,
-        modifiedAtAfter: true,
-        modifiedAtBefore: true,
-        previousRelativePath: true,
-        retryCount: true,
-        safeErrorCategory: true,
-        scanSessionId: true,
-        sizeAfter: true,
-        sizeBefore: true,
-      },
-      take: monitoringQueueLimit,
-      where: {
-        connectedFolderId: folder.id,
-        processingStatus: {
-          in: processableStatuses,
-        },
-      },
-    });
-
-    if (events.length === 0) {
-      return getMonitoringDashboardData();
-    }
-
-    const batch = await prisma.monitoringBatch.create({
-      data: {
-        connectedFolderId: folder.id,
-        status: "PROCESSING",
-        summary: toJsonInput({
-          eventIds: events.map((event) => event.id),
-        }),
-      },
-    });
-
-    await prisma.monitoringEvent.updateMany({
-      data: {
-        batchId: batch.id,
-        processingStatus: "PROCESSING",
-        retryCount: {
-          increment: options.retryAttention ? 1 : 0,
-        },
-      },
-      where: {
-        id: {
-          in: events.map((event) => event.id),
-        },
-      },
-    });
-
+  if (!scanSessionId) {
+    await renewMonitoringBatch(owner);
+    await monitoringContextForFolder(folder.id, "watch this folder");
+    let renewal: Promise<void> | null = null, renewalError: unknown;
+    const heartbeat = setInterval(() => {
+      if (!renewal && !renewalError) renewal = renewMonitoringBatch(owner).then(() => undefined)
+        .catch((error: unknown) => { renewalError = error; }).finally(() => { renewal = null; });
+    }, 25_000);
+    heartbeat.unref();
+    let scan;
     try {
-      await processMonitoringEventsForBatch(
-        batch.id,
-        folder.id,
-        rootPath,
-        folder.displayName,
-        events,
-      );
-    } catch {
-      await prisma.monitoringEvent.updateMany({
-        data: {
-          processedAt: new Date(),
-          processingStatus: "NEEDS_ATTENTION",
-          safeErrorCategory: "MONITORING_PROCESSING_FAILED",
-        },
-        where: {
-          batchId: batch.id,
-          processingStatus: "PROCESSING",
-        },
-      });
-    }
-
-    await finalizeMonitoringBatch(batch.id);
-
-    return getMonitoringDashboardData();
-  } catch (error) {
-    if (error instanceof BridgeScannerError) {
-      throw new BridgeMonitoringError(error.message, error.statusCode);
-    }
-
-    throw error;
-  } finally {
-    globalForBridgeMonitor.nsnBridgeMonitorProcessing = false;
+      scan = await import("./scanner").then(({ scanConnectedLibrary }) => scanConnectedLibrary(folder.id));
+    } finally { clearInterval(heartbeat); await renewal; }
+    if (renewalError) throw renewalError;
+    await renewMonitoringBatch(owner);
+    const session = await createBridgeScanSessionFromScan(scan, { connectedLibraryId: folder.id, allowReusableSession: false, monitoringOwner: owner });
+    scanSessionId = session.id;
   }
+  if (!folder.bridgeDeviceId) await processBridgeScanSession(scanSessionId, { recordNotebook: false, beforeFile: () => renewMonitoringBatch(owner) });
+  await finishMonitoringSnapshot(owner);
+}
+
+export async function recoverMonitoringBatchesForDevice(bridgeDeviceId: string) {
+  const candidates = await getPrismaClient().monitoringBatch.findMany({ select: { connectedFolderId: true }, take: 2,
+    orderBy: [{ processingLeaseUntil: "asc" }, { id: "asc" }], where: { status: "PROCESSING",
+      connectedFolder: { ...currentReadableRootWhere, bridgeDeviceId, watchPermission: true, monitoringState: "WATCHING" },
+      OR: [{ processingLeaseUntil: null }, { processingLeaseUntil: { lte: new Date() } },
+        { scanSession: { status: { in: ["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"] } } }],
+    } });
+  for (const candidate of candidates) {
+    // A live batch whose scan just completed may settle without replacing its owner.
+    const current = await getPrismaClient().monitoringBatch.findFirst({ where: { connectedFolderId: candidate.connectedFolderId, status: "PROCESSING" } });
+    if (current?.processingGeneration && current.processingLeaseUntil && current.processingLeaseUntil > new Date()) {
+      await finishMonitoringSnapshot({ batchId: current.id, generation: current.processingGeneration }).catch(() => undefined);
+    } else {
+      const admitted = await claimMonitoringRoot(candidate.connectedFolderId, false);
+      if (admitted) await runMonitoringSnapshot(admitted).catch(() => undefined);
+    }
+  }
+}
+
+export async function processMonitoringQueue(options: { connectedFolderId?: string; retryAttention?: boolean } = {}) {
+  await drainLocalBridgeWatcherEvents(options.connectedFolderId);
+  const prisma = getPrismaClient();
+  const abandoned = await prisma.monitoringBatch.findFirst({ select: { connectedFolderId: true },
+    orderBy: [{ processingLeaseUntil: "asc" }, { id: "asc" }], where: { connectedFolderId: options.connectedFolderId, status: "PROCESSING",
+      connectedFolder: { ...currentReadableRootWhere, watchPermission: true, monitoringState: "WATCHING" },
+      OR: [{ processingLeaseUntil: null }, { processingLeaseUntil: { lte: new Date() } }] } });
+  const event = abandoned ? null : await prisma.monitoringEvent.findFirst({ select: { connectedFolderId: true },
+    orderBy: [{ detectedAt: "asc" }, { id: "asc" }], where: { connectedFolderId: options.connectedFolderId,
+      processingStatus: { in: options.retryAttention ? ["QUEUED", "NEEDS_ATTENTION", "FAILED"] : ["QUEUED"] },
+      connectedFolder: { ...currentReadableRootWhere, watchPermission: true, monitoringState: "WATCHING",
+        scanSessions: { none: { status: { in: [...activeMonitoringScanStatuses] } } },
+        monitoringBatches: { none: { status: "PROCESSING", processingLeaseUntil: { gt: new Date() } } } },
+    } });
+  const rootId = abandoned?.connectedFolderId ?? event?.connectedFolderId;
+  if (rootId) {
+    const admitted = await claimMonitoringRoot(rootId, options.retryAttention ?? false);
+    if (admitted) await runMonitoringSnapshot(admitted).catch(async () => {
+      // The exact owner remains durable and reclaimable; do not forge terminal
+      // success or edit path-only historical source records after a failure.
+      await prisma.monitoringBatch.updateMany({ where: { id: admitted.batch.id, processingGeneration: admitted.owner.generation, status: "PROCESSING" },
+        data: { processingLeaseUntil: new Date() } });
+    });
+  }
+  return getMonitoringDashboardData();
 }

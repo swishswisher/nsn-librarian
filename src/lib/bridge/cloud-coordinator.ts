@@ -1,3 +1,5 @@
+import { retireRootReadWork } from "./command-lifecycle";
+import { expireUnstartedCommands, settleUnstartedCommands } from "./command-lifecycle";
 import type {
   BridgeCommandEnvelope,
   BridgeCommandReport,
@@ -9,7 +11,6 @@ import type {
 } from "../../../packages/bridge-protocol/src";
 import {
   bridgeCommandIsExpired,
-  commandStatusAllowsAcknowledgement,
   commandStatusAllowsCompletion,
   createBridgeCommandEnvelope,
   createPairingCode,
@@ -18,10 +19,12 @@ import {
   pairingRateLimitAllows,
   validatePairingRedemption,
 } from "../../../packages/bridge-protocol/src";
-import { Prisma } from "@prisma/client";
+import { Prisma, type ConnectedLibrary } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
-import { latestScannedFileObservation, usableObservation } from "./observation-authority";
+import { lockAuthorityOwner } from "@/lib/db/authority";
+import { deviceKeyFingerprint, latestScannedFileObservation, usableObservation } from "./observation-authority";
+import { isCurrentReadableRoot } from "./current-readable-root";
 
 const defaultOwnerId = "deanne";
 const activePairingCodeLimit = 5;
@@ -156,24 +159,7 @@ async function expirePairingCodes(now = new Date()) {
   });
 }
 
-async function expirePendingCommands(now = new Date()) {
-  const prisma = getPrismaClient();
-
-  await prisma.bridgeCommand.updateMany({
-    data: {
-      status: "EXPIRED",
-    },
-    where: {
-      commandType: { not: "READ_FILE_TEMPORARILY" },
-      expiresAt: {
-        lte: now,
-      },
-      status: {
-        in: ["PENDING", "ACKNOWLEDGED", "RUNNING"],
-      },
-    },
-  });
-}
+async function expirePendingCommands(now = new Date()) { await expireUnstartedCommands(now); }
 
 export async function createBridgePairingCode(actorUserId = defaultOwnerId) {
   const prisma = getPrismaClient();
@@ -275,8 +261,23 @@ export async function pairBridgeDevice(
     throw new BridgeCloudError(validation.message, 401, validation.code);
   }
 
-  const now = new Date();
   const device = await prisma.$transaction(async (tx) => {
+    await lockAuthorityOwner(tx, "BridgePairingCode", pairing.id);
+    const current = await tx.bridgePairingCode.findUniqueOrThrow({ where: { id: pairing.id } });
+    const freshValidation = validatePairingRedemption({
+      actorUserId, appVersion: registration.appVersion, codeHash: current.codeHash,
+      expectedUserId: current.requestedByUserId, expiresAt: current.expiresAt,
+      pairingCode: registration.pairingCode, pairingSecret: bridgePairingSecret(),
+      publicKey: registration.publicKey, status: current.status,
+    });
+    if (!freshValidation.ok) {
+      throw new BridgeCloudError(freshValidation.message, 401, freshValidation.code);
+    }
+    const now = new Date();
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`bridge-device:${registration.bridgeDeviceId}`}, 0))::text`;
+    const prior = await tx.bridgeDevice.findUnique({ where: { bridgeDeviceId: registration.bridgeDeviceId } });
+    if (prior) await lockAuthorityOwner(tx, "BridgeDevice", prior.id);
+    const previousDevice = prior ? await tx.bridgeDevice.findUniqueOrThrow({ where: { id: prior.id } }) : null;
     const nextDevice = await tx.bridgeDevice.upsert({
       create: {
         appVersion: registration.appVersion,
@@ -306,6 +307,14 @@ export async function pairBridgeDevice(
       },
     });
 
+    if (previousDevice && previousDevice.publicKey !== registration.publicKey) {
+      await tx.connectedLibrary.updateMany({ where: { bridgeDeviceId: registration.bridgeDeviceId }, data: {
+        isEnabled: false, disconnectedAt: now, status: "DISCONNECTED", monitoringState: "STOPPED", watchPermission: false,
+      } });
+      for (const root of await tx.connectedLibrary.findMany({ where: { bridgeDeviceId: registration.bridgeDeviceId }, select: { id: true }, orderBy: { id: "asc" } }))
+        await retireRootReadWork(tx, root.id);
+      await settleUnstartedCommands(tx, { bridgeDeviceId: registration.bridgeDeviceId }, "CANCELLED", "DEVICE_KEY_CHANGED");
+    }
     await tx.bridgePairingCode.update({
       data: {
         consumedAt: now,
@@ -349,24 +358,17 @@ export async function recordBridgeHeartbeat(
     architecture?: unknown;
     platform?: unknown;
   } = {},
+  expectedPublicKey?: string,
 ) {
   const prisma = getPrismaClient();
-  const existing = await prisma.bridgeDevice.findUnique({
-    where: {
-      bridgeDeviceId,
-    },
-  });
-
-  if (!existing || existing.status === "REVOKED") {
-    throw new BridgeCloudError(
-      "This Bridge device is not paired.",
-      401,
-      "DEVICE_NOT_PAIRED",
-    );
-  }
-
-  const now = new Date();
-  const device = await prisma.bridgeDevice.update({
+  const device = await prisma.$transaction(async (tx) => {
+    const owner = await tx.bridgeDevice.findUnique({ where: { bridgeDeviceId }, select: { id: true } });
+    if (owner) await lockAuthorityOwner(tx, "BridgeDevice", owner.id);
+    const existing = await tx.bridgeDevice.findUnique({ where: { bridgeDeviceId } });
+    if (!existing || existing.status === "REVOKED" || existing.revokedAt || (expectedPublicKey && existing.publicKey !== expectedPublicKey)) {
+      throw new BridgeCloudError("This Bridge device is not paired.", 401, "DEVICE_NOT_PAIRED");
+    }
+    const device = await tx.bridgeDevice.update({
     data: {
       appVersion:
         typeof input.appVersion === "string" && input.appVersion.trim()
@@ -376,7 +378,7 @@ export async function recordBridgeHeartbeat(
         typeof input.architecture === "string" && input.architecture.trim()
           ? input.architecture.trim()
           : existing.architecture,
-      lastSeenAt: now,
+      lastSeenAt: new Date(),
       platform:
         input.platform === "WINDOWS" ||
         input.platform === "MACOS" ||
@@ -389,23 +391,27 @@ export async function recordBridgeHeartbeat(
     where: {
       bridgeDeviceId,
     },
-  });
+    });
 
-  await prisma.bridgeAuditEntry.create({
+    await tx.bridgeAuditEntry.create({
     data: {
       bridgeDeviceId,
       eventType: "HEARTBEAT_RECEIVED",
       safeSummary: "The Bridge checked in with NSN Librarian.",
     },
+    });
+    return device;
   });
-
   return deviceSummary(device);
 }
 
 export async function revokeBridgeDevice(bridgeDeviceId: string) {
   const prisma = getPrismaClient();
   const now = new Date();
-  const device = await prisma.bridgeDevice.update({
+  const device = await prisma.$transaction(async (tx) => {
+    const owner = await tx.bridgeDevice.findUniqueOrThrow({ where: { bridgeDeviceId }, select: { id: true } });
+    await lockAuthorityOwner(tx, "BridgeDevice", owner.id);
+    const device = await tx.bridgeDevice.update({
     data: {
       revokedAt: now,
       status: "REVOKED",
@@ -413,23 +419,11 @@ export async function revokeBridgeDevice(bridgeDeviceId: string) {
     where: {
       bridgeDeviceId,
     },
-  });
-
-  await prisma.bridgeCommand.updateMany({
-    data: {
-      status: "CANCELLED",
-    },
-    where: {
-      bridgeDeviceId,
-      status: {
-        in: ["PENDING", "ACKNOWLEDGED", "RUNNING"],
-      },
-    },
-  });
-
-  await prisma.connectedLibrary.updateMany({
+    });
+    await tx.connectedLibrary.updateMany({
     data: {
       isEnabled: false,
+      disconnectedAt: now,
       monitoringState: "STOPPED",
       status: "DISCONNECTED",
       watchPermission: false,
@@ -437,16 +431,18 @@ export async function revokeBridgeDevice(bridgeDeviceId: string) {
     where: {
       bridgeDeviceId,
     },
-  });
-
-  await prisma.bridgeAuditEntry.create({
+    });
+    for (const root of await tx.connectedLibrary.findMany({ where: { bridgeDeviceId }, select: { id: true }, orderBy: { id: "asc" } })) await retireRootReadWork(tx, root.id);
+    await settleUnstartedCommands(tx, { bridgeDeviceId }, "CANCELLED", "DEVICE_REVOKED");
+    await tx.bridgeAuditEntry.create({
     data: {
       bridgeDeviceId,
       eventType: "DEVICE_REVOKED",
       safeSummary: "A paired Bridge device was revoked.",
     },
+    });
+    return device;
   });
-
   return deviceSummary(device);
 }
 
@@ -454,10 +450,16 @@ async function assertCommandTarget(input: {
   bridgeDeviceId: string;
   bridgeRootId?: string | null;
   connectedLibraryId?: string | null;
+  commandType: BridgeCommandType;
 }, prisma: Prisma.TransactionClient = getPrismaClient()) {
   if (!input.connectedLibraryId) {
+    if (!["SELECT_FOLDERS", "REGISTER_ROOT"].includes(input.commandType)) {
+      throw new BridgeCloudError("This command requires a connected folder.", 403);
+    }
     return;
   }
+
+  await prisma.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE id = ${input.connectedLibraryId} FOR SHARE`;
 
   const library = await prisma.connectedLibrary.findUnique({
     where: {
@@ -472,7 +474,7 @@ async function assertCommandTarget(input: {
     );
   }
 
-  if (library.bridgeDeviceId && library.bridgeDeviceId !== input.bridgeDeviceId) {
+  if (library.bridgeDeviceId !== input.bridgeDeviceId) {
     throw new BridgeCloudError(
       "This command belongs to a different paired Mac.",
       403,
@@ -480,15 +482,29 @@ async function assertCommandTarget(input: {
   }
 
   if (
-    input.bridgeRootId &&
-    library.bridgeRootId &&
-    library.bridgeRootId !== input.bridgeRootId
+    !input.bridgeRootId || library.bridgeRootId !== input.bridgeRootId
   ) {
     throw new BridgeCloudError(
       "This command points to a different connected folder.",
       403,
     );
   }
+
+  if (!commandRootAllows(input.commandType, library)) {
+    throw new BridgeCloudError("This connected folder no longer authorizes that operation.", 403, "ROOT_NOT_CONNECTED");
+  }
+  return library;
+}
+
+/** Permission repair and stopping access may operate on an unreadable root.
+ * They still require the exact live device/root binding. All data operations
+ * use canonical current root semantics; Undo may use a historical scan. */
+export function commandRootAllows(commandType: string, root: Parameters<typeof isCurrentReadableRoot>[0] & {
+  watchPermission: boolean;
+}) {
+  if (["REVOKE_ROOT_ACCESS", "UPDATE_ROOT_PERMISSIONS", "PAUSE_WATCHING", "STOP_WATCHING"].includes(commandType)) return Boolean(root);
+  return isCurrentReadableRoot(root) &&
+    (!["START_WATCHING", "RESUME_WATCHING"].includes(commandType) || Boolean(root?.watchPermission));
 }
 
 export async function createBridgeCloudCommand(input: {
@@ -500,21 +516,33 @@ export async function createBridgeCloudCommand(input: {
   expiresAt?: Date;
   idempotencyKey?: string;
   payload?: BridgeJson;
-}, prisma: Prisma.TransactionClient = getPrismaClient()) {
+}, transaction?: Prisma.TransactionClient): Promise<BridgeCommandEnvelope> {
+  if (!transaction) {
+    return getPrismaClient().$transaction((tx) => createBridgeCloudCommand(input, tx));
+  }
+  const prisma = transaction;
+  const available = await prisma.$queryRaw<Array<{ id: string }>>`
+    SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${input.bridgeDeviceId}
+      AND status <> 'REVOKED' AND "revokedAt" IS NULL FOR SHARE`;
+  if (!available.length) throw new BridgeCloudError("This Bridge device is not available.", 403);
   const device = await prisma.bridgeDevice.findUnique({
     where: {
       bridgeDeviceId: input.bridgeDeviceId,
     },
   });
 
-  if (!device || device.status === "REVOKED") {
+  if (!device || device.status === "REVOKED" || device.revokedAt) {
     throw new BridgeCloudError("This Bridge device is not available.", 403);
   }
 
-  await assertCommandTarget(input, prisma);
+  const root = await assertCommandTarget(input, prisma);
 
   const envelope = createBridgeCommandEnvelope({
-    authorizationContext: input.authorizationContext ?? {},
+    authorizationContext: root ? {
+      ...(input.authorizationContext && typeof input.authorizationContext === "object" && !Array.isArray(input.authorizationContext) ? input.authorizationContext : {}),
+      rootConnectionRevision: root.nativeConnectionRevision,
+      deviceKeyFingerprint: deviceKeyFingerprint(device.publicKey),
+    } : input.authorizationContext ?? {},
     bridgeDeviceId: input.bridgeDeviceId,
     bridgeRootId: input.bridgeRootId ?? null,
     commandType: input.commandType,
@@ -697,7 +725,7 @@ function commandEnvelopeFromRow(row: {
 export async function fetchPendingBridgeCloudCommands(bridgeDeviceId: string) {
   const prisma = getPrismaClient();
 
-  await recordBridgeHeartbeat(bridgeDeviceId).catch(() => undefined);
+  await recordBridgeHeartbeat(bridgeDeviceId);
   await expirePendingCommands();
 
   const rows = await prisma.bridgeCommand.findMany({
@@ -713,68 +741,84 @@ export async function fetchPendingBridgeCloudCommands(bridgeDeviceId: string) {
     },
   });
 
-  return rows.map(commandEnvelopeFromRow);
+  return (await authorizedBridgeCommands(rows)).map(commandEnvelopeFromRow);
+}
+
+export async function authorizedBridgeCommands<T extends {
+  bridgeDeviceId: string; bridgeRootId: string | null;
+  connectedLibraryId: string | null; commandType: string;
+  authorizationContext?: unknown;
+}>(rows: T[], transaction?: Prisma.TransactionClient): Promise<T[]> {
+  const prisma = transaction ?? getPrismaClient();
+  const ids = [...new Set(rows.flatMap((row) => row.connectedLibraryId ? [row.connectedLibraryId] : []))];
+  const roots = new Map<string, ConnectedLibrary>();
+  for (let offset = 0; offset < ids.length; offset += 500) {
+    const chunk = ids.slice(offset, offset + 500).sort();
+    if (transaction) await transaction.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id IN (${Prisma.join(chunk)}) ORDER BY id FOR SHARE`);
+    for (const root of await prisma.connectedLibrary.findMany({ where: { id: { in: chunk } } })) roots.set(root.id, root);
+  }
+  return rows.filter((row) => {
+    if (!row.connectedLibraryId) return ["SELECT_FOLDERS", "REGISTER_ROOT"].includes(row.commandType);
+    const root = roots.get(row.connectedLibraryId);
+    const context = row.authorizationContext && typeof row.authorizationContext === "object" && !Array.isArray(row.authorizationContext)
+      ? row.authorizationContext as Record<string, unknown> : null;
+    const revision = context?.rootConnectionRevision;
+    return Boolean(root && (revision === root.nativeConnectionRevision || (revision === undefined && root.nativeConnectionRevision === 0)) &&
+      root.bridgeDeviceId === row.bridgeDeviceId && root.bridgeRootId === row.bridgeRootId && commandRootAllows(row.commandType, root));
+  });
 }
 
 export async function acknowledgeBridgeCloudCommand(
   bridgeDeviceId: string,
   commandId: string,
+  expectedPublicKey?: string,
 ) {
-  const prisma = getPrismaClient();
-  const row = await prisma.bridgeCommand.findUnique({
-    where: {
-      commandId,
-    },
+  const result = await getPrismaClient().$transaction(async (prisma) => {
+    await prisma.$queryRaw(Prisma.sql`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${bridgeDeviceId} FOR SHARE`);
+    const device = await prisma.bridgeDevice.findUnique({ where: { bridgeDeviceId } });
+    const binding = await prisma.bridgeCommand.findUnique({ where: { commandId } });
+    if (binding?.connectedLibraryId) await prisma.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id = ${binding.connectedLibraryId} FOR SHARE`);
+    await prisma.$queryRaw(Prisma.sql`SELECT "commandId" FROM "BridgeCommand" WHERE "commandId" = ${commandId} FOR UPDATE`);
+    const row = await prisma.bridgeCommand.findUnique({ where: { commandId } });
+    if (!row || row.bridgeDeviceId !== bridgeDeviceId) throw new BridgeCloudError("That Bridge command could not be found.", 404);
+    if (!["PENDING", "ACKNOWLEDGED", "RUNNING"].includes(row.status)) return row;
+    if (!device || (expectedPublicKey && device.publicKey !== expectedPublicKey) || device.status === "REVOKED" || device.revokedAt) throw new BridgeCloudError("This device was revoked.", 401);
+    if (row.connectedLibraryId) {
+      const root = await prisma.connectedLibrary.findUnique({ where: { id: row.connectedLibraryId } });
+      const context = row.authorizationContext && typeof row.authorizationContext === "object" && !Array.isArray(row.authorizationContext) ? row.authorizationContext : {};
+      const revision = context.rootConnectionRevision;
+      if (!root || root.bridgeDeviceId !== bridgeDeviceId || root.bridgeRootId !== row.bridgeRootId || !commandRootAllows(row.commandType, root) ||
+          !(revision === root.nativeConnectionRevision || (revision === undefined && root.nativeConnectionRevision === 0))) {
+        if (row.status === "PENDING") {
+          await settleUnstartedCommands(prisma, { commandId }, "CANCELLED", "ROOT_NOT_CONNECTED");
+          return prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId } });
+        }
+        throw new BridgeCloudError("This command no longer authorizes a physical operation.", 403);
+      }
+    }
+    if (row.status !== "PENDING") return row;
+    if (bridgeCommandIsExpired(row.expiresAt)) {
+      await settleUnstartedCommands(prisma, { commandId }, "EXPIRED", "COMMAND_EXPIRED");
+      return prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId } });
+    }
+    const acknowledged = await prisma.bridgeCommand.update({ data: { acknowledgedAt: new Date(), status: "ACKNOWLEDGED" }, where: { commandId } });
+    await prisma.bridgeAuditEntry.create({ data: { bridgeDeviceId, commandId, connectedLibraryId: row.connectedLibraryId,
+      eventType: "COMMAND_ACKNOWLEDGED", safeSummary: "The Bridge acknowledged a queued command." } });
+    return acknowledged;
   });
-
-  if (!row || row.bridgeDeviceId !== bridgeDeviceId) {
-    throw new BridgeCloudError("That Bridge command could not be found.", 404);
-  }
-
-  if (bridgeCommandIsExpired(row.expiresAt)) {
-    await prisma.bridgeCommand.update({
-      data: {
-        status: "EXPIRED",
-      },
-      where: {
-        commandId,
-      },
-    });
-    throw new BridgeCloudError("That Bridge command has expired.", 410);
-  }
-
-  if (!commandStatusAllowsAcknowledgement(row.status)) {
-    return commandEnvelopeFromRow(row);
-  }
-
-  const acknowledged = await prisma.bridgeCommand.update({
-    data: {
-      acknowledgedAt: new Date(),
-      status: "ACKNOWLEDGED",
-    },
-    where: {
-      commandId,
-    },
-  });
-
-  await prisma.bridgeAuditEntry.create({
-    data: {
-      bridgeDeviceId,
-      commandId,
-      connectedLibraryId: row.connectedLibraryId,
-      eventType: "COMMAND_ACKNOWLEDGED",
-      safeSummary: "The Bridge acknowledged a queued command.",
-    },
-  });
-
-  return commandEnvelopeFromRow(acknowledged);
+  if (result.status === "CANCELLED") throw new BridgeCloudError("This command no longer authorizes an operation.", 403);
+  if (result.status === "EXPIRED") throw new BridgeCloudError("That Bridge command has expired.", 410);
+  return commandEnvelopeFromRow(result);
 }
 
 export async function completeBridgeCloudCommand(
   bridgeDeviceId: string,
   report: BridgeCommandReport,
-) {
-  const prisma = getPrismaClient();
+  transaction?: Prisma.TransactionClient,
+): Promise<BridgeCommandEnvelope> {
+  if (!transaction) return getPrismaClient().$transaction((tx) => completeBridgeCloudCommand(bridgeDeviceId, report, tx), { timeout: 120_000 });
+  const prisma = transaction;
+  await prisma.$queryRaw(Prisma.sql`SELECT "commandId" FROM "BridgeCommand" WHERE "commandId" = ${report.commandId} FOR UPDATE`);
   const row = await prisma.bridgeCommand.findUnique({
     where: {
       commandId: report.commandId,
@@ -785,7 +829,7 @@ export async function completeBridgeCloudCommand(
     throw new BridgeCloudError("That Bridge command could not be found.", 404);
   }
 
-  if (["COMPLETED", "FAILED", "REJECTED", "EXPIRED"].includes(row.status)) {
+  if (["COMPLETED", "FAILED", "REJECTED", "EXPIRED", "CANCELLED"].includes(row.status)) {
     return commandEnvelopeFromRow(row);
   }
 
@@ -812,10 +856,10 @@ export async function completeBridgeCloudCommand(
 
   const completion = await prisma.bridgeCommand.updateMany({
     data: {
-      completedAt: new Date(),
+      completedAt: report.safeErrorCategory === "COMMAND_RECOVERY_REQUIRED" ? null : new Date(),
       result: prismaJson(report.result ?? null),
       safeErrorCategory: report.safeErrorCategory ?? null,
-      status: report.status,
+      status: report.safeErrorCategory === "COMMAND_RECOVERY_REQUIRED" ? "RUNNING" : report.status,
     },
     where: {
       commandId: report.commandId, status: { in: ["ACKNOWLEDGED", "RUNNING"] },

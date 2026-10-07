@@ -5,7 +5,6 @@ import {
   ObservationSessionError,
   saveHumanDecision,
 } from "@/lib/library/observation-sessions";
-import { buildMemoryFromApprovedSession } from "@/lib/library/memory";
 import { recordObservationDecisionNotebookEntry } from "@/lib/library/notebook";
 import { getNotebookArchiveRoute, getNotebookRoute } from "@/lib/library/routes";
 import { refreshSearchForObservation } from "@/lib/library/search-index";
@@ -52,10 +51,7 @@ export async function POST(
       note: optionalText(body.note),
       editedSuggestion: optionalText(body.editedSuggestion),
     });
-    const memoryUpdatedCount =
-      result.status === "APPROVED" || result.status === "MODIFIED"
-        ? await buildMemoryFromApprovedSession(sessionId)
-        : 0;
+    const memoryUpdatedCount = result.memoryUpdatedCount;
 
     try {
       await refreshSearchForObservation(sessionId);

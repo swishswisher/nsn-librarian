@@ -96,3 +96,281 @@ Restoring a root's existing permission/current/canonical fields makes an otherwi
 The new production suite uses deterministic barriers for stale Search orderings and database row locks for plan races. Root independence and backend death are exercised against PostgreSQL. Memory tests seed recovered parents with zero/partial sources, use the real builder, retry twice and verify Search/Ask eligibility plus invalid-authority controls. SQL trigger faults inject failure at preference and Memory child boundaries. Authorization tests cover each canonical field and restoration. Cap tests include history/actionable ties, unusable evidence, old checksums and revoked observations. Native Bridge tests cover cancellation before execution admission and competing plan writes after admission.
 
 Counterfactual regressions are run in a detached worktree of the exact reviewed base with only the test file copied in. All application validation uses disposable `127.0.0.1:5432/nsn_library_machine_test`, isolated schemas, mocked AI and no OPENAI_API_KEY. The original cloud environment and untracked Bridge distribution are isolated during validation and restored byte-for-byte afterward. No production database, paid application AI, push, release, promotion or master operation is part of this task.
+
+## Whole-project audit of 6a1a4f0
+
+Baseline: `6a1a4f074668038f5b556413769dd6178ca752eb`, `release-candidate/phase-1-3`, fetched origin at the same head, tracked index/worktree clean, ahead/behind 0/0. Native dist was untracked and unstaged. Master/origin master were `99bfcfdbef6b8e63f0a845d6e9dd359aff5b717a`. Inspection covered the production source/configuration inventory, API/page/UI boundaries, protocol/native storage and operations, all 34 migration definitions and 33 subsystems in [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md). Read/write/lock/cap/dependency maps guided targeted line inspection; this is not a claim that every line received an independent review. The normalized inspection ledger records 421 paths: 357 production, 35 migrations, 14 test paths and 15 configuration/documentation paths, including all 343 tracked baseline production paths. Validation evidence belongs in external artifacts.
+
+This register was established **before any production remediation**. Initial confirmed counts: P0 **0**, P1 **13**, P2 **12**, P3 **0** (25 confirmed findings). All 25 confirmed findings are REMEDIATED following production-path controls and the complete final validation gate. No confirmed P0/P1/P2 remains open. Recommendations/false positives are separate below. Earlier sections record the preceding narrow audit; the newly discovered sibling defects supersede any broader interpretation of its assurances, particularly about physical recovery, root admission and per-session completion.
+
+### Confirmed finding register
+
+Each line reference below points to the unchanged reviewed baseline. Architectural class numbers correspond to the task's 17 adversarial classes. Each design is a safety requirement; implementation must preserve stronger existing behavior and be verified across its named siblings.
+
+#### AUD-001 — P1 — Conflicting observation authority (REMEDIATED)
+
+* Path: human decision API → `src/lib/library/observation-sessions.ts:636–738`, `saveHumanDecision` (known inline 4208026599).
+* Violates AUTH-2 / TX-1; classes 1, 2, 3. Concurrent ACCEPT and REJECT/MODIFY can read the same prior state and independently append history/update status. Transaction-start timestamps and missing id tie-break can order events differently from committed materialized status, exposing rejected material to downstream consumers.
+* Cause: no database owner lock/version before authority read; event order is not assigned after serialization.
+* Siblings inspected: Memory builder/live provenance, reuse/latest authority, persistent relationship/correction reviews, preference version-CAS, recommendation review, plan CAS, graph and Notebook revisions.
+* Gap/design: deterministic real-PG conflicting review barriers (A/R, A/M, R/M), same-action retry, event/status/Memory agreement. Serialize the observation row before reads; assign strictly increasing per-owner authority time, stable id tie-break; commit status/event/invalidation/pending work together.
+
+#### AUD-002 — P2 — Approval can strand missing Memory (REMEDIATED)
+
+* Path: `observation-sessions.ts:718–738` → `src/app/api/library/observation-sessions/[sessionId]/decision/route.ts:55`, post-commit Memory builder.
+* Violates DERIVED-2 / RECOVER-1; classes 3, 4, 14. Death after successful ACCEPT/MODIFY commit but before route-level Memory build leaves no Memory creation and no ordinary recovery admission. Existing atomic invalidation and live retrieval fail closed, but cannot create the missing new derived object.
+* Siblings: Memory manifest/source builder and recovery, observation reuse, scan publication pending markers, ordinary Bridge polling.
+* Gap/design: fail after review commit then use normal recovery twice. Admit generation-bound pending Memory work in the authority transaction and recover it in bounded coordinator work; avoid holding one observation write lock while acquiring many other observation locks for an expensive global builder.
+
+#### AUD-003 — P2 — Current-root read/watch predicate drift (REMEDIATED)
+
+* Path: `remote-scan-queue.ts:528–557` (known inline 4208026617), `queueRemoteReads:514`, manual `remote-read-commands.ts:904`, `connected-libraries.ts:1275`, `remote-monitoring.ts:22`, `monitor.ts:1286`, command target/delivery in `cloud-coordinator.ts:453,697` and `recoverable-commands.ts:90`.
+* Violates ROOT-1/3 / PRIVACY-2; classes 2, 9, 16. Hidden/merged/noncanonical/disconnected-at roots can still queue reads; queued work may dispatch after revocation; manual/local siblings and late watch events use smaller predicates.
+* Cause: local status/permission copies and admission outside fresh shared authorization.
+* Siblings: canonical helper, scan/read/media resolver, observation recovery, Search/Ask/Memory/Knowledge/preferences/plan current guards, native grants, cessation/management exceptions.
+* Gap/design: every canonical field individually, valid/device mismatch, admission and dispatch, retained evidence control. Use canonical predicate plus exact device/root at current read/watch boundaries; fresh root share lock in command admission; preserve stronger operation grants and explicitly documented stop/repair/physical-history exceptions.
+
+#### AUD-004 — P1 — Native/root reports overwrite later human state or another device (REMEDIATED)
+
+* Path: `device-root-sync.ts:258–392`, `cloud-command-results.ts:932–1045`, `scan-sessions.ts:789`, remote scan result root update, native `filesystem/scanner.ts:312`.
+* Violates ROOT-2 / CURRENT-2; classes 1, 2, 9, 13, 16. Cloud disconnect/hide can be undone by the next native sync; stale watch/permission/scan results can restore old root status/grants. Root sync finds global root identity then unconditionally writes a different device binding.
+* Cause: report freshness/authority does not protect all root fields; update payload clears human lifecycle fields; global deterministic native root IDs are not permission to rebind devices.
+* Siblings: fingerprint reconciliation/reconnect, confirmed permission anti-stale logic, disconnect/hide endpoints, native root registration, revocation, monitoring generations.
+* Gap/design: delayed sync/scan/watch/permission report after disconnect/revoke; cross-device same root ID; explicit reconnect control. Serialize root state, preserve human lifecycle and device binding, persist/report native generation freshness, permit reactivation only on an explicit newer authorized connection action. Background scan success only updates scan diagnostics.
+
+#### AUD-005 — P1 — Device revocation endpoint is publicly reachable (REMEDIATED)
+
+* Path: `src/lib/auth/route-policy.ts:isSignedBridgeDevicePath` → `src/proxy.ts` → `src/app/api/bridge/cloud/devices/[deviceId]/revoke/route.ts`.
+* Violates PRIVACY-2 / ROOT-2; class 16. An unauthenticated request to the revocation endpoint passes the broad public device-prefix exemption; the route has no signed-device or human guard and revokes the named device.
+* Cause: public route classification is broader than signed-machine implementations.
+* Siblings: every API route, Google auth/CSRF, signed device command/heartbeat/root/watch routes, pairing redemption, release manifest, legacy command APIs.
+* Gap/design: proxy production-path unauthenticated and authenticated cross-origin revocation controls; exact signed-path allowlist, protected human revocation. Unknown descendants fail closed.
+
+#### AUD-006 — P1 — Concurrent pairing code reuse (REMEDIATED)
+
+* Path: public pairing redemption → `cloud-coordinator.ts:238–330`.
+* Violates ROOT-2 / TX-1; classes 1, 2, 16. Two devices can validate the same ACTIVE code before either transaction consumes it; both upserts succeed and the code records only the last device. Same code can also replace a device key twice concurrently.
+* Cause: one-use validation outside consumption transaction without lock/CAS.
+* Siblings: device registration validation, pairing expiry/rate limit/audit, native identity/keychain, signed request nonce.
+* Gap/design: real concurrent redemption with deterministic DB barrier and distinct keys; exactly one device/audit winner. Lock/revalidate code inside the transaction before device mutation and consumption; keep unique registration/key constraints.
+
+#### AUD-007 — P1 — Revocation can be lost or partially applied (REMEDIATED)
+
+* Path: `cloud-coordinator.ts:345–450`, heartbeat and revoke; signed request eligibility is read earlier in `device-request-auth.ts:155`.
+* Violates ROOT-2 / TX-1 / CURRENT-2; classes 1–3, 16. Heartbeat reads PAIRED, waits, then sets ONLINE after revoke. Revocation writes device, command cancellation and root denial separately; death can leave a revoked device with current readable roots.
+* Cause: stale unconditional heartbeat update and multi-commit authority propagation.
+* Siblings: device sync/admission/delivery, root current evidence consumers, command expiry/results and pending execution/scan state.
+* Gap/design: heartbeat/revoke barrier and child-write rollback fault. Atomic device/root/command/audit revocation, locked fresh device eligibility or update CAS that cannot clear revoked state, safe dependent-work reconciliation.
+
+#### AUD-008 — P2 — Partial remote scan import and lifecycle replay (REMEDIATED)
+
+* Path: `remote-scan-queue.ts:671–788`, `importRemoteBridgeScanReport`; local `scan-sessions.ts:648–746` has the same parent/child gap.
+* Violates CURRENT-1 / TX-1 / RECOVER-1/2; classes 2–4, 14, 17. Death after first 500-file chunk leaves a partial session; retry sees nonzero child count and skips the remainder but reports full counts/complete work. Repeated terminal report can rewind an already complete scan to READING. A scan parent can also be left SCANNING before command admission/import finishes.
+* Siblings: scan report parser, media metadata children, checksum bootstrap, observation reuse/read queue, command complete route, publication/current snapshot selection.
+* Gap/design: trigger failure after first chunk/media row, retry twice, report replay after completion. Atomic bounded import or complete stable-key per-file reconciliation with owner lock and verified coverage; import completion cannot reset later lifecycle; session + scan command admission atomic.
+
+#### AUD-009 — P2 — Recommendation batch ownership has no recovery/fresh completion (REMEDIATED)
+
+* Path: `scan-recommendation-batch.ts:108–205`, `completeSession:71`, timeout failure:51.
+* Violates CURRENT-2 / RECOVER-1/2; classes 2, 4, 14, 17. Death after status claim strands GENERATING_SUGGESTIONS forever. A timed-out promise continues writing, while unconditional failure/completion can overwrite newer file/session retry authority. An old batch can complete a session whose newly retried reads are unfinished.
+* Siblings: local processing, manual read retry/reset/regeneration, recommendation per-file authority fences, publication epochs, coordinator/progress UI.
+* Gap/design: expired ownership takeover, old worker after retry, active understanding at completion, process-death normal recovery. Durable batch generation/lease, owned heartbeat/CAS, fresh child coverage and completion transaction; abort/stale work cannot settle a newer generation.
+
+#### AUD-010 — P2 — Library batch and cluster work is quadratic (REMEDIATED)
+
+* Path: `processing-pipeline.ts:227,418` repeatedly loads all files; `scan-recommendation-batch.ts:140` finds in all files; `organization-suggestions.ts:2338–2690` expands all sibling files per target and scans relationships/clusters; `scan-working-knowledge.ts:970–1028` shifts BFS queue and filters all edges per component.
+* Violates SCALE-3; classes 7, 8. 20,000 targets can fetch/process ~400 million sibling rows and repeatedly scan component edges. Existing typed/correction scale fixes do not cover this production batch.
+* Siblings: checksum duplicate/media match helpers, suggestion pure algorithms, current authority/preference/Memory checks, local/cloud batch callers, result action lookup loops.
+* Additional confirmed sibling before its remediation: `checksum-duplicates.ts:196–214` scans accumulated physical candidates for every row; `:95–109,721–722` filters/sorts the full same-checksum family for each file; `comparableSessionIdsFor:170–189` scans prior root aliases repeatedly. A 20,000-file duplicate family produces quadratic work even before recommendations. Preserve conservative physical alias/presentation exclusions while indexing identity and choosing deterministic distinct targets; chunk checksum/session IDs rather than unbounded IN lists.
+* Gap/design: realistic synthetic 20,000-file and disjoint-component operation/query counters. Share immutable batch indexes for file IDs, folders, checksums/media, semantic postings, per-file adjacency/clusters; retain fresh per-target authority and eligibility. Cursor queue and edge adjacency for O(V+E); bounded local candidate selection, no loop × full library DB load.
+
+#### AUD-011 — P1 — Machine graph refresh overwrites human curation (REMEDIATED)
+
+* Path: `knowledge/graph.ts:367–512` upserts and `cleanupWorkflowKnowledgeNoise:1373–1478`, human reviews:1845–2055.
+* Violates AUTH-1/3 / CURRENT-2; classes 1, 2, 11. Memory backfill can promote a REJECTED/ARCHIVED/KEEP_PROVISIONAL object or relation back to approved, replace human revised meaning with longer machine text, or cleanup a newly approved object after an earlier read. Concurrent read/modify/write loses evidence/source contributions.
+* Cause: machine upsert/cleanup treats materialized status as inference authority without human-revision fence.
+* Siblings: Memory/Notebook/observation/media/history graph producers, human review endpoints, merge and trustedReasoningFilter, recommendation context.
+* Confirmed recommendation sibling: `organization-suggestions.ts:persistDrafts` protected only all-PENDING generations and otherwise invalidated APPROVED/MODIFIED/REJECTED recommendations during ordinary batch replay. The older regeneration regression intentionally exercised that unsafe default. Automatic generation now preserves reviewed active recommendations; `prepareOrganizationRecommendationRegeneration(..., { confirmedReviewedDecisions: true })` remains the explicit human transition that archives their approval and prepares fresh pending proposals. Update that regression to use the real confirmation path and add unconfirmed preservation assertions without removing its stale-approval/history checks.
+* Gap/design: real backfill after reject/revise/keep, cleanup barrier after human review, contribution retry. Serialized owner mutation and explicit human-revision preservation; machine may refresh provenance but cannot overwrite saved human status/text/canonical choice. Human events/materialized state ordered atomically.
+
+#### AUD-012 — P2 — Curated Knowledge merges can form canonical cycles (REMEDIATED)
+
+* Path: `knowledge/graph.ts:2057–2205`, merge API.
+* Violates AUTH-3 / FILE-1 / RECOVER-1; classes 1, 2, 4. A→B then B→A is accepted even when target is an archived redirect; concurrent opposite merges can do the same, leaving neither live canonical item and broken relation navigation.
+* Cause: no canonical-target validation/lock order; relationship duplicate reconciliation may discard stronger human state.
+* Siblings: object/relationship upsert, human object review, trusted graph queries, duplicate relationship merge history.
+* Gap/design: sequential/opposite concurrent merges plus duplicate human relation. Lock graph mutation owners in stable order; reject noncanonical/archived targets or resolve a verified acyclic live canonical owner; preserve stronger relation authority and audit originals.
+
+#### AUD-013 — P2 — Graph derives approved current trust from invalid Memory (REMEDIATED)
+
+* Path: `knowledge/graph.ts:982–1031`, Memory backfill; observation backfill:1129–1193.
+* Violates DERIVED-1 / PROOF-2 / SCALE-1; classes 5, 6, 10, 16. ACTIVE Memory with a modern incomplete/revoked/rejected provenance manifest is copied into HUMAN_APPROVED graph without live source validation. Raw non-REJECT decision budget can be consumed by repeated or no-longer-usable owners; MODIFY proposal text still mixes replaced machine meaning.
+* Siblings: strict Memory retrieval/build SQL, explicit standalone human curation exception, graph historical Notebook/recommendation sources, recommendations' graph context and current QA exclusion.
+* Additional confirmed sibling, recorded before its remediation: `memory-provenance.ts:89` admits a modern standalone-upload Memory statement after MODIFY changes the same observation's authority, because the manifest binds only the observation id. Rootless modern derivation must bind the exact latest non-NOTE decision too; the legacy standalone-note history exception does not authorize stale modern statements.
+* Its recovery sibling is `memory.ts:855`: correction reconciliation selects only root-bound `MemorySearchSource` rows and misses a standalone manifest. Select either indexed retained manifest support or physical support and reconcile the complete family on the explicit human correction; never rebind stale wording to a fresh decision.
+* Gap/design: modern invalid Memory ahead of valid sources, deep review history, human MODIFY replacement. Live Memory provenance before approved graph admission; keep explicit standalone human curation distinct; latest usable non-NOTE observation per owner before cap and use only authoritative edited meaning. Graph history remains history, not new QA authority.
+
+#### AUD-014 — P2 — Notebook ignores/overwrites human meaning and approval (REMEDIATED)
+
+* Path: `library/notebook.ts:338–417`, `saveNotebookEntryResponse:1456–1505`, display:274–301.
+* Violates AUTH-3 / TX-1; classes 1–3, 11, 17. Revised text is written only into revision history while displayed/backfilled text stays machine-generated. APPROVE then REJECT/KEEP_ONLY leaves approvedForMemory=true. Machine backfill resets human approval/attention and can replace text after later source changes.
+* Siblings: archive/restore, Notebook detail/timeline, graph Notebook source priority, optional historical reflections, explicit exclusion from Ask.
+* Gap/design: revise/approve/reject/keep/archive then real backfill, concurrent updates. Serialize entry authority, materialize saved human text/flags with event; protect revised meaning/status from machine updates while refreshing source/history metadata.
+
+#### AUD-015 — P2 — Notebook raw cap hides actionable categories (REMEDIATED)
+
+* Path: `library/notebook.ts:1266–1297`, Notebook landing UI.
+* Violates SCALE-1 / CURRENT-3; classes 5, 17. 250 archived attention rows or one high-volume category consume the raw window before filtering; valid current attention/questions/learning disappear from their advertised panels.
+* Siblings: homepage eligible queries, archive retention, digest and category filters, graph backfill/source budgets.
+* Gap/design: >250 ineligible/deep-owner rows and same-time controls. Independent SQL-filtered budgets by semantic category with deterministic ordering; retain accessible archive/history, no deletion to meet a cap.
+
+#### AUD-016 — P1 — Remote execution claim and command admission are not atomic (REMEDIATED)
+
+* Path: `remote-execution.ts:637–753`.
+* Violates AUTH-4 / TX-1 / RECOVER-1; classes 2–4, 14, 15. Death after exact plan/run claim but before command creation leaves immutable PENDING execution with no recoverable job. If post-queue page refresh fails, the catch marks admitted run BLOCKED while the command can still execute, allowing another admission.
+* Siblings: command creation/audit optional Tx API, plan exact revision CAS, native execution, remote Undo, pending expiry, plan UI refresh.
+* Gap/design: command child fault rolls back claim, death after queue, post-queue presentation failure, competing plan/root changes. Claim/run/actions/command/audit in one fresh authority transaction; presentation errors cannot change queued authority; retain exact source snapshot checks and current operation grants.
+
+#### AUD-017 — P1 — Remote result replay and unverified summaries corrupt execution truth (REMEDIATED)
+
+* Path: signed complete route → `remote-execution.ts:764–921`, `remote-undo.ts:447–595` before `completeBridgeCloudCommand` terminal check.
+* Violates RECOVER-2 / TX-1 / FILE-2; classes 2, 3, 13–15, 17. Retried old report can rewrite results/paths after later Undo; per-action/plan/run writes commit separately; report COMPLETED is trusted even if actions fail/missing, yielding falsely executed/undone UI. Undo path-only metadata update can bind a different replacement file.
+* Siblings: scan/read report application, native action report shape, command terminal CAS, execution/Undo snapshots, scanned source binding, Notebook/history.
+* Gap/design: report replay after terminal/Undo, invalid coverage/duplicate IDs/checksum/path, fault between action and run. Check terminal owner before effects; validate exact action IDs/paths/checksum/coverage; derive status/counts from verified outcomes; atomically apply DB report effects and terminal authority. Index results once, not find per action.
+
+#### AUD-018 — P1 — Concurrent and partial remote Undo admission (REMEDIATED)
+
+* Path: `remote-undo.ts:73–261,325–445`.
+* Violates AUTH-4 / TX-1 / RECOVER-1 / FILE-2; classes 1–4, 13, 15. Concurrent previews both find no pending Undo and create two runs/commands; queue gap and page-refresh catch mirror execution. Partial retry includes already restored actions and can block safe completion. Current path row checksum can supersede immutable executed-file checksum.
+* Siblings: local Undo owner transaction/completed-action filtering, execution history, native folder ownership/checksum validation, command expiry/report replay.
+* Gap/design: deterministic concurrent UNDO, queue rollback, partial retry and external replacement. Lock execution owner; atomically admit run/actions/command; exclude completed reversals; immutable execution result checksum is restoration authority, with fresh native verification.
+
+#### AUD-019 — P2 — Command acknowledgement/expiry strands dependent work (REMEDIATED)
+
+* Path: `cloud-coordinator.ts:159,719–771`, `recoverable-commands.ts:80–100`.
+* Violates CURRENT-2 / RECOVER-1/2; classes 2, 3, 14, 17. ACK read then unconditional update can downgrade a concurrently completed command. Expiring PENDING/ACK/RUN commands does not reconcile their execution/Undo/scan dependents; pending work can remain blocking forever, while executed-but-unreported work becomes unqueryable.
+* Siblings: native replay/outbox, command report/terminal rules, scan/read recovery, plan ownership, execution/Undo UI.
+* Gap/design: ACK/complete barrier, pending expiry and known/unknown physical outcomes. CAS monotonic status transitions; atomic safe unexecuted dependent failure/recovery; acknowledged uncertain physical work retains reconciliation/journal recovery, never assumed safely unexecuted.
+
+#### AUD-020 — P1 — Replay marker cannot recover mid-execution physical outcomes (REMEDIATED)
+
+* Path: `apps/bridge/src/main/command-runner.ts:421–510`, native `filesystem/operations.ts`, local compatibility executor/Undo.
+* Violates TX-3 / RECOVER-1/2; classes 3, 4, 14, 15. Replay key is persisted before filesystem work, while complete result outbox is written only after operation returns. Death after one move yields recovery rejection with no completed action details; server can mark moved files failed and Undo cannot restore them. Local compatibility response loss has the same outcome gap.
+* Siblings: native report outbox/keychain/replay, server result application, local API/executor/Undo, physical source identity and created-folder ownership.
+* Gap/design: injected death after first physical move and before final report; normal restart/retry recovers exactly once and enables partial Undo. Durable per-command/action intent/outcome journal before each effect; reconstruct only verified outcomes using recorded source physical identity, fail closed for uncertainty; replay never blindly moves again.
+
+#### AUD-021 — P1 — Destination check then rename can overwrite user files (REMEDIATED)
+
+* Path: native `filesystem/operations.ts:290–510,614`, application `executor.ts` and `undo.ts:1112–1125` developer physical fallbacks.
+* Violates TX-3 / FILE-2; classes 2, 15. Another process creates a destination after lstat/check and before POSIX rename; rename overwrites the unrelated file despite the advertised no-overwrite policy, during execution or Undo.
+* Siblings: source checksum/stat check, safe-path/symlink resolution, journal crash ownership, CREATE/REMOVE_FOLDER behavior.
+* Final self-review sibling: unlinking the public source pathname after an identity check can delete an editor's atomic replacement. Source removal now captures the pathname into a unique private same-volume directory, journals its directory identity before capture, verifies the captured inode/checksum, and removes only that owned internal name. A raced unrelated replacement is preserved/restored exclusively; recovery never unlinks the public source name. Real command-process death during capture and a later public replacement are permanent controls.
+* Gap/design: deterministic destination insertion at operation boundary in native and fallback paths, content preservation, external source mutation. Shared exclusive destination primitive (no-overwrite claim), source identity verification and safe completion/journal integration; unsupported filesystem must fail closed without deleting user data.
+
+#### AUD-022 — P1 — Local extraction binds changed bytes to old scanned identity (REMEDIATED)
+
+* Path: `reader.ts:158–224,379–419`, local audio/video/image readers, unclaimed local `scanned-file-observations.ts:301–363`.
+* Violates FILE-1/2 / PROOF-1 / CURRENT-2; classes 2, 9, 13, 16. Native read returns sourceChecksum but web path does not compare it to scan checksum; developer extraction has no before/after hash. Changed bytes can create observation/typed/provenance evidence under the old checksum. Unconditional stage writes can settle newer work.
+* Siblings: strong remote completed-read checksum/lease path, native read verification, resolver/root permissions, observation commit and Search/QA metadata fallback.
+* Gap/design: mutate source after scan/during extraction across local text/media, stale read vs newer generation. Shared expected-source verification at extraction and mutation, claim/CAS ownership, exact bound checksum carried into observation publication; failure cannot mutate a newer successful generation.
+
+#### AUD-023 — P2 — Monitoring treats partial changes as full snapshot and applies stale events (REMEDIATED)
+
+* Path: `monitor.ts:2244–2340,2503–2596,2634–2787`.
+* Violates CURRENT-1/2/3 / FILE-2 / RECOVER-1; classes 2, 4, 8–10, 13, 14, 17. A one-file change creates a new completed scan containing only changed files, so current publication can retire unchanged library evidence. Delayed delete/path events mutate all snapshots by path (checksum optional), including newer replacements/history. Process-local batch admission can duplicate work; global active scan blocks unrelated root progression.
+* Siblings: native/cloud watchers, full reconcile scan, baseline loading, completed-snapshot selection, publication/Search/Knowledge, monitoring restart lease, UI completion/reconcile claims.
+* Gap/design: unchanged current file survives single change, delayed delete after replacement, retained path history, root independence and batch retry. Watch events trigger verified full-root reconciliation; events are hints, not source truth. Serialize root/batch ownership, use generation/identity for settlement and avoid rewriting retained historical provenance.
+
+#### AUD-024 — P1 — Native registry/outbox read-modify-write loses grants/history (REMEDIATED)
+
+* Path: `bridge-app/src/main/registry.ts:40–65,128–278,312–388`, command/event outbox persistence.
+* Violates ROOT-3 / RECOVER-3 / CURRENT-2; classes 1, 2, 4, 15, 16. Concurrent watcher/status/permission/root mutations load the same JSON and overwrite one another; one can restore revoked permissions. Shared temporary filenames race. Corrupt existing storage is interpreted as empty and overwritten, erasing roots/pending outcomes rather than preserving diagnostic evidence.
+* Siblings: single Electron instance/poll guard (does not serialize IPC/watcher mutations), keychain, native root sync, watcher event acknowledgement, command journal/report delivery.
+* Gap/design: concurrent different/same root patch with deterministic storage barrier, corrupt-state preservation. Serialize local authoritative mutations, unique atomic replacement with durable flush; only ENOENT means initial empty state; malformed/unreadable existing state fails closed. Keep replay/outbox retention auditable.
+
+#### AUD-025 — P2 — Local observation processing bypasses shared ownership (REMEDIATED)
+
+* Path: `processing-pipeline.ts:143–175,319–360,380–434`, `scanned-file-observations.ts:301–363`, direct observe/read API.
+* Violates CURRENT-2 / TX-1 / RECOVER-1; classes 1–4, 14. Two local processors can select the same file without a durable claim, make duplicate provider/observation work and overwrite stages/status after timeout or primary completion. Observation creation and file completion split when claimedAt is absent.
+* Siblings: strong remote per-file observation lease, observation recovery/reuse, direct local/media reads, recommendation batch readiness, manual retry, exact provider source identity.
+* Gap/design: deterministic competing local processing, death after observation parent and expired worker after success. All production generation uses the shared owned lease and atomic observation/file completion; guard local primary/failure writes by source/owner generation. No optional unowned production publication path.
+
+### Recommendations and intentional non-findings
+
+* **REC-001 (P3 recommendation):** Paginate the complete Notebook archive and large curated graph historical exports with a user-visible continuation if these surfaces grow. The audit will not silently truncate/delete historical evidence; actionable category starvation is separately AUD-015. Bounded display tails of already selected append-only history are not authority caps.
+* **REC-002 (P3 recommendation):** Release updater manifest trust relies on HTTPS plus verified asset checksum and explicit open/install. Strong signed manifest distribution would be separate product work; no confirmed arbitrary-library operation or authorization bypass was established in the updater. The audit does not publish a release.
+* **REC-003 (P3 recommendation):** Path containment checks cannot fully defend against a malicious local privileged process swapping directory components concurrently without OS descriptor-relative operations. Native symlink exclusion/containment remain; confirmed destination overwrite and ordinary source mutation are addressed, not hidden behind this limitation.
+* Existing canonical current consumers, typed/version complete-family checks, correction O(V+E) traversal, human-confirmed relationships outside candidate bounds, source manifests, Search pending publication epochs, version/copy retention and context8/claim3 are controls, not defects to reimplement.
+* `queueExecutionCommandForApprovedPlan` is exported legacy code with no production caller in the repository. It is not counted as a production-reachable defect. Production execution admission is audited through `queueRemoteOrganizationPlanExecution`.
+* Installation-wide authenticated human access, management/history visibility, physical Undo of a historical approved snapshot, optional historical Notebook reflection and bounded model/excerpt/history tails are intentional contexts documented in the invariants. They cannot weaken current Search/Ask/root/read semantics.
+* Serializable/CAS relationship, correction, preference and plan reviews can safely reject a conflicting writer instead of appending contradictory status history. Their existing tests remain controls. Do not add global locking or replace strict endpoint semantics merely for uniformity.
+
+### Adversarial coverage and remediation evidence
+
+All 17 classes map to register entries: concurrent authority 001/006/007/011/012/014/018/024/025; stale writers 001/003/004/007–009/011/016–025; source/derived gaps 002/007/008/016/017/019/020/025; partial retry 002/008/009/020/024/025; eligibility caps 013/015; per-owner latest 010/013 and existing typed/Search/QA controls; complexity/fanout 010/017/023; root drift 003/004; current/history 004/008/013/017/023; human candidate dominance 011/014 and existing confirmed correction controls; physical/semantic copies existing typed/version controls plus 017/018/022; strong identity 004/017/018/021–023; premature terminal 008/009/017/019/020/023/025; physical consistency 016–025; privacy/auth 003–007/013/022/024; UI truth 008/009/014/015/017/019/023.
+
+The following production changes and their permanent production-path controls passed the complete final release gate. All register entries are REMEDIATED. Test names below refer to permanent production-path suites, not separate model implementations.
+
+| Finding | Remediation and permanent proof |
+| --- | --- |
+| 001 | Observation owner UPDATE lock before authority read, strict next timestamp and id tie-break; latest non-NOTE retry authority; atomic event/status/invalidation/work marker. `system-invariants` runs both deterministic lock orders of ACCEPT/REJECT, ACCEPT/MODIFY and REJECT/MODIFY plus same-action/NOTE/Memory retry. |
+| 002 | Review commits `PENDING@decisionId`; eager builder plus bounded fair ordinary poll recovery with exact generation CAS. Real Memory-child fault followed by two ordinary device polls; complete source-family structural controls. |
+| 003 | Shared canonical seven-field read/watch predicate at admission, dispatch and local read boundary; fresh Device → Root authorization. Individual root fields, valid root/device mismatch, retained history, signed watch and rotated-key controls. |
+| 004 | Exact native/device identity, monotonically explicit connection revision and native timestamp; sorted fingerprint reconciliation, preserve human denial and canonical duplicate ownership. Reconnect suite and late sync/revision/key/result invariant tests. |
+| 005 | Public machine route classification is an exact signed implementation allowlist. Human revoke remains session/same-origin protected; auth/proxy tests exercise anonymous revocation, unknown descendants and cross-origin mutation. |
+| 006 | Pair-code row lock/revalidation plus identity advisory lock, device write and consumption/audit in one transaction. Deterministic simultaneous different-key redemption has one winner. |
+| 007 | Device/root denial, command cancellation and safe dependent-owner settlement atomic; fresh locked heartbeat/key authority. Barrier heartbeat/revoke, injected root-write rollback, key replacement and physical-history result controls. |
+| 008 | Stable session/path identities, immutable inventory hash, 500-file imports and exact fresh key/revision/inventory owner; local complete import atomic. 601-file second-page fault, repeated retry and completed replay prove full coverage without lifecycle rewind. |
+| 009 | UUID ten-minute recommendation owner, renewal, aborted 25-second model deadline, fenced result/failure/completion; physical generation/unresolved operation fences at claim and persistence. Abandoned ordinary poll, superseded worker, aborted late result, incomplete understanding, explicit regeneration and current-inventory controls. |
+| 010 | Stable 500-file keyset pages, shared file/semantic/physical indexes and O(V+E) graph adjacency; 100-source independently durable duplicate-persistence pages with fresh tuple locks. Real 20,000-owner DB fault/retry and query/operation counters, existing 20,000/50,000 typed/correction fixtures. Progress uses DB aggregates, not a claim of constant DB work. |
+| 011 | Curated graph machine updates share owner authority and preserve human revisions; cleanup rechecks human incidents. Automatic suggestion replacement preserves reviewed decisions; only explicit confirmed regeneration disputes/reset them atomically. Actual backfill/cleanup/approval/preference structural controls. |
+| 012 | Shared/exclusive graph coordination, stable owner locks, live canonical merge validation and stronger human duplicate-relation preservation. Cycle/idempotent canonical/human relationship/history controls; opposite merge requests serialize on graph coordination before owner resolution. |
+| 013 | Graph sources use live Memory provenance and latest usable non-NOTE authority before per-owner caps; MODIFY uses edited meaning. Modern standalone Memory binds exact decision and correction reconciles indexed complete manifests. Invalid-before-valid, deep history, changed human meaning and repeated source-family recovery controls. |
+| 014 | Notebook owner serialization and monotonic revision order; materialized human text/approval/status; machine refresh preserves it. Conflicting review, revise/backfill, approve→keep/reject/archive and both archival entry points. |
+| 015 | Independent SQL-filtered attention/question/learning budgets with deterministic ordering. One thousand archived attention entries cannot hide actionable categories; history retained. |
+| 016 | Exact approved plan claim/run/actions/signed command/audit in one fresh Serializable authority transaction; post-admission presentation failure cannot change queued ownership. Child-command rollback, deterministic competing execution, cancelled plan and immutable action-source controls. |
+| 017 | Exact indexed result sets/paths/checksums; complete child coverage determines parent truth; DB projection/result/command terminal state atomic; terminal replay has no effects. Invalid/duplicate/missing results, signed-completion rollback, replay after Undo and reconciliation/current Search controls. |
+| 018 | Execution owner serializes Undo claim, actions and command; immutable executed checksums; exclude already completed original reversals across attempts. Concurrent Undo, partial retry, late first report, external mutation and real local database-gap controls. |
+| 019 | Monotonic command CAS; expire only safely unstarted physical work, settle dependents atomically; acknowledged physical uncertainty stays recoverable. Pending expiry/ACK history, revocation/key settlement and real native replay controls. |
+| 020 | Command journal before ACK; immutable per-action intent/link/source-capture/completion proof, restart recovery even after revoked polling. Local bounded action transaction plus journal-backed ordinary history recovery. Actual child-process death at ACK, after effect and during source capture; DB-gap/partial Undo controls. Legacy local owners lacking both captured authority revision and journal proof remain visibly unresolved on repeated ordinary recovery; missing proof cannot authorize a repeated effect or invented terminal failure. |
+| 021 | Exclusive hard-link destination, verified inode/checksum and private source capture; same-volume requirement fails closed. Destination insertion, editor source replacement, captured crash, no repeated effects and created-folder ownership native controls. |
+| 022 | Native expected checksum plus local before/after SHA/inode/size/time validation, shared lease and scoped write guard through all four readers. Real document/audio/video/image changed-source entry points and late local writer controls. |
+| 023 | Watch events are hints for a full inventory; renewable root/batch generation, revision and watch state fence; exact latest-scan baseline and indexed events. Unchanged current/history survives delayed delete; concurrent claims produce one command; signed hint denial/key fences. |
+| 024 | Serialized local read/modify/write, exclusive UUID temporary file, flush/atomic rename; only ENOENT initializes empty state. Real concurrent registry/outbox writes and byte-preserving corruption; existing connection fault/retry controls. |
+| 025 | Every local producer uses the shared owned observation lease, fresh root/key/revision/physical generation and atomic document/observation/file/counters; only exact owner may fail/release. Abandoned file ordinary recovery, competing/expired writer, downstream completion and existing media simultaneous-report controls. |
+
+Permanent gate: `npm run test:invariants` includes `system-invariants.test.ts`, `structural-derived-state.test.ts`, `scan-publication-recovery.test.ts` and `knowledge-eligibility-caps.test.ts` with concurrency one. The existing release quality job runs it after Memory, before the unchanged full Phase1–3 workflow. `test:bridge` includes the three new native invariant files and real process fixture. No redundant CI pipeline was created.
+
+Final self-review checked cross-subsystem authority, eligibility, deadlock order, scope, replay/history, physical inventory, privacy and scale. New sibling corrections were included in their original finding classes: physical outcome epochs fence reads/recommendations/current publication; stale connection revisions cannot regain grants with a newer clock; key replacement settles unstarted owners; Notebook archive clears approval; NOTE cannot create duplicate authority; native source capture closes the public-name unlink race. Root UPDATE precedes physical run ownership, and Device → Root → command → scan ordering protects signed import/admission; publication and source builders retain independent per-root/owner locks. Provider/extraction/full scan I/O stays outside authority transactions; one local physical action is the documented bounded 120-second exception with a durable journal. Duplicate persistence commits independent 100-source pages rather than holding a whole-library write transaction.
+
+Existing regression expectations changed only where the audited contract proved the old expectation incorrect: reconnect fixtures now provide explicit connection revision 2; native atomic-writer faults target actual UUID rename rather than an obsolete fixed temp name; physical completion initially admits REQUIRED reconciliation and ordinary full-scan publication proves completion; automatic machine regeneration preserves APPROVED support/preference history rather than disputing it. Existing explicit human reset/regeneration rollback, checksum, root, complete-family, context8/claim3 and 20,000/50,000 fixtures remain intact. Restored permission error categories and JSON semantic equality were production fixes. New pairing-key assertions compare the boundary's canonical trimmed public key.
+
+Final validation passed on the frozen production/configuration/test source, using only disposable localhost PostgreSQL, synthetic files, mocked AI and unset OPENAI_API_KEY. The final remaining database gates ran sequentially after parallel large Serializable fixtures exceeded PostgreSQL predicate-lock shared memory; no scale fixtures or safety assertions were reduced. The two Bridge skips are existing Windows symlink controls requiring privileges unavailable to this account. Full native macOS packaging/publication was not invoked. Legacy physical owners without journal proof remain visibly unresolved for human inspection, without repeated moves or invented outcomes. No confirmed P0/P1/P2 remains unresolved. Ephemeral logs and the full local commit report stay outside the repository.
+
+| Final gate | Result |
+| --- | --- |
+| `test-invariants` | 141 passed / 141 tests |
+| `workflow` | 367 passed / 367 tests |
+| `qa-suite` | 132 passed / 132 tests |
+| `convergence` | 63 passed / 63 tests |
+| `provenance` | 36 passed / 36 tests |
+| `claims` | 21 passed / 21 tests |
+| `lifecycle` | 36 passed / 36 tests |
+| `publication` | 12 passed / 12 tests |
+| `eligible-caps` | 18 passed / 18 tests |
+| `refresh` | 3 passed / 3 tests |
+| `copies` | 8 passed / 8 tests |
+| `observations` | 7 passed / 7 tests |
+| `test-bridge` | 344 passed / 346 tests; 2 existing platform skips |
+| `native-command` | 15 passed / 15 tests |
+| `legacy-controls` | 4 passed / 4 tests |
+| `test-memory` | 9 passed / 9 tests |
+| `test-auth` | 9 passed / 9 tests |
+| `test-protocol` | 49 passed / 49 tests |
+| `migrations` | PASS; schema valid, 35 migrations deployed/up to date |
+| `db-generate` | PASS |
+| `lint` | PASS |
+| `build` | PASS |
+| `build-bridge` | PASS |
+| `source-typecheck` | PASS |
+| `diffcheck` | PASS |

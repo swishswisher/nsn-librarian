@@ -215,6 +215,26 @@ test("allows only the exact Bridge release manifest through proxy without human 
   });
 });
 
+test("human-only device revocation and unknown device descendants fail closed at proxy", () => {
+  for (const suffix of ["revoke", "anything-else", "commands/command-1/delete", "roots/sync/extra"]) {
+    const pathname = `/api/bridge/cloud/devices/device-1/${suffix}`;
+    assert.equal(isPublicMachinePath(pathname), false, `${suffix} is not a signed machine route`);
+    assert.equal(isHumanApiPath(pathname), true);
+    assert.equal(proxy(proxyRequest(pathname, "POST")).status, 401);
+  }
+  for (const suffix of ["commands", "commands/command-1/acknowledge", "commands/command-1/complete",
+    "heartbeat", "roots/sync", "watch-events"]) {
+    assert.equal(isPublicMachinePath(`/api/bridge/cloud/devices/device-1/${suffix}`), true);
+  }
+  configureAuth();
+  const user = approvedUsers()[0];
+  const token = createHumanSessionToken(user, { email: user.email, googleSubject: user.googleSubject, name: user.name, picture: null });
+  const request = proxyRequest("/api/bridge/cloud/devices/device-1/revoke", "POST");
+  Object.assign(request, { cookies: { get: () => ({ value: token }) },
+    headers: new Headers({ origin: "https://attacker.example", "sec-fetch-site": "cross-site" }) });
+  assert.equal(proxy(request).status, 403, "Authenticated revocation still requires same-origin human intent");
+});
+
 test("blocks open redirects and cross-origin state-changing requests", () => {
   assert.equal(safeInternalPath("https://example.com"), "/admin/library");
   assert.equal(safeInternalPath("//example.com"), "/admin/library");

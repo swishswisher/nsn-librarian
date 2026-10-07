@@ -20,9 +20,13 @@ export async function lockCurrentScanPublication(tx: Prisma.TransactionClient, s
   if (!lock?.owned) return null;
   await tx.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder"
     WHERE id = ${session.connectedFolderId} FOR SHARE`);
+  const root = await tx.connectedLibrary.findUniqueOrThrow({ where: { id: session.connectedFolderId } });
+  try {
+    await (await import("./execution-reconciliation")).assertInventoryAfterPhysicalOutcomes(tx, root.id, root.physicalInventoryGeneration);
+  } catch { return null; }
   const latest = await tx.scanSession.findFirst({
     where: { connectedFolderId: session.connectedFolderId,
-      status: { in: ["COMPLETED", "COMPLETED_WITH_ERRORS"] },
+      status: { in: ["COMPLETED", "COMPLETED_WITH_ERRORS"] }, inventoryGeneration: root.physicalInventoryGeneration,
       connectedFolder: currentReadableRootWhere },
     orderBy: [{ startedAt: "desc" }, { id: "desc" }],
     select: { id: true, connectedFolderId: true, knowledgePersistenceStatus: true, searchIndexStatus: true },

@@ -10,6 +10,10 @@ export const latestKnowledgeSnapshot = Prisma.sql`
     SELECT snapshot.id FROM "ScanSession" snapshot
     WHERE snapshot."connectedFolderId" = root.id
       AND snapshot.status IN ('COMPLETED', 'COMPLETED_WITH_ERRORS')
+      AND snapshot."inventoryGeneration" = root."physicalInventoryGeneration"
+      AND NOT EXISTS (SELECT 1 FROM "ExecutionRun" physical_run WHERE physical_run."connectedLibraryId" = root.id AND physical_run.status IN ('PENDING', 'RUNNING'))
+      AND NOT EXISTS (SELECT 1 FROM "UndoRun" physical_undo JOIN "ExecutionRun" undo_owner ON undo_owner.id = physical_undo."executionRunId"
+        WHERE undo_owner."connectedLibraryId" = root.id AND physical_undo.status IN ('PENDING', 'RUNNING'))
     ORDER BY snapshot."startedAt" DESC, snapshot.id DESC LIMIT 1
   ) latest ON true`;
 

@@ -187,13 +187,16 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   const prisma = getPrismaClient();
   // This is a single-human installation today. Root grants remain an explicit
   // database predicate; there is no per-user library ownership model to infer.
-  const roots = await prisma.connectedLibrary.findMany({
-    select: { id: true, displayName: true, scanSessions: {
-      orderBy: [{ startedAt: "desc" }, { id: "desc" }], select: { id: true }, take: 1,
+  const readableRoots = await prisma.connectedLibrary.findMany({
+    select: { id: true, displayName: true, physicalInventoryGeneration: true, scanSessions: {
+      orderBy: [{ startedAt: "desc" }, { id: "desc" }], select: { id: true, inventoryGeneration: true }, take: 1,
       where: usableScanSnapshotWhere,
     } },
-    where: { ...currentReadableRootWhere, ...(permittedRootIds ? { id: { in: permittedRootIds } } : {}) },
+    where: { ...currentReadableRootWhere, ...(permittedRootIds ? { id: { in: permittedRootIds } } : {}),
+      ...(!intent.wantsHistory ? { executionRuns: { none: { OR: [ { status: { in: ["PENDING", "RUNNING"] as const } },
+        { undoRuns: { some: { status: { in: ["PENDING", "RUNNING"] as const } } } } ] } } } : {}) },
   });
+  const roots = readableRoots.filter((root) => intent.wantsHistory || root.scanSessions[0]?.inventoryGeneration === root.physicalInventoryGeneration);
   const rootById = new Map(roots.map((root) => [root.id, root]));
   const rootIds = roots.map((root) => root.id);
   const latestSessionIds = roots.flatMap((root) => root.scanSessions.map((session) => session.id));

@@ -961,39 +961,70 @@ export function buildScanWorkingKnowledge(input: {
       }
   }
 
+  const clusters = buildWorkingKnowledgeClusters(files, relationships);
+
+  return {
+    clusters,
+    files,
+    relationships: relationships.sort(
+      (left, right) =>
+        left.leftFileId.localeCompare(right.leftFileId) ||
+        left.rightFileId.localeCompare(right.rightFileId),
+    ),
+    scanSessionId: input.scanSessionId,
+  };
+}
+
+export type WorkingClusterWork = { fileVisits?: number; edgeVisits?: number; nodeVisits?: number };
+
+export function buildWorkingKnowledgeClusters(files: ScanWorkingKnowledgeFile[], relationships: ScanWorkingKnowledgeRelationship[], work?: WorkingClusterWork) {
   const fileById = new Map(files.map((file) => [file.id, file]));
   const clusters: ScanWorkingKnowledgeCluster[] = [];
 
   // Build one connected component per semantic subject. A global component
   // would let a weak bridge transfer every subject to every member.
   for (const topic of semanticTopicFamilies) {
-    const topicRelationships = relationships.filter((relation) =>
-      relation.supportingTopics.includes(topic.id),
-    );
+    const topicRelationships = relationships.filter((relation) => {
+      if (work) work.edgeVisits = (work.edgeVisits ?? 0) + 1;
+      return relation.supportingTopics.includes(topic.id);
+    });
     const adjacency = new Map<string, Set<string>>();
+    const incident = new Map<string, number[]>();
 
-    for (const relation of topicRelationships) {
+    for (const [index, relation] of topicRelationships.entries()) {
       const left = adjacency.get(relation.leftFileId) ?? new Set<string>();
       const right = adjacency.get(relation.rightFileId) ?? new Set<string>();
       left.add(relation.rightFileId);
       right.add(relation.leftFileId);
       adjacency.set(relation.leftFileId, left);
       adjacency.set(relation.rightFileId, right);
+      for (const id of [relation.leftFileId, relation.rightFileId]) {
+        const edges = incident.get(id) ?? [];
+        edges.push(index);
+        incident.set(id, edges);
+      }
     }
 
     const visited = new Set<string>();
     for (const file of files) {
+      if (work) work.fileVisits = (work.fileVisits ?? 0) + 1;
       if (visited.has(file.id) || !adjacency.has(file.id)) {
         continue;
       }
 
       const pending = [file.id];
       const memberIds: string[] = [];
+      const memberEdgeIndices = new Set<number>();
       visited.add(file.id);
 
-      while (pending.length > 0) {
-        const current = pending.shift() as string;
+      for (let cursor = 0; cursor < pending.length; cursor++) {
+        const current = pending[cursor];
         memberIds.push(current);
+        if (work) work.nodeVisits = (work.nodeVisits ?? 0) + 1;
+        for (const index of incident.get(current) ?? []) {
+          if (work) work.edgeVisits = (work.edgeVisits ?? 0) + 1;
+          memberEdgeIndices.add(index);
+        }
         for (const related of [...(adjacency.get(current) ?? [])].sort()) {
           if (!visited.has(related)) {
             visited.add(related);
@@ -1002,11 +1033,8 @@ export function buildScanWorkingKnowledge(input: {
         }
       }
 
-      const memberSet = new Set(memberIds);
-      const memberRelationships = topicRelationships.filter(
-        (relation) =>
-          memberSet.has(relation.leftFileId) && memberSet.has(relation.rightFileId),
-      );
+      const memberRelationships = [...memberEdgeIndices].sort((a, b) => a - b)
+        .map((index) => topicRelationships[index]);
       const topicTerms = semanticTopicSupportTerms(topic.id);
       const termCounts = new Map<string, number>();
 
@@ -1051,16 +1079,7 @@ export function buildScanWorkingKnowledge(input: {
     }
   }
 
-  return {
-    clusters,
-    files,
-    relationships: relationships.sort(
-      (left, right) =>
-        left.leftFileId.localeCompare(right.leftFileId) ||
-        left.rightFileId.localeCompare(right.rightFileId),
-    ),
-    scanSessionId: input.scanSessionId,
-  };
+  return clusters;
 }
 
 export async function loadScanWorkingKnowledge(

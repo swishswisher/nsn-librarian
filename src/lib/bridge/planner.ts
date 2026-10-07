@@ -1463,6 +1463,8 @@ export async function getOrganizationPlanPageData(
   scanSessionId: string,
 ): Promise<BridgeOrganizationPlanPageData | null> {
   const prisma = getPrismaClient();
+  await (await import("./local-physical-recovery")).recoverLocalPhysicalRunsForSession(scanSessionId);
+  await (await import("./execution-reconciliation")).recoverExecutionReconciliations({ scanSessionId });
   const session = await prisma.scanSession.findUnique({
     include: {
       connectedFolder: {

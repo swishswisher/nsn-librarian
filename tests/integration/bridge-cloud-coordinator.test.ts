@@ -1718,10 +1718,13 @@ test("cloud watch events reject unsafe paths and cross-root delivery", async () 
 
 test("signed watch-events route accepts device events without exposing localhost", async () => {
   const bridgeRootId = "root_444444444444444444444444";
-  const { device, keys } = await createCloudScannedFile({
+  const { device, keys, library } = await createCloudScannedFile({
     bridgeRootId,
     relativePath: "Notes/route-event.txt",
   });
+  // Signed device identity does not grant watching. This positive route control
+  // supplies the root's explicit, active Read + Watch authority.
+  await prisma.connectedLibrary.update({ where: { id: library.id }, data: { watchPermission: true, monitoringState: "WATCHING" } });
   const route = await import(
     "../../src/app/api/bridge/cloud/devices/[deviceId]/watch-events/route"
   );

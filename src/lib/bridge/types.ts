@@ -708,6 +708,8 @@ export type BridgeScannedFileDraft = {
 };
 
 export type BridgeFolderScanResult = {
+  physicalInventoryGeneration?: number;
+  rootConnectionRevision?: number;
   folderDisplayName: string;
   rootPath: string;
   bridgeRootId?: string;

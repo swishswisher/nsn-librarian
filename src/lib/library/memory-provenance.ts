@@ -90,10 +90,22 @@ export const curatedMemorySql = Prisma.sql`${eligibleMemorySql()} OR (
   memory.status = 'ACTIVE' AND memory."searchSourceCount" = 0
   AND NOT EXISTS (SELECT 1 FROM "MemorySearchSource" source WHERE source."memoryEntryId" = memory.id)
   AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(memory.evidence) = 'array'
-    THEN memory.evidence ELSE '[]'::jsonb END) item,
-    LATERAL jsonb_array_elements_text(CASE WHEN item->>'kind' = 'MEMORY_PROVENANCE_REQUIRED'
-      AND jsonb_typeof(item->'sourceSessionIds') = 'array' THEN item->'sourceSessionIds' ELSE '[]'::jsonb END) required(id)
-    WHERE NOT EXISTS (SELECT 1 FROM "ObservationSession" observation WHERE observation.id = required.id
-      AND ${reviewedObservationIsCurrent}
-      AND NOT EXISTS (SELECT 1 FROM "ScannedFile" bound WHERE bound."libraryDocumentId" = observation."libraryDocumentId")))
+    THEN memory.evidence ELSE '[]'::jsonb END) item
+    CROSS JOIN LATERAL (SELECT CASE WHEN jsonb_typeof(item->'sourceSessionIds') = 'array'
+      THEN item->'sourceSessionIds' ELSE '[]'::jsonb END AS ids,
+      CASE WHEN jsonb_typeof(item->'sourceAuthorities') = 'array' THEN item->'sourceAuthorities' ELSE '[]'::jsonb END AS authorities) manifest
+    WHERE item->>'kind' = 'MEMORY_PROVENANCE_REQUIRED' AND NOT (
+      jsonb_array_length(manifest.ids) > 0
+      AND jsonb_array_length(manifest.ids) = (SELECT count(DISTINCT required.id) FROM jsonb_array_elements_text(manifest.ids) required(id))
+      AND jsonb_array_length(manifest.ids) = jsonb_array_length(manifest.authorities)
+      AND jsonb_array_length(manifest.ids) = (
+        SELECT count(DISTINCT observation.id) FROM jsonb_array_elements_text(manifest.ids) required(id)
+          JOIN jsonb_array_elements(manifest.authorities) binding ON binding->>'observationSessionId' = required.id
+          JOIN "ObservationSession" observation ON observation.id = required.id
+          WHERE ${reviewedObservationIsCurrent}
+            AND binding->>'decisionId' IS NOT DISTINCT FROM (SELECT authority.id FROM "HumanDecision" authority
+              WHERE authority."observationSessionId" = observation.id AND ${memoryReviewAuthoritySql}
+              ORDER BY authority."createdAt" DESC, authority.id DESC LIMIT 1)
+            AND NOT EXISTS (SELECT 1 FROM "ScannedFile" bound WHERE bound."libraryDocumentId" = observation."libraryDocumentId"))
+    ))
 )`;

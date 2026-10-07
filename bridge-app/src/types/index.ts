@@ -24,6 +24,7 @@ export type BridgePermissions = {
 };
 
 export type BridgeRootRecord = BridgePermissions & {
+  connectionRevision?: number;
   id: string;
   actualPath: string;
   connectedAt: string;
@@ -38,6 +39,7 @@ export type BridgeRootRecord = BridgePermissions & {
 };
 
 export type BridgeRootSummary = BridgePermissions & {
+  connectionRevision?: number;
   id: string;
   connectedAt: string;
   displayName: string;
@@ -214,6 +216,7 @@ export type BridgeExecutionPlanAction = {
 
 export type BridgeUndoPlanAction = {
   id: string;
+  originalExecutionActionId?: string;
   actionType: "REMOVE_FOLDER" | "MOVE_FILE" | "RENAME_FILE";
   sourceRelativePath: string;
   sourceChecksum?: string | null;

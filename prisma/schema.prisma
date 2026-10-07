@@ -647,6 +647,7 @@ model ObservationSession {
   planSuggestions   Json
   confidence        Float                    @default(0)
   warnings          Json
+  memoryReconciliationStatus String          @default("NOT_REQUIRED")
   createdAt         DateTime                 @default(now())
   updatedAt         DateTime                 @updatedAt
   libraryDocument   LibraryDocument          @relation(fields: [libraryDocumentId], references: [id], onDelete: Cascade)
@@ -658,6 +659,8 @@ model ObservationSession {
   @@index([libraryDocumentId])
   @@index([status])
   @@index([createdAt])
+  @@index([memoryReconciliationStatus])
+  @@index([libraryDocumentId, createdAt, id])
 }
 
 model HumanDecision {
@@ -672,6 +675,7 @@ model HumanDecision {
   @@index([observationSessionId])
   @@index([decisionType])
   @@index([createdAt])
+  @@index([observationSessionId, createdAt, id])
 }
 
 model KnowledgeConnection {
@@ -765,6 +769,7 @@ model MemoryEntry {
   @@index([memoryType])
   @@index([status])
   @@index([lastSeen])
+  @@index([evidence], type: Gin)
 }
 
 model MemorySearchSource {
@@ -794,6 +799,9 @@ model ConnectedLibrary {
   platform                         ConnectedLibraryPlatform @default(UNKNOWN)
   status                           ConnectedLibraryStatus   @default(CONNECTED)
   connectedAt                      DateTime                 @default(now())
+  nativeConnectionRevision         Int                      @default(0)
+  physicalInventoryGeneration Int @default(0)
+  nativeRootUpdatedAt              DateTime?
   disconnectedAt                   DateTime?
   hiddenFromActiveListAt           DateTime?
   mergedAt                         DateTime?
@@ -954,6 +962,11 @@ model BridgeAuditEntry {
 }
 
 model ScanSession {
+  importInventoryHash String?
+  inventoryGeneration Int @default(0)
+  recommendationGeneration String?
+  recommendationRegenerationGeneration String?
+  recommendationLeaseUntil DateTime?
   id                      String                   @id @default(cuid())
   connectedFolderId       String
   startedAt               DateTime                 @default(now())
@@ -976,6 +989,7 @@ model ScanSession {
 
   @@index([connectedFolderId])
   @@index([status])
+  @@index([status, recommendationLeaseUntil])
   @@index([startedAt])
 }
 
@@ -1066,6 +1080,8 @@ model ScannedFile {
   observationVersion      String?
   observationOrigin       String?
   observationClaimedAt    DateTime?
+  observationRootRevision Int?
+  observationDeviceKeyFingerprint String?
   aiRequestCount          Int                        @default(0)
   aiHttpAttempts          Int                        @default(0)
   aiInputTokens           Int?
@@ -1082,6 +1098,7 @@ model ScannedFile {
   videoMetadata           VideoRecordingMetadata?
 
   @@index([sessionId])
+  @@index([sessionId, relativePath, id])
   @@index([readStatus])
   @@index([readingStatus])
   @@index([extractionStatus])
@@ -1222,6 +1239,9 @@ model ImageAssetMetadata {
 }
 
 model MonitoringBatch {
+  processingGeneration String?
+  processingLeaseUntil DateTime?
+  rootConnectionRevision Int?
   id                    String                      @id @default(cuid())
   connectedFolderId     String
   scanSessionId         String?
@@ -1249,6 +1269,7 @@ model MonitoringBatch {
   @@index([status])
   @@index([startedAt])
   @@index([completedAt])
+  @@index([status, processingLeaseUntil, id])
 }
 
 model MonitoringEvent {
@@ -1438,6 +1459,11 @@ model ExecutionRun {
   bridgeRootId         String?
   permissionSnapshot   Json?
   reconciliationStatus String            @default("NOT_REQUESTED")
+  reconciliationGeneration String?
+  reconciliationRootRevision Int?
+  reconciliationScanSessionId String?
+  physicalRootRevision Int?
+  physicalRecoveryAttemptedAt DateTime?
   organizationPlan     OrganizationPlan  @relation(fields: [organizationPlanId], references: [id], onDelete: Cascade)
   connectedLibrary     ConnectedLibrary  @relation(fields: [connectedLibraryId], references: [id], onDelete: Cascade)
   bridgeDevice         BridgeDevice?     @relation(fields: [bridgeDeviceId], references: [bridgeDeviceId], onDelete: SetNull)
@@ -1464,6 +1490,7 @@ model ExecutionAction {
   completedAt              DateTime?
   safeErrorCategory        String?
   sourceChecksumBefore     String?
+  sourceScannedFileId       String?
   destinationChecksumAfter String?
   sequence                 Int
   createdFilesystemItem    Boolean         @default(false)
@@ -1487,6 +1514,8 @@ model UndoRun {
   failedActions     Int          @default(0)
   durationMs        Int?
   safeErrorCategory String?
+  physicalRootRevision Int?
+  physicalRecoveryAttemptedAt DateTime?
   executionRun      ExecutionRun @relation(fields: [executionRunId], references: [id], onDelete: Cascade)
   actions           UndoAction[]
 

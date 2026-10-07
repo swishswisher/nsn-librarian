@@ -1,18 +1,14 @@
+import { executeLocalPhysicalRun, localPhysicalPermission } from "./local-physical-recovery";
+import { isCurrentReadableRoot } from "./current-readable-root";
 import { claimPlanExecution } from "./plan-execution-authority";
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { lstat, mkdir, rename } from "node:fs/promises";
-import path from "node:path";
 
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { recordExecutionNotebookEntry } from "@/lib/library/notebook";
 
 import {
-  executeLocalBridgeActions,
   previewLocalBridgeExecution,
-  takeLocalBridgeWatcherEvents,
   type LocalBridgeExecutionActionInput,
 } from "./local-bridge-client";
 import { bridgeDeviceIsOnline } from "./effective-health";
@@ -49,16 +45,6 @@ export class BridgeExecutorError extends Error {
     this.name = "BridgeExecutorError";
     this.statusCode = statusCode;
     this.preview = preview;
-  }
-}
-
-class BridgeActionExecutionError extends Error {
-  category: BridgeExecutionIssueCategory;
-
-  constructor(category: BridgeExecutionIssueCategory, message: string) {
-    super(message);
-    this.name = "BridgeActionExecutionError";
-    this.category = category;
   }
 }
 
@@ -238,12 +224,6 @@ const executionOrder: Record<ExecutableAction["actionType"], number> = {
   RENAME_FILE: 40,
   MOVE_AND_RENAME_FILE: 50,
 };
-function pathKey(value: string) {
-  const normalized = path.normalize(value);
-
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -516,22 +496,6 @@ function summarizeUndoRunFromStored(run: StoredUndoRun): BridgeUndoRunSummary {
     status: normalizeUndoStatus(run.status),
     totalActions: run.totalActions,
   };
-}
-
-function folderFromRelativePath(relativePath: string) {
-  const directory = path.posix.dirname(relativePath);
-
-  return directory === "." ? "" : directory;
-}
-
-function isInsideRoot(rootPath: string, filePath: string) {
-  const relativePath = path.relative(rootPath, filePath);
-
-  return (
-    relativePath.length > 0 &&
-    !relativePath.startsWith("..") &&
-    !path.isAbsolute(relativePath)
-  );
 }
 
 function issue(
@@ -920,228 +884,6 @@ function bridgeExecutionIssueCategory(
     : "VALIDATION_FAILED";
 }
 
-async function checksumFile(filePath: string) {
-  return new Promise<string>((resolve, reject) => {
-    const hash = createHash("sha256");
-    const stream = createReadStream(filePath);
-
-    stream.on("data", (chunk) => hash.update(chunk));
-    stream.on("error", reject);
-    stream.on("end", () => resolve(hash.digest("hex")));
-  });
-}
-
-function fileMetadataMatches(
-  scannedFile: StoredScannedFileForExecution,
-  stats: Awaited<ReturnType<typeof lstat>>,
-) {
-  if (scannedFile.sizeBytes !== null && BigInt(stats.size) !== scannedFile.sizeBytes) {
-    return false;
-  }
-
-  if (!scannedFile.lastModified) {
-    return scannedFile.sizeBytes !== null;
-  }
-
-  return Math.abs(stats.mtime.getTime() - scannedFile.lastModified.getTime()) <= 1000;
-}
-
-async function validateSourceFile(
-  rootPath: string,
-  action: ResolvedExecutableAction,
-  issues: BridgeExecutionIssue[],
-) {
-  if (!action.sourceRelativePath || !action.sourcePath) {
-    issues.push(
-      issue(
-        "INVALID_PATH",
-        "A source path is missing",
-        "The Bridge needs a relative source path before it can move or rename a file.",
-        [action.action.id],
-      ),
-    );
-    return;
-  }
-
-  const scannedFile = action.scannedFile;
-
-  if (!scannedFile) {
-    issues.push(
-      issue(
-        "VALIDATION_FAILED",
-        "A source file could not be matched to the folder scan record",
-        "The Bridge could not verify this file against the scan session.",
-        [action.action.id],
-      ),
-    );
-    return;
-  }
-
-  if (pathKey(action.sourcePath) !== pathKey(scannedFile.localPath)) {
-    issues.push(
-      issue(
-        "VALIDATION_FAILED",
-        "The source file no longer matches the folder scan record",
-        "The recorded scan path does not match the planned source path.",
-        [action.action.id],
-      ),
-    );
-    return;
-  }
-
-  let stats: Awaited<ReturnType<typeof lstat>>;
-
-  try {
-    stats = await lstat(action.sourcePath);
-  } catch {
-    issues.push(
-      issue(
-        "MISSING_SOURCE",
-        "A source file is missing",
-        `${action.sourceRelativePath} could not be found.`,
-        [action.action.id],
-      ),
-    );
-    return;
-  }
-
-  if (!stats.isFile() || stats.isSymbolicLink()) {
-    issues.push(
-      issue(
-        "SOURCE_NOT_FILE",
-        "A source item is not a regular file",
-        `${action.sourceRelativePath} is not a regular file the Bridge can move or rename.`,
-        [action.action.id],
-      ),
-    );
-    return;
-  }
-
-  if (scannedFile.checksum) {
-    const currentChecksum = await checksumFile(action.sourcePath);
-
-    if (currentChecksum !== scannedFile.checksum) {
-      issues.push(
-        issue(
-          "CHANGED_SOURCE",
-          "A source file changed after scanning",
-          `${action.sourceRelativePath} no longer matches its scanned checksum.`,
-          [action.action.id],
-        ),
-      );
-    }
-    return;
-  }
-
-  if (!fileMetadataMatches(scannedFile, stats)) {
-    issues.push(
-      issue(
-        "CHANGED_SOURCE",
-        "A source file changed after scanning",
-        `${action.sourceRelativePath} no longer matches its scanned file metadata.`,
-        [action.action.id],
-      ),
-    );
-  }
-
-  if (!isInsideRoot(rootPath, action.sourcePath)) {
-    issues.push(
-      issue(
-        "PATH_OUTSIDE_ROOT",
-        "A source path is outside the connected folder",
-        "The Bridge refused a source path that is not inside the connected folder.",
-        [action.action.id],
-      ),
-    );
-  }
-}
-
-async function pathExists(filePath: string) {
-  try {
-    return await lstat(filePath);
-  } catch {
-    return null;
-  }
-}
-
-function folderIsCoveredByCreateAction(
-  parentFolder: string,
-  createFolders: Set<string>,
-) {
-  if (!parentFolder) {
-    return true;
-  }
-
-  for (const folder of createFolders) {
-    if (folder === parentFolder || folder.startsWith(`${parentFolder}/`)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-async function validateDestination(
-  rootPath: string,
-  action: ResolvedExecutableAction,
-  createFolders: Set<string>,
-  issues: BridgeExecutionIssue[],
-) {
-  const destinationStats = await pathExists(action.destinationPath);
-
-  if (action.actionType === "CREATE_FOLDER") {
-    if (destinationStats && !destinationStats.isDirectory()) {
-      issues.push(
-        issue(
-          "DESTINATION_CONFLICT",
-          "A planned folder conflicts with an existing file",
-          `${action.destinationRelativePath} already exists as a file.`,
-          [action.action.id],
-        ),
-      );
-    }
-    return;
-  }
-
-  if (destinationStats) {
-    issues.push(
-      issue(
-        "DESTINATION_CONFLICT",
-        "A destination already exists",
-        `${action.destinationRelativePath} already exists. The Bridge will not overwrite files.`,
-        [action.action.id],
-      ),
-    );
-    return;
-  }
-
-  const parentFolder = folderFromRelativePath(action.destinationRelativePath);
-
-  if (!parentFolder) {
-    return;
-  }
-
-  const parentPath = path.dirname(action.destinationPath);
-  const parentStats = await pathExists(parentPath);
-
-  if (parentStats?.isDirectory()) {
-    return;
-  }
-
-  if (folderIsCoveredByCreateAction(parentFolder, createFolders)) {
-    return;
-  }
-
-  issues.push(
-    issue(
-      "MISSING_PARENT",
-      "A destination folder is missing",
-      `${parentFolder} is not present and is not created by this plan.`,
-      [action.action.id],
-    ),
-  );
-}
-
 function classifyIssues(issues: BridgeExecutionIssue[]) {
   const conflicts = issues.filter(
     (item) =>
@@ -1164,38 +906,6 @@ function classifyIssues(issues: BridgeExecutionIssue[]) {
     missingFiles,
     warnings: issues.filter((item) => item.severity === "WARNING"),
   };
-}
-
-function firstBlockingIssue(issues: BridgeExecutionIssue[]) {
-  return issues.find((item) => item.severity === "BLOCKING") ?? issues[0] ?? null;
-}
-
-async function assertActionStillSafe(
-  rootPath: string,
-  action: ResolvedExecutableAction,
-  allActions: ResolvedExecutableAction[],
-) {
-  const issues: BridgeExecutionIssue[] = [];
-  const createFolders = new Set(
-    allActions
-      .filter((item) => item.actionType === "CREATE_FOLDER")
-      .map((item) => item.destinationRelativePath),
-  );
-
-  if (action.actionType !== "CREATE_FOLDER") {
-    await validateSourceFile(rootPath, action, issues);
-  }
-
-  await validateDestination(rootPath, action, createFolders, issues);
-
-  const blockingIssue = firstBlockingIssue(issues);
-
-  if (blockingIssue) {
-    throw new BridgeActionExecutionError(
-      blockingIssue.category,
-      blockingIssue.description,
-    );
-  }
 }
 
 async function loadPlanForExecution(planId: string) {
@@ -1454,6 +1164,8 @@ async function buildExecutionPreview(
   rootPath: string;
 }> {
   const issues: BridgeExecutionIssue[] = [];
+  const root = await getPrismaClient().connectedLibrary.findUnique({ where: { id: plan.connectedLibraryId } });
+  if (!isCurrentReadableRoot(root)) issues.push(issue("PERMISSION_DENIED", "This root is not currently authorized", "Reconnect and authorize the canonical connected folder before execution."));
   const planActions = asPlanActions(plan.actions);
   const priorBlockingRun = priorExecutionBlocks(plan);
 
@@ -1589,186 +1301,10 @@ export async function validateOrganizationPlanForApproval(planId: string) {
   return (await buildExecutionPreview(plan, { allowDraft: true })).preview;
 }
 
-function safeErrorCategory(error: unknown) {
-  if (error instanceof BridgeActionExecutionError) {
-    return error.category;
-  }
-
-  if (error instanceof BridgeExecutorError) {
-    return "VALIDATION_FAILED";
-  }
-
-  if (error instanceof Error && error.message.includes("already exists")) {
-    return "DESTINATION_CONFLICT";
-  }
-
-  return "FILESYSTEM_OPERATION_FAILED";
-}
-
-async function executeFileAction(action: ResolvedExecutableAction) {
-  if (!action.sourcePath) {
-    throw new BridgeActionExecutionError(
-      "INVALID_PATH",
-      "A source path is missing.",
-    );
-  }
-
-  if (await pathExists(action.destinationPath)) {
-    throw new BridgeActionExecutionError(
-      "DESTINATION_CONFLICT",
-      "The destination already exists.",
-    );
-  }
-
-  await rename(action.sourcePath, action.destinationPath);
-}
-
-async function updateScannedFileAfterAction(action: ResolvedExecutableAction) {
-  if (action.actionType === "CREATE_FOLDER" || !action.scannedFile) {
-    return null;
-  }
-
-  const prisma = getPrismaClient();
-  const stats = await lstat(action.destinationPath);
-  const checksum = await checksumFile(action.destinationPath);
-
-  await prisma.scannedFile.update({
-    data: {
-      checksum,
-      lastModified: stats.mtime,
-      localPath: action.destinationPath,
-      relativePath: action.destinationRelativePath,
-      sizeBytes: BigInt(stats.size),
-    },
-    where: {
-      id: action.scannedFile.id,
-    },
-  });
-
-  return checksum;
-}
-
-async function appendPlanExecutedHistory(plan: StoredPlanForExecution) {
-  const now = new Date().toISOString();
-
-  return [
-    ...asHistoryItems(plan.history),
-    {
-      at: now,
-      detail:
-        "The Bridge executed the approved organization plan. No files were deleted or overwritten.",
-      id: `history-executed-${now.replace(/[^a-z0-9]+/gi, "-")}`,
-      label: "Plan executed",
-    },
-  ].slice(-20);
-}
-
-function monitoringPathFieldsFor(
-  eventType: string,
-  relativePath: string,
-  executedPaths: Set<string>,
-) {
-  if (eventType === "FILE_DELETED" || eventType === "FOLDER_DELETED") {
-    return {
-      currentRelativePath: null,
-      previousRelativePath: relativePath,
-      wasExecutionEvent: executedPaths.has(relativePath),
-    };
-  }
-
-  return {
-    currentRelativePath: relativePath,
-    previousRelativePath: null,
-    wasExecutionEvent: executedPaths.has(relativePath),
-  };
-}
-
-async function correlateBridgeWatcherEventsForExecution(
-  plan: StoredPlanForExecution,
-  executionRunId: string,
-  actions: ResolvedExecutableAction[],
-) {
-  const bridgeRootId = plan.scanSession.connectedFolder.bridgeRootId;
-
-  if (!bridgeRootId) {
-    return "NOT_REQUESTED";
-  }
-
-  if (!plan.scanSession.connectedFolder.watchPermission) {
-    return "COMPLETED";
-  }
-
-  const executedPaths = new Set<string>();
-
-  for (const action of actions) {
-    if (action.sourceRelativePath) {
-      executedPaths.add(action.sourceRelativePath);
-    }
-    executedPaths.add(action.destinationRelativePath);
-  }
-
-  try {
-    const events = await takeLocalBridgeWatcherEvents(bridgeRootId);
-    const prisma = getPrismaClient();
-
-    for (const event of events) {
-      const pathFields = monitoringPathFieldsFor(
-        event.eventType,
-        event.relativePath,
-        executedPaths,
-      );
-      const executionRunMatch = pathFields.wasExecutionEvent
-        ? executionRunId
-        : null;
-      const eventKey = [
-        plan.connectedLibraryId,
-        event.eventType,
-        pathFields.previousRelativePath ?? "",
-        pathFields.currentRelativePath ?? "",
-        executionRunMatch ?? event.id,
-      ].join("\u001f");
-
-      await prisma.monitoringEvent.upsert({
-        create: {
-          connectedFolderId: plan.connectedLibraryId,
-          currentRelativePath: pathFields.currentRelativePath,
-          detectedAt: new Date(event.detectedAt),
-          eventKey,
-          eventType: event.eventType,
-          executionRunId: executionRunMatch,
-          previousRelativePath: pathFields.previousRelativePath,
-          processingStatus: executionRunMatch ? "SKIPPED" : "QUEUED",
-          safeErrorCategory: executionRunMatch
-            ? "NSN_EXECUTION_CORRELATED"
-            : null,
-          scanSessionId: plan.scanSessionId,
-          stabilizedAt: new Date(event.detectedAt),
-        },
-        update: {
-          detectedAt: new Date(event.detectedAt),
-          executionRunId: executionRunMatch,
-          processingStatus: executionRunMatch ? "SKIPPED" : "QUEUED",
-          safeErrorCategory: executionRunMatch
-            ? "NSN_EXECUTION_CORRELATED"
-            : null,
-          stabilizedAt: new Date(event.detectedAt),
-        },
-        where: {
-          eventKey,
-        },
-      });
-    }
-
-    return "COMPLETED";
-  } catch {
-    return "WATCHER_UNAVAILABLE";
-  }
-}
-
 export async function executeOrganizationPlan(
   planId: string,
   confirmation: string,
-  options: { beforeStartClaim?: () => Promise<void>; afterStartClaim?: () => Promise<void> } = {},
+  options: { beforeStartClaim?: () => Promise<void>; afterStartClaim?: () => Promise<void>; afterPhysical?: (actionId: string) => Promise<void> } = {},
 ) {
   if (confirmation !== "EXECUTE") {
     throw new BridgeExecutorError(
@@ -1787,7 +1323,7 @@ export async function executeOrganizationPlan(
     );
   }
 
-  const { preview, resolvedActions, rootPath } = await buildExecutionPreview(plan);
+  const { preview, resolvedActions } = await buildExecutionPreview(plan);
 
   if (!preview.canExecute) {
     await recordBlockedExecutionRun(plan, preview);
@@ -1801,6 +1337,11 @@ export async function executeOrganizationPlan(
   await options.beforeStartClaim?.();
   const executionStartedAt = new Date();
   const executionRun = await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id = ${plan.connectedLibraryId} FOR SHARE`);
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "ScanSession" WHERE id = ${plan.scanSessionId} FOR UPDATE`);
+    const root = await tx.connectedLibrary.findUniqueOrThrow({ where: { id: plan.connectedLibraryId } });
+    if (resolvedActions.some((action) => !localPhysicalPermission(root, action.actionType)))
+      throw new BridgeExecutorError("Current root authority does not permit these actions.", 403);
     if (!await claimPlanExecution(tx, plan)) {
       throw new BridgeExecutorError("This plan changed or execution already started. Refresh and review it again.", 409);
     }
@@ -1812,6 +1353,7 @@ export async function executeOrganizationPlan(
           destinationRelativePath: action.destinationRelativePath,
           sequence: action.sequence,
           sourceChecksumBefore: action.scannedFile?.checksum ?? null,
+          sourceScannedFileId: action.scannedFile?.id ?? null,
           sourceRelativePath: action.sourceRelativePath ?? "",
           status: "PENDING",
         })),
@@ -1822,6 +1364,7 @@ export async function executeOrganizationPlan(
       organizationPlanId: plan.id,
       permissionSnapshot: jsonInput(permissionSnapshotFor(plan)),
       reconciliationStatus: "PENDING",
+      physicalRootRevision: root.nativeConnectionRevision,
       startedAt: executionStartedAt,
       status: "RUNNING",
       totalActions: resolvedActions.length,
@@ -1836,394 +1379,11 @@ export async function executeOrganizationPlan(
   });
   }, { isolationLevel: "Serializable", timeout: 120_000 });
   await options.afterStartClaim?.();
-  const actionRecordsBySequence = new Map(
-    executionRun.actions.map((action) => [action.sequence, action]),
-  );
-  let completedActions = 0;
-  let failedActions = 0;
-  let safeRunErrorCategory: string | null = null;
-
-  if (plan.scanSession.connectedFolder.bridgeRootId) {
-    try {
-      const bridgeExecution = await executeLocalBridgeActions(
-        plan.scanSession.connectedFolder.bridgeRootId,
-        resolvedActions.map(localBridgeActionFor),
-      );
-      const resultByActionId = new Map(
-        bridgeExecution.actions.map((action) => [action.actionId, action]),
-      );
-
-      for (const action of resolvedActions) {
-        const actionRecord = actionRecordsBySequence.get(action.sequence);
-        const result = resultByActionId.get(action.action.id);
-
-        if (!actionRecord || !result) {
-          continue;
-        }
-
-        if (result.status === "PENDING") {
-          continue;
-        }
-
-        await prisma.executionAction.update({
-          data: {
-            completedAt: new Date(),
-            createdFilesystemItem:
-              result.status === "COMPLETED" && result.createdFilesystemItem,
-            destinationChecksumAfter: result.destinationChecksumAfter,
-            safeErrorCategory: result.safeErrorCategory,
-            sourceChecksumBefore:
-              result.sourceChecksumBefore ?? action.scannedFile?.checksum ?? null,
-            startedAt: new Date(),
-            status: result.status,
-          },
-          where: {
-            id: actionRecord.id,
-          },
-        });
-
-        if (
-          result.status === "COMPLETED" &&
-          action.actionType !== "CREATE_FOLDER" &&
-          action.scannedFile
-        ) {
-          await prisma.scannedFile.update({
-            data: {
-              lastModified: result.lastModified
-                ? new Date(result.lastModified)
-                : action.scannedFile.lastModified,
-              localPath: `bridge://${plan.scanSession.connectedFolder.bridgeRootId}/${result.destinationRelativePath}`,
-              relativePath: result.destinationRelativePath,
-              checksum: result.destinationChecksumAfter ?? action.scannedFile.checksum,
-              sizeBytes:
-                result.sizeBytes === null
-                  ? action.scannedFile.sizeBytes
-                  : BigInt(result.sizeBytes),
-            },
-            where: {
-              id: action.scannedFile.id,
-            },
-          });
-        }
-      }
-
-      completedActions = bridgeExecution.completedActions;
-      failedActions = bridgeExecution.failedActions;
-      safeRunErrorCategory =
-        bridgeExecution.actions.find((action) => action.safeErrorCategory)
-          ?.safeErrorCategory ?? null;
-    } catch (error) {
-      failedActions = resolvedActions.length;
-      safeRunErrorCategory = "FILESYSTEM_OPERATION_FAILED";
-
-      await prisma.executionAction.updateMany({
-        data: {
-          completedAt: new Date(),
-          safeErrorCategory: safeRunErrorCategory,
-          startedAt: new Date(),
-          status: "FAILED",
-        },
-        where: {
-          executionRunId: executionRun.id,
-        },
-      });
-
-      if (error instanceof Error) {
-        safeRunErrorCategory = "VALIDATION_FAILED";
-      }
-    }
-
-    const finalStatus: ExecutionStatus =
-      failedActions > 0
-        ? completedActions > 0
-          ? "PARTIALLY_COMPLETED"
-          : "FAILED"
-        : "COMPLETED";
-    const executionCompletedAt = new Date();
-    const durationMs = Math.max(
-      0,
-      executionCompletedAt.getTime() - executionStartedAt.getTime(),
-    );
-    const watcherReconciliationStatus =
-      completedActions > 0
-        ? await correlateBridgeWatcherEventsForExecution(
-            plan,
-            executionRun.id,
-            resolvedActions,
-          )
-        : "NOT_STARTED";
-    const updatedRun = await prisma.executionRun.update({
-      data: {
-        completedActions,
-        completedAt: executionCompletedAt,
-        durationMs,
-        errorCategory: safeRunErrorCategory,
-        failedActions,
-        reconciliationStatus:
-          watcherReconciliationStatus === "COMPLETED"
-            ? finalStatus === "COMPLETED"
-              ? "COMPLETED"
-              : "PARTIAL"
-            : watcherReconciliationStatus,
-        safeErrorCategory: safeRunErrorCategory,
-        status: finalStatus,
-        successfulActions: completedActions,
-      },
-      include: {
-        actions: {
-          orderBy: {
-            sequence: "asc",
-          },
-        },
-      },
-      where: {
-        id: executionRun.id,
-      },
-    });
-
-    await prisma.organizationPlan.update({
-      data:
-        finalStatus === "COMPLETED"
-          ? {
-              history: JSON.parse(
-                JSON.stringify(await appendPlanExecutedHistory(plan)),
-              ) as Prisma.InputJsonValue,
-              status: "EXECUTED",
-            }
-          : {},
-      where: {
-        id: plan.id,
-      },
-    });
-
-    const updatedPlan = await loadPlanForExecution(plan.id);
-
-    if (!updatedPlan) {
-      throw new BridgeExecutorError(
-        "The Librarian could not reload that organization plan.",
-        404,
-      );
-    }
-
-    try {
-      await recordExecutionNotebookEntry(updatedRun.id);
-    } catch {
-      // Notebook reflections should never block execution results.
-    }
-
-    return {
-      plan: summarizePlan(updatedPlan),
-      preview,
-      run: summarizeExecutionRun(updatedRun),
-    };
-  }
-
-  for (const action of resolvedActions) {
-    const actionRecord = actionRecordsBySequence.get(action.sequence);
-
-    if (!actionRecord) {
-      continue;
-    }
-
-    await prisma.executionAction.update({
-      data: {
-        startedAt: new Date(),
-        status: "RUNNING",
-      },
-      where: {
-        id: actionRecord.id,
-      },
-    });
-
-    try {
-      await assertActionStillSafe(rootPath, action, resolvedActions);
-      let createdFilesystemItem = false;
-      let destinationChecksumAfter: string | null = null;
-
-      if (action.actionType === "CREATE_FOLDER") {
-        const folderAlreadyExisted = Boolean(await pathExists(action.destinationPath));
-
-        await mkdir(action.destinationPath, { recursive: true });
-        createdFilesystemItem = !folderAlreadyExisted;
-      } else {
-        await executeFileAction(action);
-        destinationChecksumAfter = await updateScannedFileAfterAction(action);
-      }
-
-      completedActions += 1;
-      await prisma.executionAction.update({
-        data: {
-          completedAt: new Date(),
-          createdFilesystemItem,
-          destinationChecksumAfter,
-          sourceChecksumBefore: action.scannedFile?.checksum ?? null,
-          status: "COMPLETED",
-        },
-        where: {
-          id: actionRecord.id,
-        },
-      });
-    } catch (error) {
-      failedActions += 1;
-      safeRunErrorCategory = safeErrorCategory(error);
-      await prisma.executionAction.update({
-        data: {
-          completedAt: new Date(),
-          safeErrorCategory: safeRunErrorCategory,
-          status: "FAILED",
-        },
-        where: {
-          id: actionRecord.id,
-        },
-      });
-      break;
-    }
-  }
-
-  const finalStatus: ExecutionStatus =
-    failedActions > 0
-      ? completedActions > 0
-        ? "PARTIALLY_COMPLETED"
-        : "FAILED"
-      : "COMPLETED";
-  const executionCompletedAt = new Date();
-  const durationMs = Math.max(
-    0,
-    executionCompletedAt.getTime() - executionStartedAt.getTime(),
-  );
-  const [updatedRun, updatedPlan] = await prisma.$transaction([
-    prisma.executionRun.update({
-      data: {
-        completedActions,
-        completedAt: executionCompletedAt,
-        durationMs,
-        errorCategory: safeRunErrorCategory,
-        failedActions,
-        reconciliationStatus:
-          finalStatus === "COMPLETED"
-            ? "COMPLETED"
-            : completedActions > 0
-              ? "PARTIAL"
-              : "NOT_STARTED",
-        safeErrorCategory: safeRunErrorCategory,
-        status: finalStatus,
-        successfulActions: completedActions,
-      },
-      include: {
-        actions: {
-          orderBy: {
-            sequence: "asc",
-          },
-        },
-      },
-      where: {
-        id: executionRun.id,
-      },
-    }),
-    prisma.organizationPlan.update({
-      data:
-        finalStatus === "COMPLETED"
-          ? {
-              history: JSON.parse(
-                JSON.stringify(await appendPlanExecutedHistory(plan)),
-              ) as Prisma.InputJsonValue,
-              status: "EXECUTED",
-            }
-          : {},
-      include: {
-        executionRuns: {
-          include: {
-            actions: {
-              orderBy: {
-                sequence: "asc",
-              },
-            },
-            undoRuns: {
-              include: {
-                actions: {
-                  orderBy: {
-                    sequence: "asc",
-                  },
-                },
-              },
-              orderBy: {
-                startedAt: "desc",
-              },
-            },
-          },
-          orderBy: {
-            startedAt: "desc",
-          },
-        },
-        scanSession: {
-          select: {
-            connectedFolder: {
-              select: {
-                bridgeDevice: {
-                  select: {
-                    lastSeenAt: true,
-                    status: true,
-                  },
-                },
-                bridgeDeviceId: true,
-                bridgeRootId: true,
-                createFolderPermission: true,
-                id: true,
-                isEnabled: true,
-                localPath: true,
-                moveFilePermission: true,
-                readPermission: true,
-                renameFilePermission: true,
-                status: true,
-                watchPermission: true,
-              },
-            },
-            organizationSuggestions: {
-              select: {
-                id: true,
-                invalidatedAt: true,
-                recommendationGenerationId: true,
-                recommendationGenerationVersion: true,
-                scannedFile: {
-                  select: {
-                    checksum: true,
-                    id: true,
-                    lastModified: true,
-                    localPath: true,
-                    relativePath: true,
-                    sizeBytes: true,
-                  },
-                },
-              },
-            },
-            scannedFiles: {
-              select: {
-                checksum: true,
-                id: true,
-                lastModified: true,
-                localPath: true,
-                relativePath: true,
-                sizeBytes: true,
-              },
-            },
-          },
-        },
-      },
-      where: {
-        id: plan.id,
-      },
-    }),
-  ]);
-
-  try {
-    await recordExecutionNotebookEntry(updatedRun.id);
-  } catch {
-    // Notebook reflections should never block execution results.
-  }
-
-  return {
-    plan: summarizePlan(updatedPlan),
-    preview,
-    run: summarizeExecutionRun(updatedRun),
-  };
+  await executeLocalPhysicalRun(executionRun.id, false, { afterPhysical: options.afterPhysical });
+  const updatedRun = await prisma.executionRun.findUniqueOrThrow({ where: { id: executionRun.id },
+    include: { actions: { orderBy: { sequence: "asc" } }, undoRuns: { include: { actions: true } } } });
+  const updatedPlan = await loadPlanForExecution(plan.id);
+  if (!updatedPlan) throw new BridgeExecutorError("The Librarian could not reload that organization plan.", 404);
+  try { await recordExecutionNotebookEntry(updatedRun.id); } catch { /* Advisory reflection is recoverable from run history. */ }
+  return { plan: summarizePlan(updatedPlan), preview, run: summarizeExecutionRun(updatedRun) };
 }

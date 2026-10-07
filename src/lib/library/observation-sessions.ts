@@ -4,6 +4,7 @@ import { runOpenAIObservation } from "@/lib/ai/openai-observer";
 import { OpenAIProviderError } from "@/lib/ai/openai-client";
 import type { AIObservationResult } from "@/lib/ai/types";
 import { getPrismaClient } from "@/lib/db/prisma";
+import { isAuthorityConflict, lockAuthorityOwner, nextAuthorityTime } from "@/lib/db/authority";
 import { reconcileObservationKnowledge, refreshApprovedObservationRelationships } from "@/lib/bridge/persistent-knowledge";
 import { buildMemoryFromApprovedSession, invalidateCorrectedMemorySources } from "@/lib/library/memory";
 import {
@@ -553,7 +554,7 @@ export async function getObservationReviewQueueItems(): Promise<ReviewQueueItem[
   const prisma = getPrismaClient();
   const sessions = await prisma.observationSession.findMany({
     where: { status: "AWAITING_REVIEW" },
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     include: {
       libraryDocument: {
         select: {
@@ -596,7 +597,7 @@ export async function getObservationSessionReview(
         },
       },
       humanDecisions: {
-        orderBy: { createdAt: "desc" },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       },
     },
   });
@@ -650,6 +651,7 @@ export async function saveHumanDecision(
   }
 
   const result = await prisma.$transaction(async (tx) => {
+    await lockAuthorityOwner(tx, "ObservationSession", sessionId);
     const existingSession = await tx.observationSession.findUnique({
       where: { id: sessionId },
       select: {
@@ -666,15 +668,19 @@ export async function saveHumanDecision(
     }
 
     const latestDecision = await tx.humanDecision.findFirst({
-      orderBy: { createdAt: "desc" },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       where: { observationSessionId: sessionId },
     });
     const intendedStatus = decisionStatusFor(input.decisionType);
+    const priorAuthority = input.decisionType === "NOTE" ? latestDecision : await tx.humanDecision.findFirst({
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      where: { observationSessionId: sessionId, decisionType: { not: "NOTE" } },
+    });
 
     if (
-      latestDecision?.decisionType === input.decisionType &&
-      latestDecision.note === note &&
-      latestDecision.editedSuggestion === editedSuggestion &&
+      priorAuthority?.decisionType === input.decisionType &&
+      priorAuthority.note === note &&
+      priorAuthority.editedSuggestion === editedSuggestion &&
       (!intendedStatus || existingSession.status === intendedStatus)
     ) {
       // The identical decision's authority and reconciliation committed together.
@@ -682,7 +688,7 @@ export async function saveHumanDecision(
       // relationships published since that edit. Pending publication is resumed
       // below without regenerating the human decision or invalidating success.
       return {
-        decisionId: latestDecision.id,
+        decisionId: priorAuthority.id,
         status: existingSession.status as ObservationSessionStatus,
         reapproved: intendedStatus === "APPROVED" && await tx.humanDecision.count({
           where: { observationSessionId: sessionId, decisionType: { in: ["REJECT", "MODIFY"] } },
@@ -696,6 +702,7 @@ export async function saveHumanDecision(
         decisionType: input.decisionType,
         note,
         editedSuggestion,
+        createdAt: await nextAuthorityTime(tx, latestDecision?.createdAt),
       },
       select: {
         id: true,
@@ -714,7 +721,7 @@ export async function saveHumanDecision(
 
     const updatedSession = await tx.observationSession.update({
       where: { id: sessionId },
-      data: { status: nextStatus },
+      data: { status: nextStatus, memoryReconciliationStatus: `PENDING@${decision.id}` },
       select: { status: true },
     });
     await reconcileObservationKnowledge(tx, sessionId);
@@ -729,10 +736,23 @@ export async function saveHumanDecision(
       status: updatedSession.status as ObservationSessionStatus,
       reapproved: nextStatus === "APPROVED" && ["MODIFIED", "REJECTED"].includes(existingSession.status),
     };
+  }, { timeout: 120_000 }).catch((error: unknown) => {
+    if (isAuthorityConflict(error)) {
+      throw new ObservationSessionError("This observation changed during review. Refresh and try again.", 409);
+    }
+    throw error;
   });
   if (["APPROVED", "MODIFIED", "REJECTED"].includes(result.status)) {
-    await refreshApprovedObservationRelationships(sessionId);
+    try { await refreshApprovedObservationRelationships(sessionId); } catch {
+      // Review and publication admission committed together; polling recovers it.
+    }
   }
-  if (result.status === "REJECTED") await buildMemoryFromApprovedSession(sessionId);
-  return result;
+  let memoryUpdatedCount = 0;
+  if (["APPROVED", "MODIFIED", "REJECTED"].includes(result.status)) {
+    try { memoryUpdatedCount = await buildMemoryFromApprovedSession(sessionId); } catch {
+      // The authority result is committed. Its pending Memory generation survives
+      // a failed eager build and is retried by ordinary coordinator polling.
+    }
+  }
+  return { ...result, memoryUpdatedCount };
 }

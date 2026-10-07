@@ -10,7 +10,7 @@ import {
   type BridgeScannedFileDraft,
 } from "../types";
 import { bridgeRootUri, isPathInsideRoot, pathKey } from "./safety";
-import { requireRootPermission, updateRoot } from "../main/registry";
+import { requireRootPermission, updateRoot, withRootAuthority } from "../main/registry";
 import { extractImageMetadata } from "../../../src/lib/bridge/image-metadata";
 
 const supportedExtensions = new Map<string, string>([
@@ -283,6 +283,9 @@ export async function scanBridgeRoot(
   rootId: string,
   options: ScanBridgeRootOptions = {},
 ): Promise<BridgeFolderScanResult> {
+  return withRootAuthority(rootId, () => scanBridgeRootOwned(rootId, options));
+}
+async function scanBridgeRootOwned(rootId: string, options: ScanBridgeRootOptions): Promise<BridgeFolderScanResult> {
   const root = await requireRootPermission(rootId, "readPermission", "scan files");
   const startedAt = new Date();
   const files: BridgeScannedFileDraft[] = [];
@@ -311,7 +314,6 @@ export async function scanBridgeRoot(
 
   await updateRoot(rootId, {
     lastScanAt: completedAt.toISOString(),
-    status: "CONNECTED",
   });
 
   return {

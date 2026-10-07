@@ -1,3 +1,5 @@
+import { recoverMonitoringBatchesForDevice } from "./monitor";
+import { expireUnstartedCommands } from "./command-lifecycle";
 import type {
   BridgeCommandEnvelope,
   BridgeCommandType,
@@ -5,11 +7,13 @@ import type {
 } from "../../../packages/bridge-protocol/src";
 import { getPrismaClient } from "@/lib/db/prisma";
 
-import { recordBridgeHeartbeat } from "./cloud-coordinator";
+import { authorizedBridgeCommands, recordBridgeHeartbeat, BridgeCloudError } from "./cloud-coordinator";
 import { queueNextRemoteReadBatchForDevice } from "./remote-scan-queue";
 import { expireRemoteReadCommandsForSession } from "./remote-read-commands";
 import { recoverScanPublicationsForDevice } from "./scan-publication";
 import { recoverAbandonedObservationFilesForDevice } from "./observation-recovery";
+import { recoverPendingObservationMemory } from "@/lib/library/memory";
+import { recoverRecommendationBatchesForDevice } from "./scan-recommendation-batch";
 
 function bridgeJson(value: unknown): BridgeJson {
   return JSON.parse(JSON.stringify(value)) as BridgeJson;
@@ -45,13 +49,17 @@ function envelopeFromRow(row: {
   };
 }
 
-export async function fetchRecoverableBridgeCommands(bridgeDeviceId: string) {
+export async function fetchRecoverableBridgeCommands(bridgeDeviceId: string, expectedPublicKey?: string) {
   const prisma = getPrismaClient();
   const now = new Date();
 
-  await recordBridgeHeartbeat(bridgeDeviceId).catch(() => undefined);
+  await recordBridgeHeartbeat(bridgeDeviceId, {}, expectedPublicKey);
+  await recoverPendingObservationMemory();
+  await recoverRecommendationBatchesForDevice(bridgeDeviceId, now);
   await recoverAbandonedObservationFilesForDevice(bridgeDeviceId, now);
   await recoverScanPublicationsForDevice(bridgeDeviceId, now);
+  await recoverMonitoringBatchesForDevice(bridgeDeviceId);
+  await (await import("./execution-reconciliation")).recoverExecutionReconciliations({ bridgeDeviceId });
   const expiredReads = await prisma.bridgeCommand.findMany({
     select: { payload: true },
     where: {
@@ -77,24 +85,22 @@ export async function fetchRecoverableBridgeCommands(bridgeDeviceId: string) {
   }
 
   await queueNextRemoteReadBatchForDevice(bridgeDeviceId).catch(() => undefined);
-  await prisma.bridgeCommand.updateMany({
-    data: { status: "EXPIRED" },
-    where: {
-      bridgeDeviceId,
-      commandType: { not: "READ_FILE_TEMPORARILY" },
-      expiresAt: { lte: now },
-      status: { in: ["PENDING", "ACKNOWLEDGED", "RUNNING"] },
-    },
-  });
+  await expireUnstartedCommands(now, bridgeDeviceId);
 
   const rows = await prisma.bridgeCommand.findMany({
     orderBy: { issuedAt: "asc" },
     where: {
       bridgeDeviceId,
-      expiresAt: { gt: now },
-      status: { in: ["PENDING", "ACKNOWLEDGED", "RUNNING"] },
+      OR: [{ expiresAt: { gt: now }, status: { in: ["PENDING", "ACKNOWLEDGED", "RUNNING"] } },
+        { commandType: { in: ["EXECUTE_PLAN", "EXECUTE_UNDO"] }, status: { in: ["ACKNOWLEDGED", "RUNNING"] } }],
     },
   });
 
-  return rows.map(envelopeFromRow);
+  return prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${bridgeDeviceId} FOR SHARE`;
+    const device = await tx.bridgeDevice.findUnique({ where: { bridgeDeviceId } });
+    if (!device || device.revokedAt || device.status === "REVOKED" || (expectedPublicKey && device.publicKey !== expectedPublicKey))
+      throw new BridgeCloudError("Device authority changed before command delivery.", 401);
+    return (await authorizedBridgeCommands(rows, tx)).map(envelopeFromRow);
+  });
 }

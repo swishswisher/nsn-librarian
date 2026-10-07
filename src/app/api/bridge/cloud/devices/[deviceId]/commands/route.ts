@@ -12,13 +12,13 @@ export async function GET(
   const { deviceId } = await context.params;
 
   try {
-    await authenticateBridgeDeviceRequest({
+    const authenticated = await authenticateBridgeDeviceRequest({
       bridgeDeviceId: deviceId,
       request,
     });
 
     return Response.json({
-      commands: await fetchRecoverableBridgeCommands(deviceId),
+      commands: await fetchRecoverableBridgeCommands(deviceId, authenticated.publicKey),
       ok: true,
     });
   } catch (error) {

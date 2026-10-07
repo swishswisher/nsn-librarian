@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { Prisma } from "@prisma/client";
 
 import { currentMemorySourceRows, validMemorySourcesSql, curatedMemorySql, eligibleMemoryObservationSql, memoryReviewAuthoritySql } from "./memory-provenance";
@@ -275,6 +276,17 @@ function requiredMemorySources(value: Prisma.JsonValue) {
 
 function provenanceRequirement(sourceSessionIds: string[]) {
   return { kind: "MEMORY_PROVENANCE_REQUIRED", sourceSessionIds: [...new Set(sourceSessionIds)].sort() };
+}
+
+async function reviewBoundProvenanceRequirement(sourceSessionIds: string[], tx: Prisma.TransactionClient) {
+  const ids = [...new Set(sourceSessionIds)].sort();
+  const sourceAuthorities: Array<{ observationSessionId: string; decisionId: string | null }> = [];
+  for (let offset = 0; offset < ids.length; offset += 500) sourceAuthorities.push(...await tx.$queryRaw<typeof sourceAuthorities>(Prisma.sql`
+    SELECT observation.id AS "observationSessionId", (SELECT authority.id FROM "HumanDecision" authority
+      WHERE authority."observationSessionId" = observation.id AND ${memoryReviewAuthoritySql}
+      ORDER BY authority."createdAt" DESC, authority.id DESC LIMIT 1) AS "decisionId"
+    FROM "ObservationSession" observation WHERE observation.id IN (${Prisma.join(ids.slice(offset, offset + 500))}) ORDER BY observation.id`));
+  return { ...provenanceRequirement(ids), sourceAuthorities };
 }
 
 function collectSessionText(session: StoredSessionForMemory) {
@@ -816,6 +828,11 @@ async function attachMemorySources(candidate: MemoryCandidate, tx: Prisma.Transa
   const entry = await tx.memoryEntry.findUnique({ where: { memoryKey: candidate.memoryKey } });
   if (!entry || entry.status !== "ACTIVE") return false;
   const sourceIds = [...new Set([...requiredMemorySources(entry.evidence), ...candidate.sourceSessionIds])];
+  const boundRequirement = await reviewBoundProvenanceRequirement(sourceIds, tx);
+  const evidence = [...evidenceFromJson(entry.evidence), boundRequirement, ...correctionArchives(entry.evidence)];
+  if (!isDeepStrictEqual(entry.evidence, evidence)) await tx.memoryEntry.update({
+    where: { id: entry.id }, data: { evidence: toJsonInput(evidence) },
+  });
   const rows = await currentMemorySourceRows(tx, sourceIds);
   await tx.memorySearchSource.createMany({ data: rows.map((row) => ({ memoryEntryId: entry.id, ...row })), skipDuplicates: true });
   const covered = new Set(rows.map((row) => row.observationSessionId));
@@ -853,21 +870,28 @@ async function reconcileCorrectedMemory(
   prisma: Prisma.TransactionClient,
 ) {
   const entries = await prisma.memoryEntry.findMany({
-    where: { status: "ACTIVE", searchSources: { some: { observationSessionId: sessionId } } },
+    where: { status: "ACTIVE", OR: [
+      { searchSources: { some: { observationSessionId: sessionId } } },
+      { evidence: { array_contains: [{ kind: "MEMORY_PROVENANCE_REQUIRED", sourceSessionIds: [sessionId] }] } },
+    ] },
     include: { searchSources: true },
   });
   const prepared = sessions.map(prepareSession);
+  const preparedById = new Map(prepared.map((source) => [source.id, source]));
+  const sessionsById = new Map(sessions.map((source) => [source.id, source]));
   const aggregate = aggregateApprovedTerms(prepared);
   for (const entry of entries) {
     const support = new Map<string, MemoryCandidate>();
-    const sourceIds = new Set(entry.searchSources.map((source) => source.observationSessionId));
+    const sourceIds = new Set([...requiredMemorySources(entry.evidence), ...entry.searchSources.map((source) => source.observationSessionId)]);
     const current = candidates.get(entry.memoryKey);
     if (current) addCandidate(support, current);
-    for (const source of prepared.filter((item) => sourceIds.has(item.id) && item.id !== sessionId)) {
+    for (const sourceId of sourceIds) {
+      const source = preparedById.get(sourceId);
+      if (!source || sourceId === sessionId) continue;
       for (const candidate of [...termCandidatesForSession(source, aggregate), ...themeCandidatesForSession(source)]) {
         if (candidate.memoryKey === entry.memoryKey) addCandidate(support, candidate);
       }
-      const stored = sessions.find((item) => item.id === source.id);
+      const stored = sessionsById.get(source.id);
       if (stored?.status === "APPROVED" && entry.memoryType === "RELATIONSHIP") {
         for (const candidate of await relationshipCandidatesForSession(source.id, source.seenAt, prisma)) {
           if (candidate.memoryKey === entry.memoryKey) addCandidate(support, candidate);
@@ -908,8 +932,44 @@ async function reconcileCorrectedMemory(
 }
 
 export async function buildMemoryFromApprovedSession(sessionId: string) {
-  return getPrismaClient().$transaction((tx) => buildMemoryInTransaction(sessionId, tx),
-    { isolationLevel: "Serializable", timeout: 120_000 });
+  return getPrismaClient().$transaction(async (tx) => {
+    const result = await buildMemoryInTransaction(sessionId, tx);
+    const session = await tx.observationSession.findUnique({ where: { id: sessionId },
+      select: { memoryReconciliationStatus: true } });
+    const eligible = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT observation.id FROM "ObservationSession" observation WHERE observation.id = ${sessionId}
+        AND (observation.status = 'REJECTED' OR ${eligibleMemoryObservationSql})
+    `);
+    if (eligible.length && session?.memoryReconciliationStatus.startsWith("PENDING@")) {
+      await tx.observationSession.updateMany({ where: { id: sessionId,
+        memoryReconciliationStatus: session.memoryReconciliationStatus },
+      data: { memoryReconciliationStatus: `COMPLETED@${session.memoryReconciliationStatus.slice(8)}` } });
+    }
+    return result;
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
+}
+
+/** Durable review admission is independent of a route's successful response.
+ * Builder transactions re-read live authority and settle the exact generation. */
+export async function recoverPendingObservationMemory(limit = 10) {
+  const prisma = getPrismaClient();
+  const sessions = await prisma.$queryRaw<Array<{ id: string; generation: string }>>(Prisma.sql`
+    SELECT observation.id, observation."memoryReconciliationStatus" AS generation
+    FROM "ObservationSession" observation WHERE observation."memoryReconciliationStatus" LIKE 'PENDING@%'
+      AND (observation.status = 'REJECTED' OR ${eligibleMemoryObservationSql})
+    ORDER BY observation."updatedAt" ASC, observation.id ASC LIMIT ${Math.max(1, Math.min(limit, 20))}
+  `);
+  let recovered = 0;
+  for (const session of sessions) {
+    try { await buildMemoryFromApprovedSession(session.id); recovered += 1; } catch {
+      // Exact pending generation remains durable on rollback/authority conflict.
+      // Rotate failed work behind other eligible owners without changing authority.
+      await prisma.observationSession.updateMany({ where: { id: session.id,
+        memoryReconciliationStatus: session.generation },
+      data: { memoryReconciliationStatus: session.generation } }).catch(() => undefined);
+    }
+  }
+  return recovered;
 }
 
 async function buildMemoryInTransaction(sessionId: string, prisma: Prisma.TransactionClient) {

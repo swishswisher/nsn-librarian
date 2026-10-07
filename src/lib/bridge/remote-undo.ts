@@ -1,3 +1,7 @@
+import { physicalResultIndex } from "./physical-result-authority";
+import { requireExecutionReconciliation } from "./execution-reconciliation";
+import { Prisma } from "@prisma/client";
+import { isCurrentReadableRoot } from "./current-readable-root";
 import { randomUUID } from "node:crypto";
 
 import type {
@@ -5,7 +9,6 @@ import type {
   BridgeJson,
 } from "../../../packages/bridge-protocol/src";
 import { getPrismaClient } from "@/lib/db/prisma";
-import { recordUndoNotebookEntry } from "@/lib/library/notebook";
 
 import {
   BridgeCloudError,
@@ -57,21 +60,12 @@ function issue(input: {
   };
 }
 
-function undoStatus(value: unknown): UndoStatus {
-  return value === "COMPLETED" ||
-    value === "PARTIALLY_COMPLETED" ||
-    value === "FAILED" ||
-    value === "BLOCKED"
-    ? value
-    : "FAILED";
-}
-
 function deviceIsOnline(device: { lastSeenAt: Date | null; status: string } | null) {
   return bridgeDeviceIsOnline(device);
 }
 
-async function loadRemoteUndo(executionRunId: string) {
-  const prisma = getPrismaClient();
+async function loadRemoteUndo(executionRunId: string, transaction?: Prisma.TransactionClient) {
+  const prisma = transaction ?? getPrismaClient();
   const run = await prisma.executionRun.findUnique({
     include: {
       actions: { orderBy: { sequence: "desc" } },
@@ -119,9 +113,8 @@ async function loadRemoteUndo(executionRunId: string) {
 
   const blockingIssues: BridgeExecutionIssue[] = [];
   const warnings: BridgeExecutionIssue[] = [];
-  const completedActions = run.actions.filter(
-    (action) => action.status === "COMPLETED",
-  );
+  const restoredIds = new Set(run.undoRuns.flatMap((undo) => undo.actions.filter((action) => action.status === "COMPLETED").map((action) => action.originalExecutionActionId)));
+  const completedActions = run.actions.filter((action) => action.status === "COMPLETED" && !restoredIds.has(action.id));
   const scannedByPath = new Map(
     run.organizationPlan.scanSession.scannedFiles.map((file) => [
       file.relativePath,
@@ -167,7 +160,7 @@ async function loadRemoteUndo(executionRunId: string) {
     );
   }
 
-  if (!run.bridgeRootId || !deviceIsOnline(run.connectedLibrary.bridgeDevice)) {
+  if (!isCurrentReadableRoot(run.connectedLibrary) || !run.bridgeRootId || run.connectedLibrary.bridgeRootId !== run.bridgeRootId || run.connectedLibrary.bridgeDeviceId !== run.bridgeDeviceId || !deviceIsOnline(run.connectedLibrary.bridgeDevice)) {
     blockingIssues.push(
       issue({
         category: "BRIDGE_UNAVAILABLE",
@@ -254,7 +247,7 @@ async function loadRemoteUndo(executionRunId: string) {
       originalExecutionActionId: action.id,
       sequence: index + 1,
       sourceChecksum:
-        currentFile?.checksum ?? action.destinationChecksumAfter ?? null,
+        action.destinationChecksumAfter ?? action.sourceChecksumBefore ?? null,
       sourceLastModified: currentFile?.lastModified?.toISOString() ?? null,
       sourceRelativePath,
       sourceSizeBytes: currentFile?.sizeBytes?.toString() ?? null,
@@ -333,121 +326,44 @@ export async function queueRemoteExecutionUndo(
     );
   }
 
-  const loaded = await loadRemoteUndo(executionRunId);
-
-  if (!loaded) {
-    return null;
-  }
-
-  if (!loaded.preview.canUndo) {
-    throw new BridgeUndoError(
-      "The Bridge found safety issues that must be resolved before undo.",
-      422,
-      loaded.preview,
-    );
-  }
-
   const prisma = getPrismaClient();
-  const undoActionIds = loaded.actions.map(() =>
-    `undo_action_${randomUUID()}`,
-  );
-  const undoRun = await prisma.undoRun.create({
-    data: {
-      executionRunId,
-      status: "PENDING",
-      totalActions: loaded.actions.length,
-      actions: {
-        create: loaded.actions.map((action, index) => ({
-          actionType: action.actionType,
-          destinationRelativePath: action.destinationRelativePath,
-          id: undoActionIds[index],
-          originalExecutionActionId: action.originalExecutionActionId,
-          sequence: action.sequence,
-          sourceRelativePath: action.sourceRelativePath,
-          status: "PENDING",
-        })),
-      },
-    },
-  });
-  const commandActions = loaded.actions.map((action, index) => ({
-    ...action,
-    id: undoActionIds[index],
-  }));
-
-  try {
-    const command = await createBridgeCloudCommand({
-      authorizationContext: {
-        confirmation: "UNDO",
-        initiatedBy: "Deanne",
-        purpose: "Restore only the completed changes from this execution run.",
-        undoRunId: undoRun.id,
-      },
-      bridgeDeviceId: loaded.run.bridgeDeviceId as string,
-      bridgeRootId: loaded.run.bridgeRootId,
-      commandType: "EXECUTE_UNDO",
-      connectedLibraryId: loaded.run.connectedLibraryId,
-      idempotencyKey: `execute-undo:${executionRunId}:${undoRun.id}`,
-      payload: {
-        actions: commandActions,
-        executionRunId,
-        organizationPlanId: loaded.run.organizationPlanId,
-        scanSessionId: loaded.run.organizationPlan.scanSessionId,
-        undoRunId: undoRun.id,
-      },
-    });
-    const stored = await prisma.executionRun.findUnique({
-      include: {
-        actions: { orderBy: { sequence: "asc" } },
-        undoRuns: {
-          include: { actions: { orderBy: { sequence: "asc" } } },
-          orderBy: { startedAt: "desc" },
-        },
-      },
-      where: { id: executionRunId },
-    });
-
-    if (!stored) {
-      throw new BridgeCloudError(
-        "The Librarian could not refresh the queued Undo run.",
-        500,
-      );
-    }
-
-    const executionRun = summarizeExecutionRun(stored);
-
-    if (!executionRun.latestUndoRun) {
-      throw new BridgeCloudError(
-        "The Librarian could not refresh the queued Undo run.",
-        500,
-      );
-    }
-
-    return {
-      command,
-      executionRun,
-      preview: loaded.preview,
-      queuedUndo: true,
-      run: executionRun.latestUndoRun,
-      scanSessionId: loaded.run.organizationPlan.scanSessionId,
-    };
-  } catch (error) {
-    await prisma.undoRun.update({
-      data: {
-        completedAt: new Date(),
-        failedActions: loaded.actions.length,
-        safeErrorCategory: "BRIDGE_UNAVAILABLE",
-        status: "BLOCKED",
-      },
-      where: { id: undoRun.id },
-    });
-    throw error;
-  }
+  const admitted = await prisma.$transaction(async (tx) => {
+    const binding = await tx.executionRun.findUnique({ where: { id: executionRunId } });
+    if (!binding?.bridgeDeviceId) return null;
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${binding.bridgeDeviceId} FOR SHARE`);
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id = ${binding.connectedLibraryId} FOR SHARE`);
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "ExecutionRun" WHERE id = ${executionRunId} FOR UPDATE`);
+    const loaded = await loadRemoteUndo(executionRunId, tx);
+    if (!loaded) return null;
+    if (!loaded.preview.canUndo) throw new BridgeUndoError("Undo changed, is already active, or its current authorization is unavailable.", 409, loaded.preview);
+    const commandActions = loaded.actions.map((action) => ({ ...action, id: `undo_action_${randomUUID()}` }));
+    const undoRun = await tx.undoRun.create({ data: { executionRunId, status: "PENDING", totalActions: commandActions.length,
+      actions: { create: commandActions.map((action) => ({ actionType: action.actionType, destinationRelativePath: action.destinationRelativePath,
+        id: action.id, originalExecutionActionId: action.originalExecutionActionId, sequence: action.sequence,
+        sourceRelativePath: action.sourceRelativePath, status: "PENDING" })) },
+    } });
+    const command = await createBridgeCloudCommand({ authorizationContext: { confirmation: "UNDO", initiatedBy: "Deanne",
+        purpose: "Restore only the completed changes from this execution run.", undoRunId: undoRun.id },
+      bridgeDeviceId: loaded.run.bridgeDeviceId!, bridgeRootId: loaded.run.bridgeRootId, commandType: "EXECUTE_UNDO",
+      connectedLibraryId: loaded.run.connectedLibraryId, idempotencyKey: `execute-undo:${executionRunId}:${undoRun.id}`,
+      payload: { actions: commandActions, executionRunId, organizationPlanId: loaded.run.organizationPlanId,
+        scanSessionId: loaded.run.organizationPlan.scanSessionId, undoRunId: undoRun.id },
+    }, tx);
+    return { command, loaded };
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
+  if (!admitted) return null;
+  const stored = await prisma.executionRun.findUniqueOrThrow({ include: { actions: { orderBy: { sequence: "asc" } },
+    undoRuns: { include: { actions: { orderBy: { sequence: "asc" } } }, orderBy: [{ startedAt: "desc" }, { id: "desc" }] } }, where: { id: executionRunId } });
+  const executionRun = summarizeExecutionRun(stored);
+  return { command: admitted.command, executionRun, preview: admitted.loaded.preview, queuedUndo: true,
+    run: executionRun.latestUndoRun!, scanSessionId: admitted.loaded.run.organizationPlan.scanSessionId };
 }
 
 export async function applyRemoteUndoReport(input: {
   commandPayload: unknown;
   report: BridgeCommandReport;
-}) {
+}, transaction?: Prisma.TransactionClient): Promise<BridgeJson> {
+  if (!transaction) return getPrismaClient().$transaction((tx) => applyRemoteUndoReport(input, tx), { timeout: 120_000 });
   const payload = objectValue(input.commandPayload);
   const undoRunId = typeof payload?.undoRunId === "string" ? payload.undoRunId : null;
 
@@ -458,10 +374,16 @@ export async function applyRemoteUndoReport(input: {
     );
   }
 
-  const prisma = getPrismaClient();
+  const prisma = transaction;
+  const binding = await prisma.undoRun.findUniqueOrThrow({ where: { id: undoRunId } });
+  const rootBinding = await prisma.executionRun.findUniqueOrThrow({ where: { id: binding.executionRunId }, include: { connectedLibrary: true } });
+  if (rootBinding.connectedLibrary.bridgeDeviceId) await prisma.$queryRaw`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${rootBinding.connectedLibrary.bridgeDeviceId} FOR SHARE`;
+  await prisma.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE id = ${rootBinding.connectedLibraryId} FOR UPDATE`;
+  await prisma.$queryRaw(Prisma.sql`SELECT id FROM "ExecutionRun" WHERE id = ${binding.executionRunId} FOR UPDATE`);
+  await prisma.$queryRaw(Prisma.sql`SELECT id FROM "UndoRun" WHERE id = ${undoRunId} FOR UPDATE`);
   const undoRun = await prisma.undoRun.findUnique({
     include: {
-      actions: true,
+      actions: { include: { originalExecutionAction: true } },
       executionRun: {
         include: {
           organizationPlan: true,
@@ -478,30 +400,38 @@ export async function applyRemoteUndoReport(input: {
     );
   }
 
+  if (!["PENDING", "RUNNING"].includes(undoRun.status)) {
+    const stored = await prisma.executionRun.findUniqueOrThrow({ include: { actions: true, undoRuns: { include: { actions: true } } }, where: { id: undoRun.executionRunId } });
+    const summary = summarizeExecutionRun(stored);
+    return { executionRun: summary, run: summary.latestUndoRun, scanSessionId: undoRun.executionRun.organizationPlan.scanSessionId } as unknown as BridgeJson;
+  }
   const result = objectValue(input.report.result);
-  const resultActions = Array.isArray(result?.actions)
-    ? result.actions.map(objectValue).filter(Boolean)
-    : [];
+  const resultActions = physicalResultIndex(result?.actions, undoRun.actions.map((action) => ({ ...action,
+    checksum: action.originalExecutionAction.destinationChecksumAfter ?? action.originalExecutionAction.sourceChecksumBefore })));
+  await requireExecutionReconciliation(prisma, undoRun.executionRunId);
   const completedAt = new Date();
   let completedActions = 0;
   let failedActions = 0;
+  let pendingActions = 0;
 
   for (const action of undoRun.actions) {
-    const resultAction = resultActions.find(
-      (item) => item?.actionId === action.id,
-    );
+    const resultAction: Record<string, unknown> | undefined = action.status === "COMPLETED" ? { status: "COMPLETED", safeErrorCategory: null,
+      destinationChecksumAfter: action.originalExecutionAction.destinationChecksumAfter ?? action.originalExecutionAction.sourceChecksumBefore } : resultActions.get(action.id);
     const actionStatus =
-      resultAction?.status === "COMPLETED" ? "COMPLETED" : "FAILED";
+      resultAction?.status === "PENDING" && input.report.safeErrorCategory === "COMMAND_RECOVERY_REQUIRED" ? "PENDING"
+        : resultAction?.status === "COMPLETED" ? "COMPLETED" : "FAILED";
 
     if (actionStatus === "COMPLETED") {
       completedActions += 1;
+    } else if (actionStatus === "PENDING") {
+      pendingActions += 1;
     } else {
       failedActions += 1;
     }
 
     await prisma.undoAction.update({
       data: {
-        completedAt,
+        completedAt: actionStatus === "PENDING" ? null : completedAt,
         safeErrorCategory:
           typeof resultAction?.safeErrorCategory === "string"
             ? resultAction.safeErrorCategory
@@ -533,6 +463,8 @@ export async function applyRemoteUndoReport(input: {
               : undefined,
         },
         where: {
+          ...(action.originalExecutionAction.sourceScannedFileId ? { id: action.originalExecutionAction.sourceScannedFileId } : {}),
+          checksum: action.originalExecutionAction.destinationChecksumAfter ?? action.originalExecutionAction.sourceChecksumBefore,
           relativePath: action.sourceRelativePath,
           sessionId: undoRun.executionRun.organizationPlan.scanSessionId,
         },
@@ -540,13 +472,8 @@ export async function applyRemoteUndoReport(input: {
     }
   }
 
-  const innerStatus = undoStatus(result?.status);
-  const status: UndoStatus =
-    input.report.status === "COMPLETED"
-      ? innerStatus
-      : completedActions > 0
-        ? "PARTIALLY_COMPLETED"
-        : "FAILED";
+  const status: UndoStatus = pendingActions > 0 ? "RUNNING" : completedActions === undoRun.totalActions && failedActions === 0 && undoRun.totalActions > 0
+    ? "COMPLETED" : completedActions > 0 ? "PARTIALLY_COMPLETED" : "FAILED";
   const durationMs = Math.max(
     0,
     completedAt.getTime() - undoRun.startedAt.getTime(),
@@ -555,7 +482,7 @@ export async function applyRemoteUndoReport(input: {
   await prisma.undoRun.update({
     data: {
       completedActions,
-      completedAt,
+      completedAt: pendingActions ? null : completedAt,
       durationMs,
       failedActions,
       safeErrorCategory:
@@ -566,7 +493,7 @@ export async function applyRemoteUndoReport(input: {
     },
     where: { id: undoRun.id },
   });
-  await recordUndoNotebookEntry(undoRun.id);
+  await prisma.executionRun.update({ data: { reconciliationStatus: "REQUIRED" }, where: { id: undoRun.executionRunId } });
   const stored = await prisma.executionRun.findUnique({
     include: {
       actions: { orderBy: { sequence: "asc" } },
