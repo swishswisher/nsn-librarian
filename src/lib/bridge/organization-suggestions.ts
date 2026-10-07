@@ -1,7 +1,10 @@
+import { blockingPlanExecutionWhere } from "./plan-execution-authority";
+import { currentReadableRootWhere } from "./current-readable-root";
+import { eligibleMemorySql } from "@/lib/library/memory-provenance";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 
 import { getPrismaClient } from "@/lib/db/prisma";
@@ -110,6 +113,8 @@ type TopicRule = {
 };
 
 type SuggestionContext = {
+  authority: string;
+  preferenceVersions: Array<{ id: string; version: number }>;
   contentText: string;
   currentRelativePath: string;
   fileName: string;
@@ -2293,6 +2298,43 @@ function duplicateSignals(
   return [...new Set(signals)];
 }
 
+async function recommendationAuthority(fileId: string, tx?: Prisma.TransactionClient) {
+  const prisma = tx ?? getPrismaClient();
+  return prisma.scannedFile.findUnique({ where: { id: fileId }, select: {
+    checksum: true, relativePath: true, lastModified: true, libraryDocumentId: true,
+    readingStatus: true, extractionStatus: true, sourceUnavailableAt: true,
+    audioMetadata: { select: { updatedAt: true } }, imageMetadata: { select: { updatedAt: true } }, videoMetadata: { select: { updatedAt: true } },
+    libraryDocument: { select: { observationSessions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      select: { id: true, status: true, humanDecisions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        select: { id: true }, take: 1 } } } } },
+    organizationSuggestions: { orderBy: { id: "asc" }, where: { invalidatedAt: null },
+      select: { id: true, status: true, updatedAt: true } },
+  } });
+}
+
+async function recommendationMemory(analysisTerms: Set<string>, analysisText: string) {
+  const prisma = getPrismaClient();
+  type Row = { id: string; memoryType: string; title: string; description: string; evidence: Prisma.JsonValue;
+    occurrenceCount: number; lastSeen: Date };
+  const matches: Row[] = [], preferred: Row[] = [];
+  let cursor: Row | undefined;
+  do {
+    const page: Row[] = await prisma.$queryRaw(Prisma.sql`
+      SELECT memory.id, memory."memoryType", memory.title, memory.description, memory.evidence,
+        memory."occurrenceCount", memory."lastSeen" FROM "MemoryEntry" memory
+      WHERE ${eligibleMemorySql()} AND ${cursor ? Prisma.sql`
+        (memory."occurrenceCount", memory."lastSeen", memory.id) < (${cursor.occurrenceCount}::int, ${cursor.lastSeen.toISOString()}::timestamp, ${cursor.id})` : Prisma.sql`true`}
+      ORDER BY memory."occurrenceCount" DESC, memory."lastSeen" DESC, memory.id DESC LIMIT 200
+    `);
+    for (const entry of page) {
+      if (matches.length < 8 && activeMemoryMatches([entry], analysisTerms).length) matches.push(entry);
+      if (preferred.length < 8 && preferredTermsFromMemory([entry], analysisText).length) preferred.push(entry);
+    }
+    cursor = page.length === 200 ? page.at(-1) : undefined;
+  } while (cursor && (matches.length < 8 || preferred.length < 8));
+  return [...new Map([...matches, ...preferred].map((entry) => [entry.id, entry])).values()];
+}
+
 async function scannedFileContext(
   scannedFileId: string,
   contentText: string,
@@ -2302,6 +2344,7 @@ async function scannedFileContext(
     contentText = "";
   }
   const prisma = getPrismaClient();
+  const authority = JSON.stringify(await recommendationAuthority(scannedFileId));
   const scannedFile = await prisma.scannedFile.findUnique({
     include: {
       audioMetadata: {
@@ -2460,13 +2503,7 @@ async function scannedFileContext(
     reviewedObservationText: reviewedText,
   });
   const analysisTerms = new Set(tokenize(analysisText));
-  const memoryEntries = await prisma.memoryEntry.findMany({
-    orderBy: [{ occurrenceCount: "desc" }, { lastSeen: "desc" }],
-    take: 80,
-    where: {
-      status: "ACTIVE",
-    },
-  });
+  const memoryEntries = await recommendationMemory(analysisTerms, analysisText);
   const memoryMatches = activeMemoryMatches(memoryEntries, analysisTerms);
   const approvedPreferences = await applicableApprovedPreferences({
     connectedLibraryId: scannedFile.scanSession.connectedFolder.id,
@@ -2535,9 +2572,7 @@ async function scannedFileContext(
             },
           },
           where: {
-            id: {
-              in: duplicateTargetIds,
-            },
+            id: { in: duplicateTargetIds }, scanSession: { connectedFolder: currentReadableRootWhere },
           },
         })
       : [];
@@ -2614,6 +2649,8 @@ async function scannedFileContext(
   });
 
   return {
+    authority,
+    preferenceVersions: approvedPreferences.map(({ id, version }) => ({ id, version })),
     checksum: scannedFile.checksum,
     contentText,
     currentRelativePath: normalizeBridgeRelativePath(scannedFile.relativePath),
@@ -2817,6 +2854,18 @@ async function persistDrafts(
 
   await prisma.$transaction(
     async (transaction) => {
+      const file = await transaction.scannedFile.findFirst({ select: { id: true }, where: {
+        id: context.scannedFileId, scanSession: { connectedFolder: { ...currentReadableRootWhere, recommendationPermission: true } },
+      } });
+      if (file) await transaction.$executeRaw(Prisma.sql`UPDATE "ScannedFile" SET id = id WHERE id = ${context.scannedFileId}`);
+      if (!file || JSON.stringify(await recommendationAuthority(context.scannedFileId, transaction)) !== context.authority) {
+        throw new OrganizationSuggestionError("The source or its review changed during recommendation preparation. Retry with current information.", 409);
+      }
+      if (context.preferenceVersions.length) {
+        const valid = await transaction.organizationPreference.count({ where: { status: "APPROVED", disputedAt: null,
+          OR: context.preferenceVersions.map(({ id, version }) => ({ id, version })) } });
+        if (valid !== context.preferenceVersions.length) throw new OrganizationSuggestionError("An organization preference changed. Retry this recommendation.", 409);
+      }
       const activeSuggestions = await transaction.organizationSuggestion.findMany({
         include: {
           revisions: {
@@ -2876,6 +2925,9 @@ async function persistDrafts(
         },
       });
 
+      await disputePreferencesFromDecisions(activeSuggestions.filter((item) => item.status !== "PENDING")
+        .map((item) => item.id), transaction);
+
       if (cleanedDrafts.length > 0) {
         await transaction.organizationSuggestion.createMany({
           data: cleanedDrafts.map((draft) => {
@@ -2912,7 +2964,7 @@ async function persistDrafts(
       }
     },
     {
-      timeout: 15_000,
+      timeout: 120_000, isolationLevel: "Serializable",
     },
   );
 
@@ -2960,6 +3012,7 @@ export async function generateOrganizationSuggestionsForScannedFileWithText(
   options: {
     replaceChecksumBootstrap?: boolean;
     workingKnowledge?: ScanWorkingKnowledgeIndex;
+    beforePersist?: () => Promise<void>;
   } = {},
 ) {
   const prisma = getPrismaClient();
@@ -3011,6 +3064,7 @@ export async function generateOrganizationSuggestionsForScannedFileWithText(
     options.workingKnowledge,
   );
   const drafts = buildDrafts(context);
+  await options.beforePersist?.();
   const result = await persistDrafts(context, drafts, {
     replaceChecksumBootstrap: options.replaceChecksumBootstrap,
   });
@@ -3200,70 +3254,72 @@ export async function prepareOrganizationRecommendationRegeneration(
     );
   }
 
-  const session = await prisma.scanSession.findUnique({
-    select: {
-      id: true,
-      organizationSuggestions: {
-        select: {
-          id: true,
-          status: true,
-        },
-        where: {
-          invalidatedAt: null,
+  return prisma.$transaction(async (tx) => {
+    const session = await tx.scanSession.findUnique({
+      select: {
+        id: true,
+        organizationSuggestions: {
+          select: {
+            id: true,
+            status: true,
+          },
+          where: {
+            invalidatedAt: null,
+          },
         },
       },
-    },
-    where: {
-      id: normalizedScanSessionId,
-    },
-  });
-
-  if (!session) {
-    throw new OrganizationSuggestionError(
-      "The Librarian could not find that scan session.",
-      404,
-    );
-  }
-
-  const reviewedRecommendationCount = session.organizationSuggestions.filter(
-    (suggestion) => normalizeSuggestionStatus(suggestion.status) !== "PENDING",
-  ).length;
-
-  if (reviewedRecommendationCount > 0 && !options.confirmedReviewedDecisions) {
-    throw new OrganizationSuggestionError(
-      "This scan has reviewed recommendations. Confirm regeneration to keep those decisions in history and prepare a new set for review.",
-      409,
-    );
-  }
-
-  const invalidatedAt = new Date();
-  const superseded = await prisma.organizationSuggestion.updateMany({
-    data: {
-      invalidatedAt,
-      invalidatedReason:
-        reviewedRecommendationCount > 0
-          ? "This recommendation was retained in history after Deanne confirmed a new recommendation pass."
-          : "This pending recommendation was superseded by a new recommendation pass.",
-    },
-    where: {
-      id: {
-        in: session.organizationSuggestions.map((suggestion) => suggestion.id),
+      where: {
+        id: normalizedScanSessionId,
       },
-      invalidatedAt: null,
-      scanSessionId: normalizedScanSessionId,
-    },
-  });
+    });
 
-  await disputePreferencesFromDecisions(
-    session.organizationSuggestions
-      .filter((suggestion) => suggestion.status !== "PENDING")
-      .map((suggestion) => suggestion.id),
-  );
+    if (!session) {
+      throw new OrganizationSuggestionError(
+        "The Librarian could not find that scan session.",
+        404,
+      );
+    }
 
-  return {
-    reviewedRecommendationCount,
-    supersededRecommendationCount: superseded.count,
-  };
+    const reviewedRecommendationCount = session.organizationSuggestions.filter(
+      (suggestion) => normalizeSuggestionStatus(suggestion.status) !== "PENDING",
+    ).length;
+
+    if (reviewedRecommendationCount > 0 && !options.confirmedReviewedDecisions) {
+      throw new OrganizationSuggestionError(
+        "This scan has reviewed recommendations. Confirm regeneration to keep those decisions in history and prepare a new set for review.",
+        409,
+      );
+    }
+
+    const invalidatedAt = new Date();
+    const superseded = await tx.organizationSuggestion.updateMany({
+      data: {
+        invalidatedAt,
+        invalidatedReason:
+          reviewedRecommendationCount > 0
+            ? "This recommendation was retained in history after Deanne confirmed a new recommendation pass."
+            : "This pending recommendation was superseded by a new recommendation pass.",
+      },
+      where: {
+        id: {
+          in: session.organizationSuggestions.map((suggestion) => suggestion.id),
+        },
+        invalidatedAt: null,
+        scanSessionId: normalizedScanSessionId,
+      },
+    });
+
+    await disputePreferencesFromDecisions(
+      session.organizationSuggestions
+        .filter((suggestion) => suggestion.status !== "PENDING")
+        .map((suggestion) => suggestion.id), tx,
+    );
+
+    return {
+      reviewedRecommendationCount,
+      supersededRecommendationCount: superseded.count,
+    };
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
 }
 
 export async function getOrganizationSuggestionsForConnectedLibraries(take = 160) {
@@ -3286,9 +3342,10 @@ export async function getOrganizationSuggestionsForConnectedLibraries(take = 160
         },
       },
     },
-    orderBy: [{ status: "asc" }, { createdAt: "desc" }],
+    orderBy: [{ status: "asc" }, { createdAt: "desc" }, { id: "desc" }],
     take,
     where: {
+      scanSession: { connectedFolder: currentReadableRootWhere },
       invalidatedAt: null,
       recommendationGenerationVersion: currentRecommendationGenerationVersion,
     },
@@ -3653,56 +3710,24 @@ export async function resetOrganizationSuggestionDecision(
     );
   }
 
-  const existing = await storedSuggestionById(suggestionId);
-
-  if (!existing) {
-    throw new OrganizationSuggestionError(
-      "The Librarian could not find that organization suggestion.",
-      404,
-    );
-  }
-
-  if (existing.scanSessionId !== normalizedScanSessionId) {
-    throw new OrganizationSuggestionError(
-      "The Librarian could not find that recommendation in this scan session.",
-      404,
-    );
-  }
-
-  if (normalizeSuggestionStatus(existing.status) !== "PENDING") {
-    await prisma.$transaction([
-      prisma.organizationSuggestion.update({
-        data: {
-          reviewedAt: null,
-          status: "PENDING",
-        },
-        where: {
-          id: suggestionId,
-        },
-      }),
-      prisma.organizationPlan.updateMany({
-        data: {
-          status: "CANCELLED",
-        },
-        where: {
-          scanSessionId: normalizedScanSessionId,
-          status: {
-            in: ["DRAFT", "READY_FOR_EXECUTION"],
-          },
-        },
-      }),
-      prisma.organizationSuggestionDecisionEvent.create({
-        data: {
-          action: "RESET",
-          nextStatus: "PENDING",
-          previousStatus: existing.status,
-          scanSessionId: normalizedScanSessionId,
-          suggestionId,
-        },
-      }),
-    ]);
-    await disputePreferencesFromDecisions([suggestionId]);
-  }
+  await prisma.$transaction(async (tx) => {
+    const existing = await tx.organizationSuggestion.findUnique({ where: { id: suggestionId } });
+    if (!existing || existing.scanSessionId !== normalizedScanSessionId) {
+      throw new OrganizationSuggestionError("The Librarian could not find that recommendation in this scan session.", 404);
+    }
+    if (existing.invalidatedAt) throw new OrganizationSuggestionError("This recommendation is historical.", 409);
+    if (normalizeSuggestionStatus(existing.status) === "PENDING") return;
+    await tx.organizationSuggestion.update({ data: { reviewedAt: null, status: "PENDING" }, where: { id: suggestionId } });
+    await tx.organizationPlan.updateMany({ data: { status: "CANCELLED" }, where: {
+      scanSessionId: normalizedScanSessionId, status: { in: ["DRAFT", "READY_FOR_EXECUTION"] },
+        executionRuns: { none: blockingPlanExecutionWhere },
+    } });
+    await tx.organizationSuggestionDecisionEvent.create({ data: {
+      action: "RESET", nextStatus: "PENDING", previousStatus: existing.status,
+      scanSessionId: normalizedScanSessionId, suggestionId,
+    } });
+    await disputePreferencesFromDecisions([suggestionId], tx);
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
 
   await recordChecksumDuplicateSuggestionsForSession(normalizedScanSessionId);
 
@@ -3747,46 +3772,22 @@ export async function resetOrganizationSuggestionDecisionsForScanSession(
     );
   }
 
-  const reviewed = await prisma.organizationSuggestion.findMany({
-    select: { id: true, status: true },
-    where: { scanSessionId: normalizedScanSessionId, status: { not: "PENDING" } },
-  });
-  const [cancelledPlans, result] = await prisma.$transaction([
-    prisma.organizationPlan.updateMany({
-      data: {
-        status: "CANCELLED",
-      },
-      where: {
-        scanSessionId: normalizedScanSessionId,
-        status: {
-          in: ["DRAFT", "READY_FOR_EXECUTION"],
-        },
-      },
-    }),
-    prisma.organizationSuggestion.updateMany({
-      data: {
-        reviewedAt: null,
-        status: "PENDING",
-      },
-      where: {
-        scanSessionId: normalizedScanSessionId,
-        status: {
-          not: "PENDING",
-        },
-      },
-    }),
-    prisma.organizationSuggestionDecisionEvent.createMany({
-      data: reviewed.map((item) => ({
-        action: "RESET",
-        nextStatus: "PENDING",
-        previousStatus: item.status,
-        scanSessionId: normalizedScanSessionId,
-        suggestionId: item.id,
-      })),
-    }),
-  ]);
-
-  await disputePreferencesFromDecisions(reviewed.map((item) => item.id));
+  const { cancelledPlans, result } = await prisma.$transaction(async (tx) => {
+    const reviewed = await tx.organizationSuggestion.findMany({ select: { id: true, status: true },
+      where: { scanSessionId: normalizedScanSessionId, invalidatedAt: null, status: { not: "PENDING" } } });
+    const cancelledPlans = await tx.organizationPlan.updateMany({ data: { status: "CANCELLED" }, where: {
+      scanSessionId: normalizedScanSessionId, status: { in: ["DRAFT", "READY_FOR_EXECUTION"] },
+        executionRuns: { none: blockingPlanExecutionWhere },
+    } });
+    const result = await tx.organizationSuggestion.updateMany({ data: { reviewedAt: null, status: "PENDING" },
+      where: { id: { in: reviewed.map((item) => item.id) }, invalidatedAt: null, status: { not: "PENDING" } } });
+    await tx.organizationSuggestionDecisionEvent.createMany({ data: reviewed.map((item) => ({
+      action: "RESET", nextStatus: "PENDING", previousStatus: item.status,
+      scanSessionId: normalizedScanSessionId, suggestionId: item.id,
+    })) });
+    await disputePreferencesFromDecisions(reviewed.map((item) => item.id), tx);
+    return { cancelledPlans, result };
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
 
   await recordChecksumDuplicateSuggestionsForSession(normalizedScanSessionId);
 

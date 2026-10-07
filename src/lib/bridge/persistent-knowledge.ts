@@ -6,8 +6,9 @@ import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
 import { getPrismaClient } from "@/lib/db/prisma";
 
 import { compareDocumentVersions, documentSignalVersion, extractDocumentSignals } from "./document-signals";
+import { currentReadableRootWhere, currentReadableRootSelect, isCurrentReadableRoot } from "./current-readable-root";
 import { currentKnowledgeFile, latestKnowledgeSnapshot, readableKnowledgeRoot } from "./current-knowledge-query";
-import { invalidateDocumentScanPublications, publishScanDerivedKnowledge } from "./scan-publication";
+import { invalidateDocumentScanPublications, invalidateRootSearchPublication, publishScanDerivedKnowledge } from "./scan-publication";
 import { RelationshipCandidatePool } from "./relationship-candidate-pool";
 import { countKnowledgeWork, type KnowledgeWork } from "./knowledge-work";
 import { semanticVersionMembers, versionDominanceCounts, versionEndpoint } from "./document-version-index";
@@ -370,8 +371,7 @@ export async function refreshApprovedObservationRelationships(observationSession
     select: { sessionId: true, scanSession: { select: { connectedFolderId: true } } },
     where: { libraryDocumentId: observation.libraryDocumentId, scanSession: {
       ...usableScanSnapshotWhere,
-      connectedFolder: { isEnabled: true, readPermission: true, status: "CONNECTED",
-        disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null },
+      connectedFolder: currentReadableRootWhere,
     } },
   });
   const latestByRoot = new Map<string, string>();
@@ -593,17 +593,13 @@ export async function persistScanWorkingKnowledge(index: ScanWorkingKnowledgeInd
     select: {
       connectedFolderId: true,
       status: true,
-      connectedFolder: { select: { isEnabled: true, readPermission: true, status: true, disconnectedAt: true,
-        hiddenFromActiveListAt: true, mergedAt: true, canonicalConnectedLibraryId: true } },
+      connectedFolder: { select: currentReadableRootSelect },
     },
     where: { id: index.scanSessionId },
   });
 
   if (!session) return 0;
-  const rootActive = session.connectedFolder.isEnabled && session.connectedFolder.readPermission &&
-    session.connectedFolder.status === "CONNECTED" && !session.connectedFolder.disconnectedAt &&
-    !session.connectedFolder.hiddenFromActiveListAt && !session.connectedFolder.mergedAt &&
-    !session.connectedFolder.canonicalConnectedLibraryId;
+  const rootActive = isCurrentReadableRoot(session.connectedFolder);
   if (!rootActive) {
     await prisma.knowledgeConnection.updateMany({ data: { supersededAt: new Date() }, where: {
       generationVersion: { in: [relationshipGenerationVersion, documentSignalVersion] },
@@ -1146,8 +1142,7 @@ export async function earlierRelationshipContext(input: {
   const prisma = getPrismaClient();
   const library = await prisma.connectedLibrary.findFirst({
     select: { id: true },
-    where: { id: input.connectedLibraryId, isEnabled: true, readPermission: true, status: "CONNECTED",
-      disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null },
+    where: { id: input.connectedLibraryId, ...currentReadableRootWhere },
   });
   if (!library) return [];
   const moveCandidate = await prisma.executionAction.findFirst({
@@ -1164,9 +1159,10 @@ export async function earlierRelationshipContext(input: {
   });
   const moves = moveCandidate ? await knownExecutedMoves(input.connectedLibraryId) : [];
   const fileKey = fileKeyAfterKnownMoves(input.connectedLibraryId, input.relativePath, input.checksum, moves);
-  const connections = await prisma.knowledgeConnection.findMany({
+  const loadPage = (cursor?: string) => prisma.knowledgeConnection.findMany({
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-    take: 8,
+    take: 100,
     where: {
       createdAt: { lt: input.scanStartedAt },
       generationVersion: { in: [relationshipGenerationVersion, documentSignalVersion] },
@@ -1179,19 +1175,27 @@ export async function earlierRelationshipContext(input: {
       ],
     },
   });
-  return connections.flatMap((connection) => {
+  const result: Array<{ relationshipKind: string | null; relativePath: string; supportingTopics: string[] }> = [];
+  let cursor: string | undefined;
+  do {
+    const connections = await loadPage(cursor);
+    for (const connection of connections) {
     const evidence = connection.sourceEvidence;
-    if (!evidence || Array.isArray(evidence) || typeof evidence !== "object") return [];
+    if (!evidence || Array.isArray(evidence) || typeof evidence !== "object") continue;
     const sourceIsCurrent = connection.sourceFileKey === fileKey;
     const otherPath = sourceIsCurrent ? evidence.targetRelativePath : evidence.sourceRelativePath;
     const topics = evidence.supportingTopics;
-    if (typeof otherPath !== "string" || !Array.isArray(topics)) return [];
-    return [{
+    if (typeof otherPath !== "string" || !Array.isArray(topics)) continue;
+    result.push({
       relationshipKind: connection.relationshipKind,
       relativePath: otherPath,
       supportingTopics: topics.filter((topic): topic is string => typeof topic === "string"),
-    }];
-  }).slice(0, 3);
+    });
+    if (result.length === 3) break;
+    }
+    cursor = connections.length === 100 ? connections.at(-1)?.id : undefined;
+  } while (result.length < 3 && cursor);
+  return result;
 }
 
 type KnowledgePageCursor = { id: string; lastSeenAt: Date | null };
@@ -1366,6 +1370,13 @@ async function currentSnapshotSignals<T extends { connectedLibraryId: string; ch
   return signals.filter((signal) => present.has(`${signal.connectedLibraryId}\0${normalizePhysicalRelativePath(signal.relativePath)}\0${signal.checksum}`));
 }
 
+function relationshipReviewConflict(error: unknown) {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const failure = error as { code: unknown; meta?: { code?: unknown } };
+  return failure.code === "P2034" || (failure.code === "P2010" &&
+    (failure.meta?.code === "40001" || failure.meta?.code === "40P01"));
+}
+
 async function supersedeCompetingCorrections(tx: Prisma.TransactionClient, selected: {
   id?: string; relationshipKind: string | null; sourceFileKey: string | null; sourceChecksum: string | null;
 }) {
@@ -1401,9 +1412,7 @@ export async function reviewPersistentRelationship(id: string, action: "CONFIRM"
       throw new RelationshipReviewError("The source library could not be verified.", 409);
     }
     const library = await tx.connectedLibrary.findFirst({ select: { id: true }, where: {
-      id: libraryId, isEnabled: true, readPermission: true, status: "CONNECTED",
-      disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null,
-      canonicalConnectedLibraryId: null,
+      id: libraryId, ...currentReadableRootWhere
     } });
     if (!library) throw new RelationshipReviewError("This library is not available for relationship review.", 409);
     const sourcePath = typeof evidence.sourceRelativePath === "string" ? evidence.sourceRelativePath : null;
@@ -1419,6 +1428,7 @@ export async function reviewPersistentRelationship(id: string, action: "CONFIRM"
         )) {
       throw new RelationshipReviewError("The supporting files are no longer in the latest scan. This relationship is now historical.", 409);
     }
+    await invalidateRootSearchPublication(tx, libraryId);
     const status = action === "CONFIRM" ? "CONFIRMED" : action === "SEPARATE" ? "REJECTED" : "NEW";
     if (action === "CONFIRM" && connection.generationVersion === humanIdentityCorrectionVersion) {
       await supersedeCompetingCorrections(tx, connection);
@@ -1456,7 +1466,7 @@ export async function reviewPersistentRelationship(id: string, action: "CONFIRM"
     });
     return tx.knowledgeConnection.findUniqueOrThrow({ where: { id } });
   }, { isolationLevel: "Serializable" }).catch((error: unknown) => {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "P2034") {
+    if (relationshipReviewConflict(error)) {
       throw new RelationshipReviewError("This relationship changed during review. Refresh and try again.", 409);
     }
     throw error;
@@ -1545,9 +1555,7 @@ export async function createIdentityCorrection(input: {
       throw new RelationshipReviewError("Choose distinct, current files in the same connected library.", 409);
     }
     const library = await tx.connectedLibrary.findFirst({ select: { id: true }, where: {
-      id: source.connectedLibraryId, isEnabled: true, readPermission: true, status: "CONNECTED",
-      disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null,
-      canonicalConnectedLibraryId: null,
+      id: source.connectedLibraryId, ...currentReadableRootWhere
     } });
     if (!library) {
       throw new RelationshipReviewError("This library is not available for relationship correction.", 409);
@@ -1591,6 +1599,7 @@ export async function createIdentityCorrection(input: {
         409,
       );
     }
+    await invalidateRootSearchPublication(tx, source.connectedLibraryId);
     // Submitting an exact human correction is an intentional later rejoin.
     // Retire an older generated SEPARATE boundary before resolving the target's
     // canonical class. A separation saved later remains active and wins.
@@ -1740,7 +1749,7 @@ export async function createIdentityCorrection(input: {
     });
     return connection;
   }, { isolationLevel: "Serializable" }).catch((error: unknown) => {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "P2034") {
+    if (relationshipReviewConflict(error)) {
       throw new RelationshipReviewError("The relationship changed during review. Refresh and try again.", 409);
     }
     throw error;
@@ -1757,15 +1766,13 @@ export type HistoricalDocumentSignalEntry = {
 /** One root-scoped adjacency index serves refresh and targeted signal resolution.
  * Every edge is loaded once in bounded pages; every reachable endpoint is queued
  * once, regardless of database order, cycles or correction direction. */
-export async function getIdentityCorrectionComponent(seeds: HistoricalDocumentSignalEntry[], work?: KnowledgeWork) {
-  const prisma = getPrismaClient();
+export async function getIdentityCorrectionComponent(seeds: HistoricalDocumentSignalEntry[], work?: KnowledgeWork, publicationTx?: Prisma.TransactionClient) {
+  const prisma = publicationTx ?? getPrismaClient();
   const rootIds = [...new Set(seeds.map((entry) => entry.connectedLibraryId))].sort();
   const allowed = new Set<string>();
   for (let offset = 0; offset < rootIds.length; offset += 500) {
     for (const root of await prisma.connectedLibrary.findMany({ select: { id: true }, where: {
-      id: { in: rootIds.slice(offset, offset + 500) }, isEnabled: true, readPermission: true,
-      status: "CONNECTED", disconnectedAt: null, hiddenFromActiveListAt: null,
-      mergedAt: null, canonicalConnectedLibraryId: null,
+      id: { in: rootIds.slice(offset, offset + 500) }, ...currentReadableRootWhere
     } })) allowed.add(root.id);
   }
   const endpoints = new Map<string, HistoricalDocumentSignalEntry>();
@@ -1830,8 +1837,7 @@ export async function getEligibleDocumentSignals(permittedRootIds?: string[], op
   const libraries = await prisma.connectedLibrary.findMany({
     select: { id: true },
     where: { ...(permittedRootIds ? { id: { in: permittedRootIds } } : {}),
-      isEnabled: true, readPermission: true, status: "CONNECTED", disconnectedAt: null,
-      hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null },
+      ...currentReadableRootWhere },
   });
   const libraryIds = libraries.map((library) => library.id);
   const historicalEntries = options?.historicalEntries.filter((entry) => !entry.isCurrent) ?? [];
@@ -1894,7 +1900,7 @@ export async function getEffectiveDocumentSignals(permittedRootIds?: string[], o
   if (scopedEntries?.length) {
     const permittedRoots = permittedRootIds ? new Set(permittedRootIds) : null;
     scopedEntries = await getIdentityCorrectionComponent(scopedEntries.filter((entry) =>
-      !permittedRoots || permittedRoots.has(entry.connectedLibraryId)), work);
+      !permittedRoots || permittedRoots.has(entry.connectedLibraryId)), work, publicationTx);
   }
   const rows = await getEligibleDocumentSignals(permittedRootIds,
     options ? { ...options, scopedEntries } : undefined, publicationTx);
@@ -1992,9 +1998,7 @@ export async function getPersistentIdentityGroups(work?: KnowledgeWork) {
   const libraryIds = [...new Set(rows.map((row) => row.connectedLibraryId))];
   const libraries = await prisma.connectedLibrary.findMany({
     select: { displayName: true, id: true },
-    where: { id: { in: libraryIds }, isEnabled: true, readPermission: true,
-      status: "CONNECTED", disconnectedAt: null, hiddenFromActiveListAt: null,
-      mergedAt: null, canonicalConnectedLibraryId: null },
+    where: { id: { in: libraryIds }, ...currentReadableRootWhere },
   });
   const byLibrary = new Map(libraries.map((library) => [library.id, library]));
   const rejected: Array<{ id: string; sourceChecksum: string | null; sourceEvidence: Prisma.JsonValue;

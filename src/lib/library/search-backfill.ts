@@ -3,6 +3,7 @@ import { Prisma } from "@prisma/client";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { loadScanWorkingKnowledge } from "@/lib/bridge/scan-working-knowledge";
 import { publishScanDerivedKnowledge } from "@/lib/bridge/scan-publication";
+import { withCurrentScanPublication } from "@/lib/bridge/scan-publication-lock";
 import { indexScanKnowledge, librarySearchIndexVersion } from "./search-index";
 
 export const searchBackfillBatchSize = 20;
@@ -33,9 +34,9 @@ export async function getSearchBackfillProgress(sessionId: string) {
 
 export async function indexOneFile(sessionId: string, fileId: string,
   stats: { reused: number; resolvedSignals?: number } = { reused: 0 }): Promise<"INDEXED" | "REUSED"> {
-  const count = await indexScanKnowledge(
-    await loadScanWorkingKnowledge(sessionId, [fileId]), [fileId], stats,
-  );
+  const count = await withCurrentScanPublication(sessionId, async (tx) => indexScanKnowledge(
+    await loadScanWorkingKnowledge(sessionId, [fileId], tx), [fileId], stats, tx,
+  ));
   if (count !== 1) throw new Error("File could not be indexed");
   return stats.reused ? "REUSED" : "INDEXED";
 }
@@ -81,7 +82,15 @@ export async function prepareSearchBatch(
     const progress = await getSearchBackfillProgress(sessionId);
     return { ...progress, completed: false, claimedFiles: 0, processedFiles: 0, waitingForClaims: true };
   }
-  await prisma.scanSession.update({ data: { searchIndexStatus: "PREPARING" }, where: { id: sessionId } });
+  const started = await withCurrentScanPublication(sessionId, async (tx, current) => {
+    if (current.knowledgePersistenceStatus !== "COMPLETED") return false;
+    if (current.searchIndexStatus !== "COMPLETED") await tx.scanSession.update({
+      data: { searchIndexStatus: "PREPARING" }, where: { id: sessionId },
+    });
+    return true;
+  });
+  if (!started) return { ...await getSearchBackfillProgress(sessionId), completed: false,
+    claimedFiles: 0, processedFiles: 0, waitingForClaims: true };
   const files = await prisma.scannedFile.findMany({
     take: searchBackfillBatchSize * 3, orderBy: { id: "asc" }, select: { id: true },
     where: { sessionId, ...eligible, searchBackfillFiles: { none: {
@@ -119,17 +128,22 @@ export async function prepareSearchBatch(
     });
     processedCount += saved.count;
   }
-  const progress = await getSearchBackfillProgress(sessionId);
+  let progress = await getSearchBackfillProgress(sessionId);
   if (progress.remaining === 0) {
-    if (progress.completed) await prisma.librarySearchEntry.updateMany({
-      data: { isCurrent: false },
-      where: { scanSessionId: { not: sessionId }, connectedLibrary: {
-        scanSessions: { some: { id: sessionId } },
-      }, isCurrent: true },
+    const settled = await withCurrentScanPublication(sessionId, async (tx, current) => {
+      if (current.knowledgePersistenceStatus !== "COMPLETED") return false;
+      if (progress.completed) await tx.librarySearchEntry.updateMany({
+        data: { isCurrent: false },
+        where: { scanSessionId: { not: sessionId }, connectedLibraryId: current.connectedFolderId, isCurrent: true },
+      });
+      const status = progress.completed ? "COMPLETED" : "INCOMPLETE";
+      // A completed full publication wins over partial/failed backfill bookkeeping.
+      if (current.searchIndexStatus !== "COMPLETED") await tx.scanSession.update({
+        data: { searchIndexStatus: status }, where: { id: sessionId },
+      });
+      return true;
     });
-    await prisma.scanSession.update({ data: {
-      searchIndexStatus: progress.completed ? "COMPLETED" : "INCOMPLETE",
-    }, where: { id: sessionId } });
+    if (!settled) progress = { ...progress, completed: false };
   }
   const activeClaims = progress.remaining > 0 && processedCount === 0
     ? await prisma.librarySearchBackfillFile.count({ where: {

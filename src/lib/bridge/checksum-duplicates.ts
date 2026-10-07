@@ -1,6 +1,8 @@
+import { currentReadableRootWhere, currentReadableRootSql } from "./current-readable-root";
+import { disputePreferencesFromDecisions } from "@/lib/library/organization-preferences";
 import { createHash } from "node:crypto";
 
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 
@@ -107,9 +109,9 @@ function duplicateTargetFor(file: DuplicateCandidate, group: DuplicateCandidate[
     )[0];
 }
 
-async function comparableSessionIdsFor(scanSessionId: string) {
-  const prisma = getPrismaClient();
-  const session = await prisma.scanSession.findUnique({
+async function comparableSessionIdsFor(scanSessionId: string, tx?: Prisma.TransactionClient) {
+  const prisma = tx ?? getPrismaClient();
+  const session = await prisma.scanSession.findFirst({
     select: {
       connectedFolder: {
         select: {
@@ -125,7 +127,7 @@ async function comparableSessionIdsFor(scanSessionId: string) {
       id: true,
     },
     where: {
-      id: scanSessionId,
+      id: scanSessionId, connectedFolder: currentReadableRootWhere,
     },
   });
 
@@ -156,15 +158,7 @@ async function comparableSessionIdsFor(scanSessionId: string) {
       id: true,
     },
     where: {
-      connectedFolder: {
-        canonicalConnectedLibraryId: null,
-        hiddenFromActiveListAt: null,
-        isEnabled: true,
-        mergedAt: null,
-        status: {
-          in: ["CONNECTED", "PAUSED", "NEEDS_ATTENTION"],
-        },
-      },
+      connectedFolder: currentReadableRootWhere,
       id: {
         not: session.id,
       },
@@ -223,9 +217,10 @@ function collapseHistoricalPhysicalFiles(
 async function duplicateCandidatesForChecksums(
   scanSessionId: string,
   checksums: string[],
+  tx?: Prisma.TransactionClient,
 ) {
-  const prisma = getPrismaClient();
-  const { sessionIds } = await comparableSessionIdsFor(scanSessionId);
+  const prisma = tx ?? getPrismaClient();
+  const { sessionIds } = await comparableSessionIdsFor(scanSessionId, tx);
 
   if (sessionIds.length === 0 || checksums.length === 0) {
     return [];
@@ -390,8 +385,8 @@ export async function findExactChecksumDuplicateForScannedFile(
 async function markAudioDuplicate(
   file: DuplicateCandidate,
   target: DuplicateCandidate,
+  prisma: Prisma.TransactionClient,
 ) {
-  const prisma = getPrismaClient();
 
   await prisma.audioRecordingMetadata.upsert({
     create: {
@@ -433,8 +428,8 @@ async function markAudioDuplicate(
 async function markVideoDuplicate(
   file: DuplicateCandidate,
   target: DuplicateCandidate,
+  prisma: Prisma.TransactionClient,
 ) {
-  const prisma = getPrismaClient();
 
   await prisma.videoRecordingMetadata.upsert({
     create: {
@@ -482,8 +477,8 @@ async function markVideoDuplicate(
 async function markImageDuplicate(
   file: DuplicateCandidate,
   target: DuplicateCandidate,
+  prisma: Prisma.TransactionClient,
 ) {
-  const prisma = getPrismaClient();
 
   await prisma.imageAssetMetadata.upsert({
     create: {
@@ -528,23 +523,24 @@ async function markImageDuplicate(
 async function markMediaDuplicate(
   file: DuplicateCandidate,
   target: DuplicateCandidate,
+  prisma: Prisma.TransactionClient,
 ) {
   if (!demonstrablyDistinctPhysicalFiles(file, target)) {
     return;
   }
 
   if (isAudioFileType(file.fileType)) {
-    await markAudioDuplicate(file, target);
+    await markAudioDuplicate(file, target, prisma);
     return;
   }
 
   if (isVideoFileType(file.fileType)) {
-    await markVideoDuplicate(file, target);
+    await markVideoDuplicate(file, target, prisma);
     return;
   }
 
   if (isImageFileType(file.fileType)) {
-    await markImageDuplicate(file, target);
+    await markImageDuplicate(file, target, prisma);
   }
 }
 
@@ -589,12 +585,25 @@ function duplicateSuggestionCopy(
 async function upsertDuplicateSuggestion(
   file: DuplicateCandidate,
   target: DuplicateCandidate,
+  prisma: Prisma.TransactionClient,
 ) {
   if (!demonstrablyDistinctPhysicalFiles(file, target)) {
     return false;
   }
 
-  const prisma = getPrismaClient();
+  // The no-op parent write is a durable per-file serialization fence shared
+  // with normal generation. A Serializable stale snapshot fails on a changed
+  // row rather than creating a second current batch after another writer.
+  await prisma.$executeRaw(Prisma.sql`UPDATE "ScannedFile" SET id = id WHERE id = ${file.id}`);
+  const active = await prisma.organizationSuggestion.findMany({ where: {
+    scannedFileId: file.id, invalidatedAt: null, recommendationGenerationVersion: currentRecommendationGenerationVersion,
+  } });
+  if (active.some((item) => !item.recommendationGenerationId.startsWith("checksum-duplicates-") || item.status !== "PENDING")) return true;
+  const history = await prisma.organizationSuggestion.findFirst({ select: { id: true },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }], where: { scannedFileId: file.id, invalidatedAt: { not: null },
+      recommendationGenerationId: { startsWith: "checksum-duplicates-" } } });
+  const key = active[0]?.suggestionKey ?? (history ? `${suggestionKeyFor(file)}:${history.id}` : suggestionKeyFor(file));
+  await markMediaDuplicate(file, target, prisma);
   const copy = duplicateSuggestionCopy(file, target);
   const recommendationGenerationId = `checksum-duplicates-${file.sessionId}`;
 
@@ -612,7 +621,7 @@ async function upsertDuplicateSuggestion(
       scanSessionId: file.sessionId,
       scannedFileId: file.id,
       status: "PENDING",
-      suggestionKey: suggestionKeyFor(file),
+      suggestionKey: key,
       suggestionType: "POSSIBLE_DUPLICATE",
       supportingInformation: jsonInput(
         recommendationSupportForStorage({
@@ -628,12 +637,8 @@ async function upsertDuplicateSuggestion(
     update: {
       confidence: exactDuplicateConfidence,
       explanation: copy.explanation,
-      invalidatedAt: null,
-      invalidatedReason: null,
       recommendationGenerationId,
       recommendationGenerationVersion: currentRecommendationGenerationVersion,
-      reviewedAt: null,
-      status: "PENDING",
       supportingInformation: jsonInput(
         recommendationSupportForStorage({
           alternatives: [],
@@ -646,7 +651,7 @@ async function upsertDuplicateSuggestion(
       whySuggested: jsonInput(copy.whySuggested),
     },
     where: {
-      suggestionKey: suggestionKeyFor(file),
+      suggestionKey: key,
     },
   });
 
@@ -656,7 +661,12 @@ async function upsertDuplicateSuggestion(
 export async function recordChecksumDuplicateSuggestionsForSession(
   scanSessionId: string,
 ) {
-  const prisma = getPrismaClient();
+  return getPrismaClient().$transaction(async (prisma) => {
+  const [root] = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT root.id FROM "ConnectedFolder" root JOIN "ScanSession" scan ON scan."connectedFolderId" = root.id
+    WHERE scan.id = ${scanSessionId} AND ${currentReadableRootSql} FOR SHARE OF root
+  `);
+  if (!root) return { duplicateFiles: 0, duplicateGroups: 0 };
   const sessionFiles = await prisma.scannedFile.findMany({
     select: {
       checksum: true,
@@ -679,11 +689,11 @@ export async function recordChecksumDuplicateSuggestionsForSession(
   ];
 
   if (checksums.length === 0) {
-    await reconcileStaleExactDuplicates(scanSessionId, new Set());
+    await reconcileStaleExactDuplicates(scanSessionId, new Set(), prisma);
     return { duplicateFiles: 0, duplicateGroups: 0 };
   }
 
-  const candidates = await duplicateCandidatesForChecksums(scanSessionId, checksums);
+  const candidates = await duplicateCandidatesForChecksums(scanSessionId, checksums, prisma);
   const groups = new Map<string, DuplicateCandidate[]>();
 
   for (const candidate of candidates) {
@@ -715,8 +725,7 @@ export async function recordChecksumDuplicateSuggestionsForSession(
         continue;
       }
 
-      await markMediaDuplicate(file, target);
-      const persisted = await upsertDuplicateSuggestion(file, target);
+      const persisted = await upsertDuplicateSuggestion(file, target, prisma);
 
       if (!persisted) {
         continue;
@@ -732,16 +741,17 @@ export async function recordChecksumDuplicateSuggestionsForSession(
     }
   }
 
-  await reconcileStaleExactDuplicates(scanSessionId, duplicateFileIds);
+  await reconcileStaleExactDuplicates(scanSessionId, duplicateFileIds, prisma);
 
   return { duplicateFiles, duplicateGroups };
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
 }
 
 async function reconcileStaleExactDuplicates(
   scanSessionId: string,
   duplicateFileIds: Set<string>,
+  prisma: Prisma.TransactionClient,
 ) {
-  const prisma = getPrismaClient();
   const staleSuggestionWhere: Prisma.OrganizationSuggestionWhereInput = {
     scanSessionId,
     suggestionType: "POSSIBLE_DUPLICATE",
@@ -757,35 +767,22 @@ async function reconcileStaleExactDuplicates(
     };
   }
 
-  await prisma.organizationSuggestion.updateMany({
-    data: {
-      confidence: 0.35,
-      explanation:
-        "The Librarian rechecked this item against the current scan snapshot and no longer found a useful exact duplicate. Same physical files seen in older scans are not treated as duplicates.",
-      invalidatedAt: new Date(),
-      invalidatedReason:
-        "The current scan snapshot no longer supports this exact duplicate recommendation.",
-      reviewedAt: null,
-      status: "PENDING",
-      suggestionType: "KEEP_UNCHANGED",
-      supportingInformation: jsonInput(
-        recommendationSupportForStorage({
-          alternatives: [],
-          duplicateEvidence: [],
-          requiredFolderPaths: [],
-          supportingInformation: [
-            "Exact duplicate metadata was rechecked using connected-library identity and relative path.",
-            "No physical files were changed.",
-          ],
-        }),
-      ),
-      title: "No exact duplicate after recheck",
-      whySuggested: jsonInput([
-        "The earlier checksum match appears to have represented the same physical file from an older scan, or a zero-byte file without useful duplicate value.",
-      ]),
-    },
-    where: staleSuggestionWhere,
-  });
+  const stale = await prisma.organizationSuggestion.findMany({ select: { id: true }, where: staleSuggestionWhere });
+  await prisma.organizationSuggestion.updateMany({ data: {
+    invalidatedAt: new Date(), invalidatedReason: "The current scan snapshot no longer supports this exact duplicate recommendation.",
+  }, where: staleSuggestionWhere });
+  // Pending bootstrap diagnostics retain the existing recheck presentation.
+  // Reviewed decisions and full generation history are never rewritten.
+  await prisma.organizationSuggestion.updateMany({ data: {
+    confidence: 0.35,
+    suggestionType: "KEEP_UNCHANGED",
+    title: "No exact duplicate after recheck",
+    explanation: "The Librarian rechecked this item against the current scan snapshot and no longer found a useful exact duplicate. Same physical files seen in older scans are not treated as duplicates.",
+    supportingInformation: jsonInput(recommendationSupportForStorage({ alternatives: [], duplicateEvidence: [], requiredFolderPaths: [],
+      supportingInformation: ["Exact duplicate metadata was rechecked using connected-library identity and relative path.", "No physical files were changed."] })),
+    whySuggested: jsonInput(["The earlier checksum match appears to have represented the same physical file from an older scan, or a zero-byte file without useful duplicate value."]),
+  }, where: { id: { in: stale.map((item) => item.id) }, status: "PENDING", recommendationGenerationId: { startsWith: "checksum-duplicates-" } } });
+  await disputePreferencesFromDecisions(stale.map((item) => item.id), prisma);
 
   const staleScannedFileWhere: Prisma.ScannedFileWhereInput = {
     sessionId: scanSessionId,

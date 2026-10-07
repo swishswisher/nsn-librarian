@@ -1,3 +1,4 @@
+import { currentReadableRootWhere } from "@/lib/bridge/current-readable-root";
 import path from "node:path";
 
 import { getPrismaClient } from "@/lib/db/prisma";
@@ -125,11 +126,7 @@ function bestExcerpt(value: unknown, terms: string[]) {
   })[0] ?? null;
 }
 
-const readableRoot = {
-  isEnabled: true, readPermission: true, status: "CONNECTED" as const,
-  disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null,
-  canonicalConnectedLibraryId: null,
-};
+const readableRoot = currentReadableRootWhere;
 
 const activeScanStatuses = [
   "PENDING", "SCANNING", "READING", "EXAMINING", "GENERATING_SUGGESTIONS",
@@ -492,6 +489,10 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
     [...sourceEntryById.entries()].filter(([, entry]) =>
       entry.scannedFile.libraryDocumentId === documentId)
       .map(([sourceId]) => [observation.id, sourceId] as const)));
+  const currentBindings = [...sourceIdByObservation].flatMap(([observationId, sourceId]) => {
+    const checksum = sourceEntryById.get(sourceId)?.checksum;
+    return checksum ? [{ observationId, checksum }] : [];
+  });
   const connections = sourceIdByObservation.size > 1 ? await prisma.knowledgeConnection.findMany({
     take: 24,
     // The cap is semantic: reviewed relationships win, and equal-priority rows
@@ -502,6 +503,11 @@ export async function retrieveQuestionContext(question: string, permittedRootIds
       generationVersion: { in: [relationshipGenerationVersion, documentSignalVersion,
         humanIdentityCorrectionVersion] },
       sourceChecksum: { not: null }, targetChecksum: { not: null },
+      // Historical checksum rows must not occupy the current relationship cap.
+      AND: [
+        { OR: currentBindings.map(({ observationId, checksum }) => ({ sourceObservationSessionId: observationId, sourceChecksum: checksum })) },
+        { OR: currentBindings.map(({ observationId, checksum }) => ({ targetObservationSessionId: observationId, targetChecksum: checksum })) },
+      ],
       sourceObservationSessionId: { in: [...sourceIdByObservation.keys()] },
       targetObservationSessionId: { in: [...sourceIdByObservation.keys()] } },
     select: { sourceObservationSessionId: true, targetObservationSessionId: true,

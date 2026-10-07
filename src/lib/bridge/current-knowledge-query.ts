@@ -1,11 +1,9 @@
 import { Prisma } from "@prisma/client";
+import { currentReadableRootSql } from "./current-readable-root";
 
 // Shared SQL predicates keep authorization and the canonical completed snapshot
 // inside the query, before any user-visible result limit. Aliases are fixed here.
-export const readableKnowledgeRoot = Prisma.sql`
-  root.enabled AND root."readPermission" AND root.status = 'CONNECTED'
-  AND root."disconnectedAt" IS NULL AND root."hiddenFromActiveListAt" IS NULL
-  AND root."mergedAt" IS NULL AND root."canonicalConnectedLibraryId" IS NULL`;
+export const readableKnowledgeRoot = currentReadableRootSql;
 
 export const latestKnowledgeSnapshot = Prisma.sql`
   JOIN LATERAL (

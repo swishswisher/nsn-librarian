@@ -1,3 +1,4 @@
+import { claimPlanExecution } from "./plan-execution-authority";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat, mkdir, rename } from "node:fs/promises";
@@ -1767,6 +1768,7 @@ async function correlateBridgeWatcherEventsForExecution(
 export async function executeOrganizationPlan(
   planId: string,
   confirmation: string,
+  options: { beforeStartClaim?: () => Promise<void>; afterStartClaim?: () => Promise<void> } = {},
 ) {
   if (confirmation !== "EXECUTE") {
     throw new BridgeExecutorError(
@@ -1796,8 +1798,13 @@ export async function executeOrganizationPlan(
     );
   }
 
+  await options.beforeStartClaim?.();
   const executionStartedAt = new Date();
-  const executionRun = await prisma.executionRun.create({
+  const executionRun = await prisma.$transaction(async (tx) => {
+    if (!await claimPlanExecution(tx, plan)) {
+      throw new BridgeExecutorError("This plan changed or execution already started. Refresh and review it again.", 409);
+    }
+    return tx.executionRun.create({
     data: {
       actions: {
         create: resolvedActions.map((action) => ({
@@ -1827,6 +1834,8 @@ export async function executeOrganizationPlan(
       },
     },
   });
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
+  await options.afterStartClaim?.();
   const actionRecordsBySequence = new Map(
     executionRun.actions.map((action) => [action.sequence, action]),
   );

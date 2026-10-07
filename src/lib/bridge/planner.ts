@@ -1,7 +1,9 @@
+import { blockingPlanExecutionWhere } from "./plan-execution-authority";
 import path from "node:path";
 
 import type { Prisma } from "@prisma/client";
 
+import { currentReadableRootWhere } from "./current-readable-root";
 import { getPrismaClient } from "@/lib/db/prisma";
 import {
   recordOrganizationPlanDecisionNotebookEntry,
@@ -1269,8 +1271,8 @@ async function planById(planId: string) {
   });
 }
 
-async function currentPlanForScanSession(scanSessionId: string) {
-  const prisma = getPrismaClient();
+async function currentPlanForScanSession(scanSessionId: string, tx?: Prisma.TransactionClient) {
+  const prisma = tx ?? getPrismaClient();
 
   return prisma.organizationPlan.findFirst({
     orderBy: {
@@ -1342,8 +1344,8 @@ async function latestDisplayPlanForScanSession(scanSessionId: string) {
   });
 }
 
-async function scanSessionForPlan(scanSessionId: string) {
-  const prisma = getPrismaClient();
+async function scanSessionForPlan(scanSessionId: string, tx?: Prisma.TransactionClient) {
+  const prisma = tx ?? getPrismaClient();
 
   return prisma.scanSession.findUnique({
     include: {
@@ -1388,63 +1390,65 @@ export async function generateOrganizationPlanForScanSession(
   scanSessionId: string,
 ) {
   const prisma = getPrismaClient();
-  const session = await scanSessionForPlan(scanSessionId);
-
-  if (!session) {
-    throw new OrganizationPlanError(
-      "The Librarian could not find that scan session.",
-      404,
-    );
-  }
-
   await requirePlanningPermission(scanSessionId);
+  const savedPlan = await prisma.$transaction(async (tx) => {
+    const session = await scanSessionForPlan(scanSessionId, tx);
 
-  const previousPlan = await currentPlanForScanSession(scanSessionId);
-  const previousHistory = previousPlan
-    ? asHistoryItems(previousPlan.history)
-    : [];
-  const snapshot = buildPlanSnapshot({
-    connectedLibraryId: session.connectedFolderId,
-    previousHistory,
-    scanSessionId,
-    scannedFiles: session.scannedFiles,
-    suggestions: session.organizationSuggestions,
-  });
+    if (!session) {
+      throw new OrganizationPlanError(
+        "The Librarian could not find that scan session.",
+        404,
+      );
+    }
 
-  if (snapshot.totalActions === 0) {
-    throw new OrganizationPlanError(
-      "No reviewed recommendations are ready for planning.",
-      422,
-    );
-  }
+    if (!await tx.connectedLibrary.findFirst({ select: { id: true }, where: { id: session.connectedFolderId, ...currentReadableRootWhere } })) {
+      throw new OrganizationPlanError("This library is not available for planning.", 409);
+    }
+    const previousPlan = await currentPlanForScanSession(scanSessionId, tx);
+    const previousHistory = previousPlan
+      ? asHistoryItems(previousPlan.history)
+      : [];
+    const snapshot = buildPlanSnapshot({
+      connectedLibraryId: session.connectedFolderId,
+      previousHistory,
+      scanSessionId,
+      scannedFiles: session.scannedFiles,
+      suggestions: session.organizationSuggestions,
+    });
 
-  const data = {
-    actions: toJsonInput(snapshot.actions),
-    approvedActions: snapshot.approvedActions,
-    connectedLibraryId: session.connectedFolderId,
-    createdBy: "NSN Librarian",
-    history: toJsonInput(snapshot.history),
-    modifiedActions: snapshot.modifiedActions,
-    rejectedActions: snapshot.rejectedActions,
-    scanSessionId,
-    skippedItems: toJsonInput(snapshot.skippedItems),
-    status: "DRAFT" as const,
-    totalActions: snapshot.totalActions,
-    unchangedActions: snapshot.unchangedActions,
-    warnings: toJsonInput(snapshot.warnings),
-  };
+    if (snapshot.totalActions === 0) {
+      throw new OrganizationPlanError(
+        "No reviewed recommendations are ready for planning.",
+        422,
+      );
+    }
 
-  const savedPlan =
-    previousPlan && previousPlan.status !== "CANCELLED"
-      ? await prisma.organizationPlan.update({
-          data,
-          where: {
-            id: previousPlan.id,
-          },
-        })
-      : await prisma.organizationPlan.create({
-          data,
-        });
+    const data = {
+      actions: toJsonInput(snapshot.actions),
+      approvedActions: snapshot.approvedActions,
+      connectedLibraryId: session.connectedFolderId,
+      createdBy: "NSN Librarian",
+      history: toJsonInput(snapshot.history),
+      modifiedActions: snapshot.modifiedActions,
+      rejectedActions: snapshot.rejectedActions,
+      scanSessionId,
+      skippedItems: toJsonInput(snapshot.skippedItems),
+      status: "DRAFT" as const,
+      totalActions: snapshot.totalActions,
+      unchangedActions: snapshot.unchangedActions,
+      warnings: toJsonInput(snapshot.warnings),
+    };
+
+    if (previousPlan) {
+      const changed = await tx.organizationPlan.updateMany({ data, where: {
+        id: previousPlan.id, status: previousPlan.status, updatedAt: previousPlan.updatedAt,
+        executionRuns: { none: blockingPlanExecutionWhere },
+      } });
+      if (changed.count !== 1) throw new OrganizationPlanError("This plan changed or execution already started. Refresh and try again.", 409);
+      return tx.organizationPlan.findUniqueOrThrow({ where: { id: previousPlan.id } });
+    }
+    return tx.organizationPlan.create({ data });
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
 
   try {
     await recordOrganizationPlanNotebookEntry(savedPlan.id);
@@ -1665,6 +1669,7 @@ function applyActionSelection(
 async function assertSelectedActionsMatchCurrentRecommendations(
   scanSessionId: string,
   actions: BridgeOrganizationPlanAction[],
+  tx?: Prisma.TransactionClient,
 ) {
   const selectedActions = normalizePlanActions(actions).filter(
     actionIsSelectedFileAction,
@@ -1674,7 +1679,7 @@ async function assertSelectedActionsMatchCurrentRecommendations(
     return;
   }
 
-  const prisma = getPrismaClient();
+  const prisma = tx ?? getPrismaClient();
   const suggestions = await prisma.organizationSuggestion.findMany({
     select: {
       id: true,
@@ -1816,11 +1821,25 @@ async function planScannedFiles(plan: StoredPlan) {
   return session.scannedFiles;
 }
 
+async function writeUnchangedPlan(existing: StoredPlan, data: Prisma.OrganizationPlanUpdateInput,
+  verifyActions?: BridgeOrganizationPlanAction[], historicalCancellation = false) {
+  return getPrismaClient().$transaction(async (tx) => {
+    if (!historicalCancellation && !await tx.connectedLibrary.findFirst({ select: { id: true }, where: {
+      id: existing.connectedLibraryId, ...currentReadableRootWhere,
+    } })) throw new OrganizationPlanError("This library is not available for planning.", 409);
+    if (verifyActions) await assertSelectedActionsMatchCurrentRecommendations(existing.scanSessionId, verifyActions, tx);
+    const changed = await tx.organizationPlan.updateMany({ data: data as Prisma.OrganizationPlanUpdateManyMutationInput,
+      where: { id: existing.id, status: normalizePlanStatus(existing.status), updatedAt: existing.updatedAt,
+        executionRuns: { none: blockingPlanExecutionWhere } } });
+    if (changed.count !== 1) throw new OrganizationPlanError("This plan changed during review. Refresh and try again.", 409);
+    return tx.organizationPlan.findUniqueOrThrow({ where: { id: existing.id } });
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
+}
+
 export async function saveOrganizationPlanSelection(
   planId: string,
   selectedActionIds: string[],
 ) {
-  const prisma = getPrismaClient();
   const existing = await planById(planId);
 
   if (!existing) {
@@ -1856,8 +1875,7 @@ export async function saveOrganizationPlanSelection(
     actions,
   );
 
-  const updated = await prisma.organizationPlan.update({
-    data: {
+  const updated = await writeUnchangedPlan(existing, {
       actions: toJsonInput(actions),
       history: toJsonInput(
         appendPlanHistory(
@@ -1870,17 +1888,12 @@ export async function saveOrganizationPlanSelection(
       ),
       totalActions: actions.length,
       warnings: toJsonInput(warnings),
-    },
-    where: {
-      id: existing.id,
-    },
-  });
+  }, actions);
 
   return summarizePlan(updated);
 }
 
 export async function clearOrganizationPlanSelection(planId: string) {
-  const prisma = getPrismaClient();
   const existing = await planById(planId);
 
   if (!existing) {
@@ -1902,8 +1915,7 @@ export async function clearOrganizationPlanSelection(planId: string) {
   const scannedFiles = await planScannedFiles(existing);
   const actions = clearActionSelection(asPlanActions(existing.actions));
   const warnings = validatePlanActions(actions, scannedFiles);
-  const updated = await prisma.organizationPlan.update({
-    data: {
+  const updated = await writeUnchangedPlan(existing, {
       actions: toJsonInput(actions),
       history: toJsonInput(
         appendPlanHistory(
@@ -1914,17 +1926,12 @@ export async function clearOrganizationPlanSelection(planId: string) {
       ),
       totalActions: actions.length,
       warnings: toJsonInput(warnings),
-    },
-    where: {
-      id: existing.id,
-    },
-  });
+  }, actions);
 
   return summarizePlan(updated);
 }
 
 export async function approveOrganizationPlan(planId: string) {
-  const prisma = getPrismaClient();
   const existing = await planById(planId);
 
   if (!existing) {
@@ -1934,6 +1941,9 @@ export async function approveOrganizationPlan(planId: string) {
     );
   }
 
+  if (!["DRAFT", "READY_FOR_EXECUTION"].includes(existing.status)) {
+    throw new OrganizationPlanError("This plan is no longer available for approval.", 409);
+  }
   const actions = normalizePlanActions(asPlanActions(existing.actions));
 
   if (actions.filter(actionIsSelectedFileAction).length === 0) {
@@ -1957,8 +1967,7 @@ export async function approveOrganizationPlan(planId: string) {
     );
   }
 
-  const updated = await prisma.organizationPlan.update({
-    data: {
+  const updated = await writeUnchangedPlan(existing, {
       history: toJsonInput(
         appendPlanHistory(
           existing,
@@ -1967,11 +1976,7 @@ export async function approveOrganizationPlan(planId: string) {
         ),
       ),
       status: "READY_FOR_EXECUTION",
-    },
-    where: {
-      id: existing.id,
-    },
-  });
+  }, actions);
 
   try {
     await recordOrganizationPlanDecisionNotebookEntry(updated.id, "APPROVE");
@@ -1983,7 +1988,6 @@ export async function approveOrganizationPlan(planId: string) {
 }
 
 export async function cancelOrganizationPlan(planId: string) {
-  const prisma = getPrismaClient();
   const existing = await planById(planId);
 
   if (!existing) {
@@ -1993,8 +1997,7 @@ export async function cancelOrganizationPlan(planId: string) {
     );
   }
 
-  const updated = await prisma.organizationPlan.update({
-    data: {
+  const updated = await writeUnchangedPlan(existing, {
       history: toJsonInput(
         appendPlanHistory(
           existing,
@@ -2003,11 +2006,7 @@ export async function cancelOrganizationPlan(planId: string) {
         ),
       ),
       status: "CANCELLED",
-    },
-    where: {
-      id: existing.id,
-    },
-  });
+  }, undefined, true);
 
   try {
     await recordOrganizationPlanDecisionNotebookEntry(updated.id, "CANCEL");

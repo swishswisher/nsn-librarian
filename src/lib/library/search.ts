@@ -1,3 +1,6 @@
+import { Prisma } from "@prisma/client";
+import { eligibleMemorySql } from "./memory-provenance";
+import { currentReadableRootWhere } from "@/lib/bridge/current-readable-root";
 import path from "node:path";
 
 import { verifiedSourceExcerpts } from "@/lib/ai/source-evidence";
@@ -189,10 +192,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
       orderBy: [{ startedAt: "desc" }, { id: "desc" }], select: { id: true }, take: 1,
       where: usableScanSnapshotWhere,
     } },
-    where: { isEnabled: true, readPermission: true, status: "CONNECTED",
-      ...(permittedRootIds ? { id: { in: permittedRootIds } } : {}),
-      disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null,
-      canonicalConnectedLibraryId: null },
+    where: { ...currentReadableRootWhere, ...(permittedRootIds ? { id: { in: permittedRootIds } } : {}) },
   });
   const rootById = new Map(roots.map((root) => [root.id, root]));
   const rootIds = roots.map((root) => root.id);
@@ -203,10 +203,14 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   const scope = {
     connectedLibraryId: { in: rootIds },
     indexVersion: librarySearchIndexVersion,
+    scannedFile: { sourceUnavailableAt: null },
     ...(retainedHistoryList
       ? { isCurrent: false }
       : intent.wantsHistory ? {} : { isCurrent: true, scanSessionId: { in: latestSessionIds } }),
   } as const;
+  const candidateScope = { ...scope, ...(intent.fileType ? {
+    fileType: { contains: intent.fileType.replace(/s$/, ""), mode: "insensitive" as const },
+  } : {}) };
   // Ask must not infer that an explicitly named entity is unique from the UI's
   // bounded candidate window. In that mode the database query is exhaustive,
   // but only the small ranked source window is ever sent to the answer model.
@@ -217,7 +221,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     take: 20,
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
       { connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
-    where: { ...scope, OR: [
+    where: { ...candidateScope, OR: [
       { fileName: { equals: intent.query, mode: "insensitive" } },
       { relativePath: { equals: intent.query, mode: "insensitive" } },
     ] },
@@ -234,7 +238,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
       { connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: {
-      ...scope,
+      ...candidateScope,
       AND: intent.terms.map((term) => ({ OR: [
         { sourceTerms: { has: term } },
         { reviewedTerms: { has: term } },
@@ -251,7 +255,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     orderBy: [{ isCurrent: "desc" }, { indexedAt: "desc" },
       { connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: {
-      ...scope,
+      ...candidateScope,
       id: { notIn: reserved.map((entry) => entry.id) },
       OR: [
         { relativePath: { contains: intent.query, mode: "insensitive" } },
@@ -266,7 +270,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
       take: searchResultLimit,
       orderBy: [{ indexedAt: "desc" }, { connectedLibraryId: "asc" },
         { relativePath: "asc" }, { id: "asc" }],
-      where: { ...scope, isCurrent: false },
+      where: { ...candidateScope, isCurrent: false },
     }).catch(() => [])
     : [];
   const historyListIds = new Set(historicalList.map((entry) => entry.id));
@@ -388,6 +392,8 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     const [connectedLibraryId, fileKey, checksum] = endpoint.split("\0");
     return { connectedLibraryId, fileKey, checksum, entityHashes: { hasSome: [...hashes] } };
   });
+  // A human-confirmed identity's name anchor may use another file format.
+  // Discover that authority across formats, then bound only type-eligible results.
   const semanticById = new Map<string, typeof initial[number]>();
   for (let offset = 0; offset < semanticFilters.length; offset += 500) {
     const entries = await prisma.librarySearchEntry.findMany({
@@ -438,7 +444,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     take: exhaustiveEntityCandidates ? undefined : 40,
     orderBy: [{ connectedLibraryId: "asc" }, { relativePath: "asc" }, { id: "asc" }],
     where: {
-      ...scope,
+      ...candidateScope,
       OR: [...expansionHashesByRoot].map(([connectedLibraryId, hashes]) => ({
         connectedLibraryId,
         entityHashes: { hasSome: hashes },
@@ -506,6 +512,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
     ...related,
     ...filteredInitial,
   ].map((entry) => [entry.id, entry])).values()]
+    .filter((entry) => !intent.fileType || entry.fileType.toLowerCase().includes(intent.fileType.replace(/s$/, "")))
     .slice(0, exhaustiveCandidates ? undefined : searchCandidateLimit);
   const candidateById = new Map(boundedCandidates.map((entry) => [entry.id, entry]));
   const currentSourceIds = new Set((await prisma.scannedFile.findMany({
@@ -581,6 +588,7 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
       } } },
       scanSession: { select: { connectedFolderId: true } } },
     where: { sessionId: { in: latestSessionIds }, sourceUnavailableAt: null,
+      ...(intent.fileType ? { fileType: { contains: intent.fileType.replace(/s$/, ""), mode: "insensitive" as const } } : {}),
       OR: [
         { relativePath: { contains: intent.query, mode: "insensitive" } },
         ...intent.terms.slice(0, 4).map((term) => ({ relativePath: { contains: term, mode: "insensitive" as const } })),
@@ -610,13 +618,20 @@ export async function searchLibrary(value: string, permittedRootIds?: string[], 
   }
   // Memory is a distinct human-approved result, never evidence that a file
   // contains the Memory wording. Every contributing root must remain readable.
+  const memoryIds = retainedHistoryList ? [] : await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT memory.id FROM "MemoryEntry" memory WHERE ${eligibleMemorySql(rootIds)} AND (
+      position(lower(${intent.query}) in lower(memory.title)) > 0 OR
+      position(lower(${intent.query}) in lower(memory.description)) > 0 OR
+      ${intent.terms.length ? Prisma.join(intent.terms.slice(0, 6).map((term) => Prisma.sql`position(lower(${term}) in lower(memory.title)) > 0`), " OR ") : Prisma.sql`false`}
+    ) ORDER BY memory.title ASC, memory.id ASC LIMIT 60
+  `);
   const memories = retainedHistoryList ? [] : await prisma.memoryEntry.findMany({
     take: 60,
     orderBy: [{ title: "asc" }, { id: "asc" }],
     select: { id: true, title: true, description: true, searchSourceCount: true, searchSources: {
       select: { connectedLibraryId: true, observationSession: { select: { status: true } } },
     } },
-    where: { status: "ACTIVE", searchProvenanceComplete: true,
+    where: { id: { in: memoryIds.map((row) => row.id) }, status: "ACTIVE", searchProvenanceComplete: true,
       searchSources: { some: {}, every: {
         connectedLibraryId: { in: rootIds },
         observationSession: { status: { in: ["APPROVED", "MODIFIED"] } },

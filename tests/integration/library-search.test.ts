@@ -1591,8 +1591,9 @@ for (const kind of ["CLIENT", "PROJECT"] as const) {
       const results = await Promise.all([a.id, b.id].map((id) => decisionRoute.POST(new Request("http://localhost/decision", {
         method: "POST", body: JSON.stringify({ action: "CONFIRM" }),
       }), { params: Promise.resolve({ relationshipId: id }) })));
-      assert.ok(results.every((response) => [200, 409].includes(response.status)));
-      assert.ok(results.some((response) => response.status === 200));
+      assert.ok(results.every((response) => [200, 409].includes(response.status)),
+        `Concurrent ${kind} review statuses: ${results.map((response) => response.status).join(", ")}`);
+      assert.ok(results.some((response) => response.status === 200), "One concurrent review must succeed");
       const winner = await prisma.knowledgeConnection.findMany({ where: {
         generationVersion: fileKey.humanIdentityCorrectionVersion, sourceFileKey: signals[0].fileKey,
         status: "CONFIRMED", supersededAt: null,
@@ -1837,7 +1838,8 @@ test("extension-changing NSN renames refresh reused search metadata and type fil
     originalPath: "Loose/intake-v1.docx", destination: "Loose/intake-v1.html", fileType: "DOCX",
   });
   assert.equal(fixture.initialEntry.fileType, "DOCX");
-  assert.ok((await search.searchLibrary("client Alice docx", [fixture.r.id])).some((item) => item.id === fixture.initialEntry.id));
+  assert.ok((await search.searchLibrary("client Alice docx", [fixture.r.id])).some((item) => item.id === fixture.initialEntry.id),
+    "A DOCX result must retain the human-confirmed identity named by its TEXT anchor.");
   const next = await indexMovedSnapshot(fixture, fixture.destination, false, "HTML");
   assert.equal(next.stats.reused, 3);
   assert.equal(next.entry.id, fixture.initialEntry.id);
@@ -1849,7 +1851,8 @@ test("extension-changing NSN renames refresh reused search metadata and type fil
   assert.equal(next.entry.fileType, "HTML");
   assert.deepEqual(next.entry.entityHashes, fixture.initialEntry.entityHashes);
   assert.equal(await prisma.librarySearchEntry.count({ where: { fileKey: fixture.initialEntry.fileKey } }), 1);
-  assert.ok(!(await search.searchLibrary("client Alice docx", [fixture.r.id])).some((item) => item.id === next.entry.id));
+  assert.ok(!(await search.searchLibrary("client Alice docx", [fixture.r.id])).some((item) => item.id === next.entry.id),
+    "An extension-changing rename must remove the old file-type result.");
   const result = (await search.searchLibrary("client Alice html", [fixture.r.id])).find((item) => item.id === next.entry.id);
   assert.equal(result?.fileType, "HTML");
   assert.equal(result?.relativePath, fixture.destination);
@@ -2061,7 +2064,11 @@ test("corrected Memory retires obsolete contributions immediately while preservi
   await memory.buildMemoryFromApprovedSession(item.observation.id);
   const archived = await prisma.memoryEntry.findUniqueOrThrow({ where: { id: old.id } });
   assert.equal(archived.status, "ARCHIVED");
-  assert.deepEqual((archived.evidence as unknown[]).filter((value) => typeof value === "string"), old.evidence);
+  assert.deepEqual((archived.evidence as unknown[]).filter((value) => typeof value === "string"),
+    (old.evidence as unknown[]).filter((value) => typeof value === "string"));
+  const archive = (archived.evidence as Array<{ kind?: string; previousEvidence?: unknown }>).
+    find((value) => value.kind === "HUMAN_CORRECTION_ARCHIVE");
+  assert.deepEqual(archive?.previousEvidence, old.evidence);
   assert.equal((await prisma.memoryEntry.findUniqueOrThrow({ where: { memoryKey: "THEME:teaching-material" } })).status, "ACTIVE");
   assert.deepEqual(await prisma.memoryEntry.findUniqueOrThrow({ where: { id: untouched.id } }), untouched);
   assert.ok((await search.searchLibrary("teaching", [r.id])).some((row) => row.kind === "MEMORY"));

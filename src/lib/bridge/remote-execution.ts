@@ -1,3 +1,4 @@
+import { claimPlanExecution } from "./plan-execution-authority";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
@@ -46,6 +47,7 @@ type RemotePlanAction = {
 type LoadedRemotePlan = {
   plan: {
     id: string;
+    updatedAt: Date;
     scanSessionId: string;
     connectedLibraryId: string;
     status: string;
@@ -667,7 +669,11 @@ export async function queueRemoteOrganizationPlanExecution(
     readPermission: loaded.plan.connectedLibrary.readPermission,
     renameFilePermission: loaded.plan.connectedLibrary.renameFilePermission,
   };
-  const run = await prisma.executionRun.create({
+  const run = await prisma.$transaction(async (tx) => {
+    if (!await claimPlanExecution(tx, loaded.plan)) {
+      throw new BridgeExecutorError("This plan changed or execution already started. Refresh and review it again.", 409);
+    }
+    return tx.executionRun.create({
     data: {
       bridgeDeviceId: loaded.plan.connectedLibrary.bridgeDeviceId,
       bridgeRootId: loaded.plan.connectedLibrary.bridgeRootId,
@@ -689,6 +695,7 @@ export async function queueRemoteOrganizationPlanExecution(
       },
     },
   });
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
   const commandActions = loaded.normalizedActions.map((action, index) => ({
     ...action,
     id: executionActionIds[index],

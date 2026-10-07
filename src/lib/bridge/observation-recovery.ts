@@ -1,3 +1,4 @@
+import { currentReadableRootWhere } from "./current-readable-root";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { latestObservationOrder, observationLeaseMs, usableObservation } from "./observation-authority";
 import { generateScanRecommendationBatchIfReady } from "./scan-recommendation-batch";
@@ -12,9 +13,7 @@ export async function recoverAbandonedObservationFilesForDevice(deviceId: string
     orderBy: [{ observationClaimedAt: "asc" }, { id: "asc" }], take: 50,
     include: { scanSession: { select: { connectedFolderId: true } } },
     where: { readStatus: "SUPPORTED", scanSession: { connectedFolder: {
-      bridgeDeviceId: deviceId, bridgeRootId: { not: null }, isEnabled: true,
-      readPermission: true, status: "CONNECTED", disconnectedAt: null,
-      hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null,
+      bridgeDeviceId: deviceId, bridgeRootId: { not: null }, ...currentReadableRootWhere,
     } }, OR: [
       { processingStage: { in: ["READ", "EXAMINING", "OBSERVING"] }, readingStatus: "READ",
         extractionStatus: "COMPLETED", OR: [{ observationClaimedAt: null }, { observationClaimedAt: { lte: stale } }] },

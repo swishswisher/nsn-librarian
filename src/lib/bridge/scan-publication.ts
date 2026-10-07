@@ -2,13 +2,13 @@ import { Prisma } from "@prisma/client";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { indexScanKnowledge } from "@/lib/library/search-index";
 import { latestKnowledgeSnapshot, readableKnowledgeRoot } from "./current-knowledge-query";
-import { persistScanWorkingKnowledge, usableScanSnapshotWhere } from "./persistent-knowledge";
+import { persistScanWorkingKnowledge } from "./persistent-knowledge";
+import { lockCurrentScanPublication, scanPublicationTransactionOptions } from "./scan-publication-lock";
 import { loadScanWorkingKnowledge } from "./scan-working-knowledge";
 import type { KnowledgeWork } from "./knowledge-work";
 
 export const scanPublicationBatchSize = 2;
 const retryDelayMs = 60_000;
-const stageTimeoutMs = 30 * 60_000;
 type Stage = "knowledgePersistenceStatus" | "searchIndexStatus";
 
 function retryTime(column: Prisma.Sql) {
@@ -27,29 +27,8 @@ export async function publishScanDerivedKnowledge(sessionId: string, through: "K
     let expectedStatus: string | undefined;
     try {
       const ready = await prisma.$transaction(async (tx) => {
-        const session = await tx.scanSession.findUnique({ where: { id: sessionId },
-          select: { connectedFolderId: true } });
-        if (!session) return false;
-        // The database owns this lock until commit/rollback or connection death.
-        // The root key also serializes publication of competing snapshots.
-        const [lock] = await tx.$queryRaw<Array<{ owned: boolean }>>(Prisma.sql`
-          SELECT pg_try_advisory_xact_lock(hashtextextended(${`scan-publication:${session.connectedFolderId}`}, 0)) AS owned
-        `);
-        if (!lock?.owned) return false;
-        // Keep the authorization row stable through this stage's commit. A
-        // concurrent revocation takes effect after these already-owned writes;
-        // the next stage must authorize again and cannot run under stale rights.
-        await tx.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder"
-          WHERE id = ${session.connectedFolderId} FOR SHARE`);
-        const current = await tx.scanSession.findFirst({
-          where: { ...usableScanSnapshotWhere, connectedFolderId: session.connectedFolderId,
-            connectedFolder: { isEnabled: true, readPermission: true, status: "CONNECTED",
-              disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null,
-              canonicalConnectedLibraryId: null } },
-          orderBy: [{ startedAt: "desc" }, { id: "desc" }],
-          select: { id: true, knowledgePersistenceStatus: true, searchIndexStatus: true },
-        });
-        if (current?.id !== sessionId) return false;
+        const current = await lockCurrentScanPublication(tx, sessionId);
+        if (!current) return false;
         if (stage === "searchIndexStatus" && current.knowledgePersistenceStatus !== "COMPLETED") return false;
         if (current[stage] === "COMPLETED") return true;
         expectedStatus = current[stage];
@@ -58,7 +37,7 @@ export async function publishScanDerivedKnowledge(sessionId: string, through: "K
         else await indexScanKnowledge(index, undefined, undefined, tx);
         await tx.scanSession.update({ where: { id: sessionId }, data: { [stage]: "COMPLETED" } });
         return true;
-      }, { isolationLevel: "Serializable", timeout: stageTimeoutMs, maxWait: 5_000 });
+      }, scanPublicationTransactionOptions);
       if (!ready) return false;
     } catch {
       // Never roll a newer worker's success back. The failed stage transaction
@@ -120,5 +99,15 @@ export async function invalidateDocumentScanPublications(tx: Prisma.TransactionC
           AND file."libraryDocumentId" = ${documentId}
       )
     )
+  `);
+}
+
+/** Identity authority changes hashes but not extracted document evidence. The
+ * ordinary publisher repairs Search even if the eager projection request dies. */
+export async function invalidateRootSearchPublication(tx: Prisma.TransactionClient, rootId: string) {
+  await tx.$executeRaw(Prisma.sql`
+    UPDATE "ScanSession" session SET "searchIndexStatus" = ${`NOT_ATTEMPTED@${crypto.randomUUID()}`}
+    WHERE session.id IN (SELECT latest.id FROM "ConnectedFolder" root ${latestKnowledgeSnapshot}
+      WHERE root.id = ${rootId} AND ${readableKnowledgeRoot})
   `);
 }

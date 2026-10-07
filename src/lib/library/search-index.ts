@@ -9,6 +9,8 @@ import { fileKeyAfterKnownMoves, getEffectiveDocumentSignals, getIdentityCorrect
 import { versionEndpoint } from "@/lib/bridge/document-version-index";
 import { countKnowledgeWork, type KnowledgeWork } from "@/lib/bridge/knowledge-work";
 import { loadScanWorkingKnowledge } from "@/lib/bridge/scan-working-knowledge";
+import { currentReadableRootSelect, currentReadableRootWhere, currentReadableRootSql, isCurrentReadableRoot } from "@/lib/bridge/current-readable-root";
+import { withCurrentScanPublication } from "@/lib/bridge/scan-publication-lock";
 
 export const librarySearchIndexVersion = "library-search-v1";
 export const searchEvidenceLimit = 8;
@@ -39,17 +41,18 @@ export function searchEntryFingerprint(input: {
 export async function indexScanKnowledge(index: ScanWorkingKnowledgeIndex, onlyFileIds?: string[], stats?: {
   reused: number;
   resolvedSignals?: number;
-}, publicationTx?: Prisma.TransactionClient) {
+}, publicationTx?: Prisma.TransactionClient): Promise<number> {
+  if (!publicationTx) return await withCurrentScanPublication(index.scanSessionId,
+    (tx) => indexScanKnowledge(index, onlyFileIds, stats, tx)) ?? 0;
   const prisma = publicationTx ?? getPrismaClient();
   const session = await prisma.scanSession.findUnique({
     select: {
       connectedFolderId: true,
-      connectedFolder: { select: { isEnabled: true, readPermission: true, status: true } },
+      connectedFolder: { select: currentReadableRootSelect },
     },
     where: { id: index.scanSessionId },
   });
-  if (!session || !session.connectedFolder.isEnabled || !session.connectedFolder.readPermission ||
-      session.connectedFolder.status !== "CONNECTED") return 0;
+  if (!session || !isCurrentReadableRoot(session.connectedFolder)) return 0;
   const latestSession = await prisma.scanSession.findFirst({
     orderBy: [{ startedAt: "desc" }, { id: "desc" }], select: { id: true },
     where: { ...usableScanSnapshotWhere, connectedFolderId: session.connectedFolderId },
@@ -177,7 +180,7 @@ export async function refreshSearchForObservation(observationSessionId: string) 
     select: { id: true, sessionId: true, scanSession: { select: { connectedFolderId: true } } },
     where: { libraryDocumentId: observation.libraryDocumentId,
       scanSession: { ...usableScanSnapshotWhere,
-        connectedFolder: { isEnabled: true, readPermission: true, status: "CONNECTED" } } },
+        connectedFolder: currentReadableRootWhere } },
     orderBy: [{ scanSession: { startedAt: "desc" } }, { scanSession: { id: "desc" } },
       { createdAt: "desc" }, { id: "desc" }],
   });
@@ -187,24 +190,34 @@ export async function refreshSearchForObservation(observationSessionId: string) 
       where: { ...usableScanSnapshotWhere, connectedFolderId: file.scanSession.connectedFolderId },
     });
     if (latest?.id !== file.sessionId) continue;
-    await indexScanKnowledge(await loadScanWorkingKnowledge(file.sessionId), [file.id]);
+    await withCurrentScanPublication(file.sessionId, async (tx) =>
+      indexScanKnowledge(await loadScanWorkingKnowledge(file.sessionId, [file.id], tx), [file.id], undefined, tx));
     return;
   }
 }
 
-export async function refreshSearchForIdentityRelationship(relationshipId: string, work?: KnowledgeWork) {
-  const prisma = getPrismaClient();
+export async function refreshSearchForIdentityRelationship(relationshipId: string, work?: KnowledgeWork,
+  publicationTx?: Prisma.TransactionClient): Promise<void> {
+  const prisma = publicationTx ?? getPrismaClient();
   const relationship = await prisma.knowledgeConnection.findUnique({ where: { id: relationshipId } });
   if (!relationship) return;
   const evidence = relationship.sourceEvidence;
   const connectedLibraryId = evidence && !Array.isArray(evidence) && typeof evidence === "object" &&
     typeof evidence.connectedLibraryId === "string" ? evidence.connectedLibraryId : null;
   if (!connectedLibraryId) return;
+  if (!publicationTx) {
+    const latest = await prisma.scanSession.findFirst({ select: { id: true },
+      orderBy: [{ startedAt: "desc" }, { id: "desc" }],
+      where: { ...usableScanSnapshotWhere, connectedFolderId: connectedLibraryId, connectedFolder: currentReadableRootWhere } });
+    if (latest) await withCurrentScanPublication(latest.id, (tx) =>
+      refreshSearchForIdentityRelationship(relationshipId, work, tx));
+    return;
+  }
   const affected = await getIdentityCorrectionComponent([
     { fileKey: relationship.sourceFileKey, checksum: relationship.sourceChecksum },
     { fileKey: relationship.targetFileKey, checksum: relationship.targetChecksum },
   ].flatMap((entry) => entry.fileKey && entry.checksum ? [{ ...entry,
-    fileKey: entry.fileKey, checksum: entry.checksum, connectedLibraryId, isCurrent: true }] : []), work);
+    fileKey: entry.fileKey, checksum: entry.checksum, connectedLibraryId, isCurrent: true }] : []), work, publicationTx);
   const entries = [];
   for (let offset = 0; offset < affected.length; offset += 500) {
     countKnowledgeWork(work, "searchRefreshQueries");
@@ -212,13 +225,12 @@ export async function refreshSearchForIdentityRelationship(relationshipId: strin
     orderBy: { id: "asc" },
     select: { id: true, connectedLibraryId: true, fileKey: true, checksum: true, entityHashes: true, fingerprint: true },
     where: { isCurrent: true, connectedLibraryId,
-      connectedLibrary: { isEnabled: true, readPermission: true, status: "CONNECTED",
-        disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null },
+      connectedLibrary: currentReadableRootWhere,
       OR: affected.slice(offset, offset + 500).map(({ fileKey, checksum }) => ({ fileKey, checksum })) },
     }));
   }
   if (!entries.length) return;
-  const signals = await getEffectiveDocumentSignals([...new Set(entries.map((entry) => entry.connectedLibraryId))]);
+  const signals = await getEffectiveDocumentSignals([...new Set(entries.map((entry) => entry.connectedLibraryId))], undefined, undefined, publicationTx);
   const hashesByEndpoint = new Map<string, Set<string>>();
   for (const signal of signals) {
     countKnowledgeWork(work, "searchRefreshSignals");
@@ -252,10 +264,7 @@ export async function refreshSearchForIdentityRelationship(relationshipId: strin
         AND entry."connectedLibraryId" = ${connectedLibraryId}
         AND entry."fileKey" = projection."fileKey" AND entry.checksum = projection.checksum
         AND EXISTS (SELECT 1 FROM "ConnectedFolder" AS root
-          WHERE root.id = entry."connectedLibraryId" AND root.enabled = true
-            AND root."readPermission" = true AND root.status = 'CONNECTED'
-            AND root."disconnectedAt" IS NULL AND root."hiddenFromActiveListAt" IS NULL
-            AND root."mergedAt" IS NULL AND root."canonicalConnectedLibraryId" IS NULL)
+          WHERE root.id = entry."connectedLibraryId" AND ${currentReadableRootSql})
     `);
   }
 }

@@ -1,6 +1,8 @@
+import { eligibleMemorySql } from "@/lib/library/memory-provenance";
+import { currentReadableRootWhere } from "./current-readable-root";
 import path from "node:path";
 
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { verifiedSourceText } from "@/lib/ai/source-evidence";
@@ -1070,12 +1072,14 @@ export async function loadScanWorkingKnowledge(
   const session = await prisma.scanSession.findFirst({
     select: { id: true },
     where: { id: scanSessionId, connectedFolder: {
-      isEnabled: true, readPermission: true, status: "CONNECTED",
-      disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null,
-      canonicalConnectedLibraryId: null,
+      ...currentReadableRootWhere,
     } },
   });
   if (!session) throw new Error("This scan is not available for reading.");
+  const memoryIds = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT memory.id FROM "MemoryEntry" memory WHERE ${eligibleMemorySql()}
+    ORDER BY memory."occurrenceCount" DESC, memory."lastSeen" DESC, memory.id DESC LIMIT 80
+  `);
   const [files, memory] = await Promise.all([
     prisma.scannedFile.findMany({
       orderBy: { relativePath: "asc" },
@@ -1114,7 +1118,7 @@ export async function loadScanWorkingKnowledge(
       },
     }),
     prisma.memoryEntry.findMany({
-      orderBy: [{ occurrenceCount: "desc" }, { lastSeen: "desc" }],
+      orderBy: [{ occurrenceCount: "desc" }, { lastSeen: "desc" }, { id: "desc" }],
       select: {
         description: true,
         evidence: true,
@@ -1125,13 +1129,11 @@ export async function loadScanWorkingKnowledge(
         title: true,
       },
       take: 80,
-      where: { status: "ACTIVE", searchProvenanceComplete: true,
+      where: { id: { in: memoryIds.map((row) => row.id) }, status: "ACTIVE", searchProvenanceComplete: true,
         searchSources: { some: {}, every: {
           observationSession: { status: { in: ["APPROVED", "MODIFIED"] } },
           connectedLibrary: {
-            isEnabled: true, readPermission: true, status: "CONNECTED",
-            disconnectedAt: null, hiddenFromActiveListAt: null, mergedAt: null,
-            canonicalConnectedLibraryId: null,
+            ...currentReadableRootWhere,
           },
         } } },
     }),
