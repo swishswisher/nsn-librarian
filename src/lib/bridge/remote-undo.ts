@@ -1,4 +1,4 @@
-import { physicalResultIndex } from "./physical-result-authority";
+import { physicalResultIndex, physicalResultState, physicalResultChanged } from "./physical-result-authority";
 import { requireExecutionReconciliation } from "./execution-reconciliation";
 import { Prisma } from "@prisma/client";
 import { isCurrentReadableRoot } from "./current-readable-root";
@@ -408,7 +408,6 @@ export async function applyRemoteUndoReport(input: {
   const result = objectValue(input.report.result);
   const resultActions = physicalResultIndex(result?.actions, undoRun.actions.map((action) => ({ ...action,
     checksum: action.originalExecutionAction.destinationChecksumAfter ?? action.originalExecutionAction.sourceChecksumBefore })));
-  await requireExecutionReconciliation(prisma, undoRun.executionRunId);
   const completedAt = new Date();
   let completedActions = 0;
   let failedActions = 0;
@@ -417,9 +416,7 @@ export async function applyRemoteUndoReport(input: {
   for (const action of undoRun.actions) {
     const resultAction: Record<string, unknown> | undefined = action.status === "COMPLETED" ? { status: "COMPLETED", safeErrorCategory: null,
       destinationChecksumAfter: action.originalExecutionAction.destinationChecksumAfter ?? action.originalExecutionAction.sourceChecksumBefore } : resultActions.get(action.id);
-    const actionStatus =
-      resultAction?.status === "PENDING" && input.report.safeErrorCategory === "COMMAND_RECOVERY_REQUIRED" ? "PENDING"
-        : resultAction?.status === "COMPLETED" ? "COMPLETED" : "FAILED";
+    const actionStatus = physicalResultState(resultAction);
 
     if (actionStatus === "COMPLETED") {
       completedActions += 1;
@@ -429,11 +426,13 @@ export async function applyRemoteUndoReport(input: {
       failedActions += 1;
     }
 
+    if (action.status === "COMPLETED") continue;
+
     await prisma.undoAction.update({
       data: {
         completedAt: actionStatus === "PENDING" ? null : completedAt,
         safeErrorCategory:
-          typeof resultAction?.safeErrorCategory === "string"
+          actionStatus === "PENDING" ? "COMMAND_RECOVERY_REQUIRED" : typeof resultAction?.safeErrorCategory === "string"
             ? resultAction.safeErrorCategory
             : actionStatus === "COMPLETED"
               ? null
@@ -472,6 +471,8 @@ export async function applyRemoteUndoReport(input: {
     }
   }
 
+  const changed = undoRun.actions.some((action) => action.status !== "COMPLETED" && physicalResultChanged(action.actionType, resultActions.get(action.id)));
+  if (changed) await requireExecutionReconciliation(prisma, undoRun.executionRunId);
   const status: UndoStatus = pendingActions > 0 ? "RUNNING" : completedActions === undoRun.totalActions && failedActions === 0 && undoRun.totalActions > 0
     ? "COMPLETED" : completedActions > 0 ? "PARTIALLY_COMPLETED" : "FAILED";
   const durationMs = Math.max(
@@ -486,14 +487,13 @@ export async function applyRemoteUndoReport(input: {
       durationMs,
       failedActions,
       safeErrorCategory:
-        status === "COMPLETED"
+        pendingActions ? "COMMAND_RECOVERY_REQUIRED" : status === "COMPLETED"
           ? null
           : input.report.safeErrorCategory ?? "EXECUTION_BLOCKED",
       status,
     },
     where: { id: undoRun.id },
   });
-  await prisma.executionRun.update({ data: { reconciliationStatus: "REQUIRED" }, where: { id: undoRun.executionRunId } });
   const stored = await prisma.executionRun.findUnique({
     include: {
       actions: { orderBy: { sequence: "asc" } },

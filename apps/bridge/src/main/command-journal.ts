@@ -6,7 +6,7 @@ import { readLocalJson, writeLocalJson } from "../../../../bridge-app/src/main/l
 import { hashBridgeCommandPayload, type BridgeCommandEnvelope } from "../../../../packages/bridge-protocol/src";
 import { syncDirectory } from "../../../../bridge-app/src/filesystem/safe-move";
 
-type CommandJournal = { version: 1; command: BridgeCommandEnvelope; delivered: boolean };
+type CommandJournal = { version: 1; command: BridgeCommandEnvelope; delivered: boolean; phase?: "PREPARED" | "STARTED" };
 function directory() { return path.join(process.env.NSN_BRIDGE_DATA_DIR?.trim() || path.join(os.homedir(), ".nsn-bridge"), "physical-commands"); }
 function target(commandId: string) { return path.join(directory(), `${createHash("sha256").update(commandId).digest("hex")}.json`); }
 function validate(value: unknown): CommandJournal {
@@ -14,11 +14,12 @@ function validate(value: unknown): CommandJournal {
   if (!entry || entry.version !== 1 || typeof entry.delivered !== "boolean" || !entry.command ||
       typeof entry.command.commandId !== "string" || typeof entry.command.bridgeDeviceId !== "string" ||
       !["EXECUTE_PLAN", "EXECUTE_UNDO"].includes(entry.command.commandType) ||
-      hashBridgeCommandPayload(entry.command.payload) !== entry.command.payloadHash)
+      hashBridgeCommandPayload(entry.command.payload) !== entry.command.payloadHash ||
+      (entry.phase !== undefined && !["PREPARED", "STARTED"].includes(entry.phase)))
     throw new Error("The physical command journal needs recovery; preserve its bytes.");
   return entry;
 }
-export async function preparePhysicalCommand(command: BridgeCommandEnvelope) {
+export async function preparePhysicalCommand(command: BridgeCommandEnvelope, legacyReplay = false) {
   const existing = await readLocalJson(target(command.commandId), () => null as CommandJournal | null, validate) ??
     await readLocalJson(path.join(directory(), "history", path.basename(target(command.commandId))), () => null as CommandJournal | null, validate);
   if (existing) {
@@ -26,7 +27,16 @@ export async function preparePhysicalCommand(command: BridgeCommandEnvelope) {
       throw new Error("Physical command journal authority changed.");
     return;
   }
-  await writeLocalJson(target(command.commandId), { version: 1, command, delivered: false });
+  await writeLocalJson(target(command.commandId), { version: 1, command, delivered: false, ...(legacyReplay ? {} : { phase: "PREPARED" }) });
+}
+export async function physicalCommandNeverStarted(command: BridgeCommandEnvelope) {
+  const entry = await readLocalJson(target(command.commandId), () => null as CommandJournal | null, validate);
+  return entry?.phase === "PREPARED" && entry.command.payloadHash === command.payloadHash && entry.command.signature === command.signature;
+}
+export async function markPhysicalCommandStarted(command: BridgeCommandEnvelope) {
+  const entry = await readLocalJson(target(command.commandId), () => null as CommandJournal | null, validate);
+  if (!entry || entry.command.payloadHash !== command.payloadHash || entry.command.signature !== command.signature) throw new Error("Physical command admission proof changed.");
+  await writeLocalJson(target(command.commandId), { ...entry, phase: "STARTED" });
 }
 export async function markPhysicalCommandDelivered(command: BridgeCommandEnvelope) {
   await writeLocalJson(target(command.commandId), { version: 1, command, delivered: true });

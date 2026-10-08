@@ -61,7 +61,7 @@ export async function recoverExecutionReconciliations(scope: { bridgeDeviceId?: 
   const prisma = getPrismaClient();
   const candidates = await prisma.executionRun.findMany({ take: 2, select: { id: true },
     orderBy: [{ physicalRecoveryAttemptedAt: { sort: "asc", nulls: "first" } }, { id: "asc" }],
-    where: { status: { in: ["COMPLETED", "PARTIALLY_COMPLETED"] }, reconciliationStatus: { in: ["REQUIRED", "IN_PROGRESS"] },
+    where: { status: { in: ["COMPLETED", "PARTIALLY_COMPLETED", "FAILED"] }, reconciliationStatus: { in: ["REQUIRED", "IN_PROGRESS"] },
       organizationPlan: { scanSessionId: scope.scanSessionId }, undoRuns: { none: { status: { in: ["PENDING", "RUNNING"] } } },
       OR: [{ reconciliationScanSessionId: { not: null } }, { connectedLibrary: { scanSessions: { none: { status: { in: [...activeScanStatuses] } } } } }],
       connectedLibrary: { ...currentReadableRootWhere, bridgeDeviceId: scope.bridgeDeviceId } } });
@@ -74,7 +74,8 @@ export async function recoverExecutionReconciliations(scope: { bridgeDeviceId?: 
         await tx.$queryRaw`SELECT id FROM "ExecutionRun" WHERE id = ${candidate.id} FOR UPDATE`;
         const run = await tx.executionRun.findUniqueOrThrow({ where: { id: candidate.id }, include: { connectedLibrary: true } });
         const root = run.connectedLibrary;
-        if (!isCurrentReadableRoot(root) || root.bridgeDeviceId !== binding.connectedLibrary.bridgeDeviceId || !["REQUIRED", "IN_PROGRESS"].includes(run.reconciliationStatus) ||
+        if (!isCurrentReadableRoot(root) || root.bridgeDeviceId !== binding.connectedLibrary.bridgeDeviceId || !["COMPLETED", "PARTIALLY_COMPLETED", "FAILED"].includes(run.status) || !["REQUIRED", "IN_PROGRESS"].includes(run.reconciliationStatus) ||
+            await tx.executionAction.count({ where: { executionRunId: run.id, status: { in: ["PENDING", "RUNNING"] } } }) ||
             await tx.undoRun.count({ where: { executionRunId: run.id, status: { in: ["PENDING", "RUNNING"] } } })) return null;
         await tx.executionRun.update({ where: { id: run.id }, data: { physicalRecoveryAttemptedAt: new Date() } });
         if (run.reconciliationScanSessionId && run.reconciliationRootRevision !== root.nativeConnectionRevision) {

@@ -4,7 +4,8 @@ import { NsnCard } from "@/components/library/NsnCard";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
 import { NsnPageHeader } from "@/components/library/NsnPageHeader";
 import { OrganizationPreferenceReviewPanel } from "@/components/library/OrganizationPreferenceReviewPanel";
-import { getMemoryPageData } from "@/lib/library/memory";
+import { getMemoryPageData, recoverMemoryForWebAccess } from "@/lib/library/memory";
+import { requireHumanSession } from "@/lib/auth/session";
 import { getOrganizationPreferencePageData } from "@/lib/library/organization-preferences";
 import type { MemoryEntrySummary, MemoryType } from "@/types/library";
 
@@ -137,7 +138,11 @@ function MemorySection({
   );
 }
 
+export const maxDuration = 150;
+
 export default async function LibraryMemoryPage() {
+  await requireHumanSession("/admin/library/memory");
+  await recoverMemoryForWebAccess();
   const [memory, organizationPreferences] = await Promise.all([
     getMemoryPageData(),
     getOrganizationPreferencePageData(),

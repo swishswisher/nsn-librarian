@@ -932,7 +932,10 @@ async function reconcileCorrectedMemory(
 }
 
 export async function buildMemoryFromApprovedSession(sessionId: string) {
-  return getPrismaClient().$transaction(async (tx) => {
+  return getPrismaClient().$transaction((tx) => reconcileObservationMemory(sessionId, tx), { isolationLevel: "Serializable", timeout: 120_000 });
+}
+
+async function reconcileObservationMemory(sessionId: string, tx: Prisma.TransactionClient) {
     const result = await buildMemoryInTransaction(sessionId, tx);
     const session = await tx.observationSession.findUnique({ where: { id: sessionId },
       select: { memoryReconciliationStatus: true } });
@@ -946,7 +949,56 @@ export async function buildMemoryFromApprovedSession(sessionId: string) {
       data: { memoryReconciliationStatus: `COMPLETED@${session.memoryReconciliationStatus.slice(8)}` } });
     }
     return result;
-  }, { isolationLevel: "Serializable", timeout: 120_000 });
+}
+
+/** Called only after the web entry point authenticates the human. One eligible
+ * durable owner/request, a nonblocking database lock and a five-second rollback
+ * deadline bound synchronous work. Neither process lifetime nor Bridge polling
+ * is a prerequisite. Death/timeout leaves the exact pending generation intact. */
+export async function recoverMemoryForWebAccess() {
+  const prisma = getPrismaClient();
+  let selected: { id: string; generation: string } | undefined;
+  const recover = (timeout: number, expected?: { id: string; generation: string }) =>
+    prisma.$transaction(async (tx) => {
+      const [lock] = await tx.$queryRaw<Array<{ owned: boolean }>>(Prisma.sql`
+        SELECT pg_try_advisory_xact_lock(hashtextextended(current_schema() || ':web-memory-recovery', 0)) AS owned`);
+      if (!lock.owned) return false;
+      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '250ms'");
+      await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${timeout - 1000}ms'`);
+      const [session] = await tx.$queryRaw<Array<{ id: string; generation: string }>>(Prisma.sql`
+        SELECT observation.id, observation."memoryReconciliationStatus" AS generation FROM "ObservationSession" observation
+        WHERE observation."memoryReconciliationStatus" LIKE 'PENDING@%'
+          AND ${expected ? Prisma.sql`observation.id = ${expected.id} AND observation."memoryReconciliationStatus" = ${expected.generation}` : Prisma.sql`true`}
+          AND (observation.status = 'REJECTED' OR ${eligibleMemoryObservationSql})
+        ORDER BY observation."updatedAt", observation.id LIMIT 1`);
+      if (!session) return false;
+      selected = session;
+      await reconcileObservationMemory(session.id, tx);
+      return true;
+    }, { isolationLevel: "Serializable", maxWait: 500, timeout });
+  try {
+    return await recover(5000);
+  } catch {
+    // Retrieval still rechecks live provenance. Interrupted work remains pending.
+    if (selected) {
+      const owner = selected;
+      await prisma.$transaction(async (tx) => {
+        await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '100ms'");
+        await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '250ms'");
+        await tx.observationSession.updateMany({ where: { id: owner.id, memoryReconciliationStatus: owner.generation },
+          data: { memoryReconciliationStatus: owner.generation } });
+      }, { maxWait: 100, timeout: 500 }).catch(() => undefined);
+    }
+    if (selected) {
+      // A large complete source family can exceed the interactive budget. Next
+      // owns this bounded response-lifetime attempt; the durable marker, exact
+      // generation check and database lock survive its cancellation or death.
+      const owner = selected;
+      const { after } = await import("next/server");
+      after(async () => { await recover(120_000, owner).catch(() => undefined); });
+    }
+    return false;
+  }
 }
 
 /** Durable review admission is independent of a route's successful response.

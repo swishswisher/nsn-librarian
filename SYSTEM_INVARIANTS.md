@@ -18,6 +18,8 @@ The machine suggests. Deanne decides. Nothing moves without approval. These requ
 
 **DERIVED-2.** Every correctness-significant derivation commits with its source transition or has durable pending work admitted in that source transaction. Best-effort UI/Notebook reflection is allowed only when it cannot publish current evidence or falsely assert completion. Memory creation after approval must recover after process death; atomic invalidation alone does not create missing new Memory.
 
+Authenticated Memory, Search and Ask requests also reach the same durable observation Memory work without a paired Bridge. Web recovery selects at most one eligible owner per request under a nonblocking transaction advisory lock, with a five-second interactive transaction deadline and short lock waits. A family exceeding that deadline gets one post-response retry of the same pending generation under the existing bounded 120-second builder deadline. Rollback/death retains pending work; duplicate requests cannot manufacture provenance or human approval. Live eligibility still gates retrieval. Migration 35 remains immutable.
+
 ## C. Currentness and snapshot ordering
 
 **CURRENT-1.** Select the latest complete usable scan per root by startedAt descending/id descending. Pending, failed, partial watcher imports and incomplete discovery are not complete snapshots. A complete snapshot's file set is exhaustive for its declared root; a changed-files batch cannot retire unchanged files.
@@ -27,6 +29,10 @@ The machine suggests. Deanne decides. Nothing moves without approval. These requ
 **CURRENT-3.** Retain historical scans, decisions, signals, corrections, plans, outcomes and provenance. History intent must not silently use current-only fallback. Current Search/Ask/Memory cannot use superseded/rejected history as current grounding. UI status must distinguish primary progress, pending derived publication and historical outcome from present filesystem state.
 
 **CURRENT-4.** Physical inventory uses a database generation, not wall-clock comparison. Discovery captures `ConnectedLibrary.physicalInventoryGeneration` before I/O; `ScanSession.inventoryGeneration` must still match at import/publication. A verified execution/Undo outcome increments the root generation in the outcome transaction and retires old active scan/read work without changing completed history. Pending/running physical work blocks inventory publication and current grounding; recovery of its journal/outcome precedes a new complete inventory. Execution reconciliation is complete only after that inventory's Knowledge and Search stages both commit.
+
+Terminal command status alone never advances that generation. Exact completed moves/removals and newly created folders are physical changes; a verified existing folder is not. Explicit native no-effect proof binds action type and paths (and any reported source checksum) to the immutable owner. Missing/legacy/unverified results remain pending with `COMMAND_RECOVERY_REQUIRED`; execution shows `INSPECTION_REQUIRED` when no verified change has admitted an inventory obligation. Signed command completion retains RUNNING for unresolved outcomes. Later no-effect proof releases that uncertainty; later changed-outcome proof admits generation/reconciliation atomically. Terminal FAILED parents with durable reconciliation work are recoverable too. Replayed completed actions cannot rewrite their outcome or advance another epoch.
+
+Abandoned observation recovery selects only eligible active scans before its 50-file window, then locks Device → Root → read commands → Scan → File. Fresh root/device key/connection revision, physical generation, scan lifecycle, source availability, extraction state and exact expired lease must agree at mutation. Retired/terminal scans and newer owners are unchanged; recovery never creates an observation or human decision as proof of success.
 
 ## D. Root/library authorization
 
@@ -72,6 +78,10 @@ Intentional exceptions:
 
 **RECOVER-4.** Ordinary Bridge polling/history navigation discovers durable work without a second human authorization to repeat the physical effect. Memory recovery owns the exact non-NOTE review generation; recommendation recovery owns a renewable ten-minute generation; watch discovery renews its ten-minute owner during I/O. Physical recovery reads the journal bound to the exact action/path/checksum/original Undo owner. Reconciliation owns its execution generation, connection revision and scan ID. Partial Undo retries exclude already completed original actions across all prior attempts. Delivered native reports leave the hot pending directory while retained journals continue to prove history.
 
+Native commands durably distinguish PREPARED from STARTED before an effect is admitted. PREPARED can prove an interrupted ACK admitted no operation; an older journal without that phase cannot. Started/legacy/replay-key commands use journal-only recovery even if a fresh ACK succeeds and current grants permit execution. Historical recovery with neither action proof nor preparation proof remains UNKNOWN and never repeats a filesystem operation. Web-only Memory recovery is request-reachable, durable and bounded; no process-startup or Bridge-connectivity assumption supplies correctness.
+
+Live native failure settlement also retains UNKNOWN when an existing action journal cannot establish its outcome. Missing destination/source names after source capture are not no-effect proof; retained private bytes and journal authority must remain available for inspection.
+
 ## H. Bounds and scale
 
 **SCALE-1.** Semantic eligibility (authorization/currentness/type/checksum/actionability/owner) precedes its result cap. Raw-row caps followed by eligibility filtering are forbidden on correctness-significant paths. Latest per owner is independently selected; one owner's deep history cannot starve another. Stable pagination uses timestamp + unique id where ordered by time; no timestamp-only cursor gaps.
@@ -97,6 +107,8 @@ Intentional exceptions:
 **PRIVACY-3.** Ordinary validation uses only disposable 127.0.0.1:5432/nsn_library_machine_test, synthetic local files, mocked AI and **unset** OPENAI_API_KEY. Never use production Neon/private production files/paid AI without explicit authorization. No generated Bridge dist, master changes, push, publication or promotion in this audit workflow.
 
 ## Permanent invariant gate
+
+Modern local execution/Undo admission also records PREPARED proof on every action. An exact STARTED owner commits separately before filesystem admission, so an outcome transaction rollback cannot falsely restore preparation evidence. Only that owner can begin an operation under fresh root locks/grants; journal-only recovery preserves its marker while pending. Revoked PREPARED work can settle as no-effect. STARTED or legacy work without bound journal proof remains uncertain and cannot repeat an operation. Native signed commands use the same phase distinction; legacy replay keys cannot create no-effect proof.
 
 The mandatory suite must exercise real service/DB/native paths, not duplicate implementation logic. Integrate its named package script into the existing CI quality job. Reuse existing expensive fixtures once per gate where possible. New regressions cover observation authority barriers, canonical read admission and sibling parity, pending derived recovery, partial scan import, generation ownership, root/device revocation, native journal/collision behavior, graph/Notebook human decisions and batch complexity. Existing structural, publication, eligibility, typed/version/QA and execution tests remain controls.
 

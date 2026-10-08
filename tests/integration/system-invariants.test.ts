@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { after, before, beforeEach, test, type TestContext } from "node:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -845,7 +845,8 @@ test("PROOF-1 incomplete remote action coverage cannot claim complete execution"
   await f.remote.applyRemoteExecutionReport({ commandPayload: f.command.payload,
     report: { commandId: f.command.commandId, status: "COMPLETED", result: { status: "COMPLETED", actions: f.results.slice(0, 1) } } });
   const run = await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } });
-  assert.equal(run.status, "PARTIALLY_COMPLETED"); assert.equal(run.successfulActions, 1); assert.equal(run.failedActions, 1);
+  assert.equal(run.status, "RUNNING"); assert.equal(run.successfulActions, 1); assert.equal(run.failedActions, 0);
+  assert.equal(run.safeErrorCategory, "COMMAND_RECOVERY_REQUIRED", "Missing action proof retains uncertainty rather than inventing a failed outcome");
 });
 
 test("PROOF-1 mismatched and repeated remote physical identities write no action or path state", async (t) => {
@@ -894,7 +895,8 @@ test("RECOVER-1 partial remote Undo retries only unrestored actions and late rep
   const checksums = new Map(f.run.actions.map((action) => [action.id, action.sourceChecksumBefore]));
   const result = (action: typeof firstRun.actions[number], status: "COMPLETED" | "FAILED") => ({ actionId: action.id,
     actionType: action.actionType, sourceRelativePath: action.sourceRelativePath, destinationRelativePath: action.destinationRelativePath,
-    sourceChecksumBefore: checksums.get(action.originalExecutionActionId)!, destinationChecksumAfter: checksums.get(action.originalExecutionActionId)!, status });
+    sourceChecksumBefore: checksums.get(action.originalExecutionActionId)!, destinationChecksumAfter: checksums.get(action.originalExecutionActionId)!,
+    physicalEffect: status === "FAILED" ? "NONE" : "CHANGED", status });
   const partialReport = { commandId: first.command.commandId, status: "FAILED" as const,
     result: { actions: firstRun.actions.map((action, index) => result(action, index === 0 ? "COMPLETED" : "FAILED")) } };
   await undo.applyRemoteUndoReport({ commandPayload: first.command.payload, report: partialReport });
@@ -912,6 +914,296 @@ test("RECOVER-1 partial remote Undo retries only unrestored actions and late rep
   assert.equal(new Set(restoredFiles.map((file) => file.relativePath)).size, 2);
   assert.deepEqual(restoredFiles.map((file) => file.relativePath).sort(), f.run.actions.map((action) => action.sourceRelativePath).sort());
   await assert.rejects(undo.queueRemoteExecutionUndo(f.run.id, "UNDO"), /Undo|undone|restor|available/i);
+});
+
+test("CLOSURE-1 definitive failed remote actions preserve the physical epoch and current evidence", async (t) => {
+  const f = await remotePlanFixture(t, 2);
+  for (const row of f.rows) {
+    await prisma.libraryDocument.update({ where: { id: row.documentId }, data: { checksum: row.checksum, rawText: "Cobalt cobalt garden stories.", previewText: "Cobalt cobalt garden stories." } });
+    await prisma.observationSession.update({ where: { id: row.observationId }, data: { status: "APPROVED", observerType: "OPENAI",
+      observations: [{ description: "Cobalt cobalt garden stories.", evidence: ['Source characters 0-28: "Cobalt cobalt garden stories."'] }] } });
+    await prisma.humanDecision.create({ data: { observationSessionId: row.observationId, decisionType: "ACCEPT" } });
+    await memory.buildMemoryFromApprovedSession(row.observationId);
+  }
+  const search = await import("../../src/lib/library/search");
+  const beforeMemory = await memory.getMemoryPageData();
+  const beforeSearch = await search.searchLibrary("records", [f.root.id]);
+  assert.ok(beforeSearch.length); assert.ok(beforeMemory.preferredTerms.length);
+  const remote = await import("../../src/lib/bridge/remote-execution");
+  const queued = await remote.queueRemoteOrganizationPlanExecution(f.plan.id, "EXECUTE"); assert.ok(queued);
+  const run = await prisma.executionRun.findFirstOrThrow({ where: { organizationPlanId: f.plan.id }, include: { actions: true } });
+  const command = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: queued.command.commandId } });
+  await remote.applyRemoteExecutionReport({ commandPayload: command.payload, report: { commandId: command.commandId, status: "FAILED",
+    result: { actions: run.actions.map((action) => ({ actionId: action.id, actionType: action.actionType, sourceRelativePath: action.sourceRelativePath || null,
+      destinationRelativePath: action.destinationRelativePath, status: "FAILED", safeErrorCategory: "DESTINATION_CONFLICT", physicalEffect: "NONE" })) } } });
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 0,
+    "A definitive no-effect failure must not invalidate a verified current inventory");
+  assert.equal((await prisma.executionRun.findUniqueOrThrow({ where: { id: run.id } })).reconciliationStatus, "NOT_REQUESTED");
+  assert.deepEqual(await search.searchLibrary("records", [f.root.id]), beforeSearch);
+  assert.deepEqual(await memory.getMemoryPageData(), beforeMemory);
+  const { latestKnowledgeSnapshot } = await import("../../src/lib/bridge/current-knowledge-query");
+  assert.deepEqual(await prisma.$queryRaw(Prisma.sql`SELECT latest.id FROM "ConnectedFolder" root ${latestKnowledgeSnapshot} WHERE root.id = ${f.root.id}`), [{ id: f.scan.id }]);
+});
+
+test("CLOSURE-2 selected abandoned work cannot resurrect a scan retired by physical completion", async (t) => {
+  const f = await queuedRemotePlan(t, 1), row = f.rows[0];
+  const authority = await import("../../src/lib/bridge/observation-authority");
+  const recovery = await import("../../src/lib/bridge/observation-recovery");
+  const stale = new Date(Date.now() - authority.observationLeaseMs - 1000);
+  await prisma.scanSession.update({ where: { id: f.scan.id }, data: { status: "READING", completedAt: null } });
+  await prisma.scannedFile.update({ where: { id: row.id }, data: { libraryDocumentId: null, processingStage: "READING", observationClaimedAt: stale,
+    observationRootRevision: 0, observationDeviceKeyFingerprint: authority.deviceKeyFingerprint(f.device.publicKey) } });
+  const held = barrier(), finish = barrier(); t.after(finish.resolve);
+  const physical = prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE id = ${f.root.id} FOR UPDATE`;
+    await tx.$queryRaw`SELECT id FROM "ScannedFile" WHERE id = ${row.id} FOR UPDATE`;
+    held.resolve(); await finish.promise;
+    await f.remote.applyRemoteExecutionReport({ commandPayload: f.command.payload,
+      report: { commandId: f.command.commandId, status: "COMPLETED", result: { actions: f.results } } }, tx);
+  }, { timeout: 30_000 });
+  await held.promise;
+  const late = recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId);
+  const deadline = Date.now() + 15_000;
+  let waiting = false;
+  while (Date.now() < deadline) {
+    const [state] = await prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`SELECT count(*) FROM pg_stat_activity
+      WHERE datname = current_database() AND wait_event_type = 'Lock'
+        AND (query LIKE '%UPDATE%ScannedFile%' OR query LIKE '%SELECT id FROM "ConnectedFolder"%FOR SHARE%')`);
+    if (Number(state.count)) { waiting = true; break; }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.ok(waiting, "The real recovery transaction reached its mutation/authority barrier");
+  finish.resolve(); await physical; const recovered = await late;
+  assert.equal((await prisma.scanSession.findUniqueOrThrow({ where: { id: f.scan.id } })).status, "FAILED",
+    "An old recovery candidate cannot revive a retired scan");
+  assert.equal(recovered, 0);
+  assert.equal((await prisma.scannedFile.findUniqueOrThrow({ where: { id: row.id } })).observationClaimedAt?.getTime(), stale.getTime());
+  const reconcile = await import("../../src/lib/bridge/execution-reconciliation");
+  await reconcile.recoverExecutionReconciliations({ bridgeDeviceId: f.device.bridgeDeviceId });
+  const run = await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } });
+  assert.equal(run.reconciliationStatus, "IN_PROGRESS"); assert.ok(run.reconciliationScanSessionId);
+  assert.equal(await recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId), 0);
+});
+
+for (const result of [undefined, { actions: [] }, { actions: [{ status: "FAILED" }] }]) {
+  test(`CLOSURE-1 ${JSON.stringify(result) ?? "absent results"} cannot manufacture a no-effect outcome`, async (t) => {
+    const f = await queuedRemotePlan(t, 1);
+    const submitted = result?.actions.length ? { actions: [{ actionId: f.run.actions[0].id, status: "FAILED" }] } : result;
+    await f.remote.applyRemoteExecutionReport({ commandPayload: f.command.payload, report: { commandId: f.command.commandId, status: "FAILED", result: submitted } });
+    const run = await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id }, include: { actions: true } });
+    assert.equal(run.status, "RUNNING"); assert.equal(run.actions[0].status, "PENDING");
+    assert.equal(run.actions[0].safeErrorCategory, "COMMAND_RECOVERY_REQUIRED", "Unknown child results cannot claim execution was blocked before any effect");
+    assert.equal(run.safeErrorCategory, "COMMAND_RECOVERY_REQUIRED"); assert.equal(run.reconciliationStatus, "INSPECTION_REQUIRED");
+    assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 0);
+    const reconcile = await import("../../src/lib/bridge/execution-reconciliation");
+    await reconcile.recoverExecutionReconciliations({ bridgeDeviceId: f.device.bridgeDeviceId });
+    assert.equal(await prisma.bridgeCommand.count({ where: { connectedLibraryId: f.root.id, commandType: "RECONCILE_LIBRARY" } }), 0);
+    await assert.rejects(prisma.$transaction((tx) => reconcile.assertInventoryAfterPhysicalOutcomes(tx, f.root.id, 0)), /unresolved/);
+  });
+}
+
+test("CLOSURE-1 partial results, replay and FAILED parent retain one recoverable physical obligation", async (t) => {
+  const f = await queuedRemotePlan(t, 2);
+  const report = { commandId: f.command.commandId, status: "FAILED" as const,
+    result: { actions: [f.results[0], { ...f.results[1], status: "FAILED", physicalEffect: "NONE" }] } };
+  await f.remote.applyRemoteExecutionReport({ commandPayload: f.command.payload, report });
+  let run = await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } });
+  assert.equal(run.status, "PARTIALLY_COMPLETED"); assert.equal(run.successfulActions, 1); assert.equal(run.failedActions, 1);
+  const generation = run.reconciliationGeneration;
+  await f.remote.applyRemoteExecutionReport({ commandPayload: f.command.payload, report });
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 1);
+  // Older retained deployments can have FAILED parents with verified completed
+  // children. The ordinary production coordinator must admit them too.
+  await prisma.executionRun.update({ where: { id: f.run.id }, data: { status: "FAILED" } });
+  const reconcile = await import("../../src/lib/bridge/execution-reconciliation");
+  for (let attempt = 0; attempt < 3; attempt++) await reconcile.recoverExecutionReconciliations({ bridgeDeviceId: f.device.bridgeDeviceId });
+  run = await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } });
+  assert.equal(run.reconciliationStatus, "IN_PROGRESS"); assert.ok(run.reconciliationScanSessionId);
+  assert.equal(run.reconciliationGeneration, generation);
+  assert.equal(await prisma.bridgeCommand.count({ where: { connectedLibraryId: f.root.id, commandType: "RECONCILE_LIBRARY" } }), 1);
+  const root = await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } });
+  const latest = await prisma.scanSession.create({ data: { connectedFolderId: root.id, inventoryGeneration: root.physicalInventoryGeneration, status: "COMPLETED" } });
+  await reconcile.recoverExecutionReconciliations({ bridgeDeviceId: f.device.bridgeDeviceId });
+  assert.equal((await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } })).reconciliationStatus, "COMPLETED");
+  assert.equal((await prisma.scanSession.findUniqueOrThrow({ where: { id: latest.id } })).searchIndexStatus, "COMPLETED");
+});
+
+test("CLOSURE-1 completed existing folder has no physical effect and failed Undo does not advance generation", async (t) => {
+  const folder = await queuedRemotePlan(t, 1);
+  await prisma.executionAction.update({ where: { id: folder.run.actions[0].id }, data: { actionType: "CREATE_FOLDER", sourceRelativePath: "", sourceChecksumBefore: null } });
+  await folder.remote.applyRemoteExecutionReport({ commandPayload: folder.command.payload, report: { commandId: folder.command.commandId, status: "COMPLETED",
+    result: { actions: [{ actionId: folder.run.actions[0].id, actionType: "CREATE_FOLDER", sourceRelativePath: null,
+      destinationRelativePath: folder.run.actions[0].destinationRelativePath, status: "COMPLETED", createdFilesystemItem: false }] } } });
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: folder.root.id } })).physicalInventoryGeneration, 0);
+  const f = await queuedRemotePlan(t, 1), undo = await import("../../src/lib/bridge/remote-undo");
+  await f.remote.applyRemoteExecutionReport({ commandPayload: f.command.payload, report: { commandId: f.command.commandId, status: "COMPLETED", result: { actions: f.results } } });
+  const queued = await undo.queueRemoteExecutionUndo(f.run.id, "UNDO"); assert.ok(queued);
+  const command = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: queued.command.commandId } });
+  const owner = await prisma.undoRun.findFirstOrThrow({ where: { executionRunId: f.run.id }, include: { actions: true } });
+  const before = await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } });
+  await undo.applyRemoteUndoReport({ commandPayload: command.payload, report: { commandId: command.commandId, status: "FAILED",
+    result: { actions: owner.actions.map((a) => ({ actionId: a.id, actionType: a.actionType, sourceRelativePath: a.sourceRelativePath,
+      destinationRelativePath: a.destinationRelativePath, status: "FAILED", physicalEffect: "NONE" })) } } });
+  assert.equal((await prisma.undoRun.findUniqueOrThrow({ where: { id: owner.id } })).status, "FAILED");
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 1);
+  assert.equal((await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } })).reconciliationGeneration, before.reconciliationGeneration);
+});
+
+test("CLOSURE-1 signed empty result remains recoverable and later proof advances the epoch exactly once", async (t) => {
+  const f = await queuedRemotePlan(t, 1), cloud = await import("../../src/lib/bridge/cloud-coordinator");
+  await cloud.acknowledgeBridgeCloudCommand(f.device.bridgeDeviceId, f.command.commandId);
+  const route = await import("../../src/app/api/bridge/cloud/devices/[deviceId]/commands/[commandId]/complete/route");
+  const pathname = `/api/bridge/cloud/devices/${f.device.bridgeDeviceId}/commands/${f.command.commandId}/complete`;
+  const send = async (actions: unknown[]) => {
+    const bodyText = JSON.stringify({ status: "COMPLETED", result: { actions } });
+    return route.POST(new Request(`http://localhost:3000${pathname}`, { method: "POST", body: bodyText,
+      headers: createBridgeDeviceRequestHeaders({ bodyText, bridgeDeviceId: f.device.bridgeDeviceId, method: "POST", pathname, privateKey: f.device.privateKey }) }),
+    { params: Promise.resolve({ deviceId: f.device.bridgeDeviceId, commandId: f.command.commandId }) });
+  };
+  assert.equal((await send([])).status, 200);
+  const unknown = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: f.command.commandId } });
+  assert.equal(unknown.status, "RUNNING"); assert.equal(unknown.safeErrorCategory, "COMMAND_RECOVERY_REQUIRED");
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 0);
+  assert.equal((await send(f.results)).status, 200); assert.equal((await send(f.results)).status, 200);
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 1);
+  assert.equal((await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } })).status, "COMPLETED");
+});
+
+test("CLOSURE-1 actual process death cannot split persisted action outcomes from reconciliation admission", async (t) => {
+  const f = await queuedRemotePlan(t, 1), directory = await mkdtemp(path.join(os.tmpdir(), "nsn-closure-report-"));
+  t.after(async () => { assert.ok(path.resolve(directory).startsWith(path.resolve(os.tmpdir()) + path.sep)); await rm(directory, { recursive: true, force: true }); });
+  const inputPath = path.join(directory, "input.json");
+  await writeFile(inputPath, JSON.stringify({ commandPayload: f.command.payload, report: { commandId: f.command.commandId, status: "COMPLETED", result: { actions: f.results } } }));
+  const held = barrier(), release = barrier(); t.after(release.resolve);
+  const lock = prisma.$transaction(async (tx) => { await tx.$queryRaw`SELECT pg_advisory_xact_lock(4213170295::bigint)::text`; held.resolve(); await release.promise; }, { timeout: 30_000 });
+  await held.promise;
+  await prisma.$executeRawUnsafe(`CREATE FUNCTION closure_epoch_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW."physicalInventoryGeneration" > OLD."physicalInventoryGeneration" THEN PERFORM pg_advisory_xact_lock(4213170295::bigint); END IF; RETURN NEW; END $$`);
+  await prisma.$executeRawUnsafe('CREATE TRIGGER closure_epoch_pause BEFORE UPDATE ON "ConnectedFolder" FOR EACH ROW EXECUTE FUNCTION closure_epoch_pause()');
+  t.after(async () => { await prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS closure_epoch_pause ON "ConnectedFolder"'); });
+  const child = () => spawn(process.execPath, ["--import", "tsx", "tests/fixtures/audit-closure-report-worker.ts", inputPath], { env: process.env, windowsHide: true, stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  const interrupted = child(); t.after(() => { interrupted.kill(); });
+  const deadline = Date.now() + 15_000; let waiting = false;
+  while (Date.now() < deadline) {
+    const [row] = await prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()
+      AND wait_event_type = 'Lock' AND query LIKE '%UPDATE%ConnectedFolder%physicalInventoryGeneration%'`);
+    if (Number(row.count)) { waiting = true; break; } await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.ok(waiting, "Child persisted its action inside the transaction and reached the reconciliation trigger");
+  interrupted.kill("SIGKILL"); await new Promise<void>((resolve) => interrupted.once("exit", () => resolve()));
+  release.resolve(); await lock;
+  assert.equal((await prisma.executionAction.findUniqueOrThrow({ where: { id: f.run.actions[0].id } })).status, "PENDING");
+  assert.equal((await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } })).reconciliationStatus, "NOT_REQUESTED");
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 0);
+  await prisma.$executeRawUnsafe('DROP TRIGGER closure_epoch_pause ON "ConnectedFolder"');
+  const committed = child(); t.after(() => { committed.kill(); });
+  await new Promise<void>((resolve, reject) => { committed.once("message", () => resolve()); committed.once("exit", (code) => reject(new Error(`Report worker exited ${code}`))); });
+  committed.kill("SIGKILL"); await new Promise<void>((resolve) => committed.once("exit", () => resolve()));
+  assert.equal((await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } })).reconciliationStatus, "REQUIRED");
+  const reconcile = await import("../../src/lib/bridge/execution-reconciliation");
+  await reconcile.recoverExecutionReconciliations({ bridgeDeviceId: f.device.bridgeDeviceId });
+  assert.equal((await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } })).reconciliationStatus, "IN_PROGRESS");
+});
+
+async function abandonedRemoteFixture(t: TestContext) {
+  const f = await remotePlanFixture(t, 1), authority = await import("../../src/lib/bridge/observation-authority");
+  const claimedAt = new Date(Date.now() - authority.observationLeaseMs - 1000);
+  await prisma.scanSession.update({ where: { id: f.scan.id }, data: { status: "READING", completedAt: null } });
+  await prisma.scannedFile.update({ where: { id: f.rows[0].id }, data: { libraryDocumentId: null,
+    processingStage: "READING", observationClaimedAt: claimedAt, observationRootRevision: 0,
+    observationDeviceKeyFingerprint: authority.deviceKeyFingerprint(f.device.publicKey) } });
+  return { ...f, authority, claimedAt, recovery: await import("../../src/lib/bridge/observation-recovery") };
+}
+
+test("CLOSURE-2 competing recovery workers resume only one genuinely current abandoned owner", async (t) => {
+  const f = await abandonedRemoteFixture(t), held = barrier(), release = barrier(); t.after(release.resolve);
+  const lock = prisma.$transaction(async (tx) => { await tx.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE id = ${f.root.id} FOR UPDATE`; held.resolve(); await release.promise; }, { timeout: 30_000 });
+  await held.promise;
+  const one = f.recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId); await waitForReviewWaiters(1, "ConnectedFolder", "SHARE");
+  const two = f.recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId); await waitForReviewWaiters(2, "ConnectedFolder", "SHARE");
+  release.resolve(); await lock;
+  assert.deepEqual((await Promise.all([one, two])).sort(), [0, 1]);
+  const file = await prisma.scannedFile.findUniqueOrThrow({ where: { id: f.rows[0].id } });
+  assert.equal(file.processingStage, "DISCOVERED"); assert.equal(file.readingStatus, "NOT_READ"); assert.equal(file.observationClaimedAt, null);
+  const state = await prisma.scanSession.findUniqueOrThrow({ where: { id: f.scan.id } });
+  assert.equal(await f.recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId), 0);
+  assert.deepEqual(await prisma.scanSession.findUniqueOrThrow({ where: { id: f.scan.id } }), state);
+  await assert.rejects(f.authority.withOwnedObservationLease(file.id, f.claimedAt, async (tx) => { await tx.scannedFile.update({ where: { id: file.id }, data: { processingStage: "EXAMINED" } }); }), /ownership/);
+});
+
+for (const state of ["FAILED", "COMPLETED", "COMPLETED_WITH_ERRORS", "GENERATING_SUGGESTIONS", "PENDING", "SCANNING"] as const) {
+  test(`CLOSURE-2 late recovery preserves ${state} scan lifecycle`, async (t) => {
+    const f = await abandonedRemoteFixture(t);
+    await prisma.scanSession.update({ where: { id: f.scan.id }, data: { status: state } });
+    const scan = await prisma.scanSession.findUniqueOrThrow({ where: { id: f.scan.id } });
+    const file = await prisma.scannedFile.findUniqueOrThrow({ where: { id: f.rows[0].id } });
+    assert.equal(await f.recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId), 0);
+    assert.deepEqual(await prisma.scanSession.findUniqueOrThrow({ where: { id: scan.id } }), scan);
+    assert.deepEqual(await prisma.scannedFile.findUniqueOrThrow({ where: { id: file.id } }), file);
+  });
+}
+
+test("CLOSURE-2 generation, connection and key mismatch never resume an old abandoned lease", async (t) => {
+  const f = await abandonedRemoteFixture(t);
+  for (const data of [{ observationRootRevision: null }, { observationDeviceKeyFingerprint: null }]) {
+    await prisma.scannedFile.update({ where: { id: f.rows[0].id }, data });
+    assert.equal(await f.recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId), 0,
+      "A timestamp without captured root/key authority is not a recoverable modern lease");
+    await prisma.scannedFile.update({ where: { id: f.rows[0].id }, data: { observationRootRevision: 0,
+      observationDeviceKeyFingerprint: f.authority.deviceKeyFingerprint(f.device.publicKey) } });
+  }
+  for (const data of [{ physicalInventoryGeneration: 1 }, { nativeConnectionRevision: 1 }, { readPermission: false }]) {
+    await prisma.connectedLibrary.update({ where: { id: f.root.id }, data });
+    assert.equal(await f.recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId), 0);
+    await prisma.connectedLibrary.update({ where: { id: f.root.id }, data: { physicalInventoryGeneration: 0, nativeConnectionRevision: 0, readPermission: true } });
+  }
+  await prisma.bridgeDevice.update({ where: { id: f.device.id }, data: { publicKey: createBridgeKeyPair().publicKey } });
+  assert.equal(await f.recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId), 0);
+  assert.equal((await prisma.scannedFile.findUniqueOrThrow({ where: { id: f.rows[0].id } })).observationClaimedAt?.getTime(), f.claimedAt.getTime());
+});
+
+test("CLOSURE-2 new lease owner wins while the selected old recovery candidate waits", async (t) => {
+  const f = await abandonedRemoteFixture(t), held = barrier(), release = barrier(); t.after(release.resolve);
+  const newer = new Date();
+  const lock = prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE id = ${f.root.id} FOR UPDATE`;
+    held.resolve(); await release.promise;
+    await tx.scannedFile.update({ where: { id: f.rows[0].id }, data: { observationClaimedAt: newer } });
+  }, { timeout: 30_000 });
+  await held.promise;
+  const late = f.recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId); await waitForReviewWaiters(1, "ConnectedFolder", "SHARE");
+  release.resolve(); await lock; assert.equal(await late, 0);
+  const file = await prisma.scannedFile.findUniqueOrThrow({ where: { id: f.rows[0].id } });
+  assert.equal(file.observationClaimedAt?.getTime(), newer.getTime()); assert.equal(file.processingStage, "READING");
+  await f.authority.withOwnedObservationLease(file.id, newer, async (tx) => { await tx.scannedFile.update({ where: { id: file.id }, data: { processingStage: "EXAMINED", observationClaimedAt: null } }); });
+  await assert.rejects(f.authority.withOwnedObservationLease(file.id, f.claimedAt, async (tx) => { await tx.scannedFile.update({ where: { id: file.id }, data: { processingStage: "READING" } }); }), /ownership/);
+  assert.equal((await prisma.scannedFile.findUniqueOrThrow({ where: { id: file.id } })).processingStage, "EXAMINED");
+});
+
+test("CLOSURE-2 terminal candidates cannot starve current abandoned work and no observation success is invented", async (t) => {
+  const f = await abandonedRemoteFixture(t), row = f.rows[0];
+  const failed = await prisma.scanSession.create({ data: { connectedFolderId: f.root.id, status: "FAILED" } });
+  await prisma.scannedFile.createMany({ data: Array.from({ length: 51 }, (_, i) => ({ sessionId: failed.id, relativePath: `old-${i}.txt`,
+    localPath: `bridge://old-${i}`, checksum: row.checksum, fileType: "TEXT", readStatus: "SUPPORTED" as const, processingStage: "READING" as const,
+    observationClaimedAt: new Date(0), observationRootRevision: 0, observationDeviceKeyFingerprint: f.authority.deviceKeyFingerprint(f.device.publicKey) })) });
+  const observations = await prisma.observationSession.count();
+  assert.equal(await f.recovery.recoverAbandonedObservationFilesForDevice(f.device.bridgeDeviceId), 1);
+  assert.equal(await prisma.observationSession.count(), observations);
+  assert.equal((await prisma.scanSession.findUniqueOrThrow({ where: { id: failed.id } })).status, "FAILED");
+  assert.equal((await prisma.scannedFile.findUniqueOrThrow({ where: { id: row.id } })).processingStage, "DISCOVERED");
+});
+
+test("CLOSURE-1 later definitive no-effect proof releases uncertainty without advancing generation", async (t) => {
+  const f = await queuedRemotePlan(t, 1), input = { commandPayload: f.command.payload,
+    report: { commandId: f.command.commandId, status: "FAILED" as const, result: { actions: [] as unknown[] } } };
+  await f.remote.applyRemoteExecutionReport(input);
+  await f.remote.applyRemoteExecutionReport({ ...input, report: { ...input.report, result: { actions: [{ ...f.results[0], status: "FAILED", physicalEffect: "NONE" }] } } });
+  const run = await prisma.executionRun.findUniqueOrThrow({ where: { id: f.run.id } });
+  assert.equal(run.status, "FAILED"); assert.equal(run.reconciliationStatus, "NOT_REQUESTED");
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 0);
+  const malformed = await queuedRemotePlan(t, 1);
+  await assert.rejects(malformed.remote.applyRemoteExecutionReport({ commandPayload: malformed.command.payload,
+    report: { commandId: malformed.command.commandId, status: "FAILED", result: { actions: [{ ...malformed.results[0], status: "FAILED", physicalEffect: "NONE", destinationRelativePath: "different.txt" }] } } }), /No-effect proof/);
+  assert.equal((await prisma.executionRun.findUniqueOrThrow({ where: { id: malformed.run.id } })).status, "PENDING");
 });
 
 test("ROOT-2 pairing key replacement atomically denies roots and settles unstarted physical owners", async (t) => {
@@ -1112,6 +1404,10 @@ test("RECOVER-1 legacy local runs without journal authority remain unresolved wi
 test("AUTH-2 revoked local authority recovers a proven move without admitting remaining actions", async (t) => {
   const f = await localPhysicalFixture(t, 2);
   await assert.rejects(f.executor.executeOrganizationPlan(f.plan.id, "EXECUTE", { afterPhysical: async () => { throw new Error("synthetic process death"); } }), /synthetic process death/);
+  const interrupted = await prisma.executionRun.findFirstOrThrow({ where: { organizationPlanId: f.plan.id }, include: { actions: { orderBy: { sequence: "asc" } } } });
+  assert.match(interrupted.actions[0].safeErrorCategory ?? "", /^PHYSICAL_ACTION_STARTED:/u);
+  assert.equal(interrupted.actions[1].safeErrorCategory, "PHYSICAL_ACTION_PREPARED");
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 0);
   await prisma.connectedLibrary.update({ where: { id: f.root.id }, data: { readPermission: false, isEnabled: false, disconnectedAt: new Date(), status: "DISCONNECTED" } });
   const page = await f.planner.getOrganizationPlanPageData(f.scan.id);
   assert.equal(page?.latestExecution?.status, "PARTIALLY_COMPLETED");
@@ -1119,6 +1415,21 @@ test("AUTH-2 revoked local authority recovers a proven move without admitting re
   assert.equal(await readFile(path.join(f.folder, "organized/0.txt"), "utf8"), "Synthetic content 0");
   assert.equal(await readFile(path.join(f.folder, ...f.rows[1].relativePath.split("/")), "utf8"), "Synthetic content 1");
   await assert.rejects(readFile(path.join(f.folder, "organized/1.txt")), /ENOENT/);
+  assert.equal((await prisma.executionAction.findUniqueOrThrow({ where: { id: interrupted.actions[1].id } })).status, "FAILED");
+  await f.planner.getOrganizationPlanPageData(f.scan.id);
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 1);
+});
+
+test("CLOSURE-1 durable local preparation proves revoked unstarted actions had no effect", async (t) => {
+  const f = await localPhysicalFixture(t);
+  await assert.rejects(f.executor.executeOrganizationPlan(f.plan.id, "EXECUTE", { afterStartClaim: async () => { throw new Error("admission interrupted"); } }), /admission interrupted/);
+  await prisma.connectedLibrary.update({ where: { id: f.root.id }, data: { moveFilePermission: false } });
+  const page = await f.planner.getOrganizationPlanPageData(f.scan.id);
+  assert.equal(page?.latestExecution?.status, "FAILED");
+  assert.equal(page.latestExecution.successfulActions, 0);
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: f.root.id } })).physicalInventoryGeneration, 0);
+  assert.equal(await readFile(path.join(f.folder, ...f.rows[0].relativePath.split("/")), "utf8"), "Synthetic content 0");
+  await assert.rejects(readFile(path.join(f.folder, "organized/0.txt")), /ENOENT/);
 });
 
 test("RECOVER-1 real local Undo survives its database gap and cannot reverse the same action twice", async (t) => {

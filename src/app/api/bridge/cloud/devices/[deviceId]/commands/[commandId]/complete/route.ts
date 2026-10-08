@@ -85,7 +85,11 @@ export async function POST(
         const result = fresh.commandType === "EXECUTE_PLAN"
           ? await applyRemoteExecutionReport({ commandPayload: fresh.payload, report: submittedReport }, tx)
           : await applyRemoteUndoReport({ commandPayload: fresh.payload, report: submittedReport }, tx);
-        return completeBridgeCloudCommand(deviceId, { ...submittedReport, result }, tx);
+        const unresolved = fresh.commandType === "EXECUTE_PLAN"
+          ? await tx.executionRun.findUniqueOrThrow({ where: { id: (fresh.payload as { executionRunId: string }).executionRunId } })
+          : await tx.undoRun.findUniqueOrThrow({ where: { id: (fresh.payload as { undoRunId: string }).undoRunId } });
+        return completeBridgeCloudCommand(deviceId, { ...submittedReport, result,
+          ...(unresolved.status === "RUNNING" ? { safeErrorCategory: "COMMAND_RECOVERY_REQUIRED" } : {}) }, tx);
       }, { timeout: 120_000 });
       return Response.json({ command: completed, ok: true });
     }

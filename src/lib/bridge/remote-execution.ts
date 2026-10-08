@@ -1,4 +1,4 @@
-import { physicalResultIndex } from "./physical-result-authority";
+import { physicalResultIndex, physicalResultState, physicalResultChanged } from "./physical-result-authority";
 import { requireExecutionReconciliation } from "./execution-reconciliation";
 import { isCurrentReadableRoot } from "./current-readable-root";
 import { claimPlanExecution } from "./plan-execution-authority";
@@ -731,7 +731,6 @@ export async function applyRemoteExecutionReport(input: {
   const result = objectValue(input.report.result);
   const resultActions = physicalResultIndex(result?.actions, run.actions.map((action) => ({ ...action,
     sourceRelativePath: action.sourceRelativePath || null, checksum: action.sourceChecksumBefore })));
-  await requireExecutionReconciliation(prisma, run.id);
   const completedAt = new Date();
   let completedActions = 0;
   let failedActions = 0;
@@ -741,15 +740,7 @@ export async function applyRemoteExecutionReport(input: {
     const resultAction: Record<string, unknown> | undefined = action.status === "COMPLETED" ? { actionId: action.id, status: "COMPLETED",
       sourceChecksumBefore: action.sourceChecksumBefore, destinationChecksumAfter: action.destinationChecksumAfter,
       safeErrorCategory: action.safeErrorCategory, createdFilesystemItem: action.createdFilesystemItem } : resultActions.get(action.id);
-    const actionStatus =
-      resultAction?.status === "PENDING" && input.report.safeErrorCategory === "COMMAND_RECOVERY_REQUIRED" ? "PENDING" :
-      resultAction?.status === "COMPLETED"
-        ? "COMPLETED"
-        : resultAction?.status === "FAILED"
-          ? "FAILED"
-          : input.report.status === "COMPLETED"
-            ? "BLOCKED"
-            : "FAILED";
+    const actionStatus = physicalResultState(resultAction);
 
     if (actionStatus === "COMPLETED") {
       completedActions += 1;
@@ -758,6 +749,8 @@ export async function applyRemoteExecutionReport(input: {
     } else {
       failedActions += 1;
     }
+
+    if (action.status === "COMPLETED") continue;
 
     await prisma.executionAction.update({
       data: {
@@ -768,7 +761,7 @@ export async function applyRemoteExecutionReport(input: {
             ? resultAction.destinationChecksumAfter
             : null,
         safeErrorCategory:
-          typeof resultAction?.safeErrorCategory === "string"
+          actionStatus === "PENDING" ? "COMMAND_RECOVERY_REQUIRED" : typeof resultAction?.safeErrorCategory === "string"
             ? resultAction.safeErrorCategory
             : actionStatus === "COMPLETED"
               ? null
@@ -795,6 +788,10 @@ export async function applyRemoteExecutionReport(input: {
     }
   }
 
+  const changed = run.actions.some((action) => action.status !== "COMPLETED" && physicalResultChanged(action.actionType, resultActions.get(action.id)));
+  if (changed) await requireExecutionReconciliation(prisma, run.id);
+  else if (pendingActions && !["REQUIRED", "IN_PROGRESS"].includes(run.reconciliationStatus)) await prisma.executionRun.update({ where: { id: run.id }, data: { reconciliationStatus: "INSPECTION_REQUIRED" } });
+  else if (!pendingActions && run.reconciliationStatus === "INSPECTION_REQUIRED") await prisma.executionRun.update({ where: { id: run.id }, data: { reconciliationStatus: "NOT_REQUESTED" } });
   const status: ExecutionStatus = pendingActions > 0 ? "RUNNING" : completedActions === run.totalActions && failedActions === 0 && run.totalActions > 0
     ? "COMPLETED" : completedActions > 0 ? "PARTIALLY_COMPLETED" : "FAILED";
   const durationMs = Math.max(0, completedAt.getTime() - run.startedAt.getTime());
@@ -807,9 +804,8 @@ export async function applyRemoteExecutionReport(input: {
         errorCategory:
           status === "COMPLETED" ? null : "REMOTE_EXECUTION_INCOMPLETE",
         failedActions,
-        reconciliationStatus: "REQUIRED",
         safeErrorCategory:
-          status === "COMPLETED"
+          pendingActions ? "COMMAND_RECOVERY_REQUIRED" : status === "COMPLETED"
             ? null
             : input.report.safeErrorCategory ??
               (typeof result?.safeErrorCategory === "string"

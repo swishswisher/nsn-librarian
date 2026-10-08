@@ -1,4 +1,4 @@
-import { preparePhysicalCommand, markPhysicalCommandDelivered, unfinishedPhysicalCommands } from "./command-journal";
+import { preparePhysicalCommand, markPhysicalCommandDelivered, unfinishedPhysicalCommands, physicalCommandNeverStarted, markPhysicalCommandStarted } from "./command-journal";
 import { recoverBridgePhysicalActions } from "../../../../bridge-app/src/filesystem/operations";
 import {
   bridgeCommandIsExpired,
@@ -491,7 +491,7 @@ export async function processPendingBridgeCommands(
       continue;
     }
 
-    if (physical) await preparePhysicalCommand(command);
+    if (physical) await preparePhysicalCommand(command, replayKeys.has(replayKey));
     else { await rememberReplayKey(replayKey); replayKeys.add(replayKey); }
     let admitted = false;
     try { await acknowledgeBridgeCommand(command.commandId); admitted = true; }
@@ -501,9 +501,15 @@ export async function processPendingBridgeCommands(
 
     try {
       const payload = payloadObject(command.payload);
-      const result = physical && (!admitted || bridgeCommandIsExpired(command.expiresAt))
+      const neverStarted = physical && await physicalCommandNeverStarted(command);
+      // A successful new ACK does not prove an older command had no effect.
+      // Only exact PREPARED evidence can admit its first filesystem attempt.
+      const historicalOnly = physical && (!admitted || bridgeCommandIsExpired(command.expiresAt) ||
+        replayKeys.has(replayKey) || (historicalPhysical && !neverStarted));
+      if (physical && !historicalOnly) await markPhysicalCommandStarted(command);
+      const result = historicalOnly
         ? await recoverBridgePhysicalActions(requiredRootId(command), command.commandType === "EXECUTE_PLAN"
-          ? requiredExecutionActions(payload.actions) : requiredUndoActions(payload.actions), command.commandType === "EXECUTE_UNDO")
+           ? requiredExecutionActions(payload.actions) : requiredUndoActions(payload.actions), command.commandType === "EXECUTE_UNDO", neverStarted)
         : await executeCommand(command, runtime);
       report = {
         commandId: command.commandId,

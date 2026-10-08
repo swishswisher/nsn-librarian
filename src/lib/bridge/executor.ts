@@ -1,4 +1,4 @@
-import { executeLocalPhysicalRun, localPhysicalPermission } from "./local-physical-recovery";
+import { executeLocalPhysicalRun, localPhysicalPermission, LOCAL_PHYSICAL_PREPARED } from "./local-physical-recovery";
 import { isCurrentReadableRoot } from "./current-readable-root";
 import { claimPlanExecution } from "./plan-execution-authority";
 
@@ -1356,6 +1356,7 @@ export async function executeOrganizationPlan(
           sourceScannedFileId: action.scannedFile?.id ?? null,
           sourceRelativePath: action.sourceRelativePath ?? "",
           status: "PENDING",
+          safeErrorCategory: LOCAL_PHYSICAL_PREPARED,
         })),
       },
       bridgeRootId: plan.scanSession.connectedFolder.bridgeRootId,

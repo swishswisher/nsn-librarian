@@ -31,6 +31,7 @@ export type BridgeExecutionActionResult = {
   sourceChecksumBefore: string | null;
   sourceRelativePath: string | null;
   status: "COMPLETED" | "FAILED" | "PENDING";
+  physicalEffect?: "NONE" | "CHANGED" | "UNKNOWN";
 };
 
 export type BridgeUndoActionResult = {
@@ -38,6 +39,7 @@ export type BridgeUndoActionResult = {
   actionType: BridgeUndoPlanAction["actionType"];
   destinationChecksumAfter: string | null;
   destinationRelativePath: string;
+  physicalEffect?: "NONE" | "CHANGED" | "UNKNOWN";
   lastModified: string | null;
   safeErrorCategory: string | null;
   sizeBytes: string | null;
@@ -326,6 +328,7 @@ async function executeBridgePlanActionsOwned(rootId: string, actions: BridgeExec
     sourceChecksumBefore: null,
     sourceRelativePath: action.sourceRelativePath ?? null,
     status: "PENDING",
+    physicalEffect: "NONE",
   }));
 
   const resultById = new Map(results.map((item) => [item.actionId, item]));
@@ -373,13 +376,13 @@ async function executeBridgePlanActionsOwned(rootId: string, actions: BridgeExec
       }
 
       result.status = "COMPLETED";
+      result.physicalEffect = action.actionType !== "CREATE_FOLDER" || result.createdFilesystemItem ? "CHANGED" : "NONE";
     } catch (error) {
       result.safeErrorCategory =
         error instanceof BridgeAppError
           ? error.code
           : "FILESYSTEM_OPERATION_FAILED";
-      result.status = error instanceof PhysicalRecoveryRequired ? "PENDING" : "FAILED";
-      if (error instanceof PhysicalRecoveryRequired) result.safeErrorCategory = error.code;
+      await settleFailedPhysicalAction(rootId, root.actualPath, action, result, false);
       break;
     }
   }
@@ -587,6 +590,7 @@ async function executeBridgeUndoActionsOwned(rootId: string, actions: BridgeUndo
     sourceChecksumBefore: null,
     sourceRelativePath: action.sourceRelativePath,
     status: "PENDING",
+    physicalEffect: "NONE",
   }));
 
   const resultById = new Map(results.map((item) => [item.actionId, item]));
@@ -616,13 +620,13 @@ async function executeBridgeUndoActionsOwned(rootId: string, actions: BridgeUndo
       }
 
       result.status = "COMPLETED";
+      result.physicalEffect = "CHANGED";
     } catch (error) {
       result.safeErrorCategory =
         error instanceof BridgeAppError
           ? error.code
           : "FILESYSTEM_OPERATION_FAILED";
-      result.status = error instanceof PhysicalRecoveryRequired ? "PENDING" : "FAILED";
-      if (error instanceof PhysicalRecoveryRequired) result.safeErrorCategory = error.code;
+      await settleFailedPhysicalAction(rootId, root.actualPath, action, result, true);
       break;
     }
   }
@@ -651,22 +655,25 @@ async function executeBridgeUndoActionsOwned(rootId: string, actions: BridgeUndo
 
 // Historical recovery never admits another filesystem operation. The result
 // identifies verified completed effects and keeps uncertain effects pending.
-export async function recoverBridgePhysicalActions(rootId: string, actions: Array<BridgeExecutionPlanAction | BridgeUndoPlanAction>, undo = false) {
+export async function recoverBridgePhysicalActions(rootId: string, actions: Array<BridgeExecutionPlanAction | BridgeUndoPlanAction>, undo = false, neverStarted = false) {
   const root = await getRoot(rootId);
   const results: BridgeExecutionActionResult[] = [];
   for (const action of actions) {
     const result: BridgeExecutionActionResult = { actionId: action.id, actionType: action.actionType as BridgeExecutionPlanAction["actionType"],
       createdFilesystemItem: false, destinationChecksumAfter: null, destinationRelativePath: action.destinationRelativePath,
       lastModified: null, sizeBytes: null, safeErrorCategory: "COMMAND_INTERRUPTED", sourceChecksumBefore: null,
-      sourceRelativePath: action.sourceRelativePath ?? null, status: "FAILED" };
+      sourceRelativePath: action.sourceRelativePath ?? null, status: "PENDING", physicalEffect: "UNKNOWN" };
     try {
       const entry = await recoverPhysicalAction(`${undo ? "undo" : "execution"}:${rootId}:${action.id}`,
         physicalActionBinding(root.actualPath, action, action.actionType === "REMOVE_FOLDER" && "originalExecutionActionId" in action ? `execution:${rootId}:${action.originalExecutionActionId}` : undefined));
       if (entry?.state === "COMPLETED") {
         result.status = "COMPLETED"; result.safeErrorCategory = null; result.createdFilesystemItem = entry.created;
+        result.physicalEffect = entry.kind === "CREATE_FOLDER" && !entry.created ? "NONE" : "CHANGED";
         result.sourceChecksumBefore = entry.kind === "MOVE" ? entry.identity!.checksum : null;
         result.destinationChecksumAfter = result.sourceChecksumBefore;
         result.lastModified = entry.modifiedAt ?? null; result.sizeBytes = entry.sizeBytes ?? null;
+      } else if (!entry && neverStarted) {
+        result.status = "FAILED"; result.physicalEffect = "NONE";
       }
     } catch {
       result.status = "PENDING"; result.safeErrorCategory = "COMMAND_RECOVERY_REQUIRED";
@@ -678,4 +685,29 @@ export async function recoverBridgePhysicalActions(rootId: string, actions: Arra
   return { actions: results, completedActions, failedActions, totalActions: results.length, rootId,
     status: results.some((result) => result.status === "PENDING") ? "RECOVERY_REQUIRED"
       : completedActions === results.length ? "COMPLETED" : completedActions ? "PARTIALLY_COMPLETED" : "FAILED" };
+}
+
+async function settleFailedPhysicalAction(rootId: string, rootPath: string, action: BridgeExecutionPlanAction | BridgeUndoPlanAction,
+  result: BridgeExecutionActionResult | BridgeUndoActionResult, undo: boolean) {
+  try {
+    const owner = `${undo ? "undo" : "execution"}:${rootId}:${action.id}`;
+    // In a live journal-first attempt, no journal proves no effect was admitted.
+    // Historical recovery without that live attempt remains UNKNOWN instead.
+    if (!await hasPhysicalActionJournal(owner)) { result.status = "FAILED"; result.physicalEffect = "NONE"; return; }
+    const entry = await recoverPhysicalAction(owner, physicalActionBinding(rootPath, action,
+      action.actionType === "REMOVE_FOLDER" && "originalExecutionActionId" in action ? `execution:${rootId}:${action.originalExecutionActionId}` : undefined));
+    if (!entry) {
+      // An existing journal with no verified outcome can follow a physical
+      // effect whose destination was removed. It does not establish no effect.
+      result.status = "PENDING"; result.physicalEffect = "UNKNOWN"; result.safeErrorCategory = "COMMAND_RECOVERY_REQUIRED"; return;
+    }
+    result.status = "COMPLETED"; result.safeErrorCategory = null;
+    result.physicalEffect = entry.kind === "CREATE_FOLDER" && !entry.created ? "NONE" : "CHANGED";
+    if ("createdFilesystemItem" in result) result.createdFilesystemItem = entry.created;
+    result.sourceChecksumBefore = entry.kind === "MOVE" ? entry.identity!.checksum : null;
+    result.destinationChecksumAfter = result.sourceChecksumBefore;
+    result.lastModified = entry.modifiedAt ?? null; result.sizeBytes = entry.sizeBytes ?? null;
+  } catch {
+    result.status = "PENDING"; result.physicalEffect = "UNKNOWN"; result.safeErrorCategory = "COMMAND_RECOVERY_REQUIRED";
+  }
 }

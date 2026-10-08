@@ -1,4 +1,5 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { Prisma, type ConnectedLibrary } from "@prisma/client";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { isCurrentReadableRoot } from "./current-readable-root";
@@ -8,12 +9,18 @@ import { executeLocalBridgeActions, executeLocalBridgeUndoActions, recoverLocalB
 import { journaledMove, journaledCreateFolder, journaledRemoveFolder, recoverPhysicalAction, physicalActionBinding } from "../../../bridge-app/src/filesystem/physical-journal";
 import { resolveInsideRoot } from "../../../bridge-app/src/filesystem/safety";
 import { requireExecutionReconciliation } from "./execution-reconciliation";
+import { physicalResultChanged } from "./physical-result-authority";
 
 type Action = { id: string; actionType: string; sourceRelativePath: string; destinationRelativePath: string;
   checksum: string | null; sourceId: string | null; originalId?: string };
 type Result = { actionId: string; actionType: string; sourceRelativePath: string | null; destinationRelativePath: string;
   status: "COMPLETED" | "FAILED" | "PENDING"; safeErrorCategory: string | null; sourceChecksumBefore: string | null;
   destinationChecksumAfter: string | null; createdFilesystemItem: boolean; lastModified: string | null; sizeBytes: string | null };
+
+// Existing durable action fields carry admission proof without changing the
+// deployed schema. STARTED must commit before entering the filesystem path.
+export const LOCAL_PHYSICAL_PREPARED = "PHYSICAL_ACTION_PREPARED";
+const LOCAL_PHYSICAL_STARTED = "PHYSICAL_ACTION_STARTED:";
 
 export function localPhysicalPermission(root: ConnectedLibrary, actionType: string) {
   return isCurrentReadableRoot(root) && !root.bridgeDeviceId &&
@@ -54,7 +61,7 @@ async function outcome(root: ConnectedLibrary, action: Action, undo: boolean, al
   try {
     let entry;
     try { entry = await recoverPhysicalAction(owner, binding); } catch { if (!allowed) return empty; }
-    if (!entry && !allowed) return { ...empty, status: "FAILED", safeErrorCategory: "PERMISSION_DENIED" };
+    if (!entry && !allowed) return empty;
     if (entry?.state !== "COMPLETED" && allowed) {
       const destination = await resolveInsideRoot(root.localPath, action.destinationRelativePath);
       if (action.actionType === "CREATE_FOLDER") entry = await journaledCreateFolder(owner, destination.resolvedPath);
@@ -102,6 +109,22 @@ export async function executeLocalPhysicalRun(runId: string, undo = false,
     : await prisma.executionAction.findMany({ where: { executionRunId: runId }, orderBy: [{ sequence: "asc" }, { id: "asc" }], select: { id: true } });
   let stop = false;
   for (const { id } of actionIds) {
+    const owner = `${LOCAL_PHYSICAL_STARTED}${randomUUID()}`;
+    const claimed = await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id = ${execution.connectedLibraryId} FOR UPDATE`);
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM "ExecutionRun" WHERE id = ${executionId} FOR UPDATE`);
+      if (undo) await tx.$queryRaw(Prisma.sql`SELECT id FROM "UndoRun" WHERE id = ${runId} FOR UPDATE`);
+      const root = await tx.connectedLibrary.findUniqueOrThrow({ where: { id: execution.connectedLibraryId } });
+      const run = undo ? await tx.undoRun.findUniqueOrThrow({ where: { id: runId } }) : await tx.executionRun.findUniqueOrThrow({ where: { id: runId } });
+      const action = undo ? await tx.undoAction.findUniqueOrThrow({ where: { id } }) : await tx.executionAction.findUniqueOrThrow({ where: { id } });
+      if (run.status !== "RUNNING" || !["PENDING", "RUNNING"].includes(action.status) || stop ||
+        action.safeErrorCategory !== LOCAL_PHYSICAL_PREPARED || run.physicalRootRevision === null ||
+        run.physicalRootRevision !== root.nativeConnectionRevision || !localPhysicalPermission(root, action.actionType)) return false;
+      const data = { safeErrorCategory: owner, startedAt: action.startedAt ?? new Date() };
+      if (undo) await tx.undoAction.update({ where: { id }, data });
+      else await tx.executionAction.update({ where: { id }, data });
+      return true;
+    }, { timeout: 120_000 });
     const state = await prisma.$transaction(async (tx) => {
       await tx.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id = ${execution.connectedLibraryId} FOR UPDATE`);
       await tx.$queryRaw(Prisma.sql`SELECT id FROM "ExecutionRun" WHERE id = ${executionId} FOR UPDATE`);
@@ -115,8 +138,13 @@ export async function executeLocalPhysicalRun(runId: string, undo = false,
       const original = "originalExecutionAction" in stored ? stored.originalExecutionAction : stored;
       const action: Action = { ...stored, checksum: undo ? original.destinationChecksumAfter ?? original.sourceChecksumBefore : original.sourceChecksumBefore,
         sourceId: original.sourceScannedFileId, originalId: undo ? original.id : undefined };
-      const allowed = !stop && run.physicalRootRevision !== null && run.physicalRootRevision === root.nativeConnectionRevision && localPhysicalPermission(root, action.actionType);
-      const result = await outcome(root, action, undo, allowed);
+      const allowed = claimed && stored.safeErrorCategory === owner && !stop && run.physicalRootRevision !== null &&
+        run.physicalRootRevision === root.nativeConnectionRevision && localPhysicalPermission(root, action.actionType);
+      const result: Result = stored.safeErrorCategory === LOCAL_PHYSICAL_PREPARED ? {
+        actionId: id, actionType: action.actionType, sourceRelativePath: action.sourceRelativePath || null,
+        destinationRelativePath: action.destinationRelativePath, status: "FAILED", safeErrorCategory: "PERMISSION_DENIED",
+        sourceChecksumBefore: null, destinationChecksumAfter: null, createdFilesystemItem: false, lastModified: null, sizeBytes: null,
+      } : await outcome(root, action, undo, allowed);
       // Pre-journal deployments did not persist this authority revision. Missing
       // local proof cannot establish that an interrupted legacy effect failed.
       // Retain uncertainty without authorizing a new operation on its snapshot.
@@ -125,9 +153,13 @@ export async function executeLocalPhysicalRun(runId: string, undo = false,
       }
       physicalResultIndex([result], [{ ...action, sourceRelativePath: action.sourceRelativePath || null }]);
       await options.afterPhysical?.(id);
-      if (result.status === "COMPLETED") await requireExecutionReconciliation(tx, executionId);
+      if (physicalResultChanged(action.actionType, result)) await requireExecutionReconciliation(tx, executionId);
       const data = { status: result.status, startedAt: stored.startedAt ?? new Date(),
-        completedAt: result.status === "PENDING" ? null : new Date(), safeErrorCategory: result.safeErrorCategory };
+        completedAt: result.status === "PENDING" ? null : new Date(),
+        // A concurrent journal-only recovery must not erase the live owner's
+        // admission between its committed STARTED marker and filesystem lock.
+        safeErrorCategory: result.status === "PENDING" && stored.safeErrorCategory?.startsWith(LOCAL_PHYSICAL_STARTED)
+          ? stored.safeErrorCategory : result.safeErrorCategory };
       if (undo) await tx.undoAction.update({ where: { id }, data });
       else await tx.executionAction.update({ where: { id }, data: { ...data,
         createdFilesystemItem: result.status === "COMPLETED" && result.createdFilesystemItem,

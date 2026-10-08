@@ -8,8 +8,9 @@ import { test, type TestContext } from "node:test";
 import { createBridgeCommandEnvelope, createBridgeDeviceId, createBridgeKeyPair } from "../../packages/bridge-protocol/src";
 import { createFolderSelection, disconnectRoot, registerRootFromSelection, updateRoot, withRootAuthority } from "../src/main/registry";
 import { saveBridgeSecret } from "../../apps/bridge/src/main/keychain";
-import { unfinishedPhysicalCommands } from "../../apps/bridge/src/main/command-journal";
-import { executeBridgePlanActions } from "../src/filesystem/operations";
+import { unfinishedPhysicalCommands, preparePhysicalCommand, markPhysicalCommandStarted } from "../../apps/bridge/src/main/command-journal";
+import { executeBridgePlanActions, executeBridgeUndoActions, recoverBridgePhysicalActions } from "../src/filesystem/operations";
+import { journaledMove } from "../src/filesystem/physical-journal";
 
 async function fixture(t: TestContext) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "nsn-command-recovery-"));
@@ -60,9 +61,68 @@ test("RECOVER-1 command process death at ACK retains admission and revoked retry
   f.run("recover");
   const reports = JSON.parse(await readFile(f.outputPath, "utf8"));
   assert.equal(reports[0].result.actions[0].status, "FAILED");
+  assert.equal(reports[0].result.actions[0].physicalEffect, "NONE", "Durable PREPARED phase proves no operation was admitted");
   assert.equal((await unfinishedPhysicalCommands(f.deviceId)).length, 0);
   assert.equal(await readFile(path.join(f.directory, "source.txt"), "utf8"), f.bytes);
   await assert.rejects(readFile(path.join(f.directory, "destination.txt")), { code: "ENOENT" });
+});
+
+for (const undo of [false, true]) {
+  test(`CLOSURE-1 live ${undo ? "Undo" : "execution"} failure cannot turn an unresolved action journal into no-effect proof`, async (t) => {
+    const f = await fixture(t), source = path.join(f.directory, "source.txt"), destination = path.join(f.directory, "destination.txt");
+    const owner = `${undo ? "undo" : "execution"}:${f.root.id}:${f.action.id}`;
+    await assert.rejects(journaledMove(owner, source, destination, f.action.sourceChecksum, undefined, async () => {
+      // A real effect already captured the source. An external actor removes
+      // the destination before completion, so absent names cannot prove NONE.
+      await rm(destination); throw new Error("Synthetic interruption after source capture and destination removal");
+    }), /interruption/);
+    const capture = (await readdir(f.directory)).find((name) => name.startsWith(".nsn-move-")); assert.ok(capture);
+    const retained = path.join(f.directory, capture, "source");
+    assert.equal(await readFile(retained, "utf8"), f.bytes);
+    const result = await (undo ? executeBridgeUndoActions : executeBridgePlanActions)(f.root.id, [f.action]);
+    assert.equal(result.actions[0].status, "PENDING"); assert.equal(result.actions[0].physicalEffect, "UNKNOWN");
+    assert.equal(result.actions[0].safeErrorCategory, "COMMAND_RECOVERY_REQUIRED");
+    assert.equal(await readFile(retained, "utf8"), f.bytes);
+    await assert.rejects(readFile(source), { code: "ENOENT" }); await assert.rejects(readFile(destination), { code: "ENOENT" });
+  });
+}
+
+test("CLOSURE-1 historical native recovery without action or preparation proof retains an unknown outcome", async (t) => {
+  const f = await fixture(t);
+  const result = await recoverBridgePhysicalActions(f.root.id, [f.action]);
+  assert.equal(result.status, "RECOVERY_REQUIRED"); assert.equal(result.actions[0].status, "PENDING");
+  assert.equal(result.actions[0].physicalEffect, "UNKNOWN");
+  assert.equal(await readFile(path.join(f.directory, "source.txt"), "utf8"), f.bytes);
+  await assert.rejects(readFile(path.join(f.directory, "destination.txt")), { code: "ENOENT" });
+});
+
+for (const phase of ["legacy", "started"] as const) {
+  test(`CLOSURE-1 authorized polling cannot start an uncertain ${phase} command without action proof`, async (t) => {
+    const f = await fixture(t);
+    const command = JSON.parse(await readFile(path.join(f.directory, "command.json"), "utf8"));
+    await preparePhysicalCommand(command, phase === "legacy");
+    if (phase === "started") await markPhysicalCommandStarted(command);
+    f.run("live-recovery"); // Current grants, successful ACK and ordinary polling.
+    const reports = JSON.parse(await readFile(f.outputPath, "utf8"));
+    assert.equal(reports[0].safeErrorCategory, "COMMAND_RECOVERY_REQUIRED");
+    assert.equal(reports[0].result.actions[0].status, "PENDING");
+    assert.equal(reports[0].result.actions[0].physicalEffect, "UNKNOWN");
+    assert.equal((await unfinishedPhysicalCommands(f.deviceId)).length, 1);
+    assert.equal(await readFile(path.join(f.directory, "source.txt"), "utf8"), f.bytes);
+    await assert.rejects(readFile(path.join(f.directory, "destination.txt")), { code: "ENOENT" });
+  });
+}
+
+test("CLOSURE-1 authorized polling can admit a proven PREPARED command after ACK process death", async (t) => {
+  const f = await fixture(t);
+  assert.throws(() => f.run("admission-death"), (error: unknown) => (error as { status: number }).status === 75);
+  f.run("live-recovery");
+  const reports = JSON.parse(await readFile(f.outputPath, "utf8"));
+  assert.equal(reports[0].result.actions[0].status, "COMPLETED");
+  assert.equal(reports[0].result.actions[0].physicalEffect, "CHANGED");
+  assert.equal((await unfinishedPhysicalCommands(f.deviceId)).length, 0);
+  assert.equal(await readFile(path.join(f.directory, "destination.txt"), "utf8"), f.bytes);
+  await assert.rejects(readFile(path.join(f.directory, "source.txt")), { code: "ENOENT" });
 });
 test("RECOVER-1 actual process death during source capture recovers after revocation without deleting a new public file", async (t) => {
   const f = await fixture(t);

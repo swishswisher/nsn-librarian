@@ -2,8 +2,10 @@ import { NextResponse } from "next/server";
 
 import { getHumanSession } from "@/lib/auth/session";
 import { answerLibraryQuestion } from "@/lib/library/qa/answer";
+import { recoverMemoryForWebAccess } from "@/lib/library/memory";
 
 export const runtime = "nodejs";
+export const maxDuration = 150;
 
 export async function POST(request: Request) {
   if (!await getHumanSession()) {
@@ -17,6 +19,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: false, error: "Enter a question of up to 500 characters." }, { status: 400 });
   }
   try {
+    await recoverMemoryForWebAccess();
     return NextResponse.json({ ok: true, result: await answerLibraryQuestion(question) },
       { headers: { "Cache-Control": "private, no-store" } });
   } catch {

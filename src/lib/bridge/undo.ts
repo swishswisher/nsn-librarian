@@ -1,4 +1,4 @@
-import { executeLocalPhysicalRun, localPhysicalPermission } from "./local-physical-recovery";
+import { executeLocalPhysicalRun, localPhysicalPermission, LOCAL_PHYSICAL_PREPARED } from "./local-physical-recovery";
 import { isCurrentReadableRoot } from "./current-readable-root";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
@@ -1139,6 +1139,7 @@ export async function executeExecutionUndo(
               sequence: action.sequence,
               sourceRelativePath: action.sourceRelativePath,
               status: "PENDING",
+              safeErrorCategory: LOCAL_PHYSICAL_PREPARED,
             })),
           },
           executionRunId,

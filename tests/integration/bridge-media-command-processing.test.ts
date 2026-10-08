@@ -1269,6 +1269,9 @@ test("observation lease recent abandoned claim stays retryable at prepare, compl
 for (const interrupted of ["ACKNOWLEDGED", "COMPLETED", "FAILED"] as const) {
   test(`observation lease restart recovers stale ${interrupted} command through bounded native read admission`, async () => {
     const { root, file, command } = await observationLeaseFixture();
+    // Capture real current root/key ownership before simulating lease expiry;
+    // a timestamp alone is not an authoritative modern observation claim.
+    await (await import("../../src/lib/bridge/observation-authority")).claimObservationLease(file.id);
     await prisma.scannedFile.update({ data: { processingStage: interrupted === "ACKNOWLEDGED" ? "READING" : "READ",
       readingStatus: interrupted === "ACKNOWLEDGED" ? "NOT_READ" : "READ", extractionStatus: "COMPLETED",
       observationClaimedAt: new Date(Date.now() - 11 * 60_000) }, where: { id: file.id } });
