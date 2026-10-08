@@ -946,15 +946,16 @@ async function reconcileObservationMemory(sessionId: string, tx: Prisma.Transact
     if (eligible.length && session?.memoryReconciliationStatus.startsWith("PENDING@")) {
       await tx.observationSession.updateMany({ where: { id: sessionId,
         memoryReconciliationStatus: session.memoryReconciliationStatus },
-      data: { memoryReconciliationStatus: `COMPLETED@${session.memoryReconciliationStatus.slice(8)}` } });
+      data: { memoryReconciliationStatus: `COMPLETED@${session.memoryReconciliationStatus.slice(8)}`,
+        memoryRecoveryFailureCount: 0, memoryRecoveryFailureGeneration: null, memoryRecoveryNextAttemptAt: null } });
     }
     return result;
 }
 
 /** Called only after the web entry point authenticates the human. One eligible
  * durable owner/request, a nonblocking database lock and a five-second rollback
- * deadline bound synchronous work. Neither process lifetime nor Bridge polling
- * is a prerequisite. Death/timeout leaves the exact pending generation intact. */
+ * deadline bound synchronous work. The independent scheduler drains the backlog;
+ * this request only accelerates it. Death/timeout retains the pending generation. */
 export async function recoverMemoryForWebAccess() {
   const prisma = getPrismaClient();
   let selected: { id: string; generation: string } | undefined;
@@ -1022,6 +1023,26 @@ export async function recoverPendingObservationMemory(limit = 10) {
     }
   }
   return recovered;
+}
+
+/** Each scheduled owner commits independently. A transaction-scoped owner lock
+ * releases on death; the exact pending generation is the durable work item. */
+export async function recoverScheduledMemoryOwner(owner: { id: string; generation: string }, timeout: number) {
+  return getPrismaClient().$transaction(async (tx) => {
+    await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '250ms'");
+    await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${Math.max(250, timeout - 500)}ms'`);
+    const [lock] = await tx.$queryRaw<Array<{ owned: boolean }>>(Prisma.sql`
+      SELECT pg_try_advisory_xact_lock(hashtextextended(current_schema() || ':scheduled-memory:' || ${owner.id}, 0)) AS owned`);
+    if (!lock.owned) return "BUSY" as const;
+    const sessions = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT observation.id FROM "ObservationSession" observation
+      WHERE observation.id = ${owner.id} AND observation."memoryReconciliationStatus" = ${owner.generation}
+        AND observation."memoryReconciliationStatus" LIKE 'PENDING@%'
+        AND (observation.status = 'REJECTED' OR ${eligibleMemoryObservationSql}) FOR SHARE`);
+    if (!sessions.length) return "SUPERSEDED" as const;
+    await reconcileObservationMemory(owner.id, tx);
+    return "COMPLETED" as const;
+  }, { isolationLevel: "Serializable", maxWait: 500, timeout });
 }
 
 async function buildMemoryInTransaction(sessionId: string, prisma: Prisma.TransactionClient) {

@@ -648,6 +648,9 @@ model ObservationSession {
   confidence        Float                    @default(0)
   warnings          Json
   memoryReconciliationStatus String          @default("NOT_REQUIRED")
+  memoryRecoveryFailureCount Int            @default(0)
+  memoryRecoveryFailureGeneration String?
+  memoryRecoveryNextAttemptAt DateTime?
   createdAt         DateTime                 @default(now())
   updatedAt         DateTime                 @updatedAt
   libraryDocument   LibraryDocument          @relation(fields: [libraryDocumentId], references: [id], onDelete: Cascade)
@@ -660,7 +663,18 @@ model ObservationSession {
   @@index([status])
   @@index([createdAt])
   @@index([memoryReconciliationStatus])
+  @@index([memoryRecoveryNextAttemptAt, updatedAt, id])
   @@index([libraryDocumentId, createdAt, id])
+}
+
+// Aggregate scheduler health only: no observations, source IDs or diagnostics.
+model MemoryRecoveryState {
+  id                  String    @id
+  runGeneration       String
+  lastStartedAt       DateTime
+  lastFinishedAt      DateTime?
+  lastSuccessfulRunAt DateTime?
+  lastRunStatus       String
 }
 
 model HumanDecision {

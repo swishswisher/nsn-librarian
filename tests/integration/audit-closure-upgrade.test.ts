@@ -33,7 +33,7 @@ before(async () => {
   // comes exclusively from the actual 34 immutable SQL migrations, never push.
   // This also works in a shallow CI checkout with no historical Git objects.
   await cp("prisma/schema.prisma", path.join(temporary, "prisma/schema.prisma"));
-  for (const name of (await readdir("prisma/migrations")).filter((name) => name !== "20261007120000_system_authority_recovery"))
+  for (const name of (await readdir("prisma/migrations")).filter((name) => name === "migration_lock.toml" || name < "20261007120000_system_authority_recovery"))
     await cp(path.join("prisma/migrations", name), path.join(temporary, "prisma/migrations", name), { recursive: true });
   execFileSync(process.execPath, ["node_modules/prisma/build/index.js", "migrate", "deploy", "--schema", path.join(temporary, "prisma/schema.prisma")], { stdio: "pipe" });
   prisma = (await import("../../src/lib/db/prisma")).getPrismaClient();
@@ -77,8 +77,11 @@ before(async () => {
       observationSessionId: id(`obs-${owner.key}`), connectedLibraryId: id(`root-${owner.root}`) });
   }
   await insert("MemoryEntry", { id: id("curated"), memoryKey: "NOTE:curated", memoryType: "NOTE", title: "Retained human curation", description: "The human's standalone note", evidence: [] });
-  execFileSync(process.execPath, ["node_modules/prisma/build/index.js", "migrate", "deploy"], { stdio: "pipe" });
+  await cp("prisma/migrations/20261007120000_system_authority_recovery", path.join(temporary, "prisma/migrations/20261007120000_system_authority_recovery"), { recursive: true });
+  execFileSync(process.execPath, ["node_modules/prisma/build/index.js", "migrate", "deploy", "--schema", path.join(temporary, "prisma/schema.prisma")], { stdio: "pipe" });
   assert.equal((await prisma.$queryRawUnsafe<Array<{ count: bigint }>>('SELECT count(*) FROM "_prisma_migrations"'))[0].count, 35n);
+  execFileSync(process.execPath, ["node_modules/prisma/build/index.js", "migrate", "deploy"], { stdio: "pipe" });
+  assert.equal((await prisma.$queryRawUnsafe<Array<{ count: bigint }>>('SELECT count(*) FROM "_prisma_migrations"'))[0].count, 36n);
   assert.equal(await prisma.bridgeDevice.count(), 0); assert.equal(await prisma.bridgeCommand.count(), 0);
   assert.equal(await prisma.memoryEntry.count({ where: { searchSourceCount: { gt: 0 }, searchProvenanceComplete: true } }), 0);
 });

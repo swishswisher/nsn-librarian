@@ -14,6 +14,8 @@ Canonical current readable root means enabled, read granted, CONNECTED, no disco
 
 ## Subsystem map
 
+Memory has an independent serverless consumer: production Vercel Cron issues authenticated GET `/api/cron/memory-recovery`. `memory-recovery.ts` selects existing pending review generations and calls the canonical transactional builder. A 20-owner/45-second work budget, 15-second owner transactions, per-owner advisory locks, exact generation checks, durable UTC retry backoff and aggregate health make overlap, failure and process death recoverable. Migration 36 adds only retry/health state; migration 35 is unchanged. Page callbacks accelerate work; they do not supply autonomous liveness. Memory renders pending/inspection counts and last-success information. The configured daily schedule is supported even on Hobby, but production activation, runtime and protection reachability remain separate operational gates. See [MEMORY_RECOVERY_OPERATIONS.md](MEMORY_RECOVERY_OPERATIONS.md).
+
 In the table, **A** is authoritative and **D** is derived. **Root** refers to the canonical predicate above; **physical** means a fresh native grant/path/checksum check; **history** is retained evidence, never implicit current authority. Baseline deficiencies in the transaction/recovery column are findings, not accepted exceptions.
 
 | Subsystem and production entry points | A → D; producers and consumers | Commit, ownership, retry and failure boundary | Authorization, human authority and identity | Scale and siblings |

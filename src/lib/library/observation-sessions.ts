@@ -721,7 +721,8 @@ export async function saveHumanDecision(
 
     const updatedSession = await tx.observationSession.update({
       where: { id: sessionId },
-      data: { status: nextStatus, memoryReconciliationStatus: `PENDING@${decision.id}` },
+      data: { status: nextStatus, memoryReconciliationStatus: `PENDING@${decision.id}`,
+        memoryRecoveryFailureCount: 0, memoryRecoveryFailureGeneration: null, memoryRecoveryNextAttemptAt: null },
       select: { status: true },
     });
     await reconcileObservationKnowledge(tx, sessionId);

@@ -5,20 +5,22 @@ import { createHumanSessionToken, HUMAN_SESSION_COOKIE } from "../../src/lib/aut
 
 let server: ChildProcess | undefined, baseUrl = "", output = "";
 export async function startWebServer() {
-  if (server) return;
+  if (server) return baseUrl;
   const address = await new Promise<number>((resolve, reject) => {
     const socket = createServer(); socket.on("error", reject);
     socket.listen(0, "127.0.0.1", () => { const port = (socket.address() as { port: number }).port; socket.close(() => resolve(port)); });
   });
   baseUrl = `http://127.0.0.1:${address}`; output = "";
-  server = spawn(process.execPath, ["node_modules/next/dist/bin/next", "dev", "--hostname", "127.0.0.1", "--port", String(address)], {
+  const application = process.env.NSN_TEST_WEB_APPLICATION_DIR ?? process.cwd();
+  server = spawn(process.execPath, ["node_modules/next/dist/bin/next", process.env.NSN_TEST_WEB_MODE === "production" ? "start" : "dev", "--hostname", "127.0.0.1", "--port", String(address)], {
+    cwd: application,
     env: { ...process.env, NEXT_PUBLIC_APP_URL: baseUrl, NSN_LIBRARIAN_APP_URL: baseUrl, NEXT_TELEMETRY_DISABLED: "1" }, windowsHide: true, detached: process.platform !== "win32",
   });
   server.stdout?.on("data", (chunk) => { output += chunk.toString(); });
   server.stderr?.on("data", (chunk) => { output += chunk.toString(); });
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
-    if (output.includes("Ready in")) return;
+    if (output.includes("Ready in")) return baseUrl;
     if (server.exitCode !== null) break;
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
   }

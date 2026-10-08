@@ -4,6 +4,8 @@ import { NsnCard } from "@/components/library/NsnCard";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
 import { NsnPageHeader } from "@/components/library/NsnPageHeader";
 import { OrganizationPreferenceReviewPanel } from "@/components/library/OrganizationPreferenceReviewPanel";
+import { MemoryRecoveryStatus } from "@/components/library/MemoryRecoveryStatus";
+import { getMemoryRecoveryProgress } from "@/lib/library/memory-recovery";
 import { getMemoryPageData, recoverMemoryForWebAccess } from "@/lib/library/memory";
 import { requireHumanSession } from "@/lib/auth/session";
 import { getOrganizationPreferencePageData } from "@/lib/library/organization-preferences";
@@ -143,9 +145,10 @@ export const maxDuration = 150;
 export default async function LibraryMemoryPage() {
   await requireHumanSession("/admin/library/memory");
   await recoverMemoryForWebAccess();
-  const [memory, organizationPreferences] = await Promise.all([
+  const [memory, organizationPreferences, recoveryProgress] = await Promise.all([
     getMemoryPageData(),
     getOrganizationPreferencePageData(),
+    getMemoryRecoveryProgress(),
   ]);
 
   return (
@@ -174,6 +177,8 @@ export default async function LibraryMemoryPage() {
             </div>
           </div>
         </NsnCard>
+
+        <MemoryRecoveryStatus progress={recoveryProgress} />
 
         <MemorySection
           description="Themes are broad patterns that keep returning after approval."

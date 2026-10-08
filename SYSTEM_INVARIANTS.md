@@ -22,6 +22,8 @@ Authenticated Memory, Search and Ask requests also reach the same durable observ
 
 ## C. Currentness and snapshot ordering
 
+Independent Memory recovery additionally requires the protected scheduled HTTP consumer in `memory-recovery.ts` and `vercel.json`. Human page requests are optional accelerators. Each delivery selects at most 20 eligible exact review generations under a 45-second work deadline, with independently committed Serializable owners, nonblocking per-owner locks and a 15-second owner timeout. Durable generation-bound failure backoff rotates repeatedly failing owners; process death releases locks and leaves unfinished generations pending. Additive migration 36 stores retry metadata and aggregate scheduler health, never approval or source authority. Memory shows eligible backlog, repeated failures and the last successful check. A configured secret or passing preview test does not prove production scheduling is active; see [MEMORY_RECOVERY_OPERATIONS.md](MEMORY_RECOVERY_OPERATIONS.md).
+
 **CURRENT-1.** Select the latest complete usable scan per root by startedAt descending/id descending. Pending, failed, partial watcher imports and incomplete discovery are not complete snapshots. A complete snapshot's file set is exhaustive for its declared root; a changed-files batch cannot retire unchanged files.
 
 **CURRENT-2.** Older work cannot retire/overwrite newer current state. Fresh currentness/root/source authority must be checked inside the actual mutation transaction, under the shared root protocol or exact generation CAS. Earlier checks, process-local flags and captured arrays do not authorize later writes. A stale lease owner cannot settle success/failure or primary completion for a newer generation.
@@ -105,6 +107,8 @@ Live native failure settlement also retains UNKNOWN when an existing action jour
 **PRIVACY-2.** Human APIs require allowlisted human sessions and same-origin state-changing requests. Only exact implemented signed-machine routes are public; release manifest and one-use pairing redemption are explicit exceptions. Device signatures/nonce/expiry and root bindings are independently checked. Revoked/hidden/historical evidence cannot indirectly ground current answers.
 
 **PRIVACY-3.** Ordinary validation uses only disposable 127.0.0.1:5432/nsn_library_machine_test, synthetic local files, mocked AI and **unset** OPENAI_API_KEY. Never use production Neon/private production files/paid AI without explicit authorization. No generated Bridge dist, master changes, push, publication or promotion in this audit workflow.
+
+**PRIVACY-4.** The exact Memory scheduler endpoint requires a strong service secret in both Proxy and the route; human sessions cannot substitute. Scheduler responses, logs and health records disclose aggregate counts/status/timestamps only. It reuses current review/root/file/checksum predicates and never authorizes AI or filesystem work.
 
 ## Permanent invariant gate
 
