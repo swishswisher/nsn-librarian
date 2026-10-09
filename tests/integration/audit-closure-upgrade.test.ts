@@ -83,8 +83,11 @@ before(async () => {
   await cp("prisma/migrations/20261008120000_memory_recovery_scheduler", path.join(temporary, "prisma/migrations/20261008120000_memory_recovery_scheduler"), { recursive: true });
   execFileSync(process.execPath, ["node_modules/prisma/build/index.js", "migrate", "deploy", "--schema", path.join(temporary, "prisma/schema.prisma")], { stdio: "pipe" });
   assert.equal((await prisma.$queryRawUnsafe<Array<{ count: bigint }>>('SELECT count(*) FROM "_prisma_migrations"'))[0].count, 36n);
-  execFileSync(process.execPath, ["node_modules/prisma/build/index.js", "migrate", "deploy"], { stdio: "pipe" });
+  await cp("prisma/migrations/20261009180000_legacy_observation_recovery", path.join(temporary, "prisma/migrations/20261009180000_legacy_observation_recovery"), { recursive: true });
+  execFileSync(process.execPath, ["node_modules/prisma/build/index.js", "migrate", "deploy", "--schema", path.join(temporary, "prisma/schema.prisma")], { stdio: "pipe" });
   assert.equal((await prisma.$queryRawUnsafe<Array<{ count: bigint }>>('SELECT count(*) FROM "_prisma_migrations"'))[0].count, 37n);
+  execFileSync(process.execPath, ["node_modules/prisma/build/index.js", "migrate", "deploy"], { stdio: "pipe" });
+  assert.equal((await prisma.$queryRawUnsafe<Array<{ count: bigint }>>('SELECT count(*) FROM "_prisma_migrations"'))[0].count, 38n);
   assert.equal(await prisma.bridgeDevice.count(), 0); assert.equal(await prisma.bridgeCommand.count(), 0);
   assert.equal(await prisma.memoryEntry.count({ where: { searchSourceCount: { gt: 0 }, searchProvenanceComplete: true } }), 0);
 });

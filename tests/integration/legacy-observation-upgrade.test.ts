@@ -6,13 +6,13 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import type { PrismaClient } from "@prisma/client";
-import { createBridgeKeyPair } from "../../packages/bridge-protocol/src";
+import { createBridgeKeyPair, createBridgeCommandEnvelope, createBridgeDeviceRequestHeaders, verifyBridgeCommandSignature } from "../../packages/bridge-protocol/src";
 
 const schema = `legacy_observation_${process.pid}_${Date.now()}`;
 const migration35 = "20261007120000_system_authority_recovery";
 const migration36 = "20261008120000_memory_recovery_scheduler";
 const cases = ["active", "expired", "acknowledged", "offline", "revoked", "key", "revision", "physical", "superseded",
-  "unavailable", "concurrent", "late", "race", "history", "bounded", "fault", "retired-race", "generation-race", "denied"];
+  "unavailable", "concurrent", "late", "race", "history", "bounded", "fault", "retired-race", "generation-race", "denied", "queued-pending", "queued-acknowledged", "queued-expired", "queued-modern", "queued-revoked", "queued-generation", "queued-checksum", "queued-race"];
 const keys = new Map(cases.map((key) => [key, createBridgeKeyPair()]));
 const id = (key: string, kind: string) => kind === "native-root"
   ? `root_${createHash("sha256").update(key).digest("hex").slice(0, 24)}` : `legacy-${key}-${kind}`;
@@ -25,6 +25,7 @@ let authority: typeof import("../../src/lib/bridge/observation-authority");
 let reports: typeof import("../../src/lib/bridge/cloud-command-results");
 let commands: typeof import("../../src/lib/bridge/cloud-coordinator");
 let historical: unknown;
+let modernQueuedCommandId: string;
 
 before(async () => {
   const url = new URL(process.env.DATABASE_URL!);
@@ -67,14 +68,21 @@ before(async () => {
       supportedFiles: key === "bounded" ? 61 : 1, startedAt: new Date(Date.now() - 60_000) });
     for (let index = 0; index < (key === "bounded" ? 61 : 1); index++) {
       const fileId = id(key, index ? `file-${index}` : "file");
+      const queued = key.startsWith("queued-");
       await insert("ScannedFile", { id: fileId, sessionId: id(key, "scan"), relativePath: `${index}.txt`, localPath: `bridge://${key}/${index}.txt`,
-        fileType: "TEXT", checksum, readStatus: "SUPPORTED", readingStatus: "READ", extractionStatus: "COMPLETED", processingStage: "OBSERVING",
-        observationClaimedAt: new Date(Date.now() - (key === "active" ? 1000 : 20 * 60_000)) });
-      await insert("BridgeCommand", { id: id(key, `command-row-${index}`), commandId: id(key, `old-command-${index}`),
+        fileType: "TEXT", checksum, readStatus: "SUPPORTED", readingStatus: queued ? "NOT_READ" : "READ", extractionStatus: queued ? "PENDING" : "COMPLETED", processingStage: queued ? "READING" : "OBSERVING",
+        observationClaimedAt: queued ? null : new Date(Date.now() - (key === "active" ? 1000 : 20 * 60_000)) });
+      const legacyEnvelope = queued ? createBridgeCommandEnvelope({ commandId: id(key, `old-command-${index}`),
+        bridgeDeviceId: id(key, "device"), bridgeRootId: id(key, "native-root"), connectedLibraryId: id(key, "root"), commandType: "READ_FILE_TEMPORARILY",
+        idempotencyKey: id(key, `old-read-${index}`), authorizationContext: {}, payload: { scannedFileId: fileId, scanSessionId: id(key, "scan"), relativePath: `${index}.txt` },
+        issuedAt: new Date(Date.now() - 60_000), expiresAt: new Date(Date.now() + (key === "queued-expired" ? -1000 : 600_000)),
+        signingSecret: process.env.NSN_BRIDGE_COMMAND_SIGNING_SECRET!, }) : null;
+      if (key !== "queued-modern") await insert("BridgeCommand", { id: id(key, `command-row-${index}`), commandId: id(key, `old-command-${index}`),
         bridgeDeviceId: id(key, "device"), bridgeRootId: id(key, "native-root"), connectedLibraryId: id(key, "root"), commandType: "READ_FILE_TEMPORARILY",
         idempotencyKey: id(key, `old-read-${index}`), payload: { scannedFileId: fileId, scanSessionId: id(key, "scan"), relativePath: `${index}.txt` },
-        authorizationContext: {}, payloadHash: "legacy-synthetic", signature: "legacy-synthetic", issuedAt: new Date(Date.now() - 20 * 60_000),
-        expiresAt: new Date(Date.now() + (key === "acknowledged" ? 600_000 : -1000)), status: key === "expired" ? "EXPIRED" : "ACKNOWLEDGED" });
+        authorizationContext: {}, payloadHash: legacyEnvelope?.payloadHash ?? "legacy-synthetic", signature: legacyEnvelope?.signature ?? "legacy-synthetic", issuedAt: legacyEnvelope ? new Date(legacyEnvelope.issuedAt) : new Date(Date.now() - 20 * 60_000),
+        expiresAt: legacyEnvelope ? new Date(legacyEnvelope.expiresAt) : new Date(Date.now() + (key === "acknowledged" ? 600_000 : -1000)),
+        status: key === "expired" || key === "queued-expired" ? "EXPIRED" : key === "queued-pending" ? "PENDING" : "ACKNOWLEDGED" });
     }
   }
   await insert("LibraryBatch", { id: "legacy-history-batch", name: "Retained synthetic history" });
@@ -100,12 +108,27 @@ before(async () => {
   assert.ok((await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: id("acknowledged", "old-command-0") } })).expiresAt.getTime() > Date.now());
   console.log(`LEASES verified: active=${activeClaim.observationClaimedAt!.toISOString()}, expired=${expiredClaim.observationClaimedAt!.toISOString()}, now=${new Date().toISOString()}; expired and live acknowledged commands verified.`);
   console.log("UPGRADE: actual 34 populated with 79 active/expired owners; actual 35 and 36 leave authority null.");
+  // Keep the exact original 37 checkpoint before the additive queued-read fix.
+  // A genuine current read can be queued between migrations 36 and 37 while
+  // the FILE observation fields are still null. Capture authority on its NEW
+  // signed command using the real producer; never fill the legacy file fields.
+  const queuedProducer = await import("../../src/lib/bridge/remote-read-commands");
+  modernQueuedCommandId = (await queuedProducer.queueRemoteReadCommand({ bridgeDeviceId: id("queued-modern", "device"), bridgeRootId: id("queued-modern", "native-root"),
+    connectedLibraryId: id("queued-modern", "root"), scanSessionId: id("queued-modern", "scan"), scannedFileId: id("queued-modern", "file"),
+    relativePath: "0.txt", idempotencyKey: "valid-modern-queued-before-37" })).commandId;
   // On the baseline there are no forward migrations. After the fix this deploy
   // applies only the additive repair admission; 35/36 are already applied.
+  await cp("prisma/migrations/20261009180000_legacy_observation_recovery", path.join(temporary, "prisma/migrations/20261009180000_legacy_observation_recovery"), { recursive: true }); deploy(); assert.equal(await count(), 37);
+  assert.equal(await prisma.scannedFile.count({ where: { legacyObservationRecoveryPending: true } }), 79);
+  assert.equal(await prisma.scannedFile.count({ where: { id: { in: cases.filter((key) => key.startsWith("queued-")).map((key) => id(key, "file")) }, legacyObservationRecoveryPending: true } }), 0);
+  console.log("UPGRADE: original migration 37 leaves all eight queued/unclaimed states unmarked.");
   execFileSync(process.execPath, ["node_modules/prisma/build/index.js", "migrate", "deploy"], { stdio: "pipe" });
   const applied = await count();
-  if (applied === 37) {
-    assert.equal(await prisma.scannedFile.count({ where: { legacyObservationRecoveryPending: true } }), 79);
+  assert.equal(applied, 38);
+  if (applied === 38) {
+    assert.equal(await prisma.scannedFile.count({ where: { legacyObservationRecoveryPending: true } }), 86);
+    assert.equal((await file("queued-modern")).legacyObservationRecoveryPending, false);
+    assert.equal(await prisma.scannedFile.count({ where: { legacyObservationRecoveryPending: true, observationClaimedAt: { not: null } } }), 79);
     assert.equal(await prisma.scannedFile.count({ where: { legacyObservationRecoveryPending: true,
       OR: [{ observationRootRevision: { not: null } }, { observationDeviceKeyFingerprint: { not: null } }] } }), 0);
     assert.equal((await prisma.scannedFile.findUniqueOrThrow({ where: { id: "legacy-history-completed-file" } })).legacyObservationRecoveryPending, false);
@@ -325,4 +348,139 @@ test("LEGACY-16 each canonical denial and changed connection revision retain rep
       hiddenFromActiveListAt: null, mergedAt: null, canonicalConnectedLibraryId: null, nativeConnectionRevision: 0 } });
   }
   await complete("denied");
+});
+
+type SignedReply = { ok: boolean; code?: string; error?: string; commands?: import("../../packages/bridge-protocol/src").BridgeCommandEnvelope[];
+  command?: { commandId: string; status: string } };
+async function signedQueuedRequest(key: string, action: "poll" | "acknowledge" | "complete", commandId?: string, body?: object) {
+  const deviceId = id(key, "device"), method = action === "poll" ? "GET" : "POST";
+  const pathname = `/api/bridge/cloud/devices/${deviceId}/commands${action === "poll" ? "" : `/${commandId}/${action}`}`;
+  const bodyText = method === "GET" ? "" : JSON.stringify(body ?? {});
+  const request = new Request(`http://127.0.0.1${pathname}`, { method,
+    headers: createBridgeDeviceRequestHeaders({ bridgeDeviceId: deviceId, method, pathname, bodyText, privateKey: keys.get(key)!.privateKey }),
+    ...(method === "POST" ? { body: bodyText } : {}) });
+  const context = { params: Promise.resolve({ deviceId, commandId: commandId ?? "" }) };
+  const response = action === "poll" ? await (await import("../../src/app/api/bridge/cloud/devices/[deviceId]/commands/route")).GET(request, context)
+    : action === "acknowledge" ? await (await import("../../src/app/api/bridge/cloud/devices/[deviceId]/commands/[commandId]/acknowledge/route")).POST(request, context)
+    : await (await import("../../src/app/api/bridge/cloud/devices/[deviceId]/commands/[commandId]/complete/route")).POST(request, context);
+  return { status: response.status, body: await response.json() as SignedReply };
+}
+const queuedReadResult = (sourceChecksum = checksum) => ({ characterCount: text.length, extractedText: text, fileName: "0.txt", fileType: "TEXT",
+  relativePath: "0.txt", sourceChecksum, warnings: [] });
+async function finishSignedQueuedRead(key: string, commandId: string) {
+  assert.equal((await signedQueuedRequest(key, "acknowledge", commandId)).status, 200);
+  const completed = await signedQueuedRequest(key, "complete", commandId, { status: "COMPLETED", result: queuedReadResult() });
+  assert.equal(completed.status, 200); assert.equal(completed.body.ok, true); assert.equal(completed.body.command?.commandId, commandId);
+  assert.equal((await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId } })).status, "COMPLETED");
+  const result = await file(key); assert.equal(result.readingStatus, "READ"); assert.equal(result.extractionStatus, "COMPLETED");
+  assert.ok(["EXAMINED", "SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"].includes(result.processingStage));
+  assert.equal(result.observationClaimedAt, null); assert.equal(result.observationRootRevision, 0);
+  assert.equal(result.observationDeviceKeyFingerprint, authority.deviceKeyFingerprint(keys.get(key)!.publicKey));
+  assert.equal((await prisma.scanSession.findUniqueOrThrow({ where: { id: id(key, "scan") } })).status, "COMPLETED");
+}
+for (const key of ["queued-pending", "queued-acknowledged", "queued-expired"] as const) test(`LEGACY-17 ${key} unclaimed upgrade read automatically completes through signed polling after old report/expiry`, async () => {
+  const initial = await file(key), oldCommandId = id(key, "old-command-0");
+  assert.equal(initial.processingStage, "READING"); assert.equal(initial.readingStatus, "NOT_READ"); assert.equal(initial.extractionStatus, "PENDING");
+  assert.equal(initial.observationClaimedAt, null); assert.equal(initial.observationRootRevision, null); assert.equal(initial.observationDeviceKeyFingerprint, null);
+  const old = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: oldCommandId } });
+  assert.deepEqual(old.authorizationContext, {});
+  if (old.status === "PENDING") assert.equal((await signedQueuedRequest(key, "acknowledge", oldCommandId)).status, 200);
+  const rejected = await signedQueuedRequest(key, "complete", oldCommandId, { status: "COMPLETED", result: queuedReadResult() });
+  assert.equal(rejected.status, key === "queued-expired" ? 200 : 409);
+  if (key !== "queued-expired") assert.equal(rejected.body.code, "LEGACY_OBSERVATION_REQUEUE_REQUIRED");
+  assert.deepEqual(await file(key), initial, "Rejected or terminal legacy replies cannot acquire a fresh owner");
+  const first = await signedQueuedRequest(key, "poll"); assert.equal(first.status, 200);
+  const initiallyFresh = first.body.commands!.filter((command) => command.commandId !== oldCommandId);
+  // Simulate only the old command's deadline passing; never issue a human retry
+  // or change primary file state. Ordinary polling must remain the consumer.
+  await prisma.bridgeCommand.update({ where: { commandId: oldCommandId }, data: { expiresAt: new Date(Date.now() - 1000) } });
+  const subsequent = await signedQueuedRequest(key, "poll"); assert.equal(subsequent.status, 200);
+  const current = await file(key), oldAfter = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: oldCommandId } });
+  const fresh = subsequent.body.commands!.filter((command) => command.commandId !== oldCommandId);
+  const expiry = await (await import("../../src/lib/bridge/remote-read-commands")).expireRemoteReadCommandsForSession(id(key, "scan"));
+  console.log(`QUEUED TRACE ${key}: pre37=READING/NOT_READ/null; admitted=${initial.legacyObservationRecoveryPending}; oldReport=${rejected.status}; firstFresh=${initiallyFresh.length}; oldAfter=${oldAfter.status}; expiry=${expiry}; afterPoll=${current.processingStage}/${current.readingStatus}; fresh=${fresh.length}`);
+  assert.equal(fresh.length, 1, "A queued legacy read must get a fresh authorized command, not become a terminal failed file");
+  assert.equal(initial.legacyObservationRecoveryPending, true); assert.equal(initiallyFresh.length, 1);
+  assert.equal(oldAfter.status, "EXPIRED");
+  if (key !== "queued-expired") assert.ok(oldAfter.completedAt && oldAfter.completedAt.getTime() <= Date.now() && oldAfter.completedAt > old.issuedAt, "Legacy invalidation records the actual UTC settlement time");
+  assert.equal(current.processingStage, "READING"); assert.equal(current.readingStatus, "NOT_READ");
+  assert.equal(current.observationRootRevision, null); assert.equal(current.observationDeviceKeyFingerprint, null);
+  assert.equal(verifyBridgeCommandSignature(fresh[0], process.env.NSN_BRIDGE_COMMAND_SIGNING_SECRET!), true);
+  assert.equal((fresh[0].authorizationContext as { rootConnectionRevision: number }).rootConnectionRevision, 0);
+  const beforeLate = await file(key);
+  assert.equal((await signedQueuedRequest(key, "complete", oldCommandId, { status: "COMPLETED", result: queuedReadResult() })).status, 200);
+  assert.deepEqual(await file(key), beforeLate, "Late obsolete reports cannot alter modern queued ownership");
+  await finishSignedQueuedRead(key, fresh[0].commandId);
+  assert.equal(await recovery.recoverAbandonedObservationFilesForDevice(id(key, "device")), 0);
+});
+test("LEGACY-18 genuine modern queued read captured between 36 and 37 keeps its command and completes", async () => {
+  const initial = await file("queued-modern"); assert.equal(initial.legacyObservationRecoveryPending, false);
+  assert.equal(initial.processingStage, "READING"); assert.equal(initial.observationClaimedAt, null);
+  assert.equal(initial.observationRootRevision, null); assert.equal(initial.observationDeviceKeyFingerprint, null);
+  const original = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: modernQueuedCommandId } });
+  assert.equal(await recovery.recoverAbandonedObservationFilesForDevice(id("queued-modern", "device")), 0);
+  const polled = await signedQueuedRequest("queued-modern", "poll"); assert.equal(polled.status, 200);
+  assert.deepEqual(polled.body.commands!.map((command) => command.commandId), [modernQueuedCommandId]);
+  assert.deepEqual(await file("queued-modern"), initial);
+  assert.deepEqual(await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: modernQueuedCommandId } }), original);
+  assert.equal(verifyBridgeCommandSignature(polled.body.commands![0], process.env.NSN_BRIDGE_COMMAND_SIGNING_SECRET!), true);
+  console.log("QUEUED TRACE modern: marker=false; same signed command delivered; file and command unchanged before completion");
+  await finishSignedQueuedRead("queued-modern", modernQueuedCommandId);
+});
+for (const key of ["queued-revoked", "queued-generation"] as const) test(`LEGACY-19 ${key} cannot resume unclaimed legacy work under denied root or generation`, async () => {
+  assert.equal((await file(key)).legacyObservationRecoveryPending, true);
+  if (key === "queued-revoked") await commands.revokeBridgeDevice(id(key, "device"));
+  else await prisma.connectedLibrary.update({ where: { id: id(key, "root") }, data: { physicalInventoryGeneration: 1 } });
+  const initial = await file(key);
+  assert.equal(await recovery.recoverAbandonedObservationFilesForDevice(id(key, "device")), 0);
+  const denied = await signedQueuedRequest(key, "poll");
+  if (key === "queued-revoked") { assert.equal(denied.status, 401); assert.equal(denied.body.ok, false); }
+  else {
+    assert.equal(denied.status, 200);
+    assert.deepEqual(denied.body.commands!.map((command) => command.commandId), [id(key, "old-command-0")], "No fresh authorized read resumes an obsolete physical generation");
+    await assert.rejects(prisma.$transaction(async (tx) => {
+      await (await import("../../src/lib/bridge/execution-reconciliation")).assertInventoryAfterPhysicalOutcomes(tx, id(key, "root"), 0);
+    }), /Inventory discovery preceded/);
+  }
+  const late = await signedQueuedRequest(key, "complete", id(key, "old-command-0"), { status: "COMPLETED", result: queuedReadResult() });
+  assert.equal(late.status, key === "queued-generation" ? 409 : 200);
+  assert.deepEqual(await file(key), initial); assert.equal(await prisma.bridgeCommand.count({ where: { bridgeDeviceId: id(key, "device"), status: "PENDING" } }), 0);
+});
+test("LEGACY-20 fresh queued replacement still rejects a source checksum mismatch without observation success", async () => {
+  const key = "queued-checksum", polled = await signedQueuedRequest(key, "poll"); assert.equal(polled.status, 200);
+  const command = polled.body.commands![0]; assert.notEqual(command.commandId, id(key, "old-command-0"));
+  assert.equal((await signedQueuedRequest(key, "acknowledge", command.commandId)).status, 200);
+  const reported = await signedQueuedRequest(key, "complete", command.commandId, { status: "COMPLETED", result: queuedReadResult("f".repeat(64)) });
+  assert.equal(reported.status, 200);
+  const failed = await file(key); assert.equal(failed.processingStage, "FAILED"); assert.equal(failed.readingStatus, "FAILED");
+  assert.equal(failed.processingErrorCategory, "FILE_CHANGED_SINCE_SCAN"); assert.equal(failed.libraryDocumentId, null);
+  assert.equal(failed.observationClaimedAt, null); assert.equal(failed.checksum, checksum);
+});
+test("LEGACY-21 modern queued command established while repair waits wins without a file observation lease", async () => {
+  const key = "queued-race", initial = await file(key); assert.equal(initial.legacyObservationRecoveryPending, true);
+  let release!: () => void, ready!: () => void, commandId!: string;
+  const held = new Promise<void>((resolve) => { ready = resolve; }), done = new Promise<void>((resolve) => { release = resolve; });
+  const lock = prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${id(key, "device")} FOR SHARE`;
+    await tx.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE id = ${id(key, "root")} FOR UPDATE`; ready(); await done;
+    await tx.bridgeCommand.update({ where: { commandId: id(key, "old-command-0") }, data: { status: "EXPIRED", completedAt: new Date() } });
+    commandId = (await (await import("../../src/lib/bridge/remote-read-commands")).queueRemoteReadCommand({ bridgeDeviceId: id(key, "device"),
+      bridgeRootId: id(key, "native-root"), connectedLibraryId: id(key, "root"), scanSessionId: id(key, "scan"), scannedFileId: id(key, "file"),
+      relativePath: "0.txt", idempotencyKey: "modern-queued-race" }, tx)).commandId;
+  }, { timeout: 30_000 });
+  await held;
+  const pending = recovery.recoverAbandonedObservationFilesForDevice(id(key, "device"));
+  try {
+    const deadline = Date.now() + 10_000; let waiting = false;
+    while (Date.now() < deadline) {
+      const rows = await prisma.$queryRawUnsafe<Array<{ count: bigint }>>(`SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%ConnectedFolder%SHARE%'`);
+      if (Number(rows[0].count)) { waiting = true; break; } await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.ok(waiting, "Legacy selection reached the root lock before modern queued ownership commits");
+  } finally { release(); await lock; }
+  assert.equal(await pending, 0); assert.deepEqual(await file(key), initial);
+  assert.equal((await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId } })).status, "PENDING");
+  const polled = await signedQueuedRequest(key, "poll"); assert.equal(polled.status, 200);
+  assert.deepEqual(polled.body.commands!.map((command) => command.commandId), [commandId]);
+  await finishSignedQueuedRead(key, commandId);
 });

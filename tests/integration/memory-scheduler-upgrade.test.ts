@@ -165,9 +165,11 @@ before(async () => {
   assert.equal(postUpgrade.pending, BigInt(123)); assert.equal(postUpgrade.retained, BigInt(122)); assert.equal(postUpgrade.complete, BigInt(0));
   await migrationLoader("first36", (migration) => migration <= "20261008120000_memory_recovery_scheduler");
   assert.equal((await prisma.$queryRawUnsafe<Array<{ count: bigint }>>('SELECT count(*) FROM "_prisma_migrations"'))[0].count, BigInt(36));
+  await migrationLoader("first37", (migration) => migration <= "20261009180000_legacy_observation_recovery");
+  assert.equal((await prisma.$queryRawUnsafe<Array<{ count: bigint }>>('SELECT count(*) FROM "_prisma_migrations"'))[0].count, BigInt(37));
   execFileSync(process.execPath, ["node_modules/prisma/build/index.js", "migrate", "deploy"], { stdio: "pipe" });
   if (!process.env.NSN_TEST_WEB_APPLICATION_DIR) {
-    assert.equal((await prisma.$queryRawUnsafe<Array<{ count: bigint }>>('SELECT count(*) FROM "_prisma_migrations"'))[0].count, BigInt(37));
+    assert.equal((await prisma.$queryRawUnsafe<Array<{ count: bigint }>>('SELECT count(*) FROM "_prisma_migrations"'))[0].count, BigInt(38));
     const configuration = JSON.parse(await readFile("vercel.json", "utf8"));
     assert.equal(configuration.crons.length, 1); assert.equal(configuration.crons[0].path, schedulerPath);
     schedulerPath = configuration.crons[0].path;

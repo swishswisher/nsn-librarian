@@ -5,6 +5,18 @@ import { latestObservationOrder, observationLeaseMs, usableObservation, deviceKe
 import { assertInventoryAfterPhysicalOutcomes } from "./execution-reconciliation";
 import { generateScanRecommendationBatchIfReady } from "./scan-recommendation-batch";
 
+// A queued read owns its signed command before it owns an observation lease.
+// Preserve even partial modern captures; missing authority must fail closed.
+function capturedQueuedReadSql(deviceId: string | Prisma.Sql, rootId: string | Prisma.Sql,
+  sessionId: string | Prisma.Sql, fileId: string | Prisma.Sql) {
+  return Prisma.sql`SELECT 1 AS present FROM "BridgeCommand" modern
+    WHERE modern."commandType" = 'READ_FILE_TEMPORARILY' AND modern.status IN ('PENDING', 'ACKNOWLEDGED', 'RUNNING')
+      AND modern."bridgeDeviceId" = ${deviceId} AND modern."connectedLibraryId" = ${rootId}
+      AND modern.payload->>'scanSessionId' = ${sessionId} AND modern.payload->>'scannedFileId' = ${fileId}
+      AND (modern."authorizationContext"->>'rootConnectionRevision' IS NOT NULL
+        OR modern."authorizationContext"->>'deviceKeyFingerprint' IS NOT NULL)`;
+}
+
 /** Migration admission is an invalidation obligation, never an old read grant.
  * Even an unexpired legacy owner cannot publish without its missing authority.
  * Reset it once, then let normal signed reads capture NEW authority and bytes. */
@@ -18,6 +30,8 @@ async function repairLegacyObservationFilesForDevice(deviceId: string, now: Date
     WHERE file."legacyObservationRecoveryPending" = true
       AND file."observationRootRevision" IS NULL AND file."observationDeviceKeyFingerprint" IS NULL
       AND file."processingStage" IN ('READING', 'READ', 'EXAMINING', 'OBSERVING')
+      AND NOT (file."processingStage" = 'READING' AND file."readingStatus" = 'NOT_READ' AND file."observationClaimedAt" IS NULL
+        AND EXISTS (${capturedQueuedReadSql(Prisma.sql`root."bridgeDeviceId"`, Prisma.sql`root.id`, Prisma.sql`scan.id`, Prisma.sql`file.id`)}))
       AND file."readStatus" = 'SUPPORTED' AND file."sourceUnavailableAt" IS NULL AND file.checksum ~ '^[a-fA-F0-9]{64}$'
       AND root."bridgeDeviceId" = ${deviceId} AND root."bridgeRootId" IS NOT NULL AND ${currentReadableRootSql}
       AND root."nativeConnectionRevision" = 0
@@ -53,14 +67,22 @@ async function repairLegacyObservationFilesForDevice(deviceId: string, now: Date
           fresh.observationClaimedAt?.getTime() !== candidate.observationClaimedAt?.getTime() ||
           !["READING", "READ", "EXAMINING", "OBSERVING"].includes(fresh.processingStage) ||
           fresh.readStatus !== "SUPPORTED" || fresh.sourceUnavailableAt || !fresh.checksum || !/^[a-fA-F0-9]{64}$/.test(fresh.checksum)) return false;
+      if (fresh.processingStage === "READING" && fresh.readingStatus === "NOT_READ" && fresh.observationClaimedAt === null &&
+          (await tx.$queryRaw<Array<{ present: number }>>(Prisma.sql`${capturedQueuedReadSql(deviceId, root.id, scan.id, fresh.id)} LIMIT 1`)).length) return false;
       if (await tx.scanSession.findFirst({ select: { id: true }, where: { connectedFolderId: root.id, status: { not: "FAILED" },
         OR: [{ startedAt: { gt: scan.startedAt } }, { startedAt: scan.startedAt, id: { gt: scan.id } }] } })) return false;
       try { await assertInventoryAfterPhysicalOutcomes(tx, root.id, scan.inventoryGeneration); } catch { return false; }
-      await tx.bridgeCommand.updateMany({ data: { status: "EXPIRED", completedAt: now, safeErrorCategory: "LEGACY_OBSERVATION_REQUEUE_REQUIRED" },
-        where: { bridgeDeviceId: deviceId, connectedLibraryId: root.id, commandType: "READ_FILE_TEMPORARILY",
-          status: { in: ["PENDING", "ACKNOWLEDGED", "RUNNING"] }, AND: [
-            { payload: { path: ["scanSessionId"], equals: scan.id } }, { payload: { path: ["scannedFileId"], equals: fresh.id } },
-          ] } });
+      // A newly admitted queued command must not be expired even if it arrives
+      // after the ownership check. Its fresh report can still complete normally.
+      const queued = fresh.processingStage === "READING" && fresh.readingStatus === "NOT_READ" && fresh.observationClaimedAt === null;
+      const settledAt = now.toISOString();
+      await tx.$executeRaw`UPDATE "BridgeCommand" SET status = 'EXPIRED', "completedAt" = ${settledAt}::timestamp,
+        "safeErrorCategory" = 'LEGACY_OBSERVATION_REQUEUE_REQUIRED'
+        WHERE "bridgeDeviceId" = ${deviceId} AND "connectedLibraryId" = ${root.id} AND "commandType" = 'READ_FILE_TEMPORARILY'
+          AND status IN ('PENDING', 'ACKNOWLEDGED', 'RUNNING')
+          AND payload->>'scanSessionId' = ${scan.id} AND payload->>'scannedFileId' = ${fresh.id}
+          AND (${!queued} OR ("authorizationContext"->>'rootConnectionRevision' IS NULL
+            AND "authorizationContext"->>'deviceKeyFingerprint' IS NULL))`;
       await tx.scannedFile.update({ where: { id: fresh.id }, data: {
         legacyObservationRecoveryPending: false, observationClaimedAt: null,
         processingStage: "DISCOVERED", readingStatus: "NOT_READ", extractionStatus: "PENDING",
