@@ -68,6 +68,8 @@ Migration cannot manufacture missing physical proof from older deployments. A no
 
 ## Durable lifecycle and ordering protocols
 
+Legacy observation upgrade recovery uses the additive migration 37 marker on ScannedFile and the existing Bridge polling consumer in `observation-recovery.ts`. The marker records incomplete upgrade-time work lacking both old authority fields, including unexpired owners; it supplies no authority. Recovery expires bound active read commands and resets primary read state atomically under the established device/root/command/scan/file order. Current grants, revision zero, physical generation, source availability/checksum, lifecycle, newer snapshots and physical-work exclusions precede its work cap and are checked again at mutation. Fresh read/observation processing establishes new authority and success; old reports cannot borrow that new ownership. The combined legacy/modern window remains 50 files. Historical observations, human decisions and Memory are retained. Root reconnect and key replacement continue retiring old scan work; neither migration nor recovery infers past grants.
+
 | Work | Authority and durable admission | Ordinary recovery and truthful completion |
 | --- | --- | --- |
 | Observation review / Memory | Owner UPDATE lock before non-NOTE authority read; timestamp strictly later than previous decision; event/status/source invalidation plus `PENDING@decisionId` atomic | Review route, bounded ordinary polling or authenticated Memory/Search/Ask access rebuilds complete current sources; web requests process one owner under a nonblocking lock/five-second deadline; exact generation completion and Serializable source locks survive process death |

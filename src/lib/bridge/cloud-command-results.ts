@@ -1051,9 +1051,15 @@ export async function prepareBridgeCommandReportForPersistence(
     throw new BridgeCloudError("That Bridge command could not be found.", 404);
   }
 
-  if (["COMPLETED", "FAILED", "REJECTED", "EXPIRED"].includes(command.status)) return report;
+  if (["COMPLETED", "FAILED", "REJECTED", "EXPIRED", "CANCELLED"].includes(command.status)) return report;
 
   if (command.commandType === "READ_FILE_TEMPORARILY") {
+    const captured = objectValue(command.authorizationContext);
+    // A legacy reply cannot acquire a fresh file lease using today's key or
+    // revision. Recovery expires its command and admits a NEW signed read.
+    if (typeof captured?.rootConnectionRevision !== "number" || typeof captured?.deviceKeyFingerprint !== "string") {
+      throw new BridgeCloudError("This legacy read requires a fresh authorized command.", 409, "LEGACY_OBSERVATION_REQUEUE_REQUIRED");
+    }
     if (report.status === "COMPLETED") {
       const context = objectValue(command.authorizationContext);
       const result = await applyCompletedRead(command.payload, report.result, {

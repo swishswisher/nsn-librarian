@@ -1005,6 +1005,7 @@ model ScanSession {
   @@index([status])
   @@index([status, recommendationLeaseUntil])
   @@index([startedAt])
+  @@index([connectedFolderId, startedAt, id])
 }
 
 model LibrarySearchBackfillFile {
@@ -1096,6 +1097,7 @@ model ScannedFile {
   observationClaimedAt    DateTime?
   observationRootRevision Int?
   observationDeviceKeyFingerprint String?
+  legacyObservationRecoveryPending Boolean @default(false)
   aiRequestCount          Int                        @default(0)
   aiHttpAttempts          Int                        @default(0)
   aiInputTokens           Int?
@@ -1122,6 +1124,7 @@ model ScannedFile {
   @@index([libraryDocumentId])
   @@index([sourceUnavailableAt])
   @@index([observationFingerprint])
+  @@index([legacyObservationRecoveryPending, sessionId, id])
 }
 
 model AudioRecordingMetadata {
