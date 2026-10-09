@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -9,6 +10,7 @@ import { createBridgeServer } from "../src/api/server";
 import { readBridgeRootFile } from "../src/filesystem/reader";
 import { resolveBridgeRootFile } from "../src/filesystem/resolver";
 import { scanBridgeRoot } from "../src/filesystem/scanner";
+import { extractImageMetadata } from "../../src/lib/bridge/image-metadata";
 import { resolveInsideRoot } from "../src/filesystem/safety";
 import {
   createFolderSelection,
@@ -80,6 +82,14 @@ function mp3FrameBuffer() {
     Buffer.from([0xff, 0xfb, 0x90, 0x64]),
     Buffer.alloc(2048),
   ]);
+}
+
+function pngMetadataFixture(width = 640, height = 480) {
+  const buffer = Buffer.alloc(24);
+  Buffer.from("89504e470d0a1a0a", "hex").copy(buffer, 0);
+  buffer.writeUInt32BE(width, 16);
+  buffer.writeUInt32BE(height, 20);
+  return buffer;
 }
 
 function atom(type: string, payload: Buffer) {
@@ -566,6 +576,19 @@ describe("NSN Bridge core", () => {
     assert.equal(video.videoMetadata?.transcriptSnippet, null);
   });
 
+  it("caps long temporary document text and reports partial analysis", async () => {
+    const folder = await makeSafeFolder("library-long-document");
+    const root = await connectFolder(folder);
+    const content = `${"Routine notes. ".repeat(150_000)}Late evidence.`;
+    await writeFile(path.join(folder, "long.txt"), content);
+
+    const read = await readBridgeRootFile(root.id, "long.txt");
+
+    assert.equal(read.characterCount, content.length);
+    assert.equal(read.extractedText.length, 2_000_000);
+    assert.ok(read.warnings.some((warning) => warning.includes("later content was not examined")));
+  });
+
   it("keeps damaged supported media in media-specific failure categories", async () => {
     const folder = await makeSafeFolder("library-media-damaged");
     const root = await connectFolder(folder);
@@ -632,6 +655,70 @@ describe("NSN Bridge core", () => {
       byPath.get("Images/Website Candidates/becoming-workshop-hero.jpg")?.readStatus,
       "SUPPORTED",
     );
+  });
+
+  it("rejects image metadata when the bytes change during extraction", async () => {
+    const folder = await makeSafeFolder("library-image-scan-race");
+    const imagePath = path.join(folder, "changing.png");
+    const root = await connectFolder(folder);
+    await writeFile(imagePath, pngMetadataFixture());
+
+    const scan = await scanBridgeRoot(root.id, {
+      imageMetadataExtractor: async (...args) => {
+        const metadata = await extractImageMetadata(...args);
+        await writeFile(imagePath, pngMetadataFixture(800, 600));
+        return metadata;
+      },
+    });
+
+    assert.equal(scan.failedFiles, 1);
+    assert.equal(scan.supportedFiles, 0);
+    assert.deepEqual(scan.files[0], {
+      checksum: null,
+      fileType: "IMAGE_PNG",
+      lastModified: null,
+      localPath: `bridge://${root.id}/changing.png`,
+      readStatus: "FAILED",
+      relativePath: "changing.png",
+      scanError: "The Bridge could not inspect this file safely.",
+      sizeBytes: null,
+      sourceCreatedAt: null,
+    });
+  });
+
+  it("uses the replacement image stats when replacement happens before the checksum guard", async () => {
+    const folder = await makeSafeFolder("library-image-scan-pre-guard-replacement");
+    const imagePath = path.join(folder, "replaced.png");
+    const root = await connectFolder(folder);
+    await writeFile(imagePath, pngMetadataFixture());
+    const replacement = Buffer.concat([pngMetadataFixture(1024, 768), Buffer.alloc(37, 7)]);
+
+    const scan = await scanBridgeRoot(root.id, {
+      beforeImageChecksum: async () => writeFile(imagePath, replacement),
+    });
+    const image = scan.files[0];
+
+    assert.equal(image.readStatus, "SUPPORTED");
+    assert.equal(image.checksum, createHash("sha256").update(replacement).digest("hex"));
+    assert.equal(image.sizeBytes, BigInt(replacement.length));
+    assert.equal(image.imageMetadata?.sizeBytes, BigInt(replacement.length));
+    assert.equal(image.imageMetadata?.width, 1024);
+    assert.equal(image.imageMetadata?.height, 768);
+  });
+
+  it("keeps unchanged images supported with matching metadata", async () => {
+    const folder = await makeSafeFolder("library-image-scan-stable");
+    const bytes = pngMetadataFixture();
+    const root = await connectFolder(folder);
+    await writeFile(path.join(folder, "stable.png"), bytes);
+
+    const scan = await scanBridgeRoot(root.id);
+    const image = scan.files[0];
+
+    assert.equal(image.readStatus, "SUPPORTED");
+    assert.equal(image.checksum, createHash("sha256").update(bytes).digest("hex"));
+    assert.equal(image.imageMetadata?.width, 640);
+    assert.equal(image.imageMetadata?.height, 480);
   });
 
   it("reports stale roots, revoked read permission, and missing files safely", async () => {

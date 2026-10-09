@@ -1,8 +1,10 @@
+import { retireRootReadWork } from "./command-lifecycle";
 import type { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { BridgeCloudError } from "@/lib/bridge/cloud-coordinator";
-import { reconcileConnectedLibraryFingerprint } from "@/lib/bridge/connected-libraries";
+import { lockAuthorityOwner } from "@/lib/db/authority";
+import { reconcileConnectedLibraryFingerprintInTransaction } from "./connected-libraries";
 import {
   bridgePermissionSnapshot,
   logBridgePermissionDiagnostic,
@@ -10,6 +12,7 @@ import {
 import type { ConnectedLibraryPermissions } from "@/lib/bridge/types";
 
 type BridgeRootSyncInput = {
+  connectionRevision: number;
   connectedAt: string;
   createFolderPermission: boolean;
   displayName: string;
@@ -136,7 +139,7 @@ function permissionSnapshotFromCommandResult(result: Prisma.JsonValue | null) {
 }
 
 async function latestConfirmedPermissionUpdate(
-  prisma: ReturnType<typeof getPrismaClient>,
+  prisma: Prisma.TransactionClient,
   input: {
     bridgeDeviceId: string;
     bridgeRootId: string;
@@ -216,6 +219,8 @@ function validatedRoot(value: unknown): BridgeRootSyncInput | null {
 
   return {
     connectedAt: root.connectedAt,
+    connectionRevision: Number.isSafeInteger(root.connectionRevision) && (root.connectionRevision as number) > 0
+      ? root.connectionRevision as number : 0,
     createFolderPermission: root.createFolderPermission === true,
     displayName: root.displayName.trim().slice(0, 200),
     id: root.id,
@@ -239,6 +244,7 @@ function validatedRoot(value: unknown): BridgeRootSyncInput | null {
 export async function syncBridgeDeviceRoots(
   bridgeDeviceId: string,
   input: unknown,
+  expectedPublicKey?: string,
 ) {
   const roots = Array.isArray(input)
     ? input.map(validatedRoot).filter((root): root is BridgeRootSyncInput => Boolean(root))
@@ -256,23 +262,29 @@ export async function syncBridgeDeviceRoots(
   const synced = [];
 
   for (const root of roots) {
-    const canonical = await reconcileConnectedLibraryFingerprint(root.id);
-    const canonicalLibrary = canonical
-      ? await prisma.connectedLibrary.findUnique({
-          where: { id: canonical.id },
-        })
-      : null;
-    const existing =
-      canonicalLibrary ??
-      (await prisma.connectedLibrary.findFirst({
-        where: {
-          OR: [
-            { bridgeRootId: root.id },
-            { folderFingerprint: root.id },
-            { localPath: bridgeRootUri(root.id) },
-          ],
-        },
-      }));
+    const library = await prisma.$transaction(async (tx) => {
+      const prisma = tx;
+      const devices = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "BridgeDevice"
+        WHERE "bridgeDeviceId" = ${bridgeDeviceId} AND status <> 'REVOKED' AND "revokedAt" IS NULL FOR SHARE`;
+      if (!devices.length) throw new BridgeCloudError("This Bridge device is not available.", 403);
+      if (expectedPublicKey && (await tx.bridgeDevice.findUniqueOrThrow({ where: { bridgeDeviceId } })).publicKey !== expectedPublicKey)
+        throw new BridgeCloudError("This request belongs to an older device key.", 401);
+      const canonical = await reconcileConnectedLibraryFingerprintInTransaction(tx, root.id, bridgeDeviceId);
+      let existing = canonical ? await tx.connectedLibrary.findUniqueOrThrow({ where: { id: canonical.id } }) : null;
+      if (existing) {
+        await lockAuthorityOwner(tx, "ConnectedFolder", existing.id);
+        existing = await tx.connectedLibrary.findUniqueOrThrow({ where: { id: existing.id } });
+        if (existing.bridgeDeviceId && existing.bridgeDeviceId !== bridgeDeviceId) {
+          throw new BridgeCloudError("This folder identity is already bound to another paired Mac.", 409, "ROOT_DEVICE_MISMATCH");
+        }
+      }
+      const explicitlyReconnected = Boolean(existing && root.connectionRevision > existing.nativeConnectionRevision);
+      if (existing && explicitlyReconnected) await retireRootReadWork(tx, existing.id);
+      const lifecycleDenied = Boolean(existing && (!existing.isEnabled || existing.status !== "CONNECTED" ||
+        existing.disconnectedAt || existing.hiddenFromActiveListAt || existing.mergedAt || existing.canonicalConnectedLibraryId));
+      const incomingUpdatedAt = dateOrNull(root.updatedAt);
+      const staleState = Boolean(existing && (root.connectionRevision < existing.nativeConnectionRevision ||
+        (existing.nativeRootUpdatedAt && (!incomingUpdatedAt || incomingUpdatedAt < existing.nativeRootUpdatedAt))));
     const confirmedPermissionUpdate = await latestConfirmedPermissionUpdate(
       prisma,
       {
@@ -367,9 +379,27 @@ export async function syncBridgeDeviceRoots(
       safeLocalLocation: root.safeLocation,
       status: connectedLibraryStatus(root),
       watchPermission: effectivePermissions.watchPermission,
+      nativeConnectionRevision: Math.max(existing?.nativeConnectionRevision ?? 0, root.connectionRevision),
+      nativeRootUpdatedAt: staleState ? existing?.nativeRootUpdatedAt : incomingUpdatedAt,
     } satisfies Prisma.ConnectedLibraryUncheckedUpdateInput;
 
-    const library = existing
+    if (existing && (staleState || existing.mergedAt || existing.canonicalConnectedLibraryId || (lifecycleDenied && !explicitlyReconnected))) {
+      // A scan/watch heartbeat cannot clear a human lifecycle decision. Merged
+      // aliases never become independent roots through native synchronization.
+      Object.assign(commonData, {
+        canonicalConnectedLibraryId: existing.canonicalConnectedLibraryId,
+        disconnectedAt: existing.disconnectedAt,
+        hiddenFromActiveListAt: existing.hiddenFromActiveListAt,
+        mergedAt: existing.mergedAt,
+        isEnabled: existing.isEnabled,
+        status: existing.status,
+        monitoringState: existing.monitoringState,
+        monitoringHeartbeatAt: existing.monitoringHeartbeatAt,
+        ...Object.fromEntries(permissionKeys.map((key) => [key, existing[key]])),
+      });
+    }
+
+    return existing
       ? await prisma.connectedLibrary.update({
           data: commonData,
           where: { id: existing.id },
@@ -380,6 +410,7 @@ export async function syncBridgeDeviceRoots(
             connectedAt: dateOrNull(root.connectedAt) ?? now,
           },
         });
+    });
 
     synced.push({
       bridgeRootId: library.bridgeRootId,
@@ -389,7 +420,6 @@ export async function syncBridgeDeviceRoots(
       status: library.status,
     });
 
-    await reconcileConnectedLibraryFingerprint(root.id);
   }
 
   return synced;

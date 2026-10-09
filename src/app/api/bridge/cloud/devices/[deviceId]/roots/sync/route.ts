@@ -13,7 +13,7 @@ export async function POST(
 
   try {
     const bodyText = await request.text();
-    await authenticateBridgeDeviceRequest({
+    const authenticated = await authenticateBridgeDeviceRequest({
       bodyText,
       bridgeDeviceId: deviceId,
       request,
@@ -23,7 +23,7 @@ export async function POST(
       : {};
 
     return Response.json({
-      libraries: await syncBridgeDeviceRoots(deviceId, body.roots),
+      libraries: await syncBridgeDeviceRoots(deviceId, body.roots, authenticated.publicKey),
       ok: true,
     });
   } catch (error) {

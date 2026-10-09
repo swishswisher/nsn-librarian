@@ -1,10 +1,12 @@
+import { Prisma } from "@prisma/client";
+import { LocalSourceIdentityError } from "./local-read-authority";
+import { claimObservationLease, latestObservationOrder, observationLeaseMs, usableObservation, withOwnedObservationLease } from "./observation-authority";
 import { getPrismaClient } from "@/lib/db/prisma";
 import { ObservationSessionError } from "@/lib/library/observation-sessions";
 
 import { requireScanSessionPermission } from "./connected-libraries";
 import { readScannedFile, BridgeReaderError } from "./reader";
 import { createObservationSessionForScannedFileReadResult } from "./scanned-file-observations";
-import { currentRecommendationGenerationVersion } from "./recommendation-generation";
 import { generateScanRecommendationBatchIfReady } from "./scan-recommendation-batch";
 import {
   createBridgeScanSessionFromEnvironment,
@@ -24,6 +26,7 @@ type ProcessingStartResult = {
 };
 
 type ProcessingOptions = {
+  beforeFile?: () => Promise<void>;
   excludeFileIds?: Set<string>;
   includeFailed?: boolean;
   recordNotebook?: boolean;
@@ -40,9 +43,7 @@ const safeFileProcessingFailureMessage =
 const readingTimeoutMs = 120_000;
 const observationTimeoutMs = 35_000;
 
-function isRecommendationTerminalStage(stage: string) {
-  return stage === "SUGGESTIONS_GENERATED" || stage === "RECOMMENDATIONS_READY";
-}
+
 
 class FileProcessingTimeoutError extends Error {
   category: string;
@@ -83,6 +84,7 @@ function fileProcessingFailure(
   error: unknown,
   fallbackCategory: string,
 ): FileProcessingFailure {
+  if (error instanceof LocalSourceIdentityError) return { category: error.category, message: error.message };
   if (error instanceof FileProcessingTimeoutError) {
     return {
       category: error.category,
@@ -116,11 +118,6 @@ async function requireAutomaticProcessingPermissions(sessionId: string) {
     "readPermission",
     "process scanned files",
   );
-  await requireScanSessionPermission(
-    sessionId,
-    "recommendationPermission",
-    "prepare organization recommendations",
-  );
 }
 
 async function activeProgressForSession(
@@ -139,154 +136,52 @@ async function activeProgressForSession(
   };
 }
 
-async function updateSessionStatus(
-  sessionId: string,
-  status: "READING" | "EXAMINING" | "GENERATING_SUGGESTIONS",
-) {
-  const prisma = getPrismaClient();
-
-  await prisma.scanSession.update({
-    data: {
-      completedAt: null,
-      status,
-    },
-    where: {
-      id: sessionId,
-    },
+async function updateSessionStatus(sessionId: string, status: "READING" | "EXAMINING", fileId: string, owner: Date) {
+  await withOwnedObservationLease(fileId, owner, async (tx) => {
+    await tx.scanSession.update({ data: { completedAt: null, status }, where: { id: sessionId } });
   });
 }
 
-async function markFileFailure(
-  scannedFileId: string,
-  failure: FileProcessingFailure,
-) {
-  const prisma = getPrismaClient();
-
-  await prisma.scannedFile.update({
-    data: {
-      processedAt: new Date(),
-      processingErrorCategory: failure.category,
-      processingStage: "FAILED",
-      scanError: failure.message,
-    },
-    where: {
-      id: scannedFileId,
-    },
-  });
+async function markFileFailure(scannedFileId: string, failure: FileProcessingFailure, owner: Date) {
+  await withOwnedObservationLease(scannedFileId, owner, async (tx) => {
+    await tx.scannedFile.update({ data: { processedAt: new Date(), processingErrorCategory: failure.category,
+      processingStage: "FAILED", scanError: failure.message, observationClaimedAt: null }, where: { id: scannedFileId } });
+  }).catch(() => undefined); // A superseded worker cannot mark a newer claim failed.
 }
 
-function fileNeedsProcessing(
-  file: {
-    extractionStatus: string;
-    libraryDocument: {
-      observationSessions: { id: string }[];
-    } | null;
-    organizationSuggestions: { id: string; suggestionType: string }[];
-    processedAt: Date | null;
-    processingStage: string;
-    readingStatus: string;
-  },
-  options: ProcessingOptions,
-) {
-  const hasObservation =
-    (file.libraryDocument?.observationSessions.length ?? 0) > 0;
-  const hasCurrentRecommendations = file.organizationSuggestions.length > 0;
 
-  if (file.processingStage === "FAILED") {
-    if (!options.includeFailed) {
-      return false;
-    }
 
-    if (!options.retryStartedAt) {
-      return true;
-    }
+export type ProcessingPageCursor = { relativePath: string; id: string };
+export type ProcessingPageWork = { pageQueries?: number; candidateRows?: number };
 
-    return !file.processedAt || file.processedAt < options.retryStartedAt;
-  }
-
-  if (file.readingStatus !== "READ" || file.extractionStatus !== "COMPLETED") {
-    return true;
-  }
-
-  if (!hasObservation) {
-    return true;
-  }
-
-  if (file.processingStage === "EXAMINED") {
-    return false;
-  }
-
-  if (!hasCurrentRecommendations) {
-    return true;
-  }
-
-  return !isRecommendationTerminalStage(file.processingStage);
+export async function processingFilePage(sessionId: string, options: ProcessingOptions = {}, after?: ProcessingPageCursor,
+  limit = 500, work?: ProcessingPageWork) {
+  const excluded = [...(options.excludeFileIds ?? [])];
+  const size = Math.max(1, Math.min(500, Math.floor(limit)));
+  const files = await getPrismaClient().$queryRaw<Array<ProcessingPageCursor>>(Prisma.sql`
+    SELECT file.id, file."relativePath" FROM "ScannedFile" file
+    WHERE file."sessionId" = ${sessionId} AND file."readStatus" = 'SUPPORTED'
+      AND file."sourceUnavailableAt" IS NULL
+      AND file."processingStage" NOT IN ('EXAMINED', 'SUGGESTIONS_GENERATED', 'RECOMMENDATIONS_READY', 'UNSUPPORTED')
+      AND (file."processingStage" <> 'FAILED' OR (${Boolean(options.includeFailed)}
+        ${options.retryStartedAt ? Prisma.sql`AND (file."processedAt" IS NULL OR file."processedAt" < ${options.retryStartedAt})` : Prisma.empty}))
+      AND (file."observationClaimedAt" IS NULL OR file."observationClaimedAt" <= ${new Date(Date.now() - observationLeaseMs)})
+      ${after ? Prisma.sql`AND (file."relativePath", file.id) > (${after.relativePath}, ${after.id})` : Prisma.empty}
+      ${excluded.length ? Prisma.sql`AND file.id NOT IN (${Prisma.join(excluded)})` : Prisma.empty}
+    ORDER BY file."relativePath", file.id LIMIT ${size}
+  `);
+  if (work) { work.pageQueries = (work.pageQueries ?? 0) + 1; work.candidateRows = (work.candidateRows ?? 0) + files.length; }
+  return files;
 }
 
-async function nextSupportedFileForProcessing(
-  sessionId: string,
-  options: ProcessingOptions,
-) {
-  const prisma = getPrismaClient();
-  const files = await prisma.scannedFile.findMany({
-    orderBy: {
-      relativePath: "asc",
-    },
-    select: {
-      extractionStatus: true,
-      id: true,
-      libraryDocument: {
-        select: {
-          observationSessions: {
-            select: {
-              id: true,
-            },
-            take: 1,
-          },
-        },
-      },
-      organizationSuggestions: {
-        select: {
-          id: true,
-          suggestionType: true,
-        },
-        where: {
-          invalidatedAt: null,
-          recommendationGenerationVersion: currentRecommendationGenerationVersion,
-        },
-      },
-      processedAt: true,
-      processingStage: true,
-      readingStatus: true,
-    },
-    where: {
-      readStatus: "SUPPORTED",
-      sessionId,
-    },
-  });
-
-  return (
-    files.find(
-      (file) =>
-        !options.excludeFileIds?.has(file.id) &&
-        fileNeedsProcessing(file, options),
-    ) ?? null
-  );
+async function nextSupportedFileForProcessing(sessionId: string, options: ProcessingOptions) {
+  return (await processingFilePage(sessionId, options, undefined, 1))[0] ?? null;
 }
 
-async function markFileExamined(scannedFileId: string) {
-  const prisma = getPrismaClient();
-
-  await prisma.scannedFile.update({
-    data: {
-      processedAt: new Date(),
-      processingErrorCategory: null,
-      processingStage: "EXAMINED",
-      scanError: null,
-    },
-    where: {
-      id: scannedFileId,
-    },
+async function markFileExamined(scannedFileId: string, owner: Date) {
+  await withOwnedObservationLease(scannedFileId, owner, async (tx) => {
+    await tx.scannedFile.update({ data: { processedAt: new Date(), processingErrorCategory: null,
+      processingStage: "EXAMINED", scanError: null, observationClaimedAt: null }, where: { id: scannedFileId } });
   });
 }
 
@@ -297,8 +192,9 @@ async function fileAlreadyExamined(scannedFileId: string) {
       libraryDocument: {
         select: {
           observationSessions: {
+            orderBy: [...latestObservationOrder],
             select: {
-              id: true,
+              id: true, status: true,
             },
             take: 1,
           },
@@ -310,37 +206,39 @@ async function fileAlreadyExamined(scannedFileId: string) {
     },
   });
 
-  return (file?.libraryDocument?.observationSessions.length ?? 0) > 0;
+  return usableObservation(file?.libraryDocument?.observationSessions[0]);
 }
 
 async function processOneScannedFile(sessionId: string, scannedFileId: string) {
+  let owner: Date;
+  try { owner = await claimObservationLease(scannedFileId); } catch { return; }
   let readResult;
 
   try {
-    await updateSessionStatus(sessionId, "READING");
+    await updateSessionStatus(sessionId, "READING", scannedFileId, owner);
     readResult = await withTimeout(
-      readScannedFile(scannedFileId),
+      readScannedFile(scannedFileId, owner),
       readingTimeoutMs,
       "READ_TIMEOUT",
     );
   } catch (error) {
     await markFileFailure(
       scannedFileId,
-      fileProcessingFailure(error, "READ_FAILED"),
+      fileProcessingFailure(error, "READ_FAILED"), owner,
     );
     return;
   }
 
   try {
-    await updateSessionStatus(sessionId, "EXAMINING");
+    await updateSessionStatus(sessionId, "EXAMINING", scannedFileId, owner);
 
     if (await fileAlreadyExamined(scannedFileId)) {
-      await markFileExamined(scannedFileId);
+      await markFileExamined(scannedFileId, owner);
     } else {
       await withTimeout(
         createObservationSessionForScannedFileReadResult(
           scannedFileId,
-          readResult,
+          readResult, owner,
         ),
         observationTimeoutMs,
         "OBSERVATION_TIMEOUT",
@@ -349,12 +247,12 @@ async function processOneScannedFile(sessionId: string, scannedFileId: string) {
   } catch (error) {
     await markFileFailure(
       scannedFileId,
-      fileProcessingFailure(error, "OBSERVATION_FAILED"),
+      fileProcessingFailure(error, "OBSERVATION_FAILED"), owner,
     );
     return;
   }
 
-  await markFileExamined(scannedFileId);
+
 }
 
 async function progressResult(
@@ -389,6 +287,7 @@ export async function processNextBridgeScanSessionFile(
     return progressResult(sessionId);
   }
 
+  await options.beforeFile?.();
   await processOneScannedFile(sessionId, nextFile.id);
 
   const remainingFile = await nextSupportedFileForProcessing(sessionId, {
@@ -410,20 +309,13 @@ export async function processBridgeScanSession(
 ) {
   await requireAutomaticProcessingPermissions(sessionId);
 
-  const processedFileIds = new Set<string>();
-
+  const retryStartedAt = options.retryStartedAt ?? new Date();
+  let cursor: ProcessingPageCursor | undefined;
   while (true) {
-    const nextFile = await nextSupportedFileForProcessing(sessionId, {
-      ...options,
-      excludeFileIds: processedFileIds,
-    });
-
-    if (!nextFile || processedFileIds.has(nextFile.id)) {
-      break;
-    }
-
-    processedFileIds.add(nextFile.id);
-    await processOneScannedFile(sessionId, nextFile.id);
+    const page = await processingFilePage(sessionId, { ...options, retryStartedAt }, cursor);
+    if (!page.length) break;
+    for (const file of page) { await options.beforeFile?.(); await processOneScannedFile(sessionId, file.id); }
+    cursor = page.at(-1);
   }
 
   await generateScanRecommendationBatchIfReady(sessionId, {

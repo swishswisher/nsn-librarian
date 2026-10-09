@@ -1,3 +1,5 @@
+import type { BridgeImageMetadataDraft } from "../../../src/lib/bridge/types";
+
 export const bridgeVersion = process.env.NSN_BRIDGE_APP_VERSION ?? "0.1.0";
 
 export const bridgePlatforms = ["WINDOWS", "MACOS", "LINUX", "UNKNOWN"] as const;
@@ -22,6 +24,7 @@ export type BridgePermissions = {
 };
 
 export type BridgeRootRecord = BridgePermissions & {
+  connectionRevision?: number;
   id: string;
   actualPath: string;
   connectedAt: string;
@@ -36,6 +39,7 @@ export type BridgeRootRecord = BridgePermissions & {
 };
 
 export type BridgeRootSummary = BridgePermissions & {
+  connectionRevision?: number;
   id: string;
   connectedAt: string;
   displayName: string;
@@ -80,6 +84,7 @@ export type BridgeScannedFileDraft = {
   sourceCreatedAt?: Date | null;
   readStatus: "PENDING" | "SUPPORTED" | "UNSUPPORTED" | "FAILED";
   scanError?: string | null;
+  imageMetadata?: BridgeImageMetadataDraft | null;
 };
 
 export type BridgeFolderScanResult = {
@@ -97,6 +102,7 @@ export type BridgeFolderScanResult = {
 };
 
 export type BridgeReadResult = {
+  sourceChecksum?: string;
   relativePath: string;
   fileName: string;
   fileType: string;
@@ -210,6 +216,7 @@ export type BridgeExecutionPlanAction = {
 
 export type BridgeUndoPlanAction = {
   id: string;
+  originalExecutionActionId?: string;
   actionType: "REMOVE_FOLDER" | "MOVE_FILE" | "RENAME_FILE";
   sourceRelativePath: string;
   sourceChecksum?: string | null;

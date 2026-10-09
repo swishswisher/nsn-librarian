@@ -1,4 +1,6 @@
 import { requestOpenAIJson } from "./openai-client";
+import { defaultMaxInputCharacters } from "./observation-processing";
+import { groundObservationResult, sampleDocumentText } from "./source-evidence";
 import {
   AI_OBSERVER_SYSTEM_PROMPT,
   AI_OBSERVER_USER_PROMPT_TEMPLATE,
@@ -13,7 +15,6 @@ import type {
   AIReviewQuestion,
 } from "./types";
 
-const defaultMaxInputCharacters = 120_000;
 const defaultMaxOutputTokens = 1_800;
 
 const stringArraySchema = {
@@ -241,9 +242,9 @@ export async function runOpenAIObservation(
   input: AIObservationInput,
   options: AIProviderOptions = {},
 ): Promise<AIObservationResult> {
-  const readableText = (input.contentText || input.previewText || "").trim();
+  const readableText = input.contentText || input.previewText || "";
 
-  if (!readableText) {
+  if (!readableText.trim()) {
     return {
       provider: "openai",
       model: "",
@@ -259,11 +260,13 @@ export async function runOpenAIObservation(
 
   const maxInputCharacters =
     options.maxInputCharacters ?? defaultMaxInputCharacters;
-  const textForOpenAI = readableText.slice(0, maxInputCharacters);
-  const wasTruncated = textForOpenAI.length < readableText.length;
+  const sample = sampleDocumentText(
+    readableText,
+    maxInputCharacters - (input.previewText?.length ?? 0),
+  );
   const response = await requestOpenAIJson({
     instructions: AI_OBSERVER_SYSTEM_PROMPT,
-    input: fillObserverPrompt(input, textForOpenAI),
+    input: fillObserverPrompt(input, sample.text),
     maxOutputTokens: options.maxOutputTokens ?? defaultMaxOutputTokens,
     schema: observationSchema,
     schemaDescription:
@@ -272,11 +275,20 @@ export async function runOpenAIObservation(
   });
   const warnings = [...response.warnings];
 
-  if (wasTruncated) {
+  if (sample.partial) {
     warnings.push(
-      `Only the first ${maxInputCharacters.toLocaleString()} characters were sent to OpenAI for observation.`,
+      `Only selected sections of this ${sample.sourceLength.toLocaleString()}-character item were observed; other sections may not have been analyzed.`,
     );
   }
+  const result = normalizeObservationResult(response.output, warnings, response.model);
 
-  return normalizeObservationResult(response.output, warnings, response.model);
+  return {
+    ...groundObservationResult(result, readableText),
+    usage: {
+      httpAttempts: response.httpAttempts,
+      inputTokens: response.inputTokens,
+      outputTokens: response.outputTokens,
+      sourceComplete: !sample.partial && response.completed,
+    },
+  };
 }

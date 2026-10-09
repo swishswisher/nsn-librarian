@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { groundedEvidence } from "../../src/lib/ai/source-evidence";
 import {
   buildScanWorkingKnowledge,
   workingKnowledgeTerms,
@@ -14,6 +15,7 @@ import {
 function observation(
   status: "AWAITING_REVIEW" | "APPROVED" | "MODIFIED",
   summary: string,
+  previewText: string,
 ) {
   return {
     explanation: { summary },
@@ -23,7 +25,12 @@ function observation(
         label: "POSSIBLE_TOPIC_SIGNAL",
       },
     ],
-    observations: [{ description: summary, evidence: [summary] }],
+    observations: [{
+      description: summary,
+      evidence: [groundedEvidence(summary, `${previewText}\n${summary}`)].filter(
+        (item): item is string => item !== null,
+      ),
+    }],
     observerType: "OPENAI",
     status,
   };
@@ -40,7 +47,7 @@ function file(
     fileType: "TEXT",
     id,
     observationSessions: summary
-      ? [observation("AWAITING_REVIEW", summary)]
+      ? [observation("AWAITING_REVIEW", summary, previewText)]
       : [],
     previewText,
     relativePath,
@@ -280,7 +287,9 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
         observations: [
           {
             description: observationText,
-            evidence: [previewText],
+            evidence: [groundedEvidence(previewText, previewText)].filter(
+              (item): item is string => item !== null,
+            ),
           },
         ],
         observerType: "OPENAI",
@@ -414,7 +423,7 @@ test("production-shaped mixed scans keep meaningful clusters separate", () => {
       cluster.semanticTopics.includes("workshops"),
     )?.confidence,
   );
-  assert.ok(financeCluster?.sharedTerms.includes("finance"));
+  assert.ok(financeCluster?.sharedSubjects.includes("finance and office operations"));
   assert.ok(workshopCluster?.sharedTerms.includes("workshop"));
   assert.equal(
     result.clusters.some((cluster) =>

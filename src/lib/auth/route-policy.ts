@@ -1,9 +1,9 @@
-const signedBridgeDevicePrefix = "/api/bridge/cloud/devices/";
+const signedBridgeDevicePath = /^\/api\/bridge\/cloud\/devices\/[^/]+\/(?:commands(?:\/[^/]+\/(?:acknowledge|complete))?|heartbeat|roots\/sync|watch-events)$/;
 const pairingRedeemPath = "/api/bridge/cloud/pairing-codes/redeem";
 const bridgeReleaseManifestPath = "/api/download/bridge/manifest";
 
 export function isSignedBridgeDevicePath(pathname: string) {
-  return pathname.startsWith(signedBridgeDevicePrefix);
+  return signedBridgeDevicePath.test(pathname);
 }
 
 export function isBridgePairingRedeemPath(pathname: string) {

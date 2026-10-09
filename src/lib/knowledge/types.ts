@@ -19,6 +19,7 @@ export type KnowledgeSourceKind =
 export type KnowledgeSourcePriority = "HIGH" | "MEDIUM" | "LOW";
 
 export type KnowledgeObjectDraft = {
+  sourceUpdatedAt?: Date;
   approvedAt?: Date | null;
   approvedBy?: string | null;
   confidence: number;
@@ -35,6 +36,7 @@ export type KnowledgeObjectDraft = {
 };
 
 export type KnowledgeRelationshipDraft = {
+  sourceUpdatedAt?: Date;
   confidence: number;
   evidence: Partial<KnowledgeEvidenceSummary>;
   explanation: string;
@@ -46,6 +48,7 @@ export type KnowledgeRelationshipDraft = {
 };
 
 export type KnowledgeSource = {
+  sourceUpdatedAt?: Date;
   appearedIn: string;
   approvedAt?: Date | null;
   approvedBy?: string | null;

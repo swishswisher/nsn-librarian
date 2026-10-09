@@ -1,4 +1,5 @@
-import type { Prisma } from "@prisma/client";
+import type { Prisma, NotebookEntry as DatabaseNotebookEntry } from "@prisma/client";
+import { lockAuthorityOwner, nextAuthorityTime } from "@/lib/db/authority";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import { currentRecommendationGenerationVersion } from "@/lib/bridge/recommendation-generation";
@@ -97,15 +98,6 @@ let notebookBackfillPromise: Promise<void> | null = null;
 
 function toJsonInput(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
-}
-
-function isUniqueConstraintError(error: unknown) {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: string }).code === "P2002"
-  );
 }
 
 function asStringArray(value: Prisma.JsonValue) {
@@ -335,12 +327,18 @@ function toNotebookRevision(revision: StoredNotebookEntryRevision) {
   };
 }
 
-async function createOrUpdateNotebookEntry(draft: NotebookEntryDraft) {
-  const prisma = getPrismaClient();
+async function createOrUpdateNotebookEntry(draft: NotebookEntryDraft, transaction?: Prisma.TransactionClient): Promise<DatabaseNotebookEntry> {
+  if (!transaction) return getPrismaClient().$transaction((tx) => createOrUpdateNotebookEntry(draft, tx));
+  const prisma = transaction;
   const sourceKey = notebookSourceKey(draft);
-  const existing = await prisma.notebookEntry.findUnique({
+  await prisma.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`notebook-source:${sourceKey}`}, 0))::text`;
+  let existing = await prisma.notebookEntry.findUnique({
     where: { sourceKey },
   });
+  if (existing) {
+    await lockAuthorityOwner(prisma, "NotebookEntry", existing.id);
+    existing = await prisma.notebookEntry.findUniqueOrThrow({ where: { id: existing.id } });
+  }
   const nextData = {
     approvedForMemory: draft.approvedForMemory ?? false,
     body: draft.body,
@@ -365,7 +363,6 @@ async function createOrUpdateNotebookEntry(draft: NotebookEntryDraft) {
   };
 
   if (!existing) {
-    try {
       return await prisma.notebookEntry.create({
         data: {
           ...nextData,
@@ -373,14 +370,11 @@ async function createOrUpdateNotebookEntry(draft: NotebookEntryDraft) {
           status: draft.status ?? "CURRENT",
         },
       });
-    } catch (error) {
-      if (!isUniqueConstraintError(error)) {
-        throw error;
-      }
-
-      return createOrUpdateNotebookEntry(draft);
-    }
   }
+
+  const humanRevision = await prisma.notebookEntryRevision.findFirst({ where: { notebookEntryId: existing.id }, select: { id: true } });
+  if (humanRevision) Object.assign(nextData, { approvedForMemory: existing.approvedForMemory, body: existing.body,
+    title: existing.title, summary: existing.summary, requiresAttention: existing.requiresAttention });
 
   const existingHistory = JSON.stringify(existing.history);
   const nextHistory = JSON.stringify(nextData.history);
@@ -831,6 +825,60 @@ export async function recordRecommendationDecisionNotebookEntry(
   });
 }
 
+export async function recordOrganizationPreferenceNotebookEntry(preferenceId: string) {
+  const prisma = getPrismaClient();
+  const preference = await prisma.organizationPreference.findUnique({
+    include: {
+      revisions: { orderBy: { createdAt: "desc" }, take: 20 },
+    },
+    where: { id: preferenceId },
+  });
+  if (!preference) return null;
+  const scope = Array.isArray(preference.scopeTerms)
+    ? preference.scopeTerms.filter((term): term is string => typeof term === "string")
+    : [];
+  const status = preference.status.toLowerCase().replaceAll("_", " ");
+  return createOrUpdateNotebookEntry({
+    body: `Deanne's organization preference for ${scope.join(" and ")} is ${status}. It applies only inside its connected library and does not move files.`,
+    entryType: "MEMORY_LEARNING",
+    history: preference.revisions.slice().reverse().map((revision) =>
+      `${formatDateTime(revision.createdAt)}: ${revision.action.toLowerCase().replaceAll("_", " ")} (${revision.previousStatus.toLowerCase()} to ${revision.nextStatus.toLowerCase()})${revision.note ? `. Context: ${revision.note}` : ""}`,
+    ),
+    provenanceSummary: "This note follows Deanne's separate review of a proposed reusable organization preference.",
+    sourceId: preference.id,
+    sourceKey: `ORGANIZATION_PREFERENCE:${preference.id}`,
+    sourceType: "ORGANIZATION_PREFERENCE",
+    summary: `A scoped organization preference is ${status}.`,
+    title: "An organization preference was reviewed",
+  });
+}
+
+export async function recordDocumentRelationshipNotebookEntry(relationshipId: string) {
+  const connection = await getPrismaClient().knowledgeConnection.findUnique({
+    include: { decisions: { orderBy: { createdAt: "desc" }, take: 20 } },
+    where: { id: relationshipId },
+  });
+  if (!connection || connection.decisions.length === 0) return null;
+  const subject = connection.relationshipKind === "PROBABLE_REVISION"
+    ? "document revision"
+    : "document identity";
+  const status = connection.status === "CONFIRMED" ? "confirmed" :
+    connection.status === "REJECTED" ? "rejected" : "open for reconsideration";
+  return createOrUpdateNotebookEntry({
+    body: `Deanne reviewed a proposed ${subject} link. It is now ${status}. This decision does not organize or change any files.`,
+    entryType: "MEMORY_LEARNING",
+    history: connection.decisions.slice().reverse().map((decision) =>
+      `${formatDateTime(decision.createdAt)}: ${decision.action.toLowerCase()} (${decision.previousStatus.toLowerCase()} to ${decision.nextStatus.toLowerCase()})${decision.note ? `. Context: ${decision.note}` : ""}`,
+    ),
+    provenanceSummary: "This note records Deanne's review of a source-backed document relationship.",
+    sourceId: connection.id,
+    sourceKey: `DOCUMENT_RELATIONSHIP:${connection.id}`,
+    sourceType: "DOCUMENT_RELATIONSHIP",
+    summary: `A proposed ${subject} link was ${status}.`,
+    title: `A ${subject} link was reviewed`,
+  });
+}
+
 export async function recordOrganizationPlanNotebookEntry(planId: string) {
   const prisma = getPrismaClient();
   const plan = await prisma.organizationPlan.findUnique({
@@ -1210,37 +1258,20 @@ export async function getNotebookPageData(): Promise<NotebookPageData> {
   await ensureNotebookBackfill();
 
   const prisma = getPrismaClient();
-  const storedEntries = await prisma.notebookEntry.findMany({
-    orderBy: [{ requiresAttention: "desc" }, { updatedAt: "desc" }],
-    take: 250,
-  });
+  const orderBy = [{ updatedAt: "desc" }, { id: "desc" }] as const;
+  const [reflections, attention, learning, archive] = await Promise.all([
+    prisma.notebookEntry.findMany({ where: { status: { not: "ARCHIVED" }, requiresAttention: false,
+      entryType: { notIn: ["QUESTION", "MEMORY_LEARNING"] } }, orderBy: [...orderBy], take: 12 }),
+    prisma.notebookEntry.findMany({ where: { status: { not: "ARCHIVED" }, OR: [{ requiresAttention: true }, { entryType: "QUESTION" }] }, orderBy: [...orderBy], take: 12 }),
+    prisma.notebookEntry.findMany({ where: { status: { not: "ARCHIVED" },
+      entryType: { in: ["MEMORY_LEARNING", "HUMAN_REVISION", "LANGUAGE_PREFERENCE", "LEARNING_UPDATE"] } }, orderBy: [...orderBy], take: 12 }),
+    prisma.notebookEntry.findMany({ orderBy: [...orderBy], take: 250 }),
+  ]);
+  const storedEntries = [...new Map([...reflections, ...attention, ...learning, ...archive].map((entry) => [entry.id, entry])).values()];
   const allEntries = storedEntries.map(toNotebookEntry);
-  const currentReflections = allEntries
-    .filter(
-      (entry) =>
-        entry.status !== "ARCHIVED" &&
-        !entry.requiresAttention &&
-        entry.entryType !== "QUESTION" &&
-        entry.entryType !== "MEMORY_LEARNING",
-    )
-    .slice(0, 12);
-  const needsAttention = allEntries
-    .filter(
-      (entry) =>
-        entry.status !== "ARCHIVED" &&
-        (entry.requiresAttention || entry.entryType === "QUESTION"),
-    )
-    .slice(0, 12);
-  const recentLearning = allEntries
-    .filter(
-      (entry) =>
-        entry.status !== "ARCHIVED" &&
-        (entry.entryType === "MEMORY_LEARNING" ||
-          entry.entryType === "HUMAN_REVISION" ||
-          entry.entryType === "LANGUAGE_PREFERENCE" ||
-          entry.entryType === "LEARNING_UPDATE"),
-    )
-    .slice(0, 12);
+  const currentReflections = reflections.map(toNotebookEntry);
+  const needsAttention = attention.map(toNotebookEntry);
+  const recentLearning = learning.map(toNotebookEntry);
   const archiveEntries = allEntries;
   const [mostImportantObservation = null, ...otherObservations] =
     currentReflections;
@@ -1359,16 +1390,17 @@ export async function getNotebookEntryDetail(
 }
 
 export async function archiveNotebookEntry(entryId: string) {
-  const prisma = getPrismaClient();
-  const archivedAt = new Date();
-
+  return notebookAuthority(entryId, async (prisma, createdAt) => {
+  const archivedAt = createdAt;
   const entry = await prisma.notebookEntry.update({
     data: {
       archivedAt,
+      approvedForMemory: false,
       requiresAttention: false,
       revisions: {
         create: {
           actionType: "ARCHIVE",
+          createdAt,
           note: "Moved out of Current Reflections. The archive keeps the entry permanently visible.",
         },
       },
@@ -1378,16 +1410,18 @@ export async function archiveNotebookEntry(entryId: string) {
   });
 
   return toNotebookEntry(entry);
+  });
 }
 
 export async function restoreNotebookEntry(entryId: string) {
-  const prisma = getPrismaClient();
+  return notebookAuthority(entryId, async (prisma, createdAt) => {
   const entry = await prisma.notebookEntry.update({
     data: {
       archivedAt: null,
       revisions: {
         create: {
           actionType: "RESTORE",
+          createdAt,
           note: "Restored to Current Reflections.",
         },
       },
@@ -1397,19 +1431,21 @@ export async function restoreNotebookEntry(entryId: string) {
   });
 
   return toNotebookEntry(entry);
+  });
 }
 
 export async function saveNotebookEntryResponse(
   entryId: string,
   input: NotebookRevisionInput,
 ) {
-  const prisma = getPrismaClient();
+  return notebookAuthority(entryId, async (prisma, createdAt) => {
   const note = input.note?.trim() || null;
   const revisedTitle = input.revisedTitle?.trim() || null;
   const revisedSummary = input.revisedSummary?.trim() || null;
   const revisedBody = input.revisedBody?.trim() || null;
   const status: Partial<{
     approvedForMemory: boolean;
+    archivedAt: Date | null;
     requiresAttention: boolean;
     status: NotebookEntryStatus;
   }> = {};
@@ -1420,6 +1456,7 @@ export async function saveNotebookEntryResponse(
   } else if (input.actionType === "REJECT_REFLECTION") {
     status.status = "REJECTED";
     status.requiresAttention = false;
+    status.approvedForMemory = false;
   } else if (input.actionType === "APPROVE_FOR_MEMORY") {
     status.status = "ACCEPTED";
     status.approvedForMemory = true;
@@ -1427,17 +1464,30 @@ export async function saveNotebookEntryResponse(
   } else if (input.actionType === "KEEP_NOTEBOOK_ONLY") {
     status.status = "NOTEBOOK_ONLY";
     status.requiresAttention = false;
+    status.approvedForMemory = false;
   } else if (input.actionType === "ANSWER_QUESTION") {
     status.status = "ACCEPTED";
     status.requiresAttention = false;
+  } else if (input.actionType === "ARCHIVE") {
+    status.status = "ARCHIVED";
+    status.approvedForMemory = false;
+    status.archivedAt = createdAt;
+    status.requiresAttention = false;
+  } else if (input.actionType === "RESTORE") {
+    status.status = "CURRENT";
+    status.archivedAt = null;
   }
 
   const entry = await prisma.notebookEntry.update({
     data: {
       ...status,
+      title: revisedTitle ?? undefined,
+      summary: revisedSummary ?? undefined,
+      body: revisedBody ?? undefined,
       revisions: {
         create: {
           actionType: input.actionType,
+          createdAt,
           note,
           revisedBody,
           revisedSummary,
@@ -1449,6 +1499,16 @@ export async function saveNotebookEntryResponse(
   });
 
   return toNotebookEntry(entry);
+  });
+}
+
+async function notebookAuthority<T>(entryId: string, change: (tx: Prisma.TransactionClient, createdAt: Date) => Promise<T>): Promise<T> {
+  return getPrismaClient().$transaction(async (tx) => {
+    await lockAuthorityOwner(tx, "NotebookEntry", entryId);
+    const latest = await tx.notebookEntryRevision.findFirst({ where: { notebookEntryId: entryId },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { createdAt: true } });
+    return change(tx, await nextAuthorityTime(tx, latest?.createdAt));
+  });
 }
 
 export function searchNotebookEntries(entries: NotebookEntry[], query: string) {

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
 
@@ -43,6 +43,7 @@ let previousOpenAIKey: string | undefined;
 let previousPairingSecret: string | undefined;
 let testDatabaseUrl: string;
 let testDirectDatabaseUrl: string;
+let safeTestDatabase = false;
 
 const testSchemaName = `bridge_cloud_coordinator_${process.pid}_${Date.now()}`;
 
@@ -55,6 +56,9 @@ function databaseUrlForSchema(
   }
 
   const url = new URL(databaseUrl);
+  if (url.hostname !== "127.0.0.1" || url.pathname !== "/nsn_library_machine_test") {
+    throw new Error("Bridge cloud coordinator tests require the isolated local test database.");
+  }
   url.searchParams.set("schema", schemaName);
 
   return url.toString();
@@ -88,6 +92,7 @@ before(async () => {
     testSchemaName,
     process.env.DIRECT_URL ?? process.env.DATABASE_URL,
   );
+  safeTestDatabase = true;
   process.env.DATABASE_URL = testDatabaseUrl;
   process.env.DIRECT_URL = testDirectDatabaseUrl;
   process.env.NSN_BRIDGE_COMMAND_SIGNING_SECRET =
@@ -153,12 +158,13 @@ beforeEach(async () => {
 after(async () => {
   await prisma?.$disconnect();
 
-  const cleanupPrisma = new PrismaClient();
-
-  await cleanupPrisma.$executeRawUnsafe(
-    `DROP SCHEMA IF EXISTS "${testSchemaName}" CASCADE`,
-  );
-  await cleanupPrisma.$disconnect();
+  if (safeTestDatabase) {
+    const cleanupPrisma = new PrismaClient();
+    await cleanupPrisma.$executeRawUnsafe(
+      `DROP SCHEMA IF EXISTS "${testSchemaName}" CASCADE`,
+    );
+    await cleanupPrisma.$disconnect();
+  }
 
   if (previousDatabaseUrl === undefined) {
     delete process.env.DATABASE_URL;
@@ -252,7 +258,7 @@ async function createCloudScannedFile(
   });
   const scannedFile = await prisma.scannedFile.create({
     data: {
-      checksum: `checksum-${randomUUID()}`,
+      checksum: createHash("sha256").update(`synthetic:${input.relativePath}`).digest("hex"),
       extractionErrorCategory:
         input.readStatus === "UNSUPPORTED" ? "UNSUPPORTED_FILE_TYPE" : "READ_FAILED",
       extractionStatus:
@@ -333,6 +339,10 @@ async function completeTemporaryRead(input: {
   relativePath: string;
   text: string;
 }) {
+  const command = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: input.commandId } });
+  const file = await prisma.scannedFile.findUniqueOrThrow({ where: {
+    id: (command.payload as { scannedFileId: string }).scannedFileId,
+  } });
   await acknowledgeBridgeCloudCommand(input.bridgeDeviceId, input.commandId);
   const prepared = await prepareBridgeCommandReportForPersistence(
     input.bridgeDeviceId,
@@ -340,6 +350,7 @@ async function completeTemporaryRead(input: {
       commandId: input.commandId,
       result: {
         extractedText: input.text,
+        sourceChecksum: file.checksum,
         fileName: input.relativePath.split("/").at(-1) ?? "note.txt",
         fileType: "DOCUMENT",
         relativePath: input.relativePath,
@@ -461,7 +472,7 @@ test("an existing cloud scan regenerates recommendations while preserving review
   });
   const secondFile = await prisma.scannedFile.create({
     data: {
-      checksum: `checksum-${randomUUID()}`,
+      checksum: createHash("sha256").update(randomUUID()).digest("hex"),
       extractionErrorCategory: "READ_FAILED",
       extractionStatus: "FAILED",
       fileType: "txt",
@@ -479,7 +490,7 @@ test("an existing cloud scan regenerates recommendations while preserving review
   await prisma.scannedFile.createMany({
     data: [
       {
-        checksum: `checksum-${randomUUID()}`,
+        checksum: createHash("sha256").update(randomUUID()).digest("hex"),
         extractionErrorCategory: "FILE_CORRUPT",
         extractionStatus: "FAILED",
         fileType: "pdf",
@@ -1707,10 +1718,13 @@ test("cloud watch events reject unsafe paths and cross-root delivery", async () 
 
 test("signed watch-events route accepts device events without exposing localhost", async () => {
   const bridgeRootId = "root_444444444444444444444444";
-  const { device, keys } = await createCloudScannedFile({
+  const { device, keys, library } = await createCloudScannedFile({
     bridgeRootId,
     relativePath: "Notes/route-event.txt",
   });
+  // Signed device identity does not grant watching. This positive route control
+  // supplies the root's explicit, active Read + Watch authority.
+  await prisma.connectedLibrary.update({ where: { id: library.id }, data: { watchPermission: true, monitoringState: "WATCHING" } });
   const route = await import(
     "../../src/app/api/bridge/cloud/devices/[deviceId]/watch-events/route"
   );
@@ -1779,5 +1793,3 @@ test("production cloud monitoring dashboard does not drain localhost events", as
   assert.equal(afterDashboard.monitoringState, "WATCHING");
   assert.equal(afterDashboard.monitoringErrorCategory, null);
 });
-
-

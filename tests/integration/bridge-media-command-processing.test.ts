@@ -1,8 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -26,8 +29,11 @@ let acknowledgeBridgeCloudCommand: typeof import("../../src/lib/bridge/cloud-coo
 let completeBridgeCloudCommand: typeof import("../../src/lib/bridge/cloud-coordinator").completeBridgeCloudCommand;
 let fileMatchesScannedFileFilter: typeof import("../../src/lib/bridge/scanned-file-filters").fileMatchesScannedFileFilter;
 let getBridgeScanSessionDetail: typeof import("../../src/lib/bridge/scan-sessions").getBridgeScanSessionDetail;
+let getBridgeScanSessionProgress: typeof import("../../src/lib/bridge/scan-sessions").getBridgeScanSessionProgress;
 let importRemoteBridgeScanReport: typeof import("../../src/lib/bridge/remote-scan-queue").importRemoteBridgeScanReport;
 let prepareBridgeCommandReportForPersistence: typeof import("../../src/lib/bridge/cloud-command-results").prepareBridgeCommandReportForPersistence;
+let fetchRecoverableBridgeCommands: typeof import("../../src/lib/bridge/recoverable-commands").fetchRecoverableBridgeCommands;
+let loadScanWorkingKnowledge: typeof import("../../src/lib/bridge/scan-working-knowledge").loadScanWorkingKnowledge;
 let prisma: PrismaClient;
 let previousBridgeDataDir: string | undefined;
 let previousClaudeKey: string | undefined;
@@ -99,33 +105,54 @@ function mp3FrameBuffer(marker = 0) {
   return buffer;
 }
 
-function atom(type: string, payload: Buffer) {
-  const buffer = Buffer.alloc(8 + payload.length);
-
-  buffer.writeUInt32BE(buffer.length, 0);
-  buffer.write(type, 4, 4, "ascii");
-  payload.copy(buffer, 8);
-
+function pngMetadataFixture() {
+  const buffer = Buffer.alloc(24);
+  Buffer.from("89504e470d0a1a0a", "hex").copy(buffer, 0);
+  buffer.writeUInt32BE(640, 16);
+  buffer.writeUInt32BE(480, 20);
   return buffer;
 }
 
 function mp4VideoBuffer(options: { hasAudioTrack?: boolean } = {}) {
-  const mvhdPayload = Buffer.alloc(100);
+  const fixtureDirectory = mkdtempSync(path.join(os.tmpdir(), "nsn-video-fixture-"));
+  const fixturePath = path.join(fixtureDirectory, "fixture.mp4");
+  const inputs = ["-f", "lavfi", "-i", "color=c=blue:s=64x48:r=2:d=1"];
+  if (options.hasAudioTrack) {
+    inputs.push("-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000:duration=1");
+  }
 
-  mvhdPayload.writeUInt32BE(1000, 12);
-  mvhdPayload.writeUInt32BE(4000, 16);
+  try {
+    execFileSync(process.env.FFMPEG_PATH ?? "ffmpeg", [
+      "-hide_banner", "-loglevel", "error", "-y", ...inputs,
+      "-c:v", "mpeg4", "-pix_fmt", "yuv420p",
+      ...(options.hasAudioTrack ? ["-c:a", "aac", "-shortest"] : ["-an"]),
+      "-movflags", "+faststart", fixturePath,
+    ], { stdio: "pipe" });
+    return readFileSync(fixturePath);
+  } catch (error) {
+    const details = error && typeof error === "object"
+      ? error as {
+          code?: unknown;
+          message?: unknown;
+          signal?: unknown;
+          status?: unknown;
+          stderr?: Buffer | string;
+        }
+      : null;
+    const diagnostics = [
+      `message=${details?.message ?? String(error)}`,
+      `code=${details?.code ?? "unknown"}`,
+      `status=${details?.status ?? "unknown"}`,
+      `signal=${details?.signal ?? "unknown"}`,
+      `stderr=${String(details?.stderr ?? "<empty>") || "<empty>"}`,
+    ].join("; ");
 
-  return Buffer.concat([
-    atom("ftyp", Buffer.from("isom0000isommp42", "ascii")),
-    atom(
-      "moov",
-      Buffer.concat([
-        atom("mvhd", mvhdPayload),
-        Buffer.from(options.hasAudioTrack ? "vide soun" : "vide", "ascii"),
-      ]),
-    ),
-    Buffer.alloc(128),
-  ]);
+    throw new Error(`FFmpeg could not create the synthetic MP4 fixture: ${diagnostics}`, {
+      cause: error,
+    });
+  } finally {
+    rmSync(fixtureDirectory, { force: true, recursive: true });
+  }
 }
 
 async function resetTestData() {
@@ -279,6 +306,91 @@ async function completeNativeRead(input: {
   return result;
 }
 
+async function repeatCloudScan(root: Awaited<ReturnType<typeof createCloudBackedBridgeRoot>>) {
+  const scan = await scanBridgeRoot(root.root.id);
+  const session = await prisma.scanSession.create({
+    data: { connectedFolderId: root.library.id, status: "SCANNING" },
+  });
+  const result = await importRemoteBridgeScanReport({
+    bridgeDeviceId: root.device.bridgeDeviceId,
+    bridgeRootId: root.root.id,
+    commandPayload: { scanSessionId: session.id },
+    connectedLibraryId: root.library.id,
+    report: {
+      commandId: `scan-${randomUUID()}`,
+      result: bridgeJson(scan),
+      safeErrorCategory: null,
+      status: "COMPLETED",
+    },
+  });
+
+  return { result, session };
+}
+
+async function withMockObserver(run: (requestCount: () => number) => Promise<void>, delayMs = 0, failFirstRequests = 0, incompleteFirstRequests = 0, onRequest?: (number: number) => Promise<void>) {
+  let requests = 0;
+  const server = createServer(async (_request, response) => {
+    requests += 1;
+    if (onRequest) await onRequest(requests);
+    if (requests <= failFirstRequests) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "Local test failure" } }));
+      return;
+    }
+    if (delayMs) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({
+      id: `resp_${requests}`,
+      object: "response",
+      created_at: 1,
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      status: requests <= incompleteFirstRequests ? "incomplete" : "completed",
+      incomplete_details: requests <= incompleteFirstRequests ? { reason: "max_output_tokens" } : null,
+      output: [{
+        id: `msg_${requests}`,
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{
+          type: "output_text",
+          text: JSON.stringify({
+            observations: [{ text: "Possible workshop notes", evidence: ["Workshop facilitation notes."], whyItMatters: "Review this file.", confidence: 0.7, uncertainty: "Possible" }],
+            possibleThemes: [],
+            possibleRelationships: [],
+            questions: [],
+            confidence: 0.7,
+            uncertainty: "Human review needed.",
+            warnings: [],
+          }),
+          annotations: [],
+        }],
+      }],
+      usage: { input_tokens: 123, output_tokens: 45, total_tokens: 168 },
+    }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  const previousKey = process.env.OPENAI_API_KEY;
+  const previousBaseUrl = process.env.OPENAI_BASE_URL;
+  const previousModel = process.env.OPENAI_MODEL;
+  process.env.OPENAI_API_KEY = "test-only-local-stub";
+  process.env.OPENAI_BASE_URL = `http://127.0.0.1:${address.port}/v1`;
+
+  try {
+    await run(() => requests);
+  } finally {
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousKey;
+    if (previousBaseUrl === undefined) delete process.env.OPENAI_BASE_URL;
+    else process.env.OPENAI_BASE_URL = previousBaseUrl;
+    if (previousModel === undefined) delete process.env.OPENAI_MODEL;
+    else process.env.OPENAI_MODEL = previousModel;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
 before(async () => {
   previousBridgeDataDir = process.env.NSN_BRIDGE_DATA_DIR;
   previousClaudeKey = process.env.CLAUDE_API_KEY;
@@ -311,6 +423,8 @@ before(async () => {
   const remoteScanQueue = await import("../../src/lib/bridge/remote-scan-queue");
   const scanSessions = await import("../../src/lib/bridge/scan-sessions");
   const filters = await import("../../src/lib/bridge/scanned-file-filters");
+  const recoverableCommands = await import("../../src/lib/bridge/recoverable-commands");
+  const workingKnowledge = await import("../../src/lib/bridge/scan-working-knowledge");
 
   prisma = prismaModule.getPrismaClient();
   acknowledgeBridgeCloudCommand = coordinator.acknowledgeBridgeCloudCommand;
@@ -319,7 +433,10 @@ before(async () => {
     commandResults.prepareBridgeCommandReportForPersistence;
   importRemoteBridgeScanReport = remoteScanQueue.importRemoteBridgeScanReport;
   getBridgeScanSessionDetail = scanSessions.getBridgeScanSessionDetail;
+  getBridgeScanSessionProgress = scanSessions.getBridgeScanSessionProgress;
   fileMatchesScannedFileFilter = filters.fileMatchesScannedFileFilter;
+  fetchRecoverableBridgeCommands = recoverableCommands.fetchRecoverableBridgeCommands;
+  loadScanWorkingKnowledge = workingKnowledge.loadScanWorkingKnowledge;
 });
 
 beforeEach(async () => {
@@ -408,8 +525,8 @@ test("cloud scan import queues audio reads and records checksum duplicates acros
     "Audio/Meetings/unrelated-note.mp3",
   );
 
-  assert.equal(first.importResult?.queuedReads, 2);
-  assert.equal(second.importResult?.queuedReads, 1);
+  assert.equal((first.importResult as Record<string, unknown>)?.queuedReads, 2);
+  assert.equal((second.importResult as Record<string, unknown>)?.queuedReads, 1);
   assert.equal(firstDuplicate.readStatus, "SUPPORTED");
   assert.equal(firstDuplicate.audioMetadata?.duplicateKind, "EXACT_DUPLICATE");
   assert.equal(secondDuplicate.audioMetadata?.duplicateKind, "EXACT_DUPLICATE");
@@ -521,6 +638,85 @@ test("cloud media read commands persist video metadata without inventing transcr
   assert.equal(processedWithAudio.videoMetadata?.transcriptSnippet, null);
 });
 
+test("mixed cloud scans finish a valid image as metadata-only and isolate a corrupt image", async () => {
+  const root = await createCloudBackedBridgeRoot(
+    "SCAN_ROOT_MIXED_IMAGES",
+    new Map([
+      ["Images/valid.png", pngMetadataFixture()],
+      ["Images/broken.jpg", Buffer.from("not a jpeg")],
+      ["Documents/note.txt", Buffer.from("Workshop facilitation notes.")],
+    ]),
+  );
+  const valid = await scannedFile(root.session.id, "Images/valid.png");
+  const broken = await scannedFile(root.session.id, "Images/broken.jpg");
+  const document = await scannedFile(root.session.id, "Documents/note.txt");
+  const metadata = await prisma.imageAssetMetadata.findUnique({
+    where: { scannedFileId: valid.id },
+  });
+
+  assert.equal(valid.fileType, "IMAGE_PNG");
+  assert.equal(valid.readStatus, "SUPPORTED");
+  assert.equal(metadata?.width, 640);
+  assert.equal(metadata?.height, 480);
+  assert.equal(broken.fileType, "IMAGE_JPG");
+  assert.equal(broken.readStatus, "SUPPORTED");
+  const brokenCommand = await readCommandFor(broken.id);
+  assert.ok(brokenCommand);
+  await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, brokenCommand.commandId);
+  await assert.rejects(
+    () => readBridgeRootFile(root.root.id, broken.relativePath),
+    (error) => error instanceof BridgeAppError && error.code === "IMAGE_DECODE_FAILED",
+  );
+  const failedReport = await prepareBridgeCommandReportForPersistence(
+    root.device.bridgeDeviceId,
+    {
+      commandId: brokenCommand.commandId,
+      result: null,
+      safeErrorCategory: "IMAGE_DECODE_FAILED",
+      status: "FAILED",
+    },
+  );
+  await completeBridgeCloudCommand(root.device.bridgeDeviceId, failedReport);
+
+  const result = await completeNativeRead({
+    bridgeDeviceId: root.device.bridgeDeviceId,
+    bridgeRootId: root.root.id,
+    relativePath: valid.relativePath,
+    scannedFileId: valid.id,
+  });
+  assert.match(result.extractedText, /metadata only/);
+  assert.match(result.extractedText, /OCR text: unavailable/);
+  assert.doesNotMatch(result.extractedText, /workshop facilitation/i);
+
+  await completeNativeRead({
+    bridgeDeviceId: root.device.bridgeDeviceId,
+    bridgeRootId: root.root.id,
+    relativePath: document.relativePath,
+    scannedFileId: document.id,
+  });
+  const processed = await scannedFile(root.session.id, valid.relativePath);
+  const processedMetadata = await prisma.imageAssetMetadata.findUnique({
+    where: { scannedFileId: valid.id },
+  });
+  const session = await prisma.scanSession.findUniqueOrThrow({ where: { id: root.session.id } });
+  const imageObservation = await prisma.observationSession.findFirst({
+    where: { libraryDocumentId: processed.libraryDocumentId ?? "" },
+  });
+
+  assert.equal(processed.readingStatus, "READ");
+  assert.equal(processed.extractionStatus, "COMPLETED");
+  const brokenAfter = await scannedFile(root.session.id, broken.relativePath);
+  assert.equal(brokenAfter.readingStatus, "FAILED");
+  assert.equal(brokenAfter.extractionErrorCategory, "IMAGE_DECODE_FAILED");
+  assert.equal(imageObservation?.observerType, "DETERMINISTIC");
+  assert.match(JSON.stringify(imageObservation?.warnings), /Only image metadata was examined/);
+  assert.equal(processedMetadata?.ocrStatus, "UNAVAILABLE");
+  assert.equal(processedMetadata?.visualAnalysisStatus, "UNAVAILABLE");
+  assert.match(JSON.stringify(imageObservation?.observations), /did not examine/);
+  assert.equal(session.status, "COMPLETED_WITH_ERRORS");
+  assert.deepEqual(await readFile(path.join(root.rootPath, "Images", "valid.png")), pngMetadataFixture());
+});
+
 test("damaged supported media fails safely while other read commands continue", async () => {
   const root = await createCloudBackedBridgeRoot(
     "SCAN_ROOT_DAMAGED_MEDIA",
@@ -577,3 +773,632 @@ test("damaged supported media fails safely while other read commands continue", 
   assert.equal(unsupported.readStatus, "UNSUPPORTED");
   assert.equal(unsupported.processingStage, "UNSUPPORTED");
 });
+
+test("an unchanged cloud document reuses its grounded observation but receives fresh recommendations", async () => {
+  await withMockObserver(async (requestCount) => {
+    const root = await createCloudBackedBridgeRoot(
+      "SCAN_ROOT_REUSE",
+      new Map([["Loose/notes.txt", Buffer.from("Workshop facilitation notes.")]]),
+    );
+    const first = await scannedFile(root.session.id, "Loose/notes.txt");
+    assert.ok(await readCommandFor(first.id));
+    await completeNativeRead({
+      bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id,
+      relativePath: first.relativePath,
+      scannedFileId: first.id,
+    });
+    const observed = await scannedFile(root.session.id, first.relativePath);
+    assert.equal(requestCount(), 1);
+    assert.equal(observed.observationOrigin, "NEW_AI");
+    assert.match(observed.observationFingerprint ?? "", /^[a-f\d]{64}$/);
+    assert.equal(observed.aiRequestCount, 1);
+    assert.equal(observed.aiHttpAttempts, 1);
+    assert.equal(observed.aiInputTokens, 123);
+    assert.equal(observed.aiOutputTokens, 45);
+    const observation = await prisma.observationSession.findFirstOrThrow({
+      where: { libraryDocumentId: observed.libraryDocumentId ?? "" },
+    });
+    await prisma.observationSession.update({
+      data: { status: "MODIFIED" },
+      where: { id: observation.id },
+    });
+    await prisma.humanDecision.create({
+      data: { observationSessionId: observation.id, decisionType: "MODIFY", editedSuggestion: "Corrected workshop context" },
+    });
+
+    const second = await repeatCloudScan(root);
+    const secondFile = await scannedFile(second.session.id, first.relativePath);
+    assert.equal((second.result as Record<string, unknown>)?.queuedReads, 0);
+    assert.equal((second.result as Record<string, unknown>)?.reusedObservations, 1);
+    assert.equal(requestCount(), 1);
+    assert.equal(secondFile.observationOrigin, "REUSED_AI");
+    assert.equal(secondFile.libraryDocumentId, observed.libraryDocumentId);
+    assert.equal(secondFile.aiRequestCount, 0);
+    assert.ok(secondFile.organizationSuggestions.length > 0);
+    assert.equal(secondFile.organizationSuggestions.every((item) => item.scanSessionId === second.session.id), true);
+    assert.equal((await prisma.observationSession.findUniqueOrThrow({ where: { id: observation.id } })).status, "MODIFIED");
+    const progress = await getBridgeScanSessionProgress(second.session.id);
+    assert.equal(progress?.progress.aiUsage?.reusedObservations, 1);
+    assert.equal(progress?.progress.aiUsage?.avoidedRequests, 1);
+    assert.equal(progress?.progress.aiUsage?.requests, 0);
+    assert.deepEqual(progress?.progress.aiUsage?.models, ["gpt-4o-mini"]);
+    assert.deepEqual(progress?.progress.aiUsage?.processingVersions, ["phase1-grounded-observer-v2"]);
+    assert.equal(progress?.progress.remainingFiles, 0);
+    const commandsBefore = await prisma.bridgeCommand.count();
+    assert.deepEqual(await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId), []);
+    assert.equal(await prisma.bridgeCommand.count(), commandsBefore);
+    assert.equal(await readCommandFor(secondFile.id), undefined);
+
+    await writeFile(path.join(root.rootPath, "Loose", "notes.txt"), "Workshop facilitation notes. Changed content.");
+    const changed = await repeatCloudScan(root);
+    assert.equal((changed.result as Record<string, unknown>)?.queuedReads, 1);
+    const changedFile = await scannedFile(changed.session.id, first.relativePath);
+    assert.equal(changedFile.observationOrigin, null);
+    await completeNativeRead({
+      bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id,
+      relativePath: changedFile.relativePath,
+      scannedFileId: changedFile.id,
+    });
+    assert.equal(requestCount(), 2);
+    process.env.OPENAI_MODEL = "test-observer-next-version";
+    const incompatible = await repeatCloudScan(root);
+    assert.equal((incompatible.result as Record<string, unknown>)?.queuedReads, 1);
+    assert.equal(requestCount(), 2);
+  });
+});
+
+test("partial observations are not reused and simultaneous reports claim paid work once", async () => {
+  await withMockObserver(async (requestCount) => {
+    const root = await createCloudBackedBridgeRoot(
+      "SCAN_ROOT_PARTIAL",
+      new Map([["Loose/notes.txt", Buffer.from(`Workshop facilitation notes.${" Routine notes.".repeat(10_000)}`)]]),
+    );
+    const first = await scannedFile(root.session.id, "Loose/notes.txt");
+    await completeNativeRead({
+      bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id,
+      relativePath: first.relativePath,
+      scannedFileId: first.id,
+    });
+    assert.equal((await scannedFile(root.session.id, first.relativePath)).observationFingerprint, null);
+    const second = await repeatCloudScan(root);
+    assert.equal((second.result as Record<string, unknown>)?.queuedReads, 1);
+    const secondFile = await scannedFile(second.session.id, first.relativePath);
+    const command = await readCommandFor(secondFile.id);
+    assert.ok(command);
+    await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, command.commandId);
+    await prisma.scannedFile.update({
+      data: { observationClaimedAt: new Date(Date.now() - 11 * 60_000) },
+      where: { id: secondFile.id },
+    });
+    const nativeResult = bridgeJson(await readBridgeRootFile(root.root.id, secondFile.relativePath));
+    const reports = await Promise.allSettled([0, 1].map(() => prepareBridgeCommandReportForPersistence(
+      root.device.bridgeDeviceId,
+      { commandId: command.commandId, result: nativeResult, safeErrorCategory: null, status: "COMPLETED" },
+    )));
+    assert.equal(requestCount(), 2);
+    assert.equal(reports.filter((report) => report.status === "fulfilled").length, 1);
+    const loser = reports.find((report) => report.status === "rejected");
+    assert.ok(loser && loser.reason.code === "OBSERVATION_IN_PROGRESS");
+    assert.notEqual((await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: command.commandId } })).status, "COMPLETED");
+    const retry = await prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId,
+      { commandId: command.commandId, result: nativeResult, safeErrorCategory: null, status: "COMPLETED" });
+    assert.equal((retry.result as Record<string, unknown>).observationReused, true);
+    await completeBridgeCloudCommand(root.device.bridgeDeviceId, retry);
+    assert.equal(await prisma.observationSession.count({
+      where: { libraryDocument: { scannedFiles: { some: { id: secondFile.id } } } },
+    }), 1);
+    assert.equal((await scannedFile(second.session.id, first.relativePath)).observationClaimedAt, null);
+  }, 150);
+});
+
+test("75 unread files advance in bounded batches only after active reads are consumed", async () => {
+  const files = new Map(Array.from({ length: 75 }, (_, index) => [
+    `Documents/note-${index}.txt`, Buffer.from(`Document ${index} remains on the Mac.`),
+  ]));
+  const root = await createCloudBackedBridgeRoot("SCAN_ROOT_LARGE", files);
+
+  assert.equal((root.importResult as Record<string, unknown>)?.queuedReads, 4);
+  assert.equal(await prisma.bridgeCommand.count({ where: { commandType: "READ_FILE_TEMPORARILY" } }), 4);
+  const firstBatch = await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId);
+  assert.equal(firstBatch.length, 4);
+  await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, firstBatch[0].commandId);
+  await prisma.bridgeCommand.update({ where: { commandId: firstBatch[1].commandId }, data: { status: "RUNNING" } });
+  for (const retry of await Promise.all([
+    fetchRecoverableBridgeCommands(root.device.bridgeDeviceId), fetchRecoverableBridgeCommands(root.device.bridgeDeviceId),
+  ])) assert.deepEqual(new Set(retry.map((command) => command.commandId)), new Set(firstBatch.map((command) => command.commandId)));
+  assert.equal(await prisma.bridgeCommand.count({ where: { commandType: "READ_FILE_TEMPORARILY" } }), 4);
+  assert.equal((await getBridgeScanSessionProgress(root.session.id))?.progress.remainingFiles, 75);
+  let batch = firstBatch;
+  const seen = new Set<string>();
+  while (batch.length > 0) {
+    assert.ok(batch.length <= 4);
+    for (const command of batch) {
+      const payload = command.payload as { scannedFileId: string; relativePath: string };
+      assert.equal(seen.has(payload.scannedFileId), false);
+      seen.add(payload.scannedFileId);
+      await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId, bridgeRootId: root.root.id, ...payload });
+    }
+    const [next, concurrent] = await Promise.all([
+      fetchRecoverableBridgeCommands(root.device.bridgeDeviceId), fetchRecoverableBridgeCommands(root.device.bridgeDeviceId),
+    ]);
+    assert.deepEqual(new Set(next.map((row) => row.commandId)), new Set(concurrent.map((row) => row.commandId)));
+    batch = next;
+  }
+  assert.equal(seen.size, 75);
+  const progress = await getBridgeScanSessionProgress(root.session.id);
+  assert.equal(progress?.progress.remainingFiles, 0);
+  assert.equal(progress?.progress.filesWithSuggestions, 75);
+  assert.equal(progress?.session.status, "COMPLETED");
+  assert.deepEqual(await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId), []);
+  assert.equal(await prisma.bridgeCommand.count(), 75);
+});
+
+test("expired read batches are isolated before recovery admits remaining files", async () => {
+  const root = await createCloudBackedBridgeRoot("SCAN_ROOT_EXPIRED_BATCH", new Map(Array.from({ length: 75 }, (_, i) => [
+    `Documents/expired-${i}.txt`, Buffer.from(`Synthetic document ${i}.`),
+  ])));
+  const first = await prisma.bridgeCommand.findMany({ where: { commandType: "READ_FILE_TEMPORARILY" } });
+  assert.equal(first.length, 4);
+  assert.ok(first.every((row) => row.expiresAt.getTime() - row.issuedAt.getTime() <= 10 * 60_000));
+  await prisma.bridgeCommand.updateMany({ where: { commandId: { in: first.map((row) => row.commandId) } },
+    data: { expiresAt: new Date(Date.now() - 1_000) } });
+  const next = await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId);
+  assert.equal(next.length, 4);
+  assert.equal(await prisma.bridgeCommand.count({ where: { status: "EXPIRED" } }), 4);
+  assert.equal(await prisma.scannedFile.count({ where: { sessionId: root.session.id, processingErrorCategory: "READ_COMMAND_TIMEOUT" } }), 4);
+  assert.equal((await getBridgeScanSessionProgress(root.session.id))?.progress.remainingFiles, 71);
+  assert.equal((await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId)).length, 4);
+  assert.equal(await prisma.bridgeCommand.count(), 8);
+});
+
+test("reused observations join new files in the next scan's working knowledge", async () => {
+  await withMockObserver(async (requestCount) => {
+    const root = await createCloudBackedBridgeRoot(
+      "SCAN_ROOT_FRESH_CONTEXT",
+      new Map([["Workshops/outline.txt", Buffer.from("Workshop facilitation notes.")]]),
+    );
+    const first = await scannedFile(root.session.id, "Workshops/outline.txt");
+    await completeNativeRead({
+      bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id,
+      relativePath: first.relativePath,
+      scannedFileId: first.id,
+    });
+    await writeFile(path.join(root.rootPath, "Workshops", "agenda.txt"), "Workshop facilitation agenda.");
+
+    const second = await repeatCloudScan(root);
+    const reused = await scannedFile(second.session.id, first.relativePath);
+    const fresh = await scannedFile(second.session.id, "Workshops/agenda.txt");
+    assert.equal(reused.observationOrigin, "REUSED_AI");
+    assert.equal((second.result as Record<string, unknown>)?.queuedReads, 1);
+    await completeNativeRead({
+      bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id,
+      relativePath: fresh.relativePath,
+      scannedFileId: fresh.id,
+    });
+    const knowledge = await loadScanWorkingKnowledge(second.session.id);
+    assert.equal(requestCount(), 2);
+    assert.equal(knowledge?.files.length, 2);
+    assert.ok((await scannedFile(second.session.id, reused.relativePath)).organizationSuggestions.length > 0);
+    assert.ok((await scannedFile(second.session.id, fresh.relativePath)).organizationSuggestions.length > 0);
+  });
+});
+
+test("provider retries count real HTTP attempts and failed AI observations remain non-reusable", async () => {
+  await withMockObserver(async (requestCount) => {
+    const root = await createCloudBackedBridgeRoot(
+      "SCAN_ROOT_PROVIDER_RETRY",
+      new Map([["Loose/notes.txt", Buffer.from("Workshop facilitation notes.")]]),
+    );
+    const first = await scannedFile(root.session.id, "Loose/notes.txt");
+    await completeNativeRead({
+      bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id,
+      relativePath: first.relativePath,
+      scannedFileId: first.id,
+    });
+    const failed = await scannedFile(root.session.id, first.relativePath);
+    assert.equal(failed.observationOrigin, "BASIC");
+    assert.equal(failed.observationFingerprint, null);
+    assert.equal(failed.aiRequestCount, 1);
+    assert.equal(failed.aiHttpAttempts, requestCount());
+    assert.ok(failed.aiHttpAttempts > 1);
+    const failedProgress = await getBridgeScanSessionProgress(root.session.id);
+    assert.equal(failedProgress?.progress.aiUsage?.failedObservations, 1);
+    assert.equal(failedProgress?.progress.aiUsage?.unreportedTokenRequests, 1);
+
+    const second = await repeatCloudScan(root);
+    assert.equal((second.result as Record<string, unknown>)?.queuedReads, 1);
+    const retry = await scannedFile(second.session.id, first.relativePath);
+    await completeNativeRead({
+      bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id,
+      relativePath: retry.relativePath,
+      scannedFileId: retry.id,
+    });
+    assert.equal((await scannedFile(second.session.id, first.relativePath)).observationOrigin, "NEW_AI");
+  }, 0, 3);
+});
+
+test("a file changed after scanning cannot be observed under its stale checksum", async () => {
+  await withMockObserver(async (requestCount) => {
+    const root = await createCloudBackedBridgeRoot(
+      "SCAN_ROOT_CHANGED_AFTER_SCAN",
+      new Map([["Loose/notes.txt", Buffer.from("Original workshop notes.")]]),
+    );
+    const file = await scannedFile(root.session.id, "Loose/notes.txt");
+    await writeFile(path.join(root.rootPath, "Loose", "notes.txt"), "Different workshop notes.");
+    await completeNativeRead({
+      bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id,
+      relativePath: file.relativePath,
+      scannedFileId: file.id,
+    });
+    const changed = await scannedFile(root.session.id, file.relativePath);
+    assert.equal(changed.processingStage, "FAILED");
+    assert.equal(changed.processingErrorCategory, "FILE_CHANGED_SINCE_SCAN");
+    assert.equal(changed.observationFingerprint, null);
+    assert.equal(requestCount(), 0);
+    assert.equal((await getBridgeScanSessionProgress(root.session.id))?.progress.remainingFiles, 0);
+  });
+});
+
+test("an image changed after scanning is isolated before a stale observation can be accepted", async () => {
+  const relativePath = "Images/changed.png";
+  const original = pngMetadataFixture();
+  const root = await createCloudBackedBridgeRoot("SCAN_ROOT_CHANGED_IMAGE", new Map([[relativePath, original]]));
+  const file = await scannedFile(root.session.id, relativePath);
+  const changedBytes = Buffer.from(original);
+  changedBytes.writeUInt32BE(800, 16);
+  await writeFile(path.join(root.rootPath, "Images", "changed.png"), changedBytes);
+  const result = await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId,
+    bridgeRootId: root.root.id, relativePath, scannedFileId: file.id });
+  assert.equal(result.sourceChecksum, createHash("sha256").update(changedBytes).digest("hex"));
+  assert.notEqual(result.sourceChecksum, file.checksum);
+  assert.equal(JSON.stringify(result).includes(changedBytes.toString("base64")), false);
+  assert.match(result.extractedText, /technical metadata only/);
+  const rejected = await scannedFile(root.session.id, relativePath);
+  assert.equal(rejected.processingStage, "FAILED");
+  assert.equal(rejected.processingErrorCategory, "FILE_CHANGED_SINCE_SCAN");
+  assert.equal(rejected.libraryDocumentId, null);
+  assert.equal(rejected.observationFingerprint, null);
+  assert.equal(rejected.organizationSuggestions.length, 0);
+  assert.equal(await prisma.bridgeCommand.count({ where: { commandType: { in: ["EXECUTE_PLAN", "EXECUTE_UNDO"] } } }), 0);
+});
+
+test("unchanged image reads return a verified checksum and keep metadata-only semantics", async () => {
+  const bytes = pngMetadataFixture();
+  const relativePath = "Images/unchanged.png";
+  const root = await createCloudBackedBridgeRoot("SCAN_ROOT_UNCHANGED_IMAGE", new Map([[relativePath, bytes]]));
+  const file = await scannedFile(root.session.id, relativePath);
+  const result = await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId,
+    bridgeRootId: root.root.id, relativePath, scannedFileId: file.id });
+  assert.equal(result.sourceChecksum, file.checksum);
+  assert.equal(result.sourceChecksum, createHash("sha256").update(bytes).digest("hex"));
+  assert.match(result.extractedText, /OCR text: unavailable/);
+  assert.match(result.extractedText, /Visual analysis: unavailable/);
+  const processed = await scannedFile(root.session.id, relativePath);
+  assert.ok(processed.libraryDocumentId);
+  assert.equal(await prisma.observationSession.count({ where: { libraryDocumentId: processed.libraryDocumentId } }), 1);
+});
+
+for (const medium of ["audio", "video"] as const) {
+  const relativePath = medium === "audio" ? "Audio/verified.mp3" : "Video/verified.mp4";
+  const bytes = medium === "audio" ? mp3FrameBuffer(1) : mp4VideoBuffer({ hasAudioTrack: true });
+
+  test(`${medium} changed after scanning cannot seed a stale observation`, async () => {
+    const root = await createCloudBackedBridgeRoot(`SCAN_ROOT_CHANGED_${medium}`, new Map([[relativePath, bytes]]));
+    const file = await scannedFile(root.session.id, relativePath);
+    const changed = Buffer.from(bytes);
+    changed[changed.length - 1] ^= 1;
+    await writeFile(path.join(root.rootPath, ...relativePath.split("/")), changed);
+    const result = await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id, relativePath, scannedFileId: file.id });
+    assert.equal(result.sourceChecksum, createHash("sha256").update(changed).digest("hex"));
+    assert.notEqual(result.sourceChecksum, file.checksum);
+    assert.equal(JSON.stringify(result).includes(changed.toString("base64")), false);
+    const rejected = await scannedFile(root.session.id, relativePath);
+    assert.equal(rejected.processingStage, "FAILED");
+    assert.equal(rejected.processingErrorCategory, "FILE_CHANGED_SINCE_SCAN");
+    assert.equal(rejected.libraryDocumentId, null);
+    assert.equal(rejected.observationFingerprint, null);
+    assert.equal(rejected.organizationSuggestions.length, 0);
+    assert.deepEqual(await readFile(path.join(root.rootPath, ...relativePath.split("/"))), changed);
+    assert.equal(await prisma.bridgeCommand.count({ where: { commandType: { in: ["EXECUTE_PLAN", "EXECUTE_UNDO"] } } }), 0);
+  });
+
+  test(`unchanged ${medium} returns a verified checksum and processes metadata only`, async () => {
+    const root = await createCloudBackedBridgeRoot(`SCAN_ROOT_UNCHANGED_${medium}`, new Map([[relativePath, bytes]]));
+    const file = await scannedFile(root.session.id, relativePath);
+    const result = await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id, relativePath, scannedFileId: file.id });
+    assert.equal(result.sourceChecksum, file.checksum);
+    assert.equal(result.sourceChecksum, createHash("sha256").update(bytes).digest("hex"));
+    assert.match(result.extractedText, /Transcript: unavailable\. No transcript was invented/);
+    const processed = await scannedFile(root.session.id, relativePath);
+    assert.ok(processed.libraryDocumentId);
+    assert.equal(await prisma.observationSession.count({ where: { libraryDocumentId: processed.libraryDocumentId } }), 1);
+    assert.deepEqual(await readFile(path.join(root.rootPath, ...relativePath.split("/"))), bytes);
+    assert.equal(await prisma.bridgeCommand.count({ where: { commandType: { in: ["EXECUTE_PLAN", "EXECUTE_UNDO"] } } }), 0);
+  });
+}
+
+test("legacy checksum-less temporary reads are rejected before observation or reuse", async () => {
+  await withMockObserver(async (requestCount) => {
+    const root = await createCloudBackedBridgeRoot(
+      "SCAN_ROOT_LEGACY_READ",
+      new Map([["Loose/notes.txt", Buffer.from("Workshop facilitation notes.")]]),
+    );
+    const file = await scannedFile(root.session.id, "Loose/notes.txt");
+    const command = await readCommandFor(file.id);
+    assert.ok(command);
+    await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, command.commandId);
+    const legacyResult = bridgeJson(await readBridgeRootFile(root.root.id, file.relativePath)) as Record<string, unknown>;
+    delete legacyResult.sourceChecksum;
+    const prepared = await prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, {
+      commandId: command.commandId,
+      result: legacyResult as BridgeJson,
+      safeErrorCategory: null,
+      status: "COMPLETED",
+    });
+    assert.equal(prepared.status, "FAILED");
+    assert.equal(prepared.safeErrorCategory, "SOURCE_CHECKSUM_MISSING");
+    await completeBridgeCloudCommand(root.device.bridgeDeviceId, prepared);
+    const observed = await scannedFile(root.session.id, file.relativePath);
+    assert.equal(observed.processingStage, "FAILED");
+    assert.equal(observed.processingErrorCategory, "SOURCE_CHECKSUM_MISSING");
+    assert.equal(observed.libraryDocumentId, null);
+    assert.equal(observed.previewText, null);
+    assert.equal(observed.organizationSuggestions.length, 0);
+    assert.equal(observed.observationFingerprint, null);
+    assert.equal(requestCount(), 0);
+    const nextScan = await repeatCloudScan(root);
+    assert.equal((nextScan.result as Record<string, unknown>)?.queuedReads, 1);
+  });
+});
+
+for (const medium of ["document", "image", "audio", "video"] as const) {
+  for (const checksumCase of ["missing", "malformed", "overlong", "non-string"] as const) {
+    test(`${medium} completed reads reject ${checksumCase} source checksums before accepting content`, async () => {
+      const relativePath = { document: "notes.txt", image: "image.png", audio: "audio.mp3", video: "video.mp4" }[medium];
+      const bytes = { document: Buffer.from("Synthetic workshop notes."), image: pngMetadataFixture(),
+        audio: mp3FrameBuffer(1), video: mp4VideoBuffer({ hasAudioTrack: true }) }[medium];
+      const root = await createCloudBackedBridgeRoot(`Integrity_${medium}_${checksumCase}`, new Map([[relativePath, bytes]]));
+      const file = await scannedFile(root.session.id, relativePath);
+      const command = await readCommandFor(file.id);
+      assert.ok(command);
+      await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, command.commandId);
+      const result = bridgeJson(await readBridgeRootFile(root.root.id, relativePath)) as Record<string, unknown>;
+      if (checksumCase === "missing") delete result.sourceChecksum;
+      else result.sourceChecksum = checksumCase === "malformed" ? "not-a-sha256" :
+        checksumCase === "non-string" ? 123 : `${file.checksum}0`;
+      const prepared = await prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, {
+        commandId: command.commandId, result: result as BridgeJson, safeErrorCategory: null, status: "COMPLETED",
+      });
+      const category = checksumCase === "missing" ? "SOURCE_CHECKSUM_MISSING" : "SOURCE_CHECKSUM_INVALID";
+      assert.equal(prepared.status, "FAILED");
+      assert.equal(prepared.safeErrorCategory, category);
+      await completeBridgeCloudCommand(root.device.bridgeDeviceId, prepared);
+      const rejected = await scannedFile(root.session.id, relativePath);
+      assert.equal(rejected.processingStage, "FAILED");
+      assert.equal(rejected.processingErrorCategory, category);
+      assert.equal(rejected.libraryDocumentId, null);
+      assert.equal(rejected.previewText, null);
+      assert.equal(rejected.organizationSuggestions.length, 0);
+      assert.equal(await prisma.observationSession.count(), 0);
+      assert.equal((await prisma.bridgeCommand.findUniqueOrThrow({ where: { id: command.id } })).status, "FAILED");
+      assert.deepEqual(await readFile(path.join(root.rootPath, relativePath)), bytes);
+      assert.equal(await prisma.bridgeCommand.count({ where: { commandType: { in: ["EXECUTE_PLAN", "EXECUTE_UNDO"] } } }), 0);
+    });
+  }
+}
+
+test("a completed read cannot establish integrity against an unverified scan checksum", async () => {
+  const root = await createCloudBackedBridgeRoot("Integrity_unverified_scan", new Map([["notes.txt", Buffer.from("Synthetic notes.")]]));
+  const file = await scannedFile(root.session.id, "notes.txt");
+  await prisma.scannedFile.update({ where: { id: file.id }, data: { checksum: null } });
+  await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId, bridgeRootId: root.root.id,
+    relativePath: file.relativePath, scannedFileId: file.id });
+  const rejected = await scannedFile(root.session.id, file.relativePath);
+  assert.equal(rejected.processingErrorCategory, "SCAN_CHECKSUM_UNVERIFIED");
+  assert.equal(rejected.libraryDocumentId, null);
+  assert.equal(await prisma.observationSession.count(), 0);
+  const errors = await import("../../src/lib/bridge/remote-read-commands");
+  assert.match(errors.remoteReadFailureMessageFor("SOURCE_CHECKSUM_MISSING", file.relativePath), /Update NSN Bridge/);
+  assert.match(errors.remoteReadFailureMessageFor("SOURCE_CHECKSUM_INVALID", file.relativePath), /verify/);
+  assert.match(errors.remoteReadFailureMessageFor(rejected.processingErrorCategory, file.relativePath), /Scan the folder again/);
+});
+
+test("an incomplete provider response is reviewable but never reused as complete", async () => {
+  await withMockObserver(async (requestCount) => {
+    const root = await createCloudBackedBridgeRoot(
+      "SCAN_ROOT_INCOMPLETE_RESPONSE",
+      new Map([["Loose/notes.txt", Buffer.from("Workshop facilitation notes.")]]),
+    );
+    const first = await scannedFile(root.session.id, "Loose/notes.txt");
+    await completeNativeRead({
+      bridgeDeviceId: root.device.bridgeDeviceId,
+      bridgeRootId: root.root.id,
+      relativePath: first.relativePath,
+      scannedFileId: first.id,
+    });
+    const incomplete = await scannedFile(root.session.id, first.relativePath);
+    assert.equal(incomplete.observationOrigin, "NEW_AI");
+    assert.equal(incomplete.observationFingerprint, null);
+    const nextScan = await repeatCloudScan(root);
+    assert.equal((nextScan.result as Record<string, unknown>)?.queuedReads, 1);
+    assert.equal(requestCount(), 1);
+  }, 0, 0, 1);
+});
+
+async function observationLeaseFixture() {
+  const root = await createCloudBackedBridgeRoot("LEASE", new Map([["notes.txt", Buffer.from("Workshop facilitation notes.")]]));
+  const file = await scannedFile(root.session.id, "notes.txt");
+  const command = await readCommandFor(file.id);
+  assert.ok(command);
+  await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, command.commandId);
+  const report = { commandId: command.commandId, result: bridgeJson(await readBridgeRootFile(root.root.id, file.relativePath)),
+    safeErrorCategory: null, status: "COMPLETED" as const };
+  return { root, file, command, report };
+}
+
+test("observation lease recent abandoned claim stays retryable at prepare, completion and timeout boundaries", async () => {
+  const { root, file, command, report } = await observationLeaseFixture();
+  const lease = new Date();
+  await prisma.scannedFile.update({ data: { processingStage: "READ", readingStatus: "READ",
+    extractionStatus: "COMPLETED", observationClaimedAt: lease }, where: { id: file.id } });
+  await assert.rejects(prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report),
+    (error: unknown) => (error as { code: string }).code === "OBSERVATION_IN_PROGRESS");
+  await assert.rejects(completeBridgeCloudCommand(root.device.bridgeDeviceId, report),
+    (error: unknown) => (error as { code: string }).code === "OBSERVATION_IN_PROGRESS");
+  await prisma.bridgeCommand.update({ data: { expiresAt: new Date(Date.now() - 1) }, where: { commandId: command.commandId } });
+  await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId);
+  assert.equal((await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: command.commandId } })).status, "ACKNOWLEDGED");
+  const current = await scannedFile(root.session.id, file.relativePath);
+  assert.equal(current.processingStage, "READ");
+  assert.equal(current.observationClaimedAt?.getTime(), lease.getTime());
+  assert.equal(current.libraryDocumentId, null);
+  assert.equal(current.organizationSuggestions.length, 0);
+  assert.equal((await getBridgeScanSessionProgress(root.session.id))?.progress.remainingFiles, 1);
+});
+
+for (const interrupted of ["ACKNOWLEDGED", "COMPLETED", "FAILED"] as const) {
+  test(`observation lease restart recovers stale ${interrupted} command through bounded native read admission`, async () => {
+    const { root, file, command } = await observationLeaseFixture();
+    // Capture real current root/key ownership before simulating lease expiry;
+    // a timestamp alone is not an authoritative modern observation claim.
+    await (await import("../../src/lib/bridge/observation-authority")).claimObservationLease(file.id);
+    await prisma.scannedFile.update({ data: { processingStage: interrupted === "ACKNOWLEDGED" ? "READING" : "READ",
+      readingStatus: interrupted === "ACKNOWLEDGED" ? "NOT_READ" : "READ", extractionStatus: "COMPLETED",
+      observationClaimedAt: new Date(Date.now() - 11 * 60_000) }, where: { id: file.id } });
+    await prisma.bridgeCommand.update({ data: { status: interrupted }, where: { commandId: command.commandId } });
+    const recovered = await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId);
+    assert.equal(recovered.length, 1);
+    assert.notEqual(recovered[0].commandId, command.commandId);
+    assert.deepEqual((await fetchRecoverableBridgeCommands(root.device.bridgeDeviceId)).map((row) => row.commandId),
+      recovered.map((row) => row.commandId));
+    await acknowledgeBridgeCloudCommand(root.device.bridgeDeviceId, recovered[0].commandId);
+    const report = { commandId: recovered[0].commandId, result: bridgeJson(await readBridgeRootFile(root.root.id, file.relativePath)),
+      safeErrorCategory: null, status: "COMPLETED" as const };
+    const prepared = await prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report);
+    await completeBridgeCloudCommand(root.device.bridgeDeviceId, prepared);
+    const final = await scannedFile(root.session.id, file.relativePath);
+    assert.ok(["EXAMINED", "SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"].includes(final.processingStage));
+    assert.equal(final.observationClaimedAt, null);
+    assert.equal(await prisma.observationSession.count({ where: { libraryDocumentId: final.libraryDocumentId! } }), 1);
+    assert.equal((await getBridgeScanSessionProgress(root.session.id))?.progress.remainingFiles, 0);
+  });
+}
+
+test("observation lease publication failure is atomic, clears only its owner and permits retry", async () => {
+  const { root, file, report } = await observationLeaseFixture();
+  await prisma.$executeRawUnsafe(`CREATE FUNCTION "${testSchemaName}".fail_observation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected observation publication failure'; END $$`);
+  await prisma.$executeRawUnsafe(`CREATE TRIGGER fail_observation BEFORE INSERT ON "${testSchemaName}"."ObservationSession" FOR EACH ROW EXECUTE FUNCTION "${testSchemaName}".fail_observation()`);
+  try {
+    await assert.rejects(prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report), /injected observation publication failure/);
+    const failed = await scannedFile(root.session.id, file.relativePath);
+    assert.equal(failed.observationClaimedAt, null);
+    assert.equal(failed.processingStage, "EXAMINING");
+    assert.equal(await prisma.observationSession.count(), 0);
+  } finally {
+    await prisma.$executeRawUnsafe(`DROP TRIGGER fail_observation ON "${testSchemaName}"."ObservationSession"`);
+    await prisma.$executeRawUnsafe(`DROP FUNCTION "${testSchemaName}".fail_observation()`);
+  }
+  const prepared = await prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report);
+  await completeBridgeCloudCommand(root.device.bridgeDeviceId, prepared);
+  assert.equal((await scannedFile(root.session.id, file.relativePath)).observationClaimedAt, null);
+});
+
+test("observation lease expired worker cannot publish or clear replacement owner", async () => {
+  let enteredA!: () => void, enteredB!: () => void, releaseA!: () => void, releaseB!: () => void;
+  const entryA = new Promise<void>((resolve) => { enteredA = resolve; });
+  const entryB = new Promise<void>((resolve) => { enteredB = resolve; });
+  const gateA = new Promise<void>((resolve) => { releaseA = resolve; });
+  const gateB = new Promise<void>((resolve) => { releaseB = resolve; });
+  await withMockObserver(async () => {
+    const { root, file, report } = await observationLeaseFixture();
+    const first = prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report);
+    const rejected = assert.rejects(first, /lease ownership changed/);
+    await entryA;
+    await prisma.scannedFile.update({ data: { observationClaimedAt: new Date(Date.now() - 11 * 60_000) }, where: { id: file.id } });
+    const replacement = prepareBridgeCommandReportForPersistence(root.device.bridgeDeviceId, report);
+    await entryB;
+    const owned = (await scannedFile(root.session.id, file.relativePath)).observationClaimedAt;
+    assert.ok(owned);
+    releaseA(); await rejected;
+    assert.equal((await scannedFile(root.session.id, file.relativePath)).observationClaimedAt?.getTime(), owned.getTime());
+    assert.equal(await prisma.observationSession.count(), 0);
+    releaseB();
+    await completeBridgeCloudCommand(root.device.bridgeDeviceId, await replacement);
+    assert.equal(await prisma.observationSession.count(), 1);
+    assert.equal((await scannedFile(root.session.id, file.relativePath)).observationClaimedAt, null);
+  }, 0, 0, 0, async (number) => {
+    if (number === 1) { enteredA(); await gateA; }
+    if (number === 2) { enteredB(); await gateB; }
+  });
+});
+
+for (const scenario of ["approved-rejected", "rejected-approved", "approved-modified", "awaiting-rejected", "awaiting-control", "tie", "incomplete", "absent", "candidate", "fingerprint", "root", "path", "size"] as const) {
+  test(`authoritative reuse ${scenario} follows latest review and exact fingerprint guards`, async () => {
+    await withMockObserver(async () => {
+      const root = await createCloudBackedBridgeRoot("REUSE_AUTHORITY", new Map([["notes.txt", Buffer.from("Workshop facilitation notes.")]]));
+      const source = await scannedFile(root.session.id, "notes.txt");
+      await completeNativeRead({ bridgeDeviceId: root.device.bridgeDeviceId, bridgeRootId: root.root.id,
+        relativePath: source.relativePath, scannedFileId: source.id });
+      const file = await scannedFile(root.session.id, source.relativePath);
+      const original = await prisma.observationSession.findFirstOrThrow({ where: { libraryDocumentId: file.libraryDocumentId! } });
+      const status = scenario === "rejected-approved" ? "APPROVED" : scenario === "approved-modified" ? "MODIFIED" : "REJECTED";
+      await prisma.observationSession.update({ data: { status: ["awaiting-rejected", "awaiting-control"].includes(scenario) ? "AWAITING_REVIEW"
+        : scenario === "rejected-approved" ? "REJECTED" : "APPROVED", createdAt: new Date("2025-01-01") }, where: { id: original.id } });
+      if (["approved-rejected", "rejected-approved", "approved-modified", "awaiting-rejected", "tie", "incomplete", "candidate"].includes(scenario)) {
+        const latest = await prisma.observationSession.create({ data: {
+          id: scenario === "tie" ? "zz-latest-authority" : randomUUID(), libraryDocumentId: file.libraryDocumentId!,
+          observerType: "OPENAI", status: scenario === "incomplete" ? "AWAITING_REVIEW" : status,
+          observations: scenario === "incomplete" ? [] : bridgeJson(original.observations)!, interpretations: [],
+          explanation: [], planSuggestions: [], warnings: [], createdAt: new Date(scenario === "tie" ? "2025-01-01" : "2025-01-02"),
+        } });
+        if (scenario === "approved-modified") await prisma.humanDecision.create({ data: {
+          observationSessionId: latest.id, decisionType: "MODIFY", editedSuggestion: "Client: Corrected Alice; Client ID: C-901", note: "Authoritative correction" } });
+        if (scenario === "candidate") {
+          // The old eligible fingerprint exists, but the newest candidate's document is rejected.
+          const olderDocument = await prisma.libraryDocument.create({ data: { batchId: (await prisma.libraryDocument.findUniqueOrThrow({ where: { id: file.libraryDocumentId! } })).batchId,
+            normalizedFileName: "older.txt", originalFileName: "older.txt" } });
+          await prisma.observationSession.create({ data: { libraryDocumentId: olderDocument.id, observerType: "OPENAI", status: "APPROVED",
+            observations: bridgeJson(original.observations)!, interpretations: [], explanation: [], planSuggestions: [], warnings: [] } });
+          await prisma.scannedFile.create({ data: { checksum: file.checksum, extractionStatus: "COMPLETED", fileType: file.fileType,
+            libraryDocumentId: olderDocument.id, localPath: file.localPath, relativePath: file.relativePath, sessionId: file.sessionId,
+            observationFingerprint: file.observationFingerprint, observationOrigin: "NEW_AI", processingStage: "EXAMINED",
+            readingStatus: "READ", readStatus: "SUPPORTED", sizeBytes: file.sizeBytes, previewText: file.previewText,
+            characterCount: file.characterCount, createdAt: new Date("2024-01-01") } });
+        }
+      }
+      if (scenario === "absent") await prisma.observationSession.deleteMany({ where: { libraryDocumentId: file.libraryDocumentId! } });
+      if (scenario === "fingerprint") await prisma.scannedFile.update({ data: { observationFingerprint: "wrong" }, where: { id: file.id } });
+      if (scenario === "path") await prisma.scannedFile.update({ data: { localPath: "bridge://wrong/path" }, where: { id: file.id } });
+      if (scenario === "size") await prisma.scannedFile.update({ data: { sizeBytes: BigInt(999) }, where: { id: file.id } });
+      if (scenario === "root") {
+        const other = await createCloudBackedBridgeRoot("OTHER_REUSE_ROOT", new Map([["notes.txt", Buffer.from("Workshop facilitation notes.")]]));
+        const excluded = await scannedFile(other.session.id, "notes.txt");
+        assert.equal(excluded.libraryDocumentId, null); assert.equal(excluded.observationOrigin, null);
+        return;
+      }
+      const next = await repeatCloudScan(root);
+      const target = await scannedFile(next.session.id, file.relativePath);
+      const allowed = ["rejected-approved", "approved-modified", "awaiting-control"].includes(scenario);
+      assert.equal(target.observationOrigin === "REUSED_AI", allowed);
+      if (allowed) {
+        assert.equal(target.libraryDocumentId, file.libraryDocumentId);
+        if (scenario === "approved-modified") assert.ok((await loadScanWorkingKnowledge(next.session.id)).files
+          .some((item) => item.trustedObservationEvidence.some((evidence) => evidence.includes("Corrected Alice"))));
+      } else {
+        assert.equal(target.libraryDocumentId, null);
+        assert.equal(target.processingStage, "READING");
+        assert.ok(!(await loadScanWorkingKnowledge(next.session.id)).files.some((item) => item.sourceEvidenceText.includes("Possible workshop notes")));
+      }
+    });
+  });
+}

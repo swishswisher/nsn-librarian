@@ -1,0 +1,158 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import { compareDocumentVersions, extractDocumentSignals, resolveDocumentEvidence, documentSignalEntityLabels } from "../../src/lib/bridge/document-signals";
+import { versionDominanceCounts, buildVersionStateIndex } from "../../src/lib/bridge/document-version-index";
+import { RelationshipCandidatePool } from "../../src/lib/bridge/relationship-candidate-pool";
+
+function verified(text: string, start = 0) {
+  return `Source characters ${start}-${start + text.length}: "${text}"`;
+}
+
+test("client identifiers resolve repeated mentions without merging same-name clients", () => {
+  const a = extractDocumentSignals(verified("Client: Alex Lee; Client ID: C-101; Project: Intake; Project ID: P-1"), "root-a");
+  const again = extractDocumentSignals(verified("Client: Alex Lee; Client ID: C-101; Project: Followup; Project ID: P-2"), "root-a");
+  const different = extractDocumentSignals(verified("Client: Alex Lee; Client ID: C-202; Project: Intake; Project ID: P-1"), "root-a");
+  assert.equal(a.find((item) => item.kind === "CLIENT")?.identityHash, again.find((item) => item.kind === "CLIENT")?.identityHash);
+  assert.notEqual(a.find((item) => item.kind === "CLIENT")?.identityHash, different.find((item) => item.kind === "CLIENT")?.identityHash);
+  assert.notEqual(a.find((item) => item.kind === "PROJECT")?.identityHash, again.find((item) => item.kind === "PROJECT")?.identityHash);
+  assert.notEqual(a.find((item) => item.kind === "PROJECT")?.identityHash, different.find((item) => item.kind === "PROJECT")?.identityHash);
+  assert.notEqual(a.find((item) => item.kind === "CLIENT")?.identityHash, extractDocumentSignals(verified("Client: Alex Lee; Client ID: C-101"), "root-b").find((item) => item.kind === "CLIENT")?.identityHash);
+});
+
+test("name-only and generic terminology stay unresolved", () => {
+  const source = extractDocumentSignals(verified("Client: Alex Lee; Project: General; workshop materials and payment notes"), "root-a");
+  assert.ok(source.some((item) => item.kind === "UNRESOLVED_CLIENT"));
+  assert.ok(source.some((item) => item.kind === "UNRESOLVED_PROJECT"));
+  assert.ok(!source.some((item) => item.kind === "CLIENT" || item.kind === "PROJECT"));
+  assert.deepEqual(extractDocumentSignals("The client and workshop share generic words.", "root-a"), []);
+  assert.ok(!extractDocumentSignals(verified("Person: Alex Lee; Email: info@example.org"), "root-a").some((item) => item.kind === "PERSON"));
+});
+
+test("conflicting explicit identifiers do not resolve to the first value", () => {
+  const signals = extractDocumentSignals(verified("Client: Alex Lee; Client ID: C-1; Client ID: C-2; Project: Outreach; Project ID: P-1; Project ID: P-2"), "root-a");
+  assert.ok(signals.some((item) => item.kind === "UNRESOLVED_CLIENT"));
+  assert.ok(signals.some((item) => item.kind === "UNRESOLVED_PROJECT"));
+  assert.ok(!signals.some((item) => item.kind === "CLIENT" || item.kind === "PROJECT"));
+  const revision = extractDocumentSignals(verified("Client ID: C-1; Document ID: D-1; Document ID: D-2; Document Title: Annual Plan; Version: v2"), "root-a");
+  assert.ok(!revision.some((item) => item.kind === "DOCUMENT_FAMILY"));
+});
+
+test("a project title reused in another year remains separate", () => {
+  const first = extractDocumentSignals(verified("Client: Acme; Client ID: C-1; Project: Outreach; Year: 2025"), "root-a");
+  const second = extractDocumentSignals(verified("Client: Acme; Client ID: C-1; Project: Outreach; Year: 2026"), "root-a");
+  assert.notEqual(first.find((item) => item.kind === "PROJECT")?.identityHash, second.find((item) => item.kind === "PROJECT")?.identityHash);
+});
+
+test("a person across projects and similar company names do not collapse project or organization identities", () => {
+  const first = extractDocumentSignals(verified("Person: Alex Lee; Email: alex@example.org; Client ID: C-1; Project ID: P-1; Organization: Acme Studio; Domain: acme-studio.example"), "root-a");
+  const second = extractDocumentSignals(verified("Person: Alex Lee; Email: alex@example.org; Client ID: C-1; Project ID: P-2; Organization: Acme Studios; Domain: acme-studios.example"), "root-a");
+  assert.equal(first.find((item) => item.kind === "PERSON")?.identityHash, second.find((item) => item.kind === "PERSON")?.identityHash);
+  assert.notEqual(first.find((item) => item.kind === "PROJECT")?.identityHash, second.find((item) => item.kind === "PROJECT")?.identityHash);
+  assert.notEqual(first.find((item) => item.kind === "ORGANIZATION")?.identityHash, second.find((item) => item.kind === "ORGANIZATION")?.identityHash);
+});
+
+test("workshop title needs date and scoped client or project evidence", () => {
+  const first = extractDocumentSignals(verified("Client: Acme; Client ID: C-1; Workshop: Boundaries; Date: 2026-08-03"), "root-a");
+  const other = extractDocumentSignals(verified("Client: Acme; Client ID: C-1; Workshop: Boundaries; Date: 2026-09-01"), "root-a");
+  assert.ok(first.some((item) => item.kind === "WORKSHOP"));
+  assert.notEqual(first.find((item) => item.kind === "WORKSHOP")?.identityHash, other.find((item) => item.kind === "WORKSHOP")?.identityHash);
+  assert.ok(!extractDocumentSignals(verified("Workshop: Boundaries"), "root-a").some((item) => item.kind === "WORKSHOP"));
+  assert.ok(!extractDocumentSignals(verified("Client ID: C-1; Workshop: Boundaries; Date: 2026-02-30"), "root-a").some((item) => item.kind === "WORKSHOP"));
+  const otherClient = extractDocumentSignals(verified("Client ID: C-2; Workshop: Boundaries; Date: 2026-08-03"), "root-a");
+  assert.notEqual(first.find((item) => item.kind === "WORKSHOP")?.identityHash, otherClient.find((item) => item.kind === "WORKSHOP")?.identityHash);
+});
+
+test("document family requires explicit identity and title, not a filename", () => {
+  const one = extractDocumentSignals(verified("Client ID: C-1; Document ID: D-42; Document Title: Annual Plan; Version: v1"), "root-a");
+  const two = extractDocumentSignals(verified("Client ID: C-1; Document ID: D-42; Document Title: Annual Plan; Version: v2"), "root-a");
+  assert.equal(one.find((item) => item.kind === "DOCUMENT_FAMILY")?.identityHash, two.find((item) => item.kind === "DOCUMENT_FAMILY")?.identityHash);
+  assert.equal(compareDocumentVersions(one.find((item) => item.kind === "DOCUMENT_FAMILY")!, two.find((item) => item.kind === "DOCUMENT_FAMILY")!), -1);
+  assert.ok(!extractDocumentSignals("final2.docx shares a template", "root-a").some((item) => item.kind === "DOCUMENT_FAMILY"));
+  assert.ok(!extractDocumentSignals(verified("Document ID: TEMPLATE-1; Document Title: Workshop Form; Version: v2"), "root-a").some((item) => item.kind === "DOCUMENT_FAMILY"));
+});
+
+test("conflicting revision dates leave ordering ambiguous", () => {
+  const one = extractDocumentSignals(verified("Client ID: C-1; Document ID: D-42; Document Title: Annual Plan; Version: v1; Date: 2026-10-01"), "root-a");
+  const two = extractDocumentSignals(verified("Client ID: C-1; Document ID: D-42; Document Title: Annual Plan; Version: v2; Date: 2026-09-01"), "root-a");
+  assert.equal(compareDocumentVersions(one.find((item) => item.kind === "DOCUMENT_FAMILY")!, two.find((item) => item.kind === "DOCUMENT_FAMILY")!), null);
+});
+
+test("source markers retain only hashes and source ranges", () => {
+  const text = "Client: Alex Lee; Client ID: C-101";
+  const signals = extractDocumentSignals(verified(text, 250), "root-a");
+  const serialized = JSON.stringify(signals);
+  assert.ok(!serialized.includes("Alex Lee") && !serialized.includes("C-101"));
+  assert.deepEqual(signals.find((item) => item.kind === "CLIENT")?.sourceRanges,
+    [{ start: 250, end: 266 }, { start: 268, end: 250 + text.length }]);
+});
+
+test("dominance oracle agrees with comparator for missing, equivalent and conflicting markers", () => {
+  const members = [null, "0", "1", "1.0", "1.2", "2", "10", "10000000000000001000000000", "10000000000000002000000000"].flatMap((revisionNumber) =>
+    [null, "2026-01-01", "2026-02-01"].map((revisionDate, index) => ({
+      revisionNumber, revisionDate, checksum: `checksum-${index}`, fileKey: crypto.randomUUID(),
+      connectedLibraryId: "root", identityHash: "family", observationSessionId: crypto.randomUUID(),
+    })));
+  for (const ordered of [members, [...members].reverse()]) {
+    for (const older of [false, true]) {
+      const counts = versionDominanceCounts(ordered, undefined, older);
+      for (const row of ordered) assert.equal(counts.get(row), ordered.filter((other) =>
+        compareDocumentVersions(other, row) === (older ? -1 : 1)).length);
+    }
+    const state = buildVersionStateIndex(ordered, new Map(), () => "");
+    for (const row of ordered) assert.equal(state.superseded.has(`${row.connectedLibraryId}\0${row.fileKey}\0${row.checksum}`),
+      ordered.some((other) => other.checksum !== row.checksum && compareDocumentVersions(other, row) === 1));
+    const pool = new RelationshipCandidatePool(ordered, true);
+    const removed = new Set<number>();
+    for (const current of ordered) {
+      const excluded = new Set([0, 3]);
+      const expected = ordered.findIndex((other, index) => !removed.has(index) && !excluded.has(index) &&
+        other.observationSessionId !== current.observationSessionId && other.checksum !== current.checksum && compareDocumentVersions(other, current) !== null);
+      assert.equal(pool.first(current, excluded), expected < 0 ? undefined : expected);
+      if (expected >= 0) { pool.set(expected, false); removed.add(expected); }
+    }
+  }
+});
+
+for (const kind of ["CLIENT", "PROJECT"] as const) {
+  test(`canonical typed provenance ${kind} shares signals and bindings across evidence boundaries and ordering`, () => {
+    const label = kind === "CLIENT" ? "Client" : "Project";
+    for (const position of [9, 23, 24]) for (const conflict of [false, true]) {
+      const texts = Array.from({ length: 24 }, (_, index) => `Note: filler ${index}`);
+      texts[0] = `${label} ID: PARITY-101${conflict ? `; ${label}: Alison River` : ""}`;
+      texts[position - 1] = `${label}: ${conflict ? "Jamie Brook" : "Alison River"}`;
+      const encode = (ordered: string[]) => ordered.map((text, index) => verified(text, index * 200)).join("\n");
+      const canonical = encode(texts);
+      const resolution = resolveDocumentEvidence(canonical, "root-a");
+      const signal = resolution.signals.find((row) => row.kind === kind)!;
+      const entity = resolution.entities.find((row) => row.kind === kind)!;
+      assert.equal(entity.nameConflicting, conflict);
+      assert.deepEqual(entity.labels, conflict ? ["parity-101"] : ["parity-101", "alison river"]);
+      assert.deepEqual(extractDocumentSignals(canonical, "root-a"), resolution.signals);
+      assert.deepEqual(documentSignalEntityLabels(resolution, kind, signal.sourceRanges, false, { ...signal, connectedLibraryId: "root-a" }), entity.labels);
+      assert.deepEqual(documentSignalEntityLabels(resolution, kind, signal.sourceRanges, false, { ...signal, connectedLibraryId: "other-root" }), []);
+      const reversed = resolveDocumentEvidence(encode([...texts].reverse()), "root-a");
+      assert.deepEqual(reversed.entities.map((row) => [row.kind, row.identityHash, row.labels, row.nameConflicting]),
+        resolution.entities.map((row) => [row.kind, row.identityHash, row.labels, row.nameConflicting]));
+    }
+    for (const conflict of [false, true]) {
+      const edited = `${label} ID: EDIT-101; ${label}: Alison River${conflict ? `; ${label}: Jamie Brook` : ""}; Note: ${"x".repeat(240)}`;
+      assert.ok(edited.length > 280 && edited.length < 400);
+      const resolution = resolveDocumentEvidence(edited, "root-a", true);
+      const signal = resolution.signals.find((row) => row.kind === kind)!;
+      assert.deepEqual(signal.sourceRanges, []);
+      assert.deepEqual(documentSignalEntityLabels(resolution, kind, [], false, { ...signal, connectedLibraryId: "root-a" }),
+        conflict ? ["edit-101"] : ["edit-101", "alison river"]);
+    }
+    // Only the first 24 verified excerpts are canonical; their ordering defines
+    // window membership, while reordering within that window leaves semantics intact.
+    const outside = Array.from({ length: 25 }, (_, index) => verified(index === 0 ? `${label} ID: WINDOW-101` :
+      index === 24 ? `${label}: Outside Name` : `Note: filler ${index}`, index * 200)).join("\n");
+    assert.deepEqual(resolveDocumentEvidence(outside, "root-a").entities.find((row) => row.kind === kind)!.labels, ["window-101"]);
+    const text = `${label}: Alison River`;
+    const legacy = resolveDocumentEvidence(verified(text, 50), "root-a");
+    const legacyIdentity = { connectedLibraryId: "root-a", identityHash: "legacy-name-only" };
+    assert.deepEqual(documentSignalEntityLabels(legacy, kind, [{ start: 50, end: 50 + text.length }], false, legacyIdentity), ["alison river"]);
+    assert.deepEqual(documentSignalEntityLabels(legacy, kind, [{ start: 50, end: 49 + text.length }], false, legacyIdentity), []);
+  });
+}

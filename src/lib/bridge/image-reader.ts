@@ -1,4 +1,4 @@
-import { getPrismaClient } from "@/lib/db/prisma";
+import { getLocalReadClient as getPrismaClient, withLocalReadAuthority, withVerifiedLocalRead } from "./local-read-authority";
 import { sanitizeReadingWarning } from "@/lib/reading-room/utils";
 
 import {
@@ -612,7 +612,11 @@ async function extractPreviewFromImageFile(
   };
 }
 
-export async function readScannedImageFile(
+export async function readScannedImageFile(scannedFileId: string, owner?: Date): Promise<BridgeReadFileApiSuccess> {
+  return withLocalReadAuthority(scannedFileId, () => readScannedImageFileOwned(scannedFileId), owner);
+}
+
+async function readScannedImageFileOwned(
   scannedFileId: string,
 ): Promise<BridgeReadFileApiSuccess> {
   const prisma = getPrismaClient();
@@ -742,6 +746,10 @@ export async function readScannedImageFile(
 }
 
 export async function readScannedImageFileTransient(scannedFileId: string) {
+  return withVerifiedLocalRead(scannedFileId, () => readScannedImageFileTransientVerified(scannedFileId));
+}
+
+async function readScannedImageFileTransientVerified(scannedFileId: string) {
   const scannedFile = await scannedImageFileForRead(scannedFileId);
 
   if (!scannedFile) {

@@ -121,6 +121,7 @@ function root(
       id: scanSessionId,
       startedAt: "2026-08-28T10:00:00.000Z",
       status: "COMPLETED",
+      searchIndexStatus: "NOT_ATTEMPTED",
     },
     platform: "MACOS",
     status: "CONNECTED",
@@ -334,7 +335,8 @@ describe("Library folder explorer", () => {
     ].join("\n");
 
     assert.doesNotMatch(source, /\b(unlink|rename|writeFile|mkdir|rm)\s*\(/);
-    assert.doesNotMatch(source, /\bfetch\s*\(/);
+    assert.match(source, /\/api\/library\/search\?q=/);
+    assert.doesNotMatch(source, /\/api\/bridge\/(?:organization-plans|execution-runs)/);
     assert.match(source, /\[overflow-wrap:anywhere\]/);
     assert.match(source, /min-w-0/);
     assert.match(source, /flex-wrap/);

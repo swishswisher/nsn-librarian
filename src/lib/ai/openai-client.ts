@@ -8,6 +8,7 @@ export const OPENAI_DEFAULT_MODEL = "gpt-4o-mini";
 export const OPENAI_DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 
 type OpenAIJsonRequest = {
+  model?: string;
   instructions: string;
   input: string;
   schemaName: string;
@@ -25,6 +26,10 @@ export type OpenAIJsonResponse = {
   model: string;
   output: AIJsonValue;
   warnings: string[];
+  httpAttempts: number;
+  completed: boolean;
+  inputTokens: number | null;
+  outputTokens: number | null;
 };
 
 export type OpenAIAudioTranscriptionResponse = {
@@ -41,7 +46,7 @@ export class OpenAIProviderConfigurationError extends Error {
 }
 
 export class OpenAIProviderError extends Error {
-  constructor(message: string) {
+  constructor(message: string, readonly httpAttempts = 0) {
     super(message);
     this.name = "OpenAIProviderError";
   }
@@ -100,6 +105,7 @@ function parseJsonOutput(value: string): AIJsonValue {
 }
 
 export async function requestOpenAIJson({
+  model,
   instructions,
   input,
   maxOutputTokens,
@@ -108,23 +114,38 @@ export async function requestOpenAIJson({
   schemaName,
 }: OpenAIJsonRequest): Promise<OpenAIJsonResponse> {
   const config = readOpenAIConfig();
-  const client = new OpenAI({ apiKey: config.apiKey });
-  const response = await client.responses.create({
-    model: config.model,
-    instructions,
-    input,
-    max_output_tokens: maxOutputTokens,
-    store: false,
-    text: {
-      format: {
-        type: "json_schema",
-        name: schemaName,
-        description: schemaDescription,
-        strict: true,
-        schema,
-      },
+  let httpAttempts = 0;
+  const client = new OpenAI({
+    apiKey: config.apiKey,
+    maxRetries: 2,
+    timeout: 90_000,
+    fetch: (input, init) => {
+      httpAttempts += 1;
+      return fetch(input, init);
     },
   });
+  let response;
+
+  try {
+    response = await client.responses.create({
+      model: model?.trim() || config.model,
+      instructions,
+      input,
+      max_output_tokens: maxOutputTokens,
+      store: false,
+      text: {
+        format: {
+          type: "json_schema",
+          name: schemaName,
+          description: schemaDescription,
+          strict: true,
+          schema,
+        },
+      },
+    });
+  } catch {
+    throw new OpenAIProviderError("AI observation was unavailable.", httpAttempts);
+  }
   const warnings: string[] = [];
 
   if (response.status && response.status !== "completed") {
@@ -136,14 +157,26 @@ export async function requestOpenAIJson({
   }
 
   if (response.error?.message) {
-    throw new OpenAIProviderError(response.error.message);
+    throw new OpenAIProviderError("AI observation was unavailable.", httpAttempts);
+  }
+
+  let output: AIJsonValue;
+
+  try {
+    output = parseJsonOutput(response.output_text);
+  } catch {
+    throw new OpenAIProviderError("AI observation could not be read.", httpAttempts);
   }
 
   return {
     responseId: response.id,
     model: response.model ?? config.model,
-    output: parseJsonOutput(response.output_text),
+    output,
     warnings,
+    httpAttempts,
+    completed: response.status === "completed" && !response.incomplete_details,
+    inputTokens: response.usage?.input_tokens ?? null,
+    outputTokens: response.usage?.output_tokens ?? null,
   };
 }
 

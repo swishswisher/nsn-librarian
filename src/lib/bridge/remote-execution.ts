@@ -1,14 +1,17 @@
+import { physicalResultIndex, physicalResultState, physicalResultChanged } from "./physical-result-authority";
+import { requireExecutionReconciliation } from "./execution-reconciliation";
+import { isCurrentReadableRoot } from "./current-readable-root";
+import { claimPlanExecution } from "./plan-execution-authority";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 
 import type {
   BridgeCommandReport,
   BridgeJson,
 } from "../../../packages/bridge-protocol/src";
 import { getPrismaClient } from "@/lib/db/prisma";
-import { recordExecutionNotebookEntry } from "@/lib/library/notebook";
 
 import {
   BridgeCloudError,
@@ -36,6 +39,7 @@ type RemotePlanAction = {
     | "RENAME_FILE"
     | "MOVE_AND_RENAME_FILE";
   sourceRelativePath: string | null;
+  sourceScannedFileId: string | null;
   sourceChecksum: string | null;
   sourceLastModified: string | null;
   sourceSizeBytes: string | null;
@@ -46,6 +50,7 @@ type RemotePlanAction = {
 type LoadedRemotePlan = {
   plan: {
     id: string;
+    updatedAt: Date;
     scanSessionId: string;
     connectedLibraryId: string;
     status: string;
@@ -242,8 +247,8 @@ function requiresPermission(
   return null;
 }
 
-async function loadRemotePlan(planId: string): Promise<LoadedRemotePlan | null> {
-  const prisma = getPrismaClient();
+async function loadRemotePlan(planId: string, transaction?: Prisma.TransactionClient): Promise<LoadedRemotePlan | null> {
+  const prisma = transaction ?? getPrismaClient();
   const plan = await prisma.organizationPlan.findUnique({
     include: {
       connectedLibrary: {
@@ -327,7 +332,7 @@ async function loadRemotePlan(planId: string): Promise<LoadedRemotePlan | null> 
     );
   }
 
-  if (!plan.connectedLibrary.isEnabled || plan.connectedLibrary.status === "DISCONNECTED") {
+  if (!isCurrentReadableRoot(plan.connectedLibrary)) {
     blockingIssues.push(
       issue({
         category: "BRIDGE_UNAVAILABLE",
@@ -519,6 +524,7 @@ async function loadRemotePlan(planId: string): Promise<LoadedRemotePlan | null> 
       destinationRelativePath,
       id: action.id,
       sequence: index + 1,
+      sourceScannedFileId: file?.id ?? null,
       sourceChecksum: file?.checksum ?? null,
       sourceLastModified: file?.lastModified?.toISOString() ?? null,
       sourceRelativePath,
@@ -643,121 +649,50 @@ export async function queueRemoteOrganizationPlanExecution(
     );
   }
 
-  const loaded = await loadRemotePlan(planId);
-
-  if (!loaded) {
-    return null;
-  }
-
-  if (!loaded.preview.canExecute) {
-    throw new BridgeExecutorError(
-      "The Bridge found safety issues that must be resolved before execution.",
-      422,
-      loaded.preview,
-    );
-  }
-
   const prisma = getPrismaClient();
-  const executionActionIds = loaded.normalizedActions.map(() =>
-    `execution_action_${randomUUID()}`,
-  );
-  const permissionSnapshot = {
-    createFolderPermission: loaded.plan.connectedLibrary.createFolderPermission,
-    moveFilePermission: loaded.plan.connectedLibrary.moveFilePermission,
-    readPermission: loaded.plan.connectedLibrary.readPermission,
-    renameFilePermission: loaded.plan.connectedLibrary.renameFilePermission,
-  };
-  const run = await prisma.executionRun.create({
-    data: {
-      bridgeDeviceId: loaded.plan.connectedLibrary.bridgeDeviceId,
-      bridgeRootId: loaded.plan.connectedLibrary.bridgeRootId,
-      connectedLibraryId: loaded.plan.connectedLibraryId,
-      organizationPlanId: loaded.plan.id,
-      permissionSnapshot: jsonInput(permissionSnapshot),
-      status: "PENDING",
-      totalActions: loaded.normalizedActions.length,
-      actions: {
-        create: loaded.normalizedActions.map((action, index) => ({
-          actionType: action.actionType,
-          destinationRelativePath: action.destinationRelativePath,
-          id: executionActionIds[index],
-          sequence: action.sequence,
-          sourceChecksumBefore: action.sourceChecksum,
-          sourceRelativePath: action.sourceRelativePath ?? "",
-          status: "PENDING",
-        })),
-      },
-    },
-  });
-  const commandActions = loaded.normalizedActions.map((action, index) => ({
-    ...action,
-    id: executionActionIds[index],
-  }));
-
-  try {
-    const command = await createBridgeCloudCommand({
-      authorizationContext: {
-        approvedBy: "Deanne",
-        confirmation: "EXECUTE",
-        executionRunId: run.id,
-        purpose: "Execute only the approved Organization Plan on the paired Mac.",
-      },
-      bridgeDeviceId: loaded.plan.connectedLibrary.bridgeDeviceId as string,
-      bridgeRootId: loaded.plan.connectedLibrary.bridgeRootId,
-      commandType: "EXECUTE_PLAN",
-      connectedLibraryId: loaded.plan.connectedLibraryId,
-      idempotencyKey: `execute-plan:${loaded.plan.id}:${run.id}`,
-      payload: {
-        actions: commandActions,
-        executionRunId: run.id,
-        organizationPlanId: loaded.plan.id,
-        scanSessionId: loaded.plan.scanSessionId,
-      },
-    });
-    const pageData = await getOrganizationPlanPageData(loaded.plan.scanSessionId);
-
-    if (!pageData?.plan || !pageData.latestExecution) {
-      throw new BridgeCloudError(
-        "The Librarian could not refresh the queued execution.",
-        500,
-      );
+  const admitted = await prisma.$transaction(async (tx) => {
+    const binding = await tx.organizationPlan.findUnique({ include: { connectedLibrary: true }, where: { id: planId } });
+    if (!binding?.connectedLibrary.bridgeDeviceId) return null;
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${binding.connectedLibrary.bridgeDeviceId} FOR SHARE`);
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id = ${binding.connectedLibraryId} FOR SHARE`);
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "ScanSession" WHERE id = ${binding.scanSessionId} FOR UPDATE`);
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "OrganizationPlan" WHERE id = ${planId} FOR UPDATE`);
+    const loaded = await loadRemotePlan(planId, tx);
+    if (!loaded) return null;
+    if (!loaded.preview.canExecute) throw new BridgeExecutorError("The Bridge found safety issues that must be resolved before execution.", 422, loaded.preview);
+    if (!await claimPlanExecution(tx, loaded.plan)) {
+      throw new BridgeExecutorError("This plan changed, execution already started, or its current authorization is unavailable.", 409, loaded.preview);
     }
-
-    return {
-      command,
-      plan: pageData.plan,
-      preview: loaded.preview,
-      queuedExecution: true,
-      run: pageData.latestExecution,
-    };
-  } catch (error) {
-    await prisma.executionRun.update({
-      data: {
-        completedAt: new Date(),
-        errorCategory: "COMMAND_QUEUE_FAILED",
-        failedActions: loaded.normalizedActions.length,
-        safeErrorCategory: "BRIDGE_UNAVAILABLE",
-        status: "BLOCKED",
-      },
-      where: { id: run.id },
-    });
-    throw error;
-  }
-}
-
-function executionStatus(value: unknown): ExecutionStatus {
-  return value === "COMPLETED" ||
-    value === "PARTIALLY_COMPLETED" ||
-    value === "FAILED" ||
-    value === "BLOCKED"
-    ? value
-    : "FAILED";
+    const commandActions = loaded.normalizedActions.map((action) => ({ ...action, id: `execution_action_${randomUUID()}` }));
+    const run = await tx.executionRun.create({ data: {
+      bridgeDeviceId: loaded.plan.connectedLibrary.bridgeDeviceId, bridgeRootId: loaded.plan.connectedLibrary.bridgeRootId,
+      connectedLibraryId: loaded.plan.connectedLibraryId, organizationPlanId: loaded.plan.id,
+      permissionSnapshot: jsonInput({ createFolderPermission: loaded.plan.connectedLibrary.createFolderPermission,
+        moveFilePermission: loaded.plan.connectedLibrary.moveFilePermission, readPermission: loaded.plan.connectedLibrary.readPermission,
+        renameFilePermission: loaded.plan.connectedLibrary.renameFilePermission }), status: "PENDING", totalActions: commandActions.length,
+      actions: { create: commandActions.map((action) => ({ actionType: action.actionType, destinationRelativePath: action.destinationRelativePath,
+        id: action.id, sequence: action.sequence, sourceScannedFileId: action.sourceScannedFileId, sourceChecksumBefore: action.sourceChecksum, sourceRelativePath: action.sourceRelativePath ?? "", status: "PENDING" })) },
+    } });
+    const command = await createBridgeCloudCommand({ authorizationContext: { approvedBy: "Deanne", confirmation: "EXECUTE", executionRunId: run.id,
+        purpose: "Execute only the approved Organization Plan on the paired Mac." },
+      bridgeDeviceId: loaded.plan.connectedLibrary.bridgeDeviceId!, bridgeRootId: loaded.plan.connectedLibrary.bridgeRootId,
+      commandType: "EXECUTE_PLAN", connectedLibraryId: loaded.plan.connectedLibraryId, idempotencyKey: `execute-plan:${loaded.plan.id}:${run.id}`,
+      payload: { actions: commandActions, executionRunId: run.id, organizationPlanId: loaded.plan.id, scanSessionId: loaded.plan.scanSessionId },
+    }, tx);
+    return { loaded, command };
+  }, { isolationLevel: "Serializable", timeout: 120_000 });
+  if (!admitted) return null;
+  // Presentation failure cannot relinquish a committed physical command.
+  const pageData = await getOrganizationPlanPageData(admitted.loaded.plan.scanSessionId);
+  if (!pageData?.plan || !pageData.latestExecution) throw new BridgeCloudError("Execution was queued; refresh its history.", 503);
+  return { command: admitted.command, plan: pageData.plan, preview: admitted.loaded.preview, queuedExecution: true, run: pageData.latestExecution };
 }
 
 export async function applyRemoteExecutionReport(input: {
   commandPayload: unknown;
   report: BridgeCommandReport;
-}) {
+}, transaction?: Prisma.TransactionClient): Promise<BridgeJson> {
+  if (!transaction) return getPrismaClient().$transaction((tx) => applyRemoteExecutionReport(input, tx), { timeout: 120_000 });
   const payload = objectValue(input.commandPayload);
   const executionRunId =
     typeof payload?.executionRunId === "string" ? payload.executionRunId : null;
@@ -769,7 +704,11 @@ export async function applyRemoteExecutionReport(input: {
     );
   }
 
-  const prisma = getPrismaClient();
+  const prisma = transaction;
+  const binding = await prisma.executionRun.findUniqueOrThrow({ where: { id: executionRunId }, include: { connectedLibrary: true } });
+  if (binding.connectedLibrary.bridgeDeviceId) await prisma.$queryRaw`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${binding.connectedLibrary.bridgeDeviceId} FOR SHARE`;
+  await prisma.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE id = ${binding.connectedLibraryId} FOR UPDATE`;
+  await prisma.$queryRaw(Prisma.sql`SELECT id FROM "ExecutionRun" WHERE id = ${executionRunId} FOR UPDATE`);
   const run = await prisma.executionRun.findUnique({
     include: {
       actions: true,
@@ -785,51 +724,49 @@ export async function applyRemoteExecutionReport(input: {
     );
   }
 
+  if (!["PENDING", "RUNNING"].includes(run.status)) {
+    const stored = await prisma.executionRun.findUniqueOrThrow({ include: { actions: true, undoRuns: { include: { actions: true } } }, where: { id: run.id } });
+    return summarizeExecutionRun(stored) as unknown as BridgeJson;
+  }
   const result = objectValue(input.report.result);
-  const resultActions = Array.isArray(result?.actions)
-    ? result.actions.map(objectValue).filter(Boolean)
-    : [];
+  const resultActions = physicalResultIndex(result?.actions, run.actions.map((action) => ({ ...action,
+    sourceRelativePath: action.sourceRelativePath || null, checksum: action.sourceChecksumBefore })));
   const completedAt = new Date();
   let completedActions = 0;
   let failedActions = 0;
+  let pendingActions = 0;
 
   for (const action of run.actions) {
-    const resultAction = resultActions.find(
-      (item) => item?.actionId === action.id,
-    );
-    const actionStatus =
-      resultAction?.status === "COMPLETED"
-        ? "COMPLETED"
-        : resultAction?.status === "FAILED"
-          ? "FAILED"
-          : input.report.status === "COMPLETED"
-            ? "BLOCKED"
-            : "FAILED";
+    const resultAction: Record<string, unknown> | undefined = action.status === "COMPLETED" ? { actionId: action.id, status: "COMPLETED",
+      sourceChecksumBefore: action.sourceChecksumBefore, destinationChecksumAfter: action.destinationChecksumAfter,
+      safeErrorCategory: action.safeErrorCategory, createdFilesystemItem: action.createdFilesystemItem } : resultActions.get(action.id);
+    const actionStatus = physicalResultState(resultAction);
 
     if (actionStatus === "COMPLETED") {
       completedActions += 1;
+    } else if (actionStatus === "PENDING") {
+      pendingActions += 1;
     } else {
       failedActions += 1;
     }
 
+    if (action.status === "COMPLETED") continue;
+
     await prisma.executionAction.update({
       data: {
-        completedAt,
-        createdFilesystemItem: resultAction?.createdFilesystemItem === true,
+        completedAt: actionStatus === "PENDING" ? null : completedAt,
+        createdFilesystemItem: actionStatus === "COMPLETED" && resultAction?.createdFilesystemItem === true,
         destinationChecksumAfter:
-          typeof resultAction?.destinationChecksumAfter === "string"
+          actionStatus === "COMPLETED" && typeof resultAction?.destinationChecksumAfter === "string"
             ? resultAction.destinationChecksumAfter
             : null,
         safeErrorCategory:
-          typeof resultAction?.safeErrorCategory === "string"
+          actionStatus === "PENDING" ? "COMMAND_RECOVERY_REQUIRED" : typeof resultAction?.safeErrorCategory === "string"
             ? resultAction.safeErrorCategory
             : actionStatus === "COMPLETED"
               ? null
               : input.report.safeErrorCategory ?? "EXECUTION_BLOCKED",
-        sourceChecksumBefore:
-          typeof resultAction?.sourceChecksumBefore === "string"
-            ? resultAction.sourceChecksumBefore
-            : action.sourceChecksumBefore,
+        sourceChecksumBefore: action.sourceChecksumBefore,
         startedAt: action.startedAt ?? run.startedAt,
         status: actionStatus,
       },
@@ -843,34 +780,32 @@ export async function applyRemoteExecutionReport(input: {
           relativePath: action.destinationRelativePath,
         },
         where: {
-          relativePath: action.sourceRelativePath,
+          ...(action.sourceScannedFileId ? { id: action.sourceScannedFileId } : {}),
+          checksum: action.sourceChecksumBefore, relativePath: action.sourceRelativePath,
           sessionId: run.organizationPlan.scanSessionId,
         },
       });
     }
   }
 
-  const innerStatus = executionStatus(result?.status);
-  const status: ExecutionStatus =
-    input.report.status === "COMPLETED"
-      ? innerStatus
-      : completedActions > 0
-        ? "PARTIALLY_COMPLETED"
-        : "FAILED";
+  const changed = run.actions.some((action) => action.status !== "COMPLETED" && physicalResultChanged(action.actionType, resultActions.get(action.id)));
+  if (changed) await requireExecutionReconciliation(prisma, run.id);
+  else if (pendingActions && !["REQUIRED", "IN_PROGRESS"].includes(run.reconciliationStatus)) await prisma.executionRun.update({ where: { id: run.id }, data: { reconciliationStatus: "INSPECTION_REQUIRED" } });
+  else if (!pendingActions && run.reconciliationStatus === "INSPECTION_REQUIRED") await prisma.executionRun.update({ where: { id: run.id }, data: { reconciliationStatus: "NOT_REQUESTED" } });
+  const status: ExecutionStatus = pendingActions > 0 ? "RUNNING" : completedActions === run.totalActions && failedActions === 0 && run.totalActions > 0
+    ? "COMPLETED" : completedActions > 0 ? "PARTIALLY_COMPLETED" : "FAILED";
   const durationMs = Math.max(0, completedAt.getTime() - run.startedAt.getTime());
 
-  await prisma.$transaction([
-    prisma.executionRun.update({
+  await prisma.executionRun.update({
       data: {
         completedActions: completedActions + failedActions,
-        completedAt,
+        completedAt: pendingActions ? null : completedAt,
         durationMs,
         errorCategory:
           status === "COMPLETED" ? null : "REMOTE_EXECUTION_INCOMPLETE",
         failedActions,
-        reconciliationStatus: "REQUIRED",
         safeErrorCategory:
-          status === "COMPLETED"
+          pendingActions ? "COMMAND_RECOVERY_REQUIRED" : status === "COMPLETED"
             ? null
             : input.report.safeErrorCategory ??
               (typeof result?.safeErrorCategory === "string"
@@ -880,8 +815,8 @@ export async function applyRemoteExecutionReport(input: {
         successfulActions: completedActions,
       },
       where: { id: run.id },
-    }),
-    prisma.organizationPlan.update({
+    });
+  await prisma.organizationPlan.update({
       data: {
         status:
           completedActions > 0 || status === "COMPLETED"
@@ -889,9 +824,7 @@ export async function applyRemoteExecutionReport(input: {
             : run.organizationPlan.status,
       },
       where: { id: run.organizationPlanId },
-    }),
-  ]);
-  await recordExecutionNotebookEntry(run.id);
+    });
   const stored = await prisma.executionRun.findUnique({
     include: {
       actions: { orderBy: { sequence: "asc" } },
