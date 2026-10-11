@@ -17,14 +17,14 @@ export async function POST(
 
   try {
     const bodyText = await request.text();
-    await authenticateBridgeDeviceRequest({
+    const authenticated = await authenticateBridgeDeviceRequest({
       bodyText,
       bridgeDeviceId: deviceId,
       request,
     });
 
     return Response.json({
-      command: await acknowledgeBridgeCloudCommand(deviceId, commandId),
+      command: await acknowledgeBridgeCloudCommand(deviceId, commandId, authenticated.publicKey),
       ok: true,
     });
   } catch (error) {

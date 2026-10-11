@@ -63,7 +63,7 @@ function bridgeFileIdentity(value: string, caseInsensitive: boolean) {
   };
 }
 
-function stableLocalFilePath(value: string | null | undefined, platform: string) {
+export function stableLocalFilePath(value: string | null | undefined, platform: string) {
   const trimmed = value?.trim();
 
   if (!trimmed) {
@@ -119,7 +119,7 @@ export function samePhysicalFilePresentation(
   );
 }
 
-function connectedRootAliases(
+export function connectedRootAliases(
   root: PhysicalRootIdentity,
   fileLocalPath?: string | null,
 ) {

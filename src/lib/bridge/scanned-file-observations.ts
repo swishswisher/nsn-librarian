@@ -1,5 +1,8 @@
 import path from "node:path";
+import type { Prisma } from "@prisma/client";
+import { claimObservationLease, latestObservationOrder, usableObservation, withOwnedObservationLease } from "./observation-authority";
 
+import { observationFingerprint, observationProcessingVersion } from "@/lib/ai/observation-processing";
 import { getPrismaClient } from "@/lib/db/prisma";
 import {
   createObservationSessionFromReadableDocument,
@@ -83,8 +86,7 @@ function itemKindForExtension(extension: string | null): KnowledgeItemKind {
           : "UNKNOWN";
 }
 
-async function bridgeBatchFor(displayName: string) {
-  const prisma = getPrismaClient();
+async function bridgeBatchFor(displayName: string, prisma: Prisma.TransactionClient = getPrismaClient()) {
   const batchName = `Bridge scan: ${displayName}`;
   const existingBatch = await prisma.libraryBatch.findFirst({
     orderBy: {
@@ -111,8 +113,7 @@ async function bridgeBatchFor(displayName: string) {
   });
 }
 
-async function scannedFileWithFolder(scannedFileId: string) {
-  const prisma = getPrismaClient();
+async function scannedFileWithFolder(scannedFileId: string, prisma: Prisma.TransactionClient = getPrismaClient()) {
 
   return prisma.scannedFile.findUnique({
     include: {
@@ -136,9 +137,9 @@ async function metadataDocumentForScannedFile(
   scannedFileId: string,
   previewText: string | null,
   wordCount: number,
+  prisma: Prisma.TransactionClient = getPrismaClient(),
 ) {
-  const prisma = getPrismaClient();
-  const scannedFile = await scannedFileWithFolder(scannedFileId);
+  const scannedFile = await scannedFileWithFolder(scannedFileId, prisma);
 
   if (!scannedFile) {
     throw new ObservationSessionError(
@@ -170,7 +171,9 @@ async function metadataDocumentForScannedFile(
       },
     });
 
-    if (existingDocument) {
+    if (existingDocument && await prisma.scannedFile.count({
+      where: { libraryDocumentId: existingDocument.id },
+    }) <= 1) {
       return prisma.libraryDocument.update({
         data: documentData,
         where: {
@@ -181,7 +184,7 @@ async function metadataDocumentForScannedFile(
   }
 
   const batch = await bridgeBatchFor(
-    scannedFile.scanSession.connectedFolder.displayName,
+    scannedFile.scanSession.connectedFolder.displayName, prisma,
   );
   const document = await prisma.libraryDocument.create({
     data: {
@@ -215,10 +218,97 @@ export async function createObservationSessionForScannedFile(
   );
 }
 
+async function completeScannedObservation(prisma: Prisma.TransactionClient, scannedFileId: string,
+  readResult: BridgeReadFileApiSuccess,
+  observation: Pick<Awaited<ReturnType<typeof createObservationSessionFromReadableDocument>>, "observerType" | "aiUsage" | "result">) {
+  const scannedFile = await prisma.scannedFile.findUnique({
+    select: {
+      checksum: true,
+      fileType: true,
+      relativePath: true,
+      scanSession: {
+        select: {
+          connectedFolder: {
+            select: {
+              bridgeDeviceId: true,
+              bridgeRootId: true,
+              bridgeDevice: { select: { appVersion: true } },
+              id: true,
+            },
+          },
+        },
+      },
+      sessionId: true,
+    },
+    where: {
+      id: scannedFileId,
+    },
+  });
+
+  if (scannedFile) {
+    const library = scannedFile.scanSession.connectedFolder;
+    const canReuse = observation.observerType === "OPENAI" &&
+      observation.aiUsage?.sourceComplete === true &&
+      observation.result.observations.length > 0 &&
+      readResult.preview.characterCount === readResult.preview.extractedText.length &&
+      readResult.preview.sourceChecksum?.toLowerCase() === scannedFile.checksum?.toLowerCase() &&
+      library.bridgeDeviceId && library.bridgeRootId && library.bridgeDevice;
+    const fingerprint = canReuse
+      ? observationFingerprint({
+          bridgeDeviceId: library.bridgeDeviceId!,
+          bridgeRootId: library.bridgeRootId!,
+          bridgeVersion: library.bridgeDevice!.appVersion,
+          checksum: scannedFile.checksum,
+          connectedLibraryId: library.id,
+          fileType: scannedFile.fileType,
+          relativePath: scannedFile.relativePath,
+        })
+      : null;
+    await prisma.scannedFile.update({
+        data: {
+          aiHttpAttempts: observation.aiUsage?.httpAttempts ?? 0,
+          aiInputTokens: observation.aiUsage?.inputTokens ?? null,
+          aiModel: observation.aiUsage?.model ?? null,
+          aiOutputTokens: observation.aiUsage?.outputTokens ?? null,
+          aiRequestCount: observation.aiUsage?.requestCount ?? 0,
+          observationClaimedAt: null,
+          observationFingerprint: fingerprint,
+          observationVersion: observation.observerType === "OPENAI" ? observationProcessingVersion : null,
+          observationOrigin: observation.observerType === "OPENAI" ? "NEW_AI" : "BASIC",
+          processedAt: new Date(),
+          processingErrorCategory: null,
+          processingStage: "EXAMINED",
+          readingStatus: "READ", extractionStatus: "COMPLETED",
+        },
+        where: {
+          id: scannedFileId,
+        },
+      });
+    await prisma.scanSession.update({
+        data: {
+          observationsCreated: {
+            increment: 1,
+          },
+        },
+        where: {
+          id: scannedFile.sessionId,
+        },
+      });
+  }
+
+}
+
 export async function createObservationSessionForScannedFileReadResult(
   scannedFileId: string,
   readResult: BridgeReadFileApiSuccess,
+  claimedAt?: Date,
 ) {
+  if (!claimedAt) {
+    const owner = await claimObservationLease(scannedFileId);
+    try { return await createObservationSessionForScannedFileReadResult(scannedFileId, readResult, owner); }
+    finally { await getPrismaClient().scannedFile.updateMany({ data: { observationClaimedAt: null },
+      where: { id: scannedFileId, observationClaimedAt: owner } }); }
+  }
   const prisma = getPrismaClient();
   const fileForStage = await prisma.scannedFile.findUnique({
     select: {
@@ -229,25 +319,25 @@ export async function createObservationSessionForScannedFileReadResult(
     },
   });
 
-  await prisma.scannedFile.update({
-    data: {
+  const stage = {
       processingErrorCategory: null,
       processingStage:
         fileForStage && isImageFileType(fileForStage.fileType)
           ? "OBSERVING"
           : "EXAMINING",
-    },
-    where: {
-      id: scannedFileId,
-    },
+  } as const;
+  await withOwnedObservationLease(scannedFileId, claimedAt, async (tx) => {
+    const current = await tx.scannedFile.findUniqueOrThrow({ select: { checksum: true }, where: { id: scannedFileId } });
+    if (!current.checksum || !readResult.preview.sourceChecksum ||
+        current.checksum.toLowerCase() !== readResult.preview.sourceChecksum.toLowerCase()) {
+      throw new Error("Observation source checksum does not match the scanned file.");
+    }
+    await tx.scannedFile.update({ data: stage, where: { id: scannedFileId } });
   });
 
   const wordCount = countWords(readResult.preview.extractedText);
-  const document = await metadataDocumentForScannedFile(
-    scannedFileId,
-    readResult.file.previewText,
-    wordCount,
-  );
+  const document = await withOwnedObservationLease(scannedFileId, claimedAt, (tx) =>
+    metadataDocumentForScannedFile(scannedFileId, readResult.file.previewText, wordCount, tx));
   const observation = await createObservationSessionFromReadableDocument(
     {
       extension: document.extension,
@@ -260,40 +350,24 @@ export async function createObservationSessionForScannedFileReadResult(
       wordCount,
     },
     "BRIDGE",
+    readResult.preview.warnings,
+    (data, observed) => withOwnedObservationLease(scannedFileId, claimedAt, async (tx) => {
+      const current = await tx.scannedFile.findUniqueOrThrow({
+        select: { checksum: true, libraryDocument: { select: { observationSessions: {
+          orderBy: [...latestObservationOrder], take: 1, select: { status: true },
+        } } } }, where: { id: scannedFileId },
+      });
+      if (current.checksum?.toLowerCase() !== readResult.preview.sourceChecksum?.toLowerCase() ||
+          usableObservation(current.libraryDocument?.observationSessions[0])) {
+        throw new Error("Observation source or completion changed; retry the report.");
+      }
+      const session = await tx.observationSession.create({ data, select: { id: true } });
+      await completeScannedObservation(tx, scannedFileId, readResult, {
+        ...observed, aiUsage: "aiUsage" in observed ? observed.aiUsage : null,
+      });
+      return session;
+    }),
   );
-  const scannedFile = await prisma.scannedFile.findUnique({
-    select: {
-      sessionId: true,
-    },
-    where: {
-      id: scannedFileId,
-    },
-  });
-
-  if (scannedFile) {
-    await prisma.$transaction([
-      prisma.scannedFile.update({
-        data: {
-          processedAt: new Date(),
-          processingErrorCategory: null,
-          processingStage: "EXAMINED",
-        },
-        where: {
-          id: scannedFileId,
-        },
-      }),
-      prisma.scanSession.update({
-        data: {
-          observationsCreated: {
-            increment: 1,
-          },
-        },
-        where: {
-          id: scannedFile.sessionId,
-        },
-      }),
-    ]);
-  }
 
   return observation;
 }

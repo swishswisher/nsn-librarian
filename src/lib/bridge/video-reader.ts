@@ -10,7 +10,7 @@ import {
   OpenAIProviderConfigurationError,
   requestOpenAIAudioTranscription,
 } from "@/lib/ai/openai-client";
-import { getPrismaClient } from "@/lib/db/prisma";
+import { getLocalReadClient as getPrismaClient, withLocalReadAuthority, withVerifiedLocalRead } from "./local-read-authority";
 import { sanitizeReadingWarning } from "@/lib/reading-room/utils";
 
 import {
@@ -933,7 +933,11 @@ async function upsertVideoMetadata(input: {
   });
 }
 
-export async function readScannedVideoFile(
+export async function readScannedVideoFile(scannedFileId: string, owner?: Date): Promise<BridgeReadFileApiSuccess> {
+  return withLocalReadAuthority(scannedFileId, () => readScannedVideoFileOwned(scannedFileId), owner);
+}
+
+async function readScannedVideoFileOwned(
   scannedFileId: string,
 ): Promise<BridgeReadFileApiSuccess> {
   const prisma = getPrismaClient();
@@ -1080,6 +1084,10 @@ export async function readScannedVideoFile(
 }
 
 export async function readScannedVideoFileTransient(scannedFileId: string) {
+  return withVerifiedLocalRead(scannedFileId, () => readScannedVideoFileTransientVerified(scannedFileId));
+}
+
+async function readScannedVideoFileTransientVerified(scannedFileId: string) {
   const scannedFile = await scannedVideoFileForRead(scannedFileId);
 
   if (!scannedFile) {

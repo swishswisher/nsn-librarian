@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { readLocalJson, withLocalStoreLock, writeLocalJson } from "./local-json-store";
 import path from "node:path";
 
 import {
@@ -33,36 +34,46 @@ export type FolderSelectionOptions = RootPathValidationOptions;
 
 const folderSelectionTtlMs = 10 * 60 * 1000;
 
+export function createFolderSelection(...args: Parameters<typeof createFolderSelectionUnlocked>): ReturnType<typeof createFolderSelectionUnlocked> {
+  return withLocalStoreLock(registryPath(), () => createFolderSelectionUnlocked(...args));
+}
+export async function registerRootFromSelection(...args: Parameters<typeof registerRootFromSelectionUnlocked>): ReturnType<typeof registerRootFromSelectionUnlocked> {
+  const selection = (await readRegistry()).selections.find((item) => item.token === args[0].selectionToken.trim());
+  if (!selection) return withLocalStoreLock(registryPath(), () => registerRootFromSelectionUnlocked(...args));
+  return withRootAuthority(rootIdForPath(selection.actualPath), () => withLocalStoreLock(registryPath(), () => registerRootFromSelectionUnlocked(...args)));
+}
+export function updateRoot(...args: Parameters<typeof updateRootUnlocked>): ReturnType<typeof updateRootUnlocked> {
+  return withRootAuthority(args[0], () => withLocalStoreLock(registryPath(), () => updateRootUnlocked(...args)));
+}
+
+// Physical operations and native grant changes serialize on the same root.
+// Registry mutation is nested inside this lock, never the reverse order.
+const rootAuthorityScopes = new AsyncLocalStorage<Set<string>>();
+export function withRootAuthority<T>(rootId: string, operation: () => Promise<T>) {
+  const key = path.join(bridgeDataDir(), `root-authority-${createHash("sha256").update(rootId).digest("hex")}`);
+  const held = rootAuthorityScopes.getStore();
+  if (held?.has(key)) return operation();
+  return withLocalStoreLock(key, () => rootAuthorityScopes.run(new Set([...(held ?? []), key]), operation));
+}
+
 function registryPath() {
   return path.join(bridgeDataDir(), "registry.json");
 }
 
 async function readRegistry(): Promise<RegistryFile> {
-  try {
-    const parsed = JSON.parse(await readFile(registryPath(), "utf8")) as Partial<RegistryFile>;
-
-    return {
-      roots: Array.isArray(parsed.roots) ? parsed.roots : [],
-      selections: Array.isArray(parsed.selections) ? parsed.selections : [],
-    };
-  } catch {
-    return {
-      roots: [],
-      selections: [],
-    };
-  }
+  return readLocalJson(registryPath(), () => ({ roots: [], selections: [] }), (value) => {
+    const parsed = value as Partial<RegistryFile> | null;
+    if (!parsed || !Array.isArray(parsed.roots) || !Array.isArray(parsed.selections) ||
+        parsed.roots.some((root) => !root || typeof root.id !== "string" || typeof root.actualPath !== "string") ||
+        parsed.selections.some((selection) => !selection || typeof selection.token !== "string" || typeof selection.actualPath !== "string")) {
+      throw new BridgeAppError("The local folder registry needs recovery.", "REGISTRY_CORRUPT", 503);
+    }
+    return { roots: parsed.roots, selections: parsed.selections };
+  });
 }
 
 async function writeRegistry(registry: RegistryFile) {
-  const filePath = registryPath();
-  const tmpPath = `${filePath}.tmp`;
-
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(tmpPath, `${JSON.stringify(registry, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await rename(tmpPath, filePath);
+  await writeLocalJson(registryPath(), registry);
 }
 
 function rootIdForPath(actualPath: string) {
@@ -106,6 +117,7 @@ function removeExpiredSelections(registry: RegistryFile) {
 export function summarizeBridgeRoot(root: BridgeRootRecord): BridgeRootSummary {
   return {
     connectedAt: root.connectedAt,
+    connectionRevision: root.connectionRevision ?? 0,
     createFolderPermission: root.createFolderPermission,
     displayName: root.displayName,
     id: root.id,
@@ -125,7 +137,7 @@ export function summarizeBridgeRoot(root: BridgeRootRecord): BridgeRootSummary {
   };
 }
 
-export async function createFolderSelection(
+async function createFolderSelectionUnlocked(
   folderPath: string,
   options: RootPathValidationOptions = {},
 ): Promise<FolderSelectionResult> {
@@ -183,7 +195,7 @@ function permissionsWithReadInvariant(
   return nextPermissions;
 }
 
-export async function registerRootFromSelection(input: {
+async function registerRootFromSelectionUnlocked(input: {
   validationOptions?: RootPathValidationOptions;
   displayName?: string;
   permissions?: Partial<BridgePermissions>;
@@ -231,12 +243,14 @@ export async function registerRootFromSelection(input: {
     ),
   };
   const existingRoot = nextRegistry.roots.find((root) => root.id === rootId);
-  const timestamp = nowIso();
+  const timestamp = new Date(Math.max(Date.now(), existingRoot ? new Date(existingRoot.updatedAt).getTime() + 1 : 0)).toISOString();
   let root: BridgeRootRecord;
 
   if (existingRoot) {
     Object.assign(existingRoot, {
       ...permissions,
+      connectionRevision: (existingRoot.connectionRevision ?? 0) + 1,
+      connectedAt: timestamp,
       actualPath,
       displayName,
       platform: selection.platform,
@@ -254,6 +268,7 @@ export async function registerRootFromSelection(input: {
       ...permissions,
       actualPath,
       connectedAt: timestamp,
+      connectionRevision: 1,
       displayName,
       id: rootId,
       lastScanAt: null,
@@ -309,7 +324,7 @@ export async function listRoots() {
   return registry.roots.map(summarizeBridgeRoot);
 }
 
-export async function updateRoot(rootId: string, input: {
+async function updateRootUnlocked(rootId: string, input: {
   displayName?: string;
   permissions?: Partial<BridgePermissions>;
   status?: BridgeRootRecord["status"];
@@ -382,7 +397,7 @@ export async function updateRoot(rootId: string, input: {
     root.lastWatchingAt = input.lastWatchingAt;
   }
 
-  root.updatedAt = nowIso();
+  root.updatedAt = new Date(Math.max(Date.now(), new Date(root.updatedAt).getTime() + 1)).toISOString();
   await writeRegistry(registry);
 
   return summarizeBridgeRoot(root);
@@ -405,7 +420,7 @@ export async function requireRootPermission(
 ) {
   const root = await getRoot(rootId);
 
-  if (root.status === "DISCONNECTED") {
+  if (root.status === "DISCONNECTED" || root.status === "NEEDS_ATTENTION") {
     throw new BridgeAppError(
       "This folder is disconnected. Reconnect it before using the Bridge.",
       "ROOT_DISCONNECTED",

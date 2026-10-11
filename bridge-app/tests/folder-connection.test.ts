@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import {
   mkdir,
   mkdtemp,
@@ -114,22 +116,20 @@ describe("Bridge folder connection pipeline", () => {
     assert.equal(result.ok ? null : result.code, "SELECTION_EXPIRED");
   });
 
-  it("keeps a valid selection after recoverable root persistence failure", async () => {
+  it("keeps a valid selection after recoverable root persistence failure", async (t) => {
     const folder = await makeFolder("Users", "test", "Documents", "Recoverable");
     const selection = await createFolderSelection(folder);
-    const tmpBlocker = `${registryPath()}.tmp`;
-
-    await mkdir(tmpBlocker, { recursive: true });
-
-    await expectBridgeCode(
+    const priorBytes = await readFile(registryPath());
+    const fault = t.mock.method(fsPromises, "rename", async () => { throw new Error("injected durable registry rename failure"); });
+    syncBuiltinESMExports();
+    try { await expectBridgeCode(
       () =>
         registerRootFromSelection({
           selectionToken: selection.selectionToken,
         }),
       "FOLDER_SELECTION_PERSISTENCE_FAILED",
-    );
-
-    await rm(tmpBlocker, { force: true, recursive: true });
+    ); } finally { fault.mock.restore(); syncBuiltinESMExports(); }
+    assert.deepEqual(await readFile(registryPath()), priorBytes);
 
     const root = await registerRootFromSelection({
       selectionToken: selection.selectionToken,
@@ -155,19 +155,20 @@ describe("Bridge folder connection pipeline", () => {
     );
   });
 
-  it("returns FOLDER_SELECTION_PERSISTENCE_FAILED through connect IPC result", async () => {
+  it("returns FOLDER_SELECTION_PERSISTENCE_FAILED through connect IPC result", async (t) => {
     const folder = await makeFolder("Users", "test", "Documents", "Write Failure");
     const selection = await createFolderSelection(folder);
-    const tmpBlocker = `${registryPath()}.tmp`;
-
-    await mkdir(tmpBlocker, { recursive: true });
-
-    const result = await folderConnectionIpcResult(() =>
+    const priorBytes = await readFile(registryPath());
+    const fault = t.mock.method(fsPromises, "rename", async () => { throw new Error("injected durable registry rename failure"); });
+    syncBuiltinESMExports();
+    let result;
+    try { result = await folderConnectionIpcResult(() =>
       connectSelectedBridgeFolders({
         folders: [selection],
         getPairedBridgeDeviceId: async () => "bridge-device-test",
       }),
-    );
+    ); } finally { fault.mock.restore(); syncBuiltinESMExports(); }
+    assert.deepEqual(await readFile(registryPath()), priorBytes);
 
     assert.equal(result.ok, false);
     assert.equal(

@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
 import { requestIsSameOrigin } from "@/lib/auth/http";
+import { authenticateSchedulerRequest, memoryRecoverySchedulerPath } from "@/lib/auth/scheduler";
 import {
   isHumanApiPath,
   isPublicAuthPath,
@@ -27,6 +28,14 @@ function protectedResponse() {
 
 export function proxy(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
+  // One exact service route; a human cookie never substitutes for machine auth.
+  if (pathname === memoryRecoverySchedulerPath) {
+    if (!authenticateSchedulerRequest(request)) {
+      return NextResponse.json({ ok: false, error: "Scheduler authentication is required." },
+        { status: 401, headers: { "Cache-Control": "no-store" } });
+    }
+    return protectedResponse();
+  }
   const session = verifyHumanSessionToken(
     request.cookies.get(HUMAN_SESSION_COOKIE)?.value,
   );
@@ -81,6 +90,7 @@ export function proxy(request: NextRequest) {
 
 export const config = {
   matcher: [
+    "/api/:path*",
     "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)",
   ],
 };

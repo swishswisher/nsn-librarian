@@ -3,7 +3,12 @@ import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
 import { NsnCard } from "@/components/library/NsnCard";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
 import { NsnPageHeader } from "@/components/library/NsnPageHeader";
-import { getMemoryPageData } from "@/lib/library/memory";
+import { OrganizationPreferenceReviewPanel } from "@/components/library/OrganizationPreferenceReviewPanel";
+import { MemoryRecoveryStatus } from "@/components/library/MemoryRecoveryStatus";
+import { getMemoryRecoveryProgress } from "@/lib/library/memory-recovery";
+import { getMemoryPageData, recoverMemoryForWebAccess } from "@/lib/library/memory";
+import { requireHumanSession } from "@/lib/auth/session";
+import { getOrganizationPreferencePageData } from "@/lib/library/organization-preferences";
 import type { MemoryEntrySummary, MemoryType } from "@/types/library";
 
 export const dynamic = "force-dynamic";
@@ -135,8 +140,16 @@ function MemorySection({
   );
 }
 
+export const maxDuration = 150;
+
 export default async function LibraryMemoryPage() {
-  const memory = await getMemoryPageData();
+  await requireHumanSession("/admin/library/memory");
+  await recoverMemoryForWebAccess();
+  const [memory, organizationPreferences, recoveryProgress] = await Promise.all([
+    getMemoryPageData(),
+    getOrganizationPreferencePageData(),
+    getMemoryRecoveryProgress(),
+  ]);
 
   return (
     <LibraryShell active="memory">
@@ -165,6 +178,8 @@ export default async function LibraryMemoryPage() {
           </div>
         </NsnCard>
 
+        <MemoryRecoveryStatus progress={recoveryProgress} />
+
         <MemorySection
           description="Themes are broad patterns that keep returning after approval."
           emptyDescription="Approve observations first. Themes appear only after the Librarian has repeated evidence."
@@ -192,6 +207,8 @@ export default async function LibraryMemoryPage() {
           entries={memory.humanPreferences}
           title="Human preferences"
         />
+
+        <OrganizationPreferenceReviewPanel preferences={organizationPreferences} />
 
         <MemorySection
           description="Recently learned entries show what Memory has updated most recently."

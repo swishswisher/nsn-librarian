@@ -6,7 +6,7 @@ import {
   OpenAIProviderConfigurationError,
   requestOpenAIAudioTranscription,
 } from "@/lib/ai/openai-client";
-import { getPrismaClient } from "@/lib/db/prisma";
+import { getLocalReadClient as getPrismaClient, withLocalReadAuthority, withVerifiedLocalRead } from "./local-read-authority";
 import { sanitizeReadingWarning } from "@/lib/reading-room/utils";
 
 import {
@@ -629,7 +629,11 @@ async function upsertAudioMetadata(input: {
   }
 }
 
-export async function readScannedAudioFile(
+export async function readScannedAudioFile(scannedFileId: string, owner?: Date): Promise<BridgeReadFileApiSuccess> {
+  return withLocalReadAuthority(scannedFileId, () => readScannedAudioFileOwned(scannedFileId), owner);
+}
+
+async function readScannedAudioFileOwned(
   scannedFileId: string,
 ): Promise<BridgeReadFileApiSuccess> {
   const prisma = getPrismaClient();
@@ -783,6 +787,10 @@ export async function readScannedAudioFile(
 }
 
 export async function readScannedAudioFileTransient(scannedFileId: string) {
+  return withVerifiedLocalRead(scannedFileId, () => readScannedAudioFileTransientVerified(scannedFileId));
+}
+
+async function readScannedAudioFileTransientVerified(scannedFileId: string) {
   const scannedFile = await scannedAudioFileForRead(scannedFileId);
 
   if (!scannedFile) {

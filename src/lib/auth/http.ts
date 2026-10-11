@@ -17,6 +17,35 @@ export function safeInternalPath(value: unknown, fallback = "/admin/library") {
   return trimmed;
 }
 
+function configuredOrigin(value: string) {
+  try {
+    const url = new URL(value);
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) ||
+        url.username || url.password || url.pathname !== "/" || url.search || url.hash ||
+        url.hostname.includes("*")) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+// Deployment configuration is the authority. Request URL/Host/Forwarded
+// headers are caller-controlled and cannot add an origin to this installation.
+function trustedOrigins() {
+  const primary = process.env.NSN_LIBRARIAN_APP_URL?.trim() || process.env.NEXT_PUBLIC_APP_URL?.trim();
+  const additional = process.env.NSN_AUTH_TRUSTED_ORIGINS?.trim();
+  if (additional && additional.split(",").some(value => !value.trim())) return new Set<string>();
+  const values = [primary, ...(additional ? additional.split(",").map(value => value.trim()) : [])]
+    .filter((value): value is string => Boolean(value));
+  if (!values.length && process.env.NODE_ENV !== "production") {
+    values.push("http://localhost:3000", "http://127.0.0.1:3000");
+  }
+  const origins = values.map(configuredOrigin);
+  // A broken allowlist must not silently become a partly trusted deployment.
+  return origins.every(origin => origin !== null) ? new Set(origins) : new Set<string>();
+}
+
 export function requestIsSameOrigin(request: Request) {
   const method = request.method.toUpperCase();
 
@@ -37,16 +66,10 @@ export function requestIsSameOrigin(request: Request) {
   }
 
   try {
-    const requestUrl = new URL(request.url);
-    const forwardedHost =
-      request.headers.get("x-forwarded-host") ?? request.headers.get("host");
-    const forwardedProtocol =
-      request.headers.get("x-forwarded-proto") ?? requestUrl.protocol.replace(":", "");
-    const expectedOrigin = forwardedHost
-      ? `${forwardedProtocol}://${forwardedHost}`
-      : requestUrl.origin;
-
-    return new URL(origin).origin === expectedOrigin;
+    // Require a single serialized HTTP(S) origin, rejecting lists, credentials,
+    // paths and opaque/null origins rather than normalizing them into authority.
+    const parsed = new URL(origin);
+    return parsed.origin === origin && trustedOrigins().has(origin);
   } catch {
     return false;
   }

@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { readLocalJson, withLocalStoreLock, writeLocalJson } from "../../../../bridge-app/src/main/local-json-store";
 import os from "node:os";
 import path from "node:path";
 
@@ -22,26 +22,16 @@ function outboxPath() {
 }
 
 async function writeOutbox(entries: PendingBridgeCommandReport[]) {
-  await mkdir(dataDirectory(), { recursive: true, mode: 0o700 });
-  const target = outboxPath();
-  const temporary = `${target}.${process.pid}.tmp`;
-
-  await writeFile(temporary, `${JSON.stringify(entries)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await rename(temporary, target);
+  await writeLocalJson(outboxPath(), entries);
 }
 
 export async function loadBridgeCommandOutbox() {
-  try {
-    const parsed = JSON.parse(await readFile(outboxPath(), "utf8")) as unknown;
-
+  return readLocalJson(outboxPath(), () => [] as PendingBridgeCommandReport[], (parsed) => {
     if (!Array.isArray(parsed)) {
-      return [] as PendingBridgeCommandReport[];
+      throw new Error("The local command report outbox needs recovery.");
     }
 
-    return parsed.filter(
+    const valid = parsed.filter(
       (item): item is PendingBridgeCommandReport =>
         typeof item === "object" &&
         item !== null &&
@@ -54,15 +44,16 @@ export async function loadBridgeCommandOutbox() {
           item.report.status === "FAILED" ||
           item.report.status === "REJECTED"),
     );
-  } catch {
-    return [];
-  }
+    if (valid.length !== parsed.length) throw new Error("The local command report outbox needs recovery.");
+    return valid;
+  });
 }
 
 export async function queueBridgeCommandReport(
   replayKey: string,
   report: BridgeCommandReport,
 ) {
+  return withLocalStoreLock(outboxPath(), async () => {
   const current = await loadBridgeCommandOutbox();
   const next = [
     ...current.filter((item) => item.report.commandId !== report.commandId),
@@ -74,13 +65,16 @@ export async function queueBridgeCommandReport(
   ];
 
   await writeOutbox(next);
+  });
 }
 
 export async function removeBridgeCommandReport(commandId: string) {
+  return withLocalStoreLock(outboxPath(), async () => {
   const current = await loadBridgeCommandOutbox();
   const next = current.filter((item) => item.report.commandId !== commandId);
 
   if (next.length !== current.length) {
     await writeOutbox(next);
   }
+  });
 }

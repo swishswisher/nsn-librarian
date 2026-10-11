@@ -1,4 +1,7 @@
+import { latestScannedFileObservation, claimObservationLease, usableObservation, withOwnedObservationLease, deviceKeyFingerprint } from "./observation-authority";
 import path from "node:path";
+import { lockAuthorityOwner } from "@/lib/db/authority";
+import { isCurrentReadableRoot } from "./current-readable-root";
 
 import type {
   AudioTranscriptionStatus,
@@ -15,13 +18,14 @@ import { getPrismaClient } from "@/lib/db/prisma";
 import {
   BridgeCloudError,
   createBridgeCloudCommand,
+  completeBridgeCloudCommand,
 } from "@/lib/bridge/cloud-coordinator";
 import { logBridgePermissionDiagnostic } from "@/lib/bridge/permission-diagnostics";
 
 import { generateScanRecommendationBatchIfReady } from "./scan-recommendation-batch";
 import {
   createBridgeScanSessionFromScan,
-  getBridgeScanSessionDetail,
+  getScannedFileSummary,
 } from "./scan-sessions";
 import { createObservationSessionForScannedFileReadResult } from "./scanned-file-observations";
 import { markRemoteReadFailure } from "./remote-read-commands";
@@ -504,6 +508,7 @@ async function applyCompletedScan(input: {
 function remoteReadResult(value: unknown) {
   const result = objectValue(value);
   const extractedText = stringValue(result?.extractedText, 2_000_000);
+  const reportedCharacterCount = numberValue(result?.characterCount);
   const relativePath = safeRelativePath(result?.relativePath);
 
   if (!result || !extractedText || !relativePath) {
@@ -515,25 +520,33 @@ function remoteReadResult(value: unknown) {
 
   return {
     audioMetadata: remoteAudioReadMetadata(result.audioMetadata),
-    characterCount: extractedText.length,
+    sourceChecksum: typeof result.sourceChecksum === "string" ? result.sourceChecksum : null,
+    characterCount: reportedCharacterCount && reportedCharacterCount >= extractedText.length
+      ? reportedCharacterCount
+      : extractedText.length,
     extractedText,
     fileName: stringValue(result.fileName, 500) ?? path.posix.basename(relativePath),
     fileType: stringValue(result.fileType, 100) ?? "DOCUMENT",
     relativePath,
     videoMetadata: remoteVideoReadMetadata(result.videoMetadata),
-    warnings: Array.isArray(result.warnings)
-      ? result.warnings
-          .filter((warning): warning is string => typeof warning === "string")
-          .slice(0, 20)
-      : [],
+    warnings: [
+      ...(Array.isArray(result.warnings)
+        ? result.warnings
+            .filter((warning): warning is string => typeof warning === "string")
+            .slice(0, 20)
+        : []),
+      ...(reportedCharacterCount && reportedCharacterCount > extractedText.length
+        ? ["Only part of this document was sent for analysis; later content was not examined."]
+        : []),
+    ],
   };
 }
 
 async function storeRemoteReadAudioMetadata(
   scannedFileId: string,
   metadata: RemoteAudioReadMetadata,
+  prisma: Prisma.TransactionClient = getPrismaClient(),
 ) {
-  const prisma = getPrismaClient();
   const data = {
     audioFingerprint: metadata.audioFingerprint,
     bitrateKbps: metadata.bitrateKbps,
@@ -572,8 +585,8 @@ async function storeRemoteReadAudioMetadata(
 async function storeRemoteReadVideoMetadata(
   scannedFileId: string,
   metadata: RemoteVideoReadMetadata,
+  prisma: Prisma.TransactionClient = getPrismaClient(),
 ) {
-  const prisma = getPrismaClient();
   const data = {
     bitrateKbps: metadata.bitrateKbps,
     chapterSuggestions: jsonInput(metadata.chapterSuggestions),
@@ -618,17 +631,46 @@ async function storeRemoteReadVideoMetadata(
 async function storeRemoteReadMediaMetadata(
   scannedFileId: string,
   result: ReturnType<typeof remoteReadResult>,
+  prisma: Prisma.TransactionClient = getPrismaClient(),
 ) {
   if (result.audioMetadata) {
-    await storeRemoteReadAudioMetadata(scannedFileId, result.audioMetadata);
+    await storeRemoteReadAudioMetadata(scannedFileId, result.audioMetadata, prisma);
   }
 
   if (result.videoMetadata) {
-    await storeRemoteReadVideoMetadata(scannedFileId, result.videoMetadata);
+    await storeRemoteReadVideoMetadata(scannedFileId, result.videoMetadata, prisma);
+  }
+
+  if (result.fileType.startsWith("IMAGE_")) {
+    await prisma.imageAssetMetadata.upsert({
+      create: {
+        format: result.fileType.replace("IMAGE_", "").toLowerCase(),
+        humanLabels: jsonInput([]),
+        machineLabels: jsonInput([]),
+        ocrErrorCategory: "IMAGE_OCR_UNAVAILABLE",
+        ocrStatus: "UNAVAILABLE",
+        privacyState: "REVIEW_REQUIRED",
+        provisionalQuestions: jsonInput([]),
+        provisionalTopics: jsonInput([]),
+        relatedSignals: jsonInput([]),
+        scannedFileId,
+        summary: "Only technical image metadata was examined; OCR and visual interpretation were unavailable.",
+        visualAnalysisErrorCategory: "IMAGE_VISUAL_ANALYSIS_UNAVAILABLE",
+        visualAnalysisStatus: "UNAVAILABLE",
+      },
+      update: {
+        ocrErrorCategory: "IMAGE_OCR_UNAVAILABLE",
+        ocrStatus: "UNAVAILABLE",
+        summary: "Only technical image metadata was examined; OCR and visual interpretation were unavailable.",
+        visualAnalysisErrorCategory: "IMAGE_VISUAL_ANALYSIS_UNAVAILABLE",
+        visualAnalysisStatus: "UNAVAILABLE",
+      },
+      where: { scannedFileId },
+    });
   }
 }
 
-async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
+async function applyCompletedRead(commandPayload: unknown, rawResult: unknown, authority?: { rootRevision?: number; deviceKeyFingerprint?: string }): Promise<BridgeJson> {
   const payload = objectValue(commandPayload);
   const scannedFileId = stringValue(payload?.scannedFileId, 100);
   const scanSessionId = stringValue(payload?.scanSessionId, 100);
@@ -643,6 +685,7 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
   const result = remoteReadResult(rawResult);
   const prisma = getPrismaClient();
   const stored = await prisma.scannedFile.findFirst({
+    include: { scanSession: { include: { connectedFolder: true } } },
     where: {
       id: scannedFileId,
       sessionId: scanSessionId,
@@ -656,61 +699,88 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
     );
   }
 
-  await prisma.scannedFile.update({
-    data: {
-      characterCount: result.characterCount,
-      extractedAt: new Date(),
-      extractionErrorCategory: null,
-      extractionStatus: "COMPLETED",
-      previewText: result.extractedText.slice(0, 2_000),
-      processingErrorCategory: null,
-      processingStage: "READ",
-      readingStatus: "READ",
-    },
-    where: { id: scannedFileId },
-  });
-  await storeRemoteReadMediaMetadata(scannedFileId, result);
-  const detail = await getBridgeScanSessionDetail(scanSessionId);
-  const file = detail?.scannedFiles.find((item) => item.id === scannedFileId);
-
-  if (!file) {
-    throw new BridgeCloudError(
-      "The Librarian could not refresh the scanned file.",
-      404,
-    );
+  if (!isCurrentReadableRoot(stored.scanSession.connectedFolder)) {
+    throw new BridgeCloudError("This folder no longer authorizes temporary analysis.", 403, "ROOT_NOT_CONNECTED");
   }
 
-  const readResult: BridgeReadFileApiSuccess = {
-    file,
-    ok: true,
-    preview: {
-      characterCount: result.characterCount,
-      extractedText: result.extractedText,
-      fileName: result.fileName,
-      fileType: result.fileType,
-      relativePath: result.relativePath,
+  const checksumError = objectValue(rawResult)?.sourceChecksum == null
+    ? "SOURCE_CHECKSUM_MISSING"
+    : !result.sourceChecksum || !/^[a-f0-9]{64}$/i.test(result.sourceChecksum)
+      ? "SOURCE_CHECKSUM_INVALID"
+      : !stored.checksum || !/^[a-f0-9]{64}$/i.test(stored.checksum)
+        ? "SCAN_CHECKSUM_UNVERIFIED"
+        : stored.checksum.toLowerCase() !== result.sourceChecksum.toLowerCase()
+          ? "FILE_CHANGED_SINCE_SCAN" : null;
+  if (checksumError) {
+    await markRemoteReadFailure({
+      authority,
+      safeErrorCategory: checksumError,
+      scanSessionId,
       scannedFileId,
-      warnings: result.warnings,
-    },
-  };
-  const observationReused = file.hasObservation;
+    });
+    await generateScanRecommendationBatchIfReady(scanSessionId);
+
+    return {
+      characterCount: result.characterCount,
+      observationPrepared: false,
+      observationReused: false,
+      safeErrorCategory: checksumError,
+      scannedFileId,
+      suggestionsCreated: 0,
+      suggestionsReused: 0,
+    } satisfies BridgeJson;
+  }
+
+  const existing = await latestScannedFileObservation(scannedFileId);
+  let observationReused = usableObservation(existing?.libraryDocument?.observationSessions[0]);
+  let claimedAt: Date;
+  try { claimedAt = await claimObservationLease(scannedFileId, authority); }
+  catch { throw new BridgeCloudError("Observation preparation is still in progress or its authority changed. Retry this report.", 503, "OBSERVATION_IN_PROGRESS"); }
+  const current = await latestScannedFileObservation(scannedFileId);
+  observationReused = usableObservation(current?.libraryDocument?.observationSessions[0]);
 
   if (observationReused) {
-    await prisma.scannedFile.update({
-      data: {
-        processedAt: new Date(),
-        processingErrorCategory: null,
-        processingStage: "EXAMINED",
-      },
-      where: {
-        id: scannedFileId,
-      },
+    await withOwnedObservationLease(scannedFileId, claimedAt, async (tx) => {
+      const authoritative = await tx.scannedFile.findUniqueOrThrow({
+        select: { processingStage: true, libraryDocument: { select: { observationSessions: {
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1, select: { status: true },
+        } } } }, where: { id: scannedFileId },
+      });
+      if (!usableObservation(authoritative.libraryDocument?.observationSessions[0])) {
+        throw new BridgeCloudError("Observation state changed. Retry this report.", 503, "OBSERVATION_IN_PROGRESS");
+      }
+      await tx.scannedFile.update({ data: {
+        characterCount: result.characterCount, extractedAt: new Date(), extractionErrorCategory: null,
+        extractionStatus: "COMPLETED", readingStatus: "READ", processedAt: new Date(),
+        processingErrorCategory: null, observationClaimedAt: null,
+        processingStage: ["SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"].includes(authoritative.processingStage)
+          ? undefined : "EXAMINED",
+      }, where: { id: scannedFileId } });
     });
   } else {
-    await createObservationSessionForScannedFileReadResult(
-      scannedFileId,
-      readResult,
-    );
+    const owner = claimedAt!;
+    try {
+      await withOwnedObservationLease(scannedFileId, owner, async (tx) => {
+        await tx.scannedFile.update({ data: {
+          characterCount: result.characterCount, extractedAt: new Date(), extractionErrorCategory: null,
+          extractionStatus: "COMPLETED", previewText: result.extractedText.slice(0, 2_000),
+          processingErrorCategory: null, processingStage: "READ", readingStatus: "READ",
+        }, where: { id: scannedFileId } });
+        await storeRemoteReadMediaMetadata(scannedFileId, result, tx);
+      });
+      const file = await getScannedFileSummary(scannedFileId, scanSessionId);
+      if (!file) throw new BridgeCloudError("The Librarian could not refresh the scanned file.", 404);
+      const readResult: BridgeReadFileApiSuccess = { file, ok: true, preview: {
+        characterCount: result.characterCount, extractedText: result.extractedText,
+        fileName: result.fileName, fileType: result.fileType, relativePath: result.relativePath,
+        scannedFileId, sourceChecksum: result.sourceChecksum, warnings: result.warnings,
+      } };
+      await createObservationSessionForScannedFileReadResult(scannedFileId, readResult, owner);
+    } catch (error) {
+      await prisma.scannedFile.updateMany({ data: { observationClaimedAt: null },
+        where: { id: scannedFileId, observationClaimedAt: owner } });
+      throw error;
+    }
   }
 
   const batch = await generateScanRecommendationBatchIfReady(scanSessionId);
@@ -725,7 +795,7 @@ async function applyCompletedRead(commandPayload: unknown, rawResult: unknown) {
   } satisfies BridgeJson;
 }
 
-async function applyFailedRead(commandPayload: unknown, safeErrorCategory: string | null) {
+async function applyFailedRead(commandPayload: unknown, safeErrorCategory: string | null, authority?: { rootRevision?: number; deviceKeyFingerprint?: string }) {
   const payload = objectValue(commandPayload);
   const scannedFileId = stringValue(payload?.scannedFileId, 100);
   const scanSessionId = stringValue(payload?.scanSessionId, 100);
@@ -738,6 +808,7 @@ async function applyFailedRead(commandPayload: unknown, safeErrorCategory: strin
     safeErrorCategory,
     scanSessionId,
     scannedFileId,
+    authority,
   });
   await generateScanRecommendationBatchIfReady(scanSessionId);
 }
@@ -780,8 +851,9 @@ async function applyCompletedPermissionUpdate(input: {
   commandPayload: unknown;
   connectedLibraryId: string;
   result: unknown;
-}) {
-  const prisma = getPrismaClient();
+}, transaction?: Prisma.TransactionClient): Promise<BridgeJson> {
+  if (!transaction) return getPrismaClient().$transaction((tx) => applyCompletedPermissionUpdate(input, tx));
+  const prisma = transaction;
   const payload = objectValue(input.commandPayload);
   const root = objectValue(input.result);
   const rootId = stringValue(root?.id, 100);
@@ -794,6 +866,7 @@ async function applyCompletedPermissionUpdate(input: {
     );
   }
 
+  await lockAuthorityOwner(prisma, "ConnectedFolder", input.connectedLibraryId);
   const existing = await prisma.connectedLibrary.findUnique({
     where: {
       id: input.connectedLibraryId,
@@ -820,6 +893,12 @@ async function applyCompletedPermissionUpdate(input: {
   const watcherState = bridgeRootWatcherState(root.watcherState);
   const status = connectedLibraryStatus(root.status);
   const rootUpdatedAt = stringValue(root.updatedAt, 100);
+  const nativeUpdatedAt = rootUpdatedAt ? new Date(rootUpdatedAt) : null;
+  if (!existing.isEnabled || existing.status !== "CONNECTED" || existing.disconnectedAt ||
+      existing.hiddenFromActiveListAt || existing.mergedAt || existing.canonicalConnectedLibraryId ||
+      (existing.nativeRootUpdatedAt && (!nativeUpdatedAt || Number.isNaN(nativeUpdatedAt.getTime()) || nativeUpdatedAt < existing.nativeRootUpdatedAt))) {
+    return { bridgeRootId: input.bridgeRootId, ignoredBecause: "NEWER_ROOT_AUTHORITY", rootUpdatedAt };
+  }
   const now = new Date();
   const permissions = {
     createFolderPermission:
@@ -855,8 +934,6 @@ async function applyCompletedPermissionUpdate(input: {
     data: {
       bridgeRootId: input.bridgeRootId,
       createFolderPermission: permissions.createFolderPermission,
-      disconnectedAt: status === "DISCONNECTED" ? now : null,
-      isEnabled: status !== "DISCONNECTED",
       lastBridgeCheckAt: now,
       ...monitoringData,
       monitoringErrorCategory: readPermission
@@ -868,7 +945,7 @@ async function applyCompletedPermissionUpdate(input: {
       recommendationPermission: permissions.recommendationPermission,
       renameFilePermission: permissions.renameFilePermission,
       safeLocalLocation: stringValue(root.safeLocation, 500) ?? undefined,
-      status,
+      nativeRootUpdatedAt: nativeUpdatedAt && !Number.isNaN(nativeUpdatedAt.getTime()) ? nativeUpdatedAt : undefined,
       watchPermission: permissions.watchPermission,
     },
     where: {
@@ -898,8 +975,9 @@ async function applyCompletedMonitoringCommand(input: {
   bridgeRootId: string;
   connectedLibraryId: string;
   result: unknown;
-}) {
-  const prisma = getPrismaClient();
+}, transaction?: Prisma.TransactionClient): Promise<BridgeJson> {
+  if (!transaction) return getPrismaClient().$transaction((tx) => applyCompletedMonitoringCommand(input, tx));
+  const prisma = transaction;
   const root = objectValue(input.result);
   const rootId = stringValue(root?.id, 100);
 
@@ -911,6 +989,7 @@ async function applyCompletedMonitoringCommand(input: {
     );
   }
 
+  await lockAuthorityOwner(prisma, "ConnectedFolder", input.connectedLibraryId);
   const existing = await prisma.connectedLibrary.findUnique({
     where: {
       id: input.connectedLibraryId,
@@ -926,6 +1005,11 @@ async function applyCompletedMonitoringCommand(input: {
   }
 
   const watcherState = bridgeRootWatcherState(root.watcherState);
+  const nativeUpdatedAt = typeof root.updatedAt === "string" ? new Date(root.updatedAt) : null;
+  if (!isCurrentReadableRoot(existing) || !existing.watchPermission ||
+      (existing.nativeRootUpdatedAt && (!nativeUpdatedAt || Number.isNaN(nativeUpdatedAt.getTime()) || nativeUpdatedAt < existing.nativeRootUpdatedAt))) {
+    return { bridgeRootId: input.bridgeRootId, ignoredBecause: "NEWER_ROOT_AUTHORITY" };
+  }
   const status = connectedLibraryStatus(root.status);
   const now = new Date();
   const monitoringData = monitoringDataFromNativeRoot(
@@ -937,29 +1021,10 @@ async function applyCompletedMonitoringCommand(input: {
   await prisma.connectedLibrary.update({
     data: {
       bridgeRootId: input.bridgeRootId,
-      createFolderPermission:
-        booleanValue(root.createFolderPermission) ??
-        existing.createFolderPermission,
-      disconnectedAt: status === "DISCONNECTED" ? now : null,
-      isEnabled: status !== "DISCONNECTED",
       lastBridgeCheckAt: now,
       ...monitoringData,
-      moveFilePermission:
-        booleanValue(root.moveFilePermission) ?? existing.moveFilePermission,
-      organizationPlanPermission:
-        booleanValue(root.organizationPlanPermission) ??
-        existing.organizationPlanPermission,
-      readPermission: booleanValue(root.readPermission) ?? existing.readPermission,
-      recommendationPermission:
-        booleanValue(root.recommendationPermission) ??
-        existing.recommendationPermission,
-      renameFilePermission:
-        booleanValue(root.renameFilePermission) ??
-        existing.renameFilePermission,
       safeLocalLocation: stringValue(root.safeLocation, 500) ?? undefined,
-      status,
-      watchPermission:
-        booleanValue(root.watchPermission) ?? existing.watchPermission,
+      nativeRootUpdatedAt: nativeUpdatedAt && !Number.isNaN(nativeUpdatedAt.getTime()) ? nativeUpdatedAt : undefined,
     },
     where: {
       id: input.connectedLibraryId,
@@ -986,15 +1051,34 @@ export async function prepareBridgeCommandReportForPersistence(
     throw new BridgeCloudError("That Bridge command could not be found.", 404);
   }
 
+  if (["COMPLETED", "FAILED", "REJECTED", "EXPIRED", "CANCELLED"].includes(command.status)) return report;
+
   if (command.commandType === "READ_FILE_TEMPORARILY") {
+    const captured = objectValue(command.authorizationContext);
+    // A legacy reply cannot acquire a fresh file lease using today's key or
+    // revision. Recovery expires its command and admits a NEW signed read.
+    if (typeof captured?.rootConnectionRevision !== "number" || typeof captured?.deviceKeyFingerprint !== "string") {
+      throw new BridgeCloudError("This legacy read requires a fresh authorized command.", 409, "LEGACY_OBSERVATION_REQUEUE_REQUIRED");
+    }
     if (report.status === "COMPLETED") {
+      const context = objectValue(command.authorizationContext);
+      const result = await applyCompletedRead(command.payload, report.result, {
+        rootRevision: typeof context?.rootConnectionRevision === "number" ? context.rootConnectionRevision : 0,
+        deviceKeyFingerprint: typeof context?.deviceKeyFingerprint === "string" ? context.deviceKeyFingerprint : undefined,
+      });
+      const safeErrorCategory = objectValue(result)?.safeErrorCategory;
       return {
         ...report,
-        result: await applyCompletedRead(command.payload, report.result),
+        ...(typeof safeErrorCategory === "string" ? { status: "FAILED" as const, safeErrorCategory } : {}),
+        result,
       };
     }
 
-    await applyFailedRead(command.payload, report.safeErrorCategory ?? null);
+    const context = objectValue(command.authorizationContext);
+    await applyFailedRead(command.payload, report.safeErrorCategory ?? null, {
+      rootRevision: typeof context?.rootConnectionRevision === "number" ? context.rootConnectionRevision : 0,
+      deviceKeyFingerprint: typeof context?.deviceKeyFingerprint === "string" ? context.deviceKeyFingerprint : undefined,
+    });
     return {
       ...report,
       result: null,
@@ -1085,4 +1169,34 @@ export async function prepareBridgeCommandReportForPersistence(
   }
 
   return report;
+}
+
+/** Root-control effects, their command outcome, and their audit marker commit
+ * together under the current device key and connection generation. */
+export async function persistBridgeControlCommandReport(bridgeDeviceId: string, report: BridgeCommandReport, expectedPublicKey: string) {
+  const prisma = getPrismaClient();
+  const binding = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: report.commandId } });
+  if (!binding.connectedLibraryId || !binding.bridgeRootId) throw new BridgeCloudError("Root control is missing its owner.", 422);
+  return prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${bridgeDeviceId} FOR SHARE`;
+    const device = await tx.bridgeDevice.findUniqueOrThrow({ where: { bridgeDeviceId } });
+    if (device.publicKey !== expectedPublicKey || device.revokedAt || device.status === "REVOKED") throw new BridgeCloudError("Device authority changed during root control.", 401);
+    await lockAuthorityOwner(tx, "ConnectedFolder", binding.connectedLibraryId!);
+    await tx.$queryRaw`SELECT "commandId" FROM "BridgeCommand" WHERE "commandId" = ${report.commandId} FOR UPDATE`;
+    const command = await tx.bridgeCommand.findUniqueOrThrow({ where: { commandId: report.commandId } });
+    if (command.bridgeDeviceId !== bridgeDeviceId) throw new BridgeCloudError("Root control belongs to another device.", 403);
+    if (!["ACKNOWLEDGED", "RUNNING"].includes(command.status)) return completeBridgeCloudCommand(bridgeDeviceId, report, tx);
+    const root = await tx.connectedLibrary.findUniqueOrThrow({ where: { id: binding.connectedLibraryId! } });
+    const context = objectValue(command.authorizationContext);
+    if (root.bridgeDeviceId !== bridgeDeviceId || root.bridgeRootId !== binding.bridgeRootId ||
+        root.nativeConnectionRevision !== (context?.rootConnectionRevision ?? 0) ||
+        (context?.deviceKeyFingerprint && context.deviceKeyFingerprint !== deviceKeyFingerprint(device.publicKey)))
+      return completeBridgeCloudCommand(bridgeDeviceId, { ...report, status: "REJECTED", result: null, safeErrorCategory: "ROOT_AUTHORITY_CHANGED" }, tx);
+    let result: BridgeJson | undefined;
+    if (report.status === "COMPLETED") result = command.commandType === "UPDATE_ROOT_PERMISSIONS"
+      ? await applyCompletedPermissionUpdate({ bridgeRootId: binding.bridgeRootId!, commandId: command.commandId,
+        commandPayload: command.payload, connectedLibraryId: root.id, result: report.result }, tx)
+      : await applyCompletedMonitoringCommand({ bridgeRootId: binding.bridgeRootId!, connectedLibraryId: root.id, result: report.result }, tx);
+    return completeBridgeCloudCommand(bridgeDeviceId, { ...report, result: result ?? null }, tx);
+  }, { timeout: 120_000 });
 }

@@ -200,6 +200,7 @@ test("disconnected folder reconnect reuses the canonical record and preserves sc
   const reconnected = await connectBridgeLibrary({
     root: rootSummary(fingerprint, {
       displayName: "Reconnected Library",
+      connectionRevision: 2,
       watchPermission: true,
     }),
   });
@@ -374,6 +375,7 @@ test("cloud root sync reactivates a disconnected canonical record without duplic
         displayName: "SCAN_ROOT_A_GENERAL_INBOX",
         platform: "MACOS",
         safeLocation: "SCAN_ROOT_A_GENERAL_INBOX",
+        connectionRevision: 2,
       }),
       id: rootId,
     },
@@ -445,6 +447,43 @@ test("repeated cloud root sync merges stale duplicates and leaves one current li
   assert.equal(rows.find((row) => row.id === duplicate.id)?.status, "MERGED");
   assert.equal(sessions[0]?.connectedFolderId, canonical.id);
   assert.equal(current.filter((library) => library.bridgeRootId === rootId).length, 1);
+});
+
+test("stale duplicate reconciliation cannot replace the native root's revoked authority", async () => {
+  const bridgeDeviceId = "bridge-sync-denied-duplicate";
+  const rootId = "root_dddddddddddddddddddddddd";
+  await createBridgeDevice(bridgeDeviceId);
+  const canonical = await prisma.connectedLibrary.create({ data: { bridgeDeviceId, bridgeRootId: rootId,
+    localPath: `bridge://${rootId}`, displayName: "Denied canonical", readPermission: false,
+    status: "DISCONNECTED", disconnectedAt: new Date(), isEnabled: false, nativeConnectionRevision: 4 } });
+  const duplicate = await prisma.connectedLibrary.create({ data: { bridgeDeviceId, folderFingerprint: rootId,
+    localPath: `bridge://${rootId}/stale-duplicate`, displayName: "Stale active duplicate", status: "CONNECTED" } });
+  const retainedScan = await prisma.scanSession.create({ data: { connectedFolderId: duplicate.id, status: "COMPLETED" } });
+  for (let retry = 0; retry < 2; retry++) await syncBridgeDeviceRoots(bridgeDeviceId, [rootSummary(rootId, { connectionRevision: 4 })]);
+  const denied = await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: canonical.id } });
+  assert.equal(denied.status, "DISCONNECTED"); assert.equal(denied.readPermission, false); assert.equal(denied.isEnabled, false);
+  assert.equal(denied.folderFingerprint, rootId);
+  assert.equal((await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: duplicate.id } })).canonicalConnectedLibraryId, canonical.id);
+  const history = await prisma.scanSession.findUniqueOrThrow({ where: { id: retainedScan.id } });
+  assert.equal(history.connectedFolderId, canonical.id); assert.equal(history.status, "COMPLETED");
+});
+
+test("newer timestamps cannot let an older native connection restore revoked read permission", async () => {
+  const bridgeDeviceId = "bridge-sync-old-connection-new-clock";
+  const rootId = "root_eeeeeeeeeeeeeeeeeeeeeeee";
+  await createBridgeDevice(bridgeDeviceId);
+  const root = await prisma.connectedLibrary.create({ data: { bridgeDeviceId, bridgeRootId: rootId,
+    folderFingerprint: rootId, localPath: `bridge://${rootId}`, displayName: "Current connection",
+    nativeConnectionRevision: 5, nativeRootUpdatedAt: new Date("2026-08-01T00:00:00.000Z"), readPermission: false } });
+  for (let retry = 0; retry < 2; retry++) await syncBridgeDeviceRoots(bridgeDeviceId, [rootSummary(rootId, {
+    connectionRevision: 4, updatedAt: "2026-10-08T00:00:00.000Z", readPermission: true })]);
+  const denied = await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: root.id } });
+  assert.equal(denied.readPermission, false); assert.equal(denied.nativeConnectionRevision, 5);
+  assert.equal(denied.nativeRootUpdatedAt?.toISOString(), "2026-08-01T00:00:00.000Z");
+  await syncBridgeDeviceRoots(bridgeDeviceId, [rootSummary(rootId, {
+    connectionRevision: 6, updatedAt: "2026-10-08T00:00:00.000Z", readPermission: true })]);
+  const reconnected = await prisma.connectedLibrary.findUniqueOrThrow({ where: { id: root.id } });
+  assert.equal(reconnected.readPermission, true); assert.equal(reconnected.nativeConnectionRevision, 6);
 });
 
 test("permission UX shows immediate pending state without disabling unrelated controls", () => {

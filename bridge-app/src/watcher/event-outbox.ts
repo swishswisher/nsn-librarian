@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { readLocalJson, withLocalStoreLock, writeLocalJson } from "../main/local-json-store";
 import path from "node:path";
 
 import { bridgeDataDir } from "../security/pairing";
@@ -9,7 +9,6 @@ type WatcherEventOutboxFile = {
 };
 
 const maxOutboxEvents = 1_000;
-let outboxMutation = Promise.resolve();
 
 function outboxPath() {
   return path.join(bridgeDataDir(), "watcher-event-outbox.json");
@@ -40,42 +39,21 @@ function validEvent(value: unknown): value is BridgeChangeEvent {
 }
 
 async function readOutbox(): Promise<WatcherEventOutboxFile> {
-  try {
-    const parsed = JSON.parse(
-      await readFile(outboxPath(), "utf8"),
-    ) as Partial<WatcherEventOutboxFile>;
-
-    return {
-      events: Array.isArray(parsed.events)
-        ? parsed.events.filter(validEvent)
-        : [],
-    };
-  } catch {
-    return { events: [] };
-  }
+  return readLocalJson(outboxPath(), () => ({ events: [] }), (value) => {
+    const parsed = value as Partial<WatcherEventOutboxFile> | null;
+    if (!parsed || !Array.isArray(parsed.events) || !parsed.events.every(validEvent)) {
+      throw new Error("The local watcher event outbox needs recovery.");
+    }
+    return { events: parsed.events };
+  });
 }
 
 async function writeOutbox(outbox: WatcherEventOutboxFile) {
-  const filePath = outboxPath();
-  const tmpPath = `${filePath}.tmp`;
-
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(tmpPath, `${JSON.stringify(outbox, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await rename(tmpPath, filePath);
+  await writeLocalJson(outboxPath(), outbox);
 }
 
 async function mutateOutbox<T>(mutation: () => Promise<T>) {
-  const nextMutation = outboxMutation.then(mutation, mutation);
-
-  outboxMutation = nextMutation.then(
-    () => undefined,
-    () => undefined,
-  );
-
-  return nextMutation;
+  return withLocalStoreLock(outboxPath(), mutation);
 }
 
 export async function queueBridgeWatcherEvent(event: BridgeChangeEvent) {

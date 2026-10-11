@@ -1,10 +1,13 @@
+import { settleUnstartedCommands, retireRootReadWork } from "./command-lifecycle";
 import { constants as fsConstants } from "node:fs";
 import { access, lstat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import { isCurrentReadableRoot } from "./current-readable-root";
+import { lockAuthorityOwner } from "@/lib/db/authority";
 
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import {
@@ -645,6 +648,7 @@ function canonicalSortKey(library: StoredConnectedLibrary) {
       : 0;
 
   return [
+    library.bridgeRootId && !library.mergedAt && !library.canonicalConnectedLibraryId ? 0 : 1,
     activeWeight,
     identityWeight,
     legacyWeight,
@@ -782,11 +786,17 @@ async function candidateLibrariesForFingerprint(
   return [...directMatches, ...legacyMatches] as StoredConnectedLibrary[];
 }
 
-async function reconcileFingerprint(
+export async function reconcileConnectedLibraryFingerprintInTransaction(
   tx: Prisma.TransactionClient,
   fingerprint: string,
+  expectedBridgeDeviceId?: string,
 ) {
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`root-fingerprint:${fingerprint}`}, 0))::text`;
+  const selected = await candidateLibrariesForFingerprint(tx, fingerprint);
+  for (const id of selected.map((library) => library.id).sort()) await lockAuthorityOwner(tx, "ConnectedFolder", id);
   const candidates = await candidateLibrariesForFingerprint(tx, fingerprint);
+  if (expectedBridgeDeviceId && candidates.some((library) => library.bridgeDeviceId && library.bridgeDeviceId !== expectedBridgeDeviceId))
+    throw new ConnectedLibraryError("This folder identity is already bound to another paired Mac.", 409);
   const canonical = chooseCanonicalLibrary(candidates);
 
   if (!canonical) {
@@ -805,7 +815,7 @@ export async function reconcileConnectedLibraryFingerprint(
   const prisma = getPrismaClient();
 
   const canonical = await prisma.$transaction((tx) =>
-    reconcileFingerprint(tx, fingerprint),
+    reconcileConnectedLibraryFingerprintInTransaction(tx, fingerprint),
   );
 
   return canonical ? { id: canonical.id } : null;
@@ -842,7 +852,7 @@ export async function reconcileDuplicateConnectedLibraries() {
     }
 
     await prisma.$transaction(async (tx) => {
-      const canonical = await reconcileFingerprint(tx, fingerprint);
+      const canonical = await reconcileConnectedLibraryFingerprintInTransaction(tx, fingerprint);
 
       if (canonical) {
         merged += group.length - 1;
@@ -1130,10 +1140,27 @@ async function connectBridgeLibraryInTransaction(
   const fingerprint = root.id;
   const permissions = permissionInput(root);
   const now = new Date();
+  const revision = Number.isSafeInteger(root.connectionRevision) ? root.connectionRevision! : 0;
+  const nativeUpdatedAt = new Date(root.updatedAt);
+  await tx.$queryRaw(Prisma.sql`SELECT pg_advisory_xact_lock(hashtextextended(${`root-fingerprint:${fingerprint}`}, 0))::text`);
+  const selected = await candidateLibrariesForFingerprint(tx, fingerprint);
+  const ids = selected.map((library) => library.id).sort();
+  if (ids.length) await tx.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id IN (${Prisma.join(ids)}) ORDER BY id FOR UPDATE`);
   const candidates = await candidateLibrariesForFingerprint(tx, fingerprint);
   const canonical = chooseCanonicalLibrary(candidates);
 
   if (canonical) {
+    if (canonical.bridgeDeviceId) {
+      throw new ConnectedLibraryError("This folder is bound to a paired Mac. Reconnect it on that Mac.", 409);
+    }
+    const authority = await tx.connectedLibrary.findUniqueOrThrow({ where: { id: canonical.id } });
+    if (revision < authority.nativeConnectionRevision || (authority.nativeRootUpdatedAt && nativeUpdatedAt < authority.nativeRootUpdatedAt))
+      throw new ConnectedLibraryError("This connection report is older than the current root authority.", 409);
+    const lifecycleDenied = Boolean(!isCurrentReadableRoot(authority) &&
+      (!canonical.isEnabled || canonical.disconnectedAt || canonical.hiddenFromActiveListAt || canonical.mergedAt || canonical.canonicalConnectedLibraryId));
+    if (lifecycleDenied && revision <= authority.nativeConnectionRevision)
+      throw new ConnectedLibraryError("Reconnect this folder on the Bridge before restoring access.", 409);
+    if (revision > authority.nativeConnectionRevision) await retireRootReadWork(tx, canonical.id);
     const action: ConnectedLibraryConnectionAction = activeCanonicalLibrary(
       canonical,
     )
@@ -1184,7 +1211,7 @@ async function connectBridgeLibraryInTransaction(
             status: root.status,
           };
     const library = await tx.connectedLibrary.update({
-      data: updateData,
+      data: { ...updateData, nativeConnectionRevision: revision, nativeRootUpdatedAt: Number.isNaN(nativeUpdatedAt.getTime()) ? undefined : nativeUpdatedAt },
       where: {
         id: canonical.id,
       },
@@ -1201,6 +1228,8 @@ async function connectBridgeLibraryInTransaction(
     data: {
       ...permissions,
       bridgeRootId: root.id,
+      nativeConnectionRevision: revision,
+      nativeRootUpdatedAt: Number.isNaN(nativeUpdatedAt.getTime()) ? undefined : nativeUpdatedAt,
       canonicalConnectedLibraryId: null,
       connectedAt: new Date(root.connectedAt),
       disconnectedAt: null,
@@ -1291,7 +1320,9 @@ export async function requireConnectedLibraryPermission(
     );
   }
 
-  if (!library.isEnabled || library.status === "DISCONNECTED") {
+  if (!isCurrentReadableRoot(library)) {
+    if (!library.readPermission && isCurrentReadableRoot({ ...library, readPermission: true }))
+      throw new ConnectedLibraryError(missingPermissionMessage(actionLabel), 403);
     throw new ConnectedLibraryError(
       "This connected library is disconnected. Reconnect it before using the Bridge.",
       403,
@@ -1642,92 +1673,66 @@ export async function getConnectedLibraryPermissionUpdateStatus(
   };
 }
 
-export async function disconnectConnectedLibrary(libraryId: string) {
+async function denyConnectedLibrary(libraryId: string, hide: boolean) {
   const prisma = getPrismaClient();
-  const existing = await prisma.connectedLibrary.findUnique({
-    where: {
-      id: libraryId,
-    },
-  });
-
-  if (!existing) {
-    throw new ConnectedLibraryError(
-      "The Librarian could not find that connected library.",
-      404,
-    );
-  }
-
-  if (existing.bridgeRootId) {
-    await disconnectLocalBridgeRoot(existing.bridgeRootId).catch(() => undefined);
-  }
-
-  const now = new Date();
-  const library = await prisma.connectedLibrary.update({
-    data: {
-      disconnectedAt: now,
-      isEnabled: false,
-      monitoringState: "STOPPED",
-      monitoringStoppedAt: now,
-      status: "DISCONNECTED",
-      watchPermission: false,
-    },
-    where: {
-      id: libraryId,
-    },
-  });
-
-  return librarySummary(library);
-}
-
-export async function hideConnectedLibrary(libraryId: string) {
-  const prisma = getPrismaClient();
-  const existing = await prisma.connectedLibrary.findUnique({
-    where: {
-      id: libraryId,
-    },
-  });
-
-  if (!existing) {
-    throw new ConnectedLibraryError(
-      "The Librarian could not find that connected library.",
-      404,
-    );
-  }
-
+  const binding = await prisma.connectedLibrary.findUnique({ where: { id: libraryId }, select: { bridgeDeviceId: true } });
+  const library = await prisma.$transaction(async (tx) => {
+    let availableDevice = false;
+    if (binding?.bridgeDeviceId) {
+      const devices = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "BridgeDevice"
+        WHERE "bridgeDeviceId" = ${binding.bridgeDeviceId} AND status <> 'REVOKED' AND "revokedAt" IS NULL FOR SHARE`;
+      availableDevice = devices.length > 0;
+    }
+    await lockAuthorityOwner(tx, "ConnectedFolder", libraryId);
+    const existing = await tx.connectedLibrary.findUnique({ where: { id: libraryId } });
+    if (!existing) throw new ConnectedLibraryError("The Librarian could not find that connected library.", 404);
   const canHide =
     !existing.isEnabled ||
     existing.isLegacyConnection ||
     existing.status === "DISCONNECTED" ||
     existing.status === "HIDDEN_FROM_ACTIVE_LIST";
 
-  if (!canHide) {
+  if (hide && !canHide) {
     throw new ConnectedLibraryError(
       "Disconnect this folder before removing it from the active list.",
       409,
     );
   }
 
-  if (existing.bridgeRootId) {
-    await disconnectLocalBridgeRoot(existing.bridgeRootId).catch(() => undefined);
+  if (availableDevice && existing.bridgeDeviceId && existing.bridgeRootId) {
+    const pending = await tx.bridgeCommand.findFirst({ where: { connectedLibraryId: libraryId,
+      bridgeDeviceId: existing.bridgeDeviceId, commandType: "REVOKE_ROOT_ACCESS",
+      expiresAt: { gt: new Date() }, status: { in: ["PENDING", "ACKNOWLEDGED", "RUNNING"] } } });
+    if (!pending) await createBridgeCloudCommand({ bridgeDeviceId: existing.bridgeDeviceId,
+      bridgeRootId: existing.bridgeRootId, connectedLibraryId: libraryId, commandType: "REVOKE_ROOT_ACCESS",
+      authorizationContext: { approvedBy: "Deanne", reason: hide ? "Hide disconnected folder" : "Disconnect folder" }, payload: {} }, tx);
   }
-
   const now = new Date();
-  const library = await prisma.connectedLibrary.update({
+  // Pending operations have not crossed the physical execution boundary.
+  // Acknowledged outcomes remain history to reconcile, never new authority.
+  await retireRootReadWork(tx, libraryId);
+  await settleUnstartedCommands(tx, { connectedLibraryId: libraryId, commandType: { not: "REVOKE_ROOT_ACCESS" } }, "CANCELLED", "ROOT_NOT_CONNECTED");
+  return tx.connectedLibrary.update({
     data: {
-      hiddenFromActiveListAt: now,
+      disconnectedAt: existing.disconnectedAt ?? now,
+      hiddenFromActiveListAt: hide ? now : existing.hiddenFromActiveListAt,
       isEnabled: false,
       monitoringState: "STOPPED",
       monitoringStoppedAt: now,
-      status: "HIDDEN_FROM_ACTIVE_LIST",
+      status: hide ? "HIDDEN_FROM_ACTIVE_LIST" : "DISCONNECTED",
       watchPermission: false,
     },
     where: {
       id: libraryId,
     },
   });
-
+  });
+  if (library.bridgeRootId && !library.bridgeDeviceId) await disconnectLocalBridgeRoot(library.bridgeRootId).catch(() => undefined);
   return librarySummary(library);
 }
+
+export function disconnectConnectedLibrary(libraryId: string) { return denyConnectedLibrary(libraryId, false); }
+export function hideConnectedLibrary(libraryId: string) { return denyConnectedLibrary(libraryId, true); }
 
 export function platformHomeLabel() {
   if (process.platform === "win32") {

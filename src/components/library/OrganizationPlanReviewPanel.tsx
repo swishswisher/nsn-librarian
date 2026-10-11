@@ -446,6 +446,14 @@ function undoActionTypeLabel(actionType: string) {
 }
 
 function safeErrorLabel(errorCategory: string) {
+  if (errorCategory === "COMMAND_RECOVERY_REQUIRED" || errorCategory.startsWith("PHYSICAL_ACTION_STARTED:")) {
+    return "The Bridge cannot yet verify this filesystem outcome. Recovery or inspection is required before another operation.";
+  }
+
+  if (errorCategory === "PHYSICAL_ACTION_PREPARED") {
+    return "This approved action has not started.";
+  }
+
   if (errorCategory === "CHANGED_SOURCE") {
     return "The Bridge stopped because a source file changed after scanning.";
   }

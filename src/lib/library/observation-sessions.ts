@@ -1,8 +1,12 @@
 import type { Prisma } from "@prisma/client";
 
 import { runOpenAIObservation } from "@/lib/ai/openai-observer";
+import { OpenAIProviderError } from "@/lib/ai/openai-client";
 import type { AIObservationResult } from "@/lib/ai/types";
 import { getPrismaClient } from "@/lib/db/prisma";
+import { isAuthorityConflict, lockAuthorityOwner, nextAuthorityTime } from "@/lib/db/authority";
+import { reconcileObservationKnowledge, refreshApprovedObservationRelationships } from "@/lib/bridge/persistent-knowledge";
+import { buildMemoryFromApprovedSession, invalidateCorrectedMemorySources } from "@/lib/library/memory";
 import {
   createKnowledgeConnectionsForSession,
   getRelatedKnowledgeForSession,
@@ -357,6 +361,39 @@ async function observeWithOpenAIOrFallback(
   document: ReadableObservationDocument,
   source: MindInput["source"] = "READING_ROOM",
 ) {
+  const metadataOnly = source === "BRIDGE" &&
+    /^(?:Image technical metadata only|Audio review material|Video review material)/.test(
+      document.rawText ?? "",
+    );
+
+  if (metadataOnly) {
+    const format = document.itemKind.toLowerCase();
+    return {
+      observerType: "DETERMINISTIC" as const,
+      result: {
+        observations: [{
+          id: "observation-metadata-only",
+          label: "MISSING_OR_EMPTY_CONTENT" as const,
+          description: `I recorded ${format} metadata, but did not examine the ${format}'s contents.`,
+          evidence: [],
+          confidence: 0.95,
+          uncertainty: "A transcript, OCR result, or visual analysis is not available for this item.",
+        }],
+        interpretations: [],
+        connections: [],
+        explanation: {
+          summary: `Only ${format} metadata was available for review.`,
+          evidence: [],
+          uncertainty: "The content itself was not interpreted.",
+          confidence: 0.95,
+        },
+        planSuggestions: [],
+        overallConfidence: 0.95,
+        warnings: [`Only ${format} metadata was examined; content understanding is unavailable.`],
+      } satisfies MindResult,
+    };
+  }
+
   if (!hasOpenAIKey()) {
     return observeWithDeterministicMind(document, [
       aiUnavailableObservationMessage,
@@ -382,11 +419,31 @@ async function observeWithOpenAIOrFallback(
         aiResult,
       ),
       observerType: "OPENAI" as const,
+      aiUsage: {
+        requestCount: 1,
+        httpAttempts: aiResult.usage?.httpAttempts ?? 0,
+        inputTokens: aiResult.usage?.inputTokens ?? null,
+        outputTokens: aiResult.usage?.outputTokens ?? null,
+        model: aiResult.model,
+        sourceComplete: aiResult.usage?.sourceComplete ?? false,
+      },
     };
-  } catch {
-    return observeWithDeterministicMind(document, [
+  } catch (error) {
+    const fallback = await observeWithDeterministicMind(document, [
       aiUnavailableObservationMessage,
     ], source);
+
+    return {
+      ...fallback,
+      aiUsage: {
+        requestCount: 1,
+        httpAttempts: error instanceof OpenAIProviderError ? error.httpAttempts : 0,
+        inputTokens: null,
+        outputTokens: null,
+        model: null,
+        sourceComplete: false,
+      },
+    };
   }
 }
 
@@ -415,40 +472,46 @@ export function isHumanDecisionType(value: unknown): value is HumanDecisionType 
 export async function createObservationSessionFromReadableDocument(
   document: ReadableObservationDocument,
   source: MindInput["source"] = "READING_ROOM",
+  readWarnings: string[] = [],
+  persist?: (data: Prisma.ObservationSessionCreateInput,
+    observed: Awaited<ReturnType<typeof observeWithOpenAIOrFallback>>) => Promise<{ id: string }>,
 ) {
   if (!document.rawText || document.rawText.trim().length === 0) {
     throw new ObservationSessionError(unreadObservationMessage, 409);
   }
 
   const prisma = getPrismaClient();
-  const { observerType, result } = await observeWithOpenAIOrFallback(
+  const observed = await observeWithOpenAIOrFallback(
     document,
     source,
   );
+  const { observerType, result } = observed;
+  const observedResult = {
+    ...result,
+    warnings: [...result.warnings, ...readWarnings.slice(0, 20)],
+  };
 
-  const session = await prisma.observationSession.create({
-    data: {
-      libraryDocumentId: document.id,
-      observerType,
-      status: "AWAITING_REVIEW",
-      observations: toJsonInput(result.observations),
-      interpretations: toJsonInput(result.interpretations),
-      explanation: toJsonInput(result.explanation),
-      planSuggestions: toJsonInput(result.planSuggestions),
-      confidence: result.overallConfidence,
-      warnings: toJsonInput(result.warnings),
-    },
-    select: {
-      id: true,
-    },
-  });
+  const data: Prisma.ObservationSessionCreateInput = {
+    libraryDocument: { connect: { id: document.id } },
+    observerType,
+    status: "AWAITING_REVIEW",
+    observations: toJsonInput(observedResult.observations),
+    interpretations: toJsonInput(observedResult.interpretations),
+    explanation: toJsonInput(observedResult.explanation),
+    planSuggestions: toJsonInput(observedResult.planSuggestions),
+    confidence: observedResult.overallConfidence,
+    warnings: toJsonInput(observedResult.warnings),
+  };
+  const session = persist ? await persist(data, observed) :
+    await prisma.observationSession.create({ data, select: { id: true } });
   const connectionCount = await createKnowledgeConnectionsForSession(session.id);
 
   return {
     sessionId: session.id,
-    result,
+    result: observedResult,
     observerType,
     connectionCount,
+    aiUsage: "aiUsage" in observed ? observed.aiUsage : null,
   };
 }
 
@@ -491,7 +554,7 @@ export async function getObservationReviewQueueItems(): Promise<ReviewQueueItem[
   const prisma = getPrismaClient();
   const sessions = await prisma.observationSession.findMany({
     where: { status: "AWAITING_REVIEW" },
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     include: {
       libraryDocument: {
         select: {
@@ -534,7 +597,7 @@ export async function getObservationSessionReview(
         },
       },
       humanDecisions: {
-        orderBy: { createdAt: "desc" },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       },
     },
   });
@@ -583,7 +646,12 @@ export async function saveHumanDecision(
   const note = input.note?.trim() || null;
   const editedSuggestion = input.editedSuggestion?.trim() || null;
 
-  return prisma.$transaction(async (tx) => {
+  if (input.decisionType === "MODIFY" && !editedSuggestion) {
+    throw new ObservationSessionError("Write the corrected observation before saving it.", 400);
+  }
+
+  const result = await prisma.$transaction(async (tx) => {
+    await lockAuthorityOwner(tx, "ObservationSession", sessionId);
     const existingSession = await tx.observationSession.findUnique({
       where: { id: sessionId },
       select: {
@@ -599,12 +667,42 @@ export async function saveHumanDecision(
       );
     }
 
+    const latestDecision = await tx.humanDecision.findFirst({
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      where: { observationSessionId: sessionId },
+    });
+    const intendedStatus = decisionStatusFor(input.decisionType);
+    const priorAuthority = input.decisionType === "NOTE" ? latestDecision : await tx.humanDecision.findFirst({
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      where: { observationSessionId: sessionId, decisionType: { not: "NOTE" } },
+    });
+
+    if (
+      priorAuthority?.decisionType === input.decisionType &&
+      priorAuthority.note === note &&
+      priorAuthority.editedSuggestion === editedSuggestion &&
+      (!intendedStatus || existingSession.status === intendedStatus)
+    ) {
+      // The identical decision's authority and reconciliation committed together.
+      // Reconcile only a new decision; replaying an edit would retire derived
+      // relationships published since that edit. Pending publication is resumed
+      // below without regenerating the human decision or invalidating success.
+      return {
+        decisionId: priorAuthority.id,
+        status: existingSession.status as ObservationSessionStatus,
+        reapproved: intendedStatus === "APPROVED" && await tx.humanDecision.count({
+          where: { observationSessionId: sessionId, decisionType: { in: ["REJECT", "MODIFY"] } },
+        }) > 0,
+      };
+    }
+
     const decision = await tx.humanDecision.create({
       data: {
         observationSessionId: sessionId,
         decisionType: input.decisionType,
         note,
         editedSuggestion,
+        createdAt: await nextAuthorityTime(tx, latestDecision?.createdAt),
       },
       select: {
         id: true,
@@ -617,18 +715,45 @@ export async function saveHumanDecision(
       return {
         decisionId: decision.id,
         status: existingSession.status as ObservationSessionStatus,
+        reapproved: false,
       };
     }
 
     const updatedSession = await tx.observationSession.update({
       where: { id: sessionId },
-      data: { status: nextStatus },
+      data: { status: nextStatus, memoryReconciliationStatus: `PENDING@${decision.id}`,
+        memoryRecoveryFailureCount: 0, memoryRecoveryFailureGeneration: null, memoryRecoveryNextAttemptAt: null },
       select: { status: true },
     });
+    await reconcileObservationKnowledge(tx, sessionId);
+
+    if (nextStatus === "MODIFIED" || nextStatus === "REJECTED") await invalidateCorrectedMemorySources(tx, sessionId);
+    if (nextStatus === "APPROVED" && ["MODIFIED", "REJECTED"].includes(existingSession.status)) {
+      await invalidateCorrectedMemorySources(tx, sessionId);
+    }
 
     return {
       decisionId: decision.id,
       status: updatedSession.status as ObservationSessionStatus,
+      reapproved: nextStatus === "APPROVED" && ["MODIFIED", "REJECTED"].includes(existingSession.status),
     };
+  }, { timeout: 120_000 }).catch((error: unknown) => {
+    if (isAuthorityConflict(error)) {
+      throw new ObservationSessionError("This observation changed during review. Refresh and try again.", 409);
+    }
+    throw error;
   });
+  if (["APPROVED", "MODIFIED", "REJECTED"].includes(result.status)) {
+    try { await refreshApprovedObservationRelationships(sessionId); } catch {
+      // Review and publication admission committed together; polling recovers it.
+    }
+  }
+  let memoryUpdatedCount = 0;
+  if (["APPROVED", "MODIFIED", "REJECTED"].includes(result.status)) {
+    try { memoryUpdatedCount = await buildMemoryFromApprovedSession(sessionId); } catch {
+      // The authority result is committed. Its pending Memory generation survives
+      // a failed eager build and is retried by ordinary coordinator polling.
+    }
+  }
+  return { ...result, memoryUpdatedCount };
 }

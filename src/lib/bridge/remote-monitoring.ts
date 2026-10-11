@@ -6,6 +6,7 @@ import {
 
 import { getConnectedLibraries, getConnectedLibrary } from "./connected-libraries";
 import { bridgeDeviceIsOnline } from "./effective-health";
+import { isCurrentReadableRoot } from "./current-readable-root";
 
 type RemoteMonitoringAction = "start" | "pause" | "resume";
 
@@ -29,7 +30,7 @@ export async function queueRemoteMonitoringAction(
     where: { id: connectedLibraryId },
   });
 
-  if (!library || !library.isEnabled || library.status === "DISCONNECTED") {
+  if (!library || (action !== "pause" && !isCurrentReadableRoot(library))) {
     throw new BridgeCloudError(
       "Reconnect this folder before changing watching.",
       409,
@@ -43,7 +44,7 @@ export async function queueRemoteMonitoringAction(
     );
   }
 
-  if (!library.readPermission || !library.watchPermission) {
+  if (action !== "pause" && (!library.readPermission || !library.watchPermission)) {
     throw new BridgeCloudError(
       "Read and Watch permissions are required before watching can start.",
       403,

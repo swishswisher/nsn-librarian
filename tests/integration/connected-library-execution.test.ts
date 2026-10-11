@@ -1200,6 +1200,12 @@ test("regenerating recommendations invalidates stale approvals instead of reusin
     },
   });
 
+  const preservedGeneration = await generateOrganizationSuggestionsForScannedFileWithText(file.id, contentText);
+  assert.ok(preservedGeneration.suggestions.every((suggestion) => suggestion.status === "APPROVED"));
+  const { prepareOrganizationRecommendationRegeneration } = await import("../../src/lib/bridge/organization-suggestions");
+  await assert.rejects(prepareOrganizationRecommendationRegeneration(fixture.session.id), /confirm|reviewed/i);
+  assert.equal(await prisma.organizationSuggestion.count({ where: { id: { in: firstSuggestionIds }, invalidatedAt: null, status: "APPROVED" } }), firstSuggestionIds.length);
+  await prepareOrganizationRecommendationRegeneration(fixture.session.id, { confirmedReviewedDecisions: true });
   const secondGeneration =
     await generateOrganizationSuggestionsForScannedFileWithText(
       file.id,
@@ -2152,7 +2158,21 @@ test("approved plan executes through the Bridge and refuses repeated execution",
   assert.equal(result.run.status, "COMPLETED");
   assert.equal(result.run.connectedLibraryId, fixture.connectedLibrary.id);
   assert.equal(result.run.bridgeRootId, fixture.root.id);
-  assert.equal(result.run.reconciliationStatus, "COMPLETED");
+  assert.equal(result.run.reconciliationStatus, "REQUIRED");
+  // Physical success precedes a new complete inventory and both publications.
+  // Ordinary page recovery must finish the durable obligation without replaying
+  // the authorized move, even when no other scan is started by the human.
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await getOrganizationPlanPageData(fixture.session.id);
+    const run = await prisma.executionRun.findUniqueOrThrow({ where: { id: result.run.id } });
+    if (run.reconciliationStatus === "COMPLETED") break;
+  }
+  const reconciled = await prisma.executionRun.findUniqueOrThrow({ where: { id: result.run.id } });
+  assert.equal(reconciled.reconciliationStatus, "COMPLETED");
+  const currentScan = await prisma.scanSession.findUniqueOrThrow({ where: { id: reconciled.reconciliationScanSessionId! } });
+  assert.equal(currentScan.knowledgePersistenceStatus, "COMPLETED");
+  assert.equal(currentScan.searchIndexStatus, "COMPLETED");
+  assert.equal(await readFile(destinationPath, "utf8"), "Attachment workshop notes\n");
   assert.ok(result.run.permissionSnapshot);
   assert.ok(
     result.run.actions.some(
@@ -2292,4 +2312,44 @@ test("completed move-and-rename actions generate undo and restore the file", asy
   assert.equal(await exists(originalPath), true);
   assert.equal(await exists(destinationPath), false);
   assert.equal(await readFile(originalPath, "utf8"), "Attachment workshop notes\n");
+});
+
+
+function executionBarrier() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+test("execution admission rejects a cancelled plan after validation before any filesystem action", async (t) => {
+  const reached = executionBarrier(), resume = executionBarrier(); t.after(resume.resolve);
+  const fixture = await approveMoveAndRenamePlan("execution-admission-cancellation");
+  const worker = executeOrganizationPlan(fixture.plan.id, "EXECUTE", { beforeStartClaim: async () => {
+    reached.resolve(); await resume.promise;
+  } });
+  const rejected = assert.rejects(worker, /plan changed or execution already started/i);
+  await reached.promise;
+  const { cancelOrganizationPlan } = await import("../../src/lib/bridge/planner");
+  await cancelOrganizationPlan(fixture.plan.id);
+  resume.resolve(); await rejected;
+  assert.equal(await prisma.executionRun.count({ where: { organizationPlanId: fixture.plan.id } }), 0);
+  assert.equal(await readFile(path.join(fixture.folderPath, ...fixture.sourceRelativePath.split("/")), "utf8"), "Attachment workshop notes\n");
+  assert.equal(await exists(path.join(fixture.folderPath, ...fixture.destinationRelativePath.split("/"))), false);
+});
+
+test("execution admission owns the action snapshot before competing plan writes", async (t) => {
+  const reached = executionBarrier(), resume = executionBarrier(); t.after(resume.resolve);
+  const fixture = await approveMoveAndRenamePlan("execution-admission-ownership");
+  const worker = executeOrganizationPlan(fixture.plan.id, "EXECUTE", { afterStartClaim: async () => {
+    reached.resolve(); await resume.promise;
+  } });
+  await reached.promise;
+  const { cancelOrganizationPlan } = await import("../../src/lib/bridge/planner");
+  await assert.rejects(cancelOrganizationPlan(fixture.plan.id), /plan changed during review/i);
+  await assert.rejects(generateOrganizationPlanForScanSession(fixture.session.id));
+  await assert.rejects(approveOrganizationPlan(fixture.plan.id));
+  resume.resolve(); const result = await worker;
+  assert.equal(result.run.status, "COMPLETED");
+  assert.equal(await prisma.executionRun.count({ where: { organizationPlanId: fixture.plan.id } }), 1);
+  assert.equal(await readFile(path.join(fixture.folderPath, ...fixture.destinationRelativePath.split("/")), "utf8"), "Attachment workshop notes\n");
 });

@@ -121,6 +121,7 @@ export async function authenticateBridgeDeviceRequest(input: {
   bodyText?: string;
   bridgeDeviceId: string;
   request: Request;
+  allowHistoricalCompletion?: boolean;
 }) {
   const { request, bridgeDeviceId } = input;
   const claimedDeviceId = request.headers.get(bridgeRequestHeaderNames.deviceId);
@@ -158,7 +159,7 @@ export async function authenticateBridgeDeviceRequest(input: {
     },
   });
 
-  if (!device || device.status === "REVOKED") {
+  if (!device || ((device.status === "REVOKED" || device.revokedAt) && !input.allowHistoricalCompletion)) {
     throw new BridgeCloudError(
       "This Bridge device is not paired.",
       401,

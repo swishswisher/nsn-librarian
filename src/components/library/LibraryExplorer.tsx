@@ -1,9 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
 
 import { NsnBadge, type NsnBadgeTone } from "@/components/library/NsnBadge";
+import { AskLibrarianPanel } from "@/components/library/AskLibrarianPanel";
 import { NsnEmptyState } from "@/components/library/NsnEmptyState";
 import { NsnSearchField } from "@/components/library/NsnSearchField";
 import {
@@ -28,6 +30,8 @@ import {
   getScanSessionRoute,
   getScannedFileExamineRoute,
 } from "@/lib/library/routes";
+import type { LibrarySearchResult } from "@/lib/library/search";
+import { runSearchPreparationBatches, type SearchPreparationProgress } from "@/lib/library/search-preparation";
 
 type LibraryExplorerProps = {
   data: LibraryExplorerData;
@@ -520,6 +524,52 @@ function RootSection({
   root: LibraryExplorerRoot;
   visibleFileIds: Set<string>;
 }) {
+  const router = useRouter();
+  const [indexing, setIndexing] = useState(false);
+  const [indexMessage, setIndexMessage] = useState<string | null>(null);
+  const prepareSearch = async () => {
+    const sessionId = root.latestScanSession?.id;
+    if (!sessionId || indexing) return;
+    setIndexing(true);
+    setIndexMessage(null);
+    try {
+      const progress = await runSearchPreparationBatches(async (retryFailed) => {
+        const response = await fetch("/api/library/search/index", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId, retryFailed }),
+        });
+        const payload: { ok?: boolean; error?: string; progress?: SearchPreparationProgress } = await response.json();
+        if (!response.ok || !payload.ok || !payload.progress) {
+          throw new Error(payload.error ?? "Search preparation could not finish.");
+        }
+        return payload.progress;
+      }, (progress) => {
+        setIndexMessage(`${progress.indexed} indexed, ${progress.reused} reused, ${progress.failed} need retry, ${progress.remaining} remaining.`);
+        if (progress.completed) setIndexMessage(`Search is ready. ${progress.indexed} indexed, ${progress.reused} reused.`);
+      });
+      if (progress.remaining > 0) {
+        setIndexMessage(progress.waitingForClaims
+          ? "Search preparation is already running elsewhere. Try Prepare Search again shortly to check or resume."
+          : "Search preparation paused without further progress. Try Prepare Search again to resume.");
+        router.refresh();
+        return;
+      }
+      for (;;) {
+        const response = await fetch("/api/library/search/index", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId, memoryBackfill: true }),
+        });
+        const payload: { ok?: boolean; memoryProgress?: { remaining: number } } = await response.json();
+        if (!response.ok || !payload.ok || !payload.memoryProgress) break;
+        if (payload.memoryProgress.remaining === 0) break;
+      }
+      router.refresh();
+    } catch (error) {
+      setIndexMessage(error instanceof Error ? error.message : "Search preparation could not finish.");
+    } finally {
+      setIndexing(false);
+    }
+  };
   const visibleRootFiles = root.tree.files.filter((file) =>
     visibleFileIds.has(file.file.id),
   );
@@ -574,6 +624,11 @@ function RootSection({
 
       <div className="mt-4 flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <CountPills counts={root.tree.counts} />
+        {root.latestScanSession && ["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(root.latestScanSession.status) ? (
+          <button className="inline-flex min-h-11 items-center justify-center rounded-md border border-[var(--nsn-border)] px-4 text-sm font-semibold text-[var(--nsn-navy)] disabled:opacity-50" disabled={indexing} onClick={prepareSearch} type="button">
+            {indexing ? "Preparing search..." : ["INCOMPLETE", "PREPARING"].includes(root.latestScanSession.searchIndexStatus) ? "Resume search preparation" : root.latestScanSession.searchIndexStatus === "COMPLETED" ? "Refresh search" : "Prepare search"}
+          </button>
+        ) : null}
         {root.latestScanSession ? (
           <Link
             className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sage-mist)]"
@@ -583,6 +638,7 @@ function RootSection({
           </Link>
         ) : null}
       </div>
+      {indexMessage ? <p aria-live="polite" className="mt-2 text-sm text-[var(--nsn-slate)]">{indexMessage}</p> : null}
 
       {root.tree.counts.files === 0 ? (
         <p className="mt-5 rounded-lg border border-dashed border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-4 text-sm text-[var(--nsn-slate)]">
@@ -629,7 +685,35 @@ export function LibraryExplorer({
   const [activeFilter, setActiveFilter] =
     useState<LibraryExplorerFilter>("ALL");
   const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<LibrarySearchResult[]>([]);
+  const [searchState, setSearchState] = useState<"IDLE" | "LOADING" | "READY" | "ERROR">("IDLE");
   const [viewMode, setViewMode] = useState<ViewMode>("FOLDERS");
+  useEffect(() => {
+    const query = searchQuery.trim();
+    if (query.length < 2) return;
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      setSearchState("LOADING");
+      try {
+        const response = await fetch(`/api/library/search?q=${encodeURIComponent(query)}`, {
+          cache: "no-store", signal: controller.signal,
+        });
+        if (!response.ok) throw new Error("Search failed");
+        const payload: { ok?: boolean; results?: LibrarySearchResult[] } = await response.json();
+        if (!payload.ok || !Array.isArray(payload.results)) throw new Error("Search failed");
+        setSearchResults(payload.results);
+        setSearchState("READY");
+      } catch {
+        if (!controller.signal.aborted) setSearchState("ERROR");
+      }
+    }, 300);
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [searchQuery]);
+  const updateSearchQuery = (value: string) => {
+    setSearchQuery(value);
+    setSearchResults([]);
+    setSearchState(value.trim().length < 2 ? "IDLE" : "LOADING");
+  };
   const allFiles = useMemo(
     () => flattenLibraryExplorerFiles(data.roots),
     [data.roots],
@@ -653,9 +737,10 @@ export function LibraryExplorer({
   const activeRefinement =
     activeFilter !== "ALL" || searchQuery.trim().length > 0;
   const hasFiles = allFiles.length > 0;
-  const showEmptyFilteredState = visibleFiles.length === 0 && hasFiles;
+  const hasSearchQuery = searchQuery.trim().length >= 2;
+  const showEmptyFilteredState = !hasSearchQuery && visibleFiles.length === 0 && hasFiles;
   const showFolderView =
-    viewMode === "FOLDERS" &&
+    !hasSearchQuery && viewMode === "FOLDERS" &&
     (visibleFiles.length > 0 || (!activeRefinement && !hasFiles));
 
   if (data.roots.length === 0) {
@@ -706,9 +791,9 @@ export function LibraryExplorer({
           <div className="flex min-w-0 flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
             <NsnSearchField
               label="Search Library"
-              onChange={setSearchQuery}
-              placeholder="Search by file, folder, root, type, or status"
-              resultCount={visibleFiles.length}
+              onChange={updateSearchQuery}
+              placeholder="Search files, subjects, clients, or projects"
+              resultCount={hasSearchQuery && searchState === "READY" ? searchResults.length : undefined}
               value={searchQuery}
             />
 
@@ -742,7 +827,7 @@ export function LibraryExplorer({
             </div>
           </div>
 
-          <div className="flex min-w-0 flex-wrap gap-2" role="group" aria-label="Library filters">
+          {!hasSearchQuery ? <div className="flex min-w-0 flex-wrap gap-2" role="group" aria-label="Library filters">
             {libraryFilters.map((filter) => {
               const count =
                 filter.countKey === undefined
@@ -766,8 +851,35 @@ export function LibraryExplorer({
                 </button>
               );
             })}
-          </div>
+          </div> : null}
         </div>
+
+        <AskLibrarianPanel />
+
+        {hasSearchQuery ? (
+          <div aria-live="polite" className="grid min-w-0 gap-3">
+            {searchState === "LOADING" ? <p className="text-sm text-[var(--nsn-slate)]">Searching your library...</p> : null}
+            {searchState === "ERROR" ? <p className="text-sm text-[var(--nsn-danger)]">Search is temporarily unavailable. Try again.</p> : null}
+            {searchState === "READY" && searchResults.length === 0 ? (
+              <NsnEmptyState title="No matching library items" description="Try a file name, subject, client, or project." />
+            ) : null}
+            {searchState === "READY" ? searchResults.map((result) => (
+              <article className="min-w-0 rounded-lg border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-4" key={result.id}>
+                <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="break-words text-xs font-semibold text-[var(--nsn-teal)] [overflow-wrap:anywhere]">{result.rootName}</p>
+                    <h3 className="mt-1 break-words text-base font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">{result.kind === "MEMORY" ? result.relativePath : result.relativePath.split("/").at(-1)}</h3>
+                    {result.kind !== "MEMORY" ? <p className="mt-1 break-words text-sm text-[var(--nsn-slate)] [overflow-wrap:anywhere]">{result.relativePath}</p> : null}
+                  </div>
+                  <Link className="inline-flex min-h-11 items-center rounded-md border border-[var(--nsn-teal)] px-4 text-sm font-semibold text-[var(--nsn-teal-dark)]" href={result.href}>{result.kind === "MEMORY" ? "Open Memory" : "Open item"}</Link>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2"><NsnBadge tone="source">{result.fileType.replaceAll("_", " ")}</NsnBadge><NsnBadge tone="pending">{result.state}</NsnBadge></div>
+                <p className="mt-3 text-sm text-[var(--nsn-slate)]">{result.reason}</p>
+                {result.excerpt ? <blockquote className="mt-2 break-words border-l-2 border-[var(--nsn-teal)] pl-3 text-sm text-[var(--nsn-navy)] [overflow-wrap:anywhere]">{result.excerpt}{result.sourceRange ? <span className="mt-1 block text-xs text-[var(--nsn-slate)]">Source characters {result.sourceRange.start}-{result.sourceRange.end}</span> : null}</blockquote> : null}
+              </article>
+            )) : null}
+          </div>
+        ) : null}
 
         {showEmptyFilteredState ? <EmptyFilteredState /> : null}
 
@@ -785,7 +897,7 @@ export function LibraryExplorer({
           </div>
         ) : null}
 
-        {viewMode === "ALL_FILES" && visibleFiles.length > 0 ? (
+        {!hasSearchQuery && viewMode === "ALL_FILES" && visibleFiles.length > 0 ? (
           <div className="grid min-w-0 gap-3">
             {visibleFiles.map((file) => (
               <FileRow

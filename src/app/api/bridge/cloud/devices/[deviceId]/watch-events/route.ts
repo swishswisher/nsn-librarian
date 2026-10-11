@@ -13,7 +13,7 @@ export async function POST(
 
   try {
     const bodyText = await request.text();
-    await authenticateBridgeDeviceRequest({
+    const device = await authenticateBridgeDeviceRequest({
       bodyText,
       bridgeDeviceId: deviceId,
       request,
@@ -21,7 +21,7 @@ export async function POST(
     const body = bodyText
       ? (JSON.parse(bodyText) as Record<string, unknown>)
       : {};
-    const result = await ingestBridgeWatchEvents(deviceId, body.events);
+    const result = await ingestBridgeWatchEvents(deviceId, body.events, device.publicKey);
 
     return Response.json({
       ...result,

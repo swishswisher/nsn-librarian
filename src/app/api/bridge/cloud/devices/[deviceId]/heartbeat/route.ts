@@ -15,7 +15,7 @@ export async function POST(
 
   try {
     const bodyText = await request.text();
-    await authenticateBridgeDeviceRequest({
+    const authenticated = await authenticateBridgeDeviceRequest({
       bodyText,
       bridgeDeviceId: deviceId,
       request,
@@ -25,7 +25,7 @@ export async function POST(
       : {};
 
     return Response.json({
-      device: await recordBridgeHeartbeat(deviceId, body),
+      device: await recordBridgeHeartbeat(deviceId, body, authenticated.publicKey),
       ok: true,
     });
   } catch (error) {

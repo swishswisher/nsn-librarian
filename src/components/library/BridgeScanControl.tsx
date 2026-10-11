@@ -492,6 +492,11 @@ export function BridgeScanControl({
               <span>{progress.failedFiles} need attention</span>
               <span>{progress.remainingFiles} remaining</span>
             </div>
+            {progress.aiUsage ? (
+              <p className="break-words text-xs text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+                AI observation: {progress.aiUsage.newlyObserved} new, {progress.aiUsage.reusedObservations} reused, {progress.aiUsage.pendingDocuments} waiting, {progress.aiUsage.failedObservations} used basic mode. {progress.aiUsage.requests} requests ({progress.aiUsage.httpAttempts} HTTP attempts); provider-reported tokens: {progress.aiUsage.inputTokens} in, {progress.aiUsage.outputTokens} out{progress.aiUsage.unreportedTokenRequests ? `; ${progress.aiUsage.unreportedTokenRequests} requests without token totals` : ""}. Reuse avoided {progress.aiUsage.avoidedRequests} observation requests. Cost estimate unavailable without maintained pricing.
+              </p>
+            ) : null}
             {showRecovery ? (
               <div className="grid min-w-0 gap-3 rounded-md border border-[var(--nsn-warm-beige)] bg-[var(--nsn-sand)] p-3 text-[var(--nsn-navy)]">
                 <p className="break-words font-semibold [overflow-wrap:anywhere]">

@@ -1,5 +1,9 @@
+import { latestObservationOrder, observationLeaseMs, usableObservation, deviceKeyFingerprint } from "./observation-authority";
+import { recoverAbandonedObservationFilesForDevice } from "./observation-recovery";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+
+import { Prisma } from "@prisma/client";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import {
@@ -8,12 +12,14 @@ import {
 } from "@/lib/bridge/cloud-coordinator";
 import { requireScanSessionPermission } from "@/lib/bridge/connected-libraries";
 import { bridgeDeviceIsOnline } from "./effective-health";
+import { isCurrentReadableRoot } from "./current-readable-root";
 
 import { currentRecommendationGenerationVersion } from "./recommendation-generation";
 import { prepareOrganizationRecommendationRegeneration } from "./organization-suggestions";
+import { queueRemoteReads } from "./remote-scan-queue";
 import { generateScanRecommendationBatchIfReady } from "./scan-recommendation-batch";
 import {
-  getBridgeScanSessionDetail,
+  getScannedFileSummary,
   getBridgeScanSessionProgress,
 } from "./scan-sessions";
 import type {
@@ -22,7 +28,6 @@ import type {
 } from "./types";
 
 const readCommandLifetimeMs = 10 * 60 * 1000;
-const regenerationReadCommandLifetimeMs = 24 * 60 * 60 * 1000;
 const activeReadCommandStatuses = [
   "PENDING",
   "ACKNOWLEDGED",
@@ -55,18 +60,6 @@ function objectValue(value: unknown) {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
-}
-
-function commandTargetsScannedFile(
-  command: { payload: unknown },
-  input: { scanSessionId: string; scannedFileId: string },
-) {
-  const payload = objectValue(command.payload);
-
-  return (
-    payload?.scanSessionId === input.scanSessionId &&
-    payload?.scannedFileId === input.scannedFileId
-  );
 }
 
 function normalizeCommandCategory(category: string | null | undefined) {
@@ -141,6 +134,10 @@ export function remoteReadFailureCategoryFor(
       : normalized;
   }
 
+  if (normalized === "IMAGE_DECODE_FAILED" || normalized === "IMAGE_METADATA_FAILED") {
+    return normalized;
+  }
+
   if (
     normalized === "PDF_PARSE_FAILED" ||
     (normalized === "BRIDGE_COMMAND_FAILED" && extension === ".pdf")
@@ -154,6 +151,14 @@ export function remoteReadFailureCategoryFor(
 
   if (normalized === "FILE_CORRUPT") {
     return "FILE_CORRUPT";
+  }
+
+  if (normalized === "FILE_CHANGED_SINCE_SCAN" || normalized === "FILE_CHANGED_DURING_READ") {
+    return "FILE_CHANGED_SINCE_SCAN";
+  }
+
+  if (["SOURCE_CHECKSUM_MISSING", "SOURCE_CHECKSUM_INVALID", "SCAN_CHECKSUM_UNVERIFIED"].includes(normalized)) {
+    return normalized;
   }
 
   return "READ_COMMAND_FAILED";
@@ -175,6 +180,22 @@ export function remoteReadFailureMessageFor(
     return "This file appears damaged or could not be read safely.";
   }
 
+  if (category === "FILE_CHANGED_SINCE_SCAN") {
+    return "This file changed after the scan. Scan the folder again before examining it.";
+  }
+
+  if (category === "SOURCE_CHECKSUM_MISSING") {
+    return "This Bridge did not verify the file's contents. Update NSN Bridge and retry reading.";
+  }
+
+  if (category === "SOURCE_CHECKSUM_INVALID") {
+    return "The Bridge could not verify the file's contents. Retry reading with an up-to-date NSN Bridge.";
+  }
+
+  if (category === "SCAN_CHECKSUM_UNVERIFIED") {
+    return "This scan does not have a verified file checksum. Scan the folder again before examining it.";
+  }
+
   if (category === "FILE_NOT_FOUND") {
     return "This file is no longer available at its scanned location.";
   }
@@ -189,6 +210,14 @@ export function remoteReadFailureMessageFor(
 
   if (category === "VIDEO_DECODE_FAILED") {
     return "This video file appears damaged or could not be read safely.";
+  }
+
+  if (category === "IMAGE_DECODE_FAILED") {
+    return "This image appears damaged or could not be read safely.";
+  }
+
+  if (category === "IMAGE_METADATA_FAILED") {
+    return "The Bridge could not read this image's technical information safely.";
   }
 
   if (
@@ -236,11 +265,13 @@ export async function markRemoteReadFailure(input: {
   scanSessionId: string;
   scannedFileId: string;
   safeErrorCategory: string | null | undefined;
+  authority?: { rootRevision?: number; deviceKeyFingerprint?: string };
 }) {
   const prisma = getPrismaClient();
   const file = await prisma.scannedFile.findFirst({
     select: {
       relativePath: true,
+      scanSession: { select: { connectedFolder: true } },
     },
     where: {
       id: input.scannedFileId,
@@ -259,11 +290,37 @@ export async function markRemoteReadFailure(input: {
   const unsupported = category === "UNSUPPORTED_FILE_TYPE";
   const sourceMissing = category === "FILE_NOT_FOUND";
   const message = remoteReadFailureMessageFor(category, file.relativePath);
-  const updated = await prisma.scannedFile.update({
+  return prisma.$transaction(async (tx) => {
+    const rootBinding = file.scanSession.connectedFolder;
+    if (rootBinding.bridgeDeviceId) await tx.$queryRaw`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${rootBinding.bridgeDeviceId} FOR SHARE`;
+    await tx.$queryRaw`SELECT id FROM "ConnectedFolder" WHERE id = ${rootBinding.id} FOR SHARE`;
+    const root = await tx.connectedLibrary.findUniqueOrThrow({ where: { id: rootBinding.id } });
+    if (!isCurrentReadableRoot(root) || root.nativeConnectionRevision !== (input.authority?.rootRevision ?? rootBinding.nativeConnectionRevision))
+      throw new BridgeCloudError("Root authority changed before read failure publication.", 403);
+    if (root.bridgeDeviceId) {
+      const device = await tx.bridgeDevice.findUniqueOrThrow({ where: { bridgeDeviceId: root.bridgeDeviceId } });
+      if (device.revokedAt || device.status === "REVOKED" || (input.authority?.deviceKeyFingerprint && deviceKeyFingerprint(device.publicKey) !== input.authority.deviceKeyFingerprint))
+        throw new BridgeCloudError("Device authority changed before read failure publication.", 401);
+    }
+    await tx.$queryRaw`SELECT id FROM "ScanSession" WHERE id = ${input.scanSessionId} FOR UPDATE`;
+    // Lock before reading completion/lease authority; failure reports do not own an observation lease.
+    await tx.scannedFile.updateMany({ data: { observationClaimedAt: null },
+      where: { id: input.scannedFileId, observationClaimedAt: null } });
+    const current = await tx.scannedFile.findUniqueOrThrow({ where: { id: input.scannedFileId },
+      include: { libraryDocument: { select: { observationSessions: {
+        orderBy: [...latestObservationOrder], take: 1, select: { status: true },
+      } } } },
+    });
+    if (usableObservation(current.libraryDocument?.observationSessions[0]) &&
+        ["EXAMINED", "SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"].includes(current.processingStage)) return current;
+    if (current.observationClaimedAt) throw new BridgeCloudError(
+      "Observation preparation owns this file. Retry this report.", 503, "OBSERVATION_IN_PROGRESS");
+    return tx.scannedFile.update({
     data: {
       extractedAt: new Date(),
       extractionErrorCategory: category,
       extractionStatus: unsupported ? "UNSUPPORTED" : "FAILED",
+      observationClaimedAt: null,
       processedAt: new Date(),
       processingErrorCategory: category,
       processingStage: unsupported ? "UNSUPPORTED" : "FAILED",
@@ -278,10 +335,10 @@ export async function markRemoteReadFailure(input: {
     },
   });
 
-  return updated;
+  });
 }
 
-export async function queueRemoteReadCommand(input: RemoteReadCommandInput) {
+export async function queueRemoteReadCommand(input: RemoteReadCommandInput, prisma?: Prisma.TransactionClient) {
   return createBridgeCloudCommand({
     authorizationContext: {
       purpose:
@@ -308,7 +365,7 @@ export async function queueRemoteReadCommand(input: RemoteReadCommandInput) {
       scanSessionId: input.scanSessionId,
       scannedFileId: input.scannedFileId,
     },
-  });
+  }, prisma);
 }
 
 async function activeReadCommandForScannedFile(input: {
@@ -317,17 +374,17 @@ async function activeReadCommandForScannedFile(input: {
   connectedLibraryId: string;
   scanSessionId: string;
   scannedFileId: string;
-}) {
-  const prisma = getPrismaClient();
-  const commands = await prisma.bridgeCommand.findMany({
-    orderBy: {
-      issuedAt: "desc",
-    },
+}, transaction?: Prisma.TransactionClient) {
+  const prisma = transaction ?? getPrismaClient();
+  return prisma.bridgeCommand.findFirst({
+    orderBy: [{ issuedAt: "desc" }, { id: "desc" }],
     where: {
       bridgeDeviceId: input.bridgeDeviceId,
       bridgeRootId: input.bridgeRootId,
       commandType: "READ_FILE_TEMPORARILY",
       connectedLibraryId: input.connectedLibraryId,
+      AND: [ { payload: { path: ["scannedFileId"], equals: input.scannedFileId } },
+        { payload: { path: ["scanSessionId"], equals: input.scanSessionId } } ],
       expiresAt: {
         gt: new Date(),
       },
@@ -336,18 +393,13 @@ async function activeReadCommandForScannedFile(input: {
       },
     },
   });
-
-  return (
-    commands.find((command) => commandTargetsScannedFile(command, input)) ?? null
-  );
 }
 
 async function scannedFileSummaryFor(
   sessionId: string,
   scannedFileId: string,
 ): Promise<BridgeScannedFileSummary> {
-  const detail = await getBridgeScanSessionDetail(sessionId);
-  const file = detail?.scannedFiles.find((item) => item.id === scannedFileId);
+  const file = await getScannedFileSummary(scannedFileId, sessionId);
 
   if (!file) {
     throw new BridgeCloudError(
@@ -386,11 +438,10 @@ async function queuedResult(input: {
   };
 }
 
-async function markRetryQueued(scannedFileId: string, scanSessionId: string) {
-  const prisma = getPrismaClient();
-
-  await prisma.$transaction([
-    prisma.scannedFile.update({
+async function markRetryQueued(scannedFileId: string, scanSessionId: string, transaction?: Prisma.TransactionClient): Promise<void> {
+  if (!transaction) return getPrismaClient().$transaction((tx) => markRetryQueued(scannedFileId, scanSessionId, tx));
+  const prisma = transaction;
+  await prisma.scannedFile.update({
       data: {
         extractedAt: null,
         extractionErrorCategory: null,
@@ -406,26 +457,18 @@ async function markRetryQueued(scannedFileId: string, scanSessionId: string) {
       where: {
         id: scannedFileId,
       },
-    }),
-    prisma.scanSession.update({
+    });
+  await prisma.scanSession.update({
       data: {
         completedAt: null,
         status: "READING",
+        recommendationGeneration: null,
+        recommendationLeaseUntil: null,
       },
       where: {
         id: scanSessionId,
       },
-    }),
-  ]);
-}
-
-function commandScannedFileId(command: { payload: unknown }, sessionId: string) {
-  const payload = objectValue(command.payload);
-
-  return payload?.scanSessionId === sessionId &&
-    typeof payload.scannedFileId === "string"
-    ? payload.scannedFileId
-    : null;
+    });
 }
 
 export async function queueRemoteRecommendationRegenerationForSession(
@@ -540,156 +583,18 @@ export async function queueRemoteRecommendationRegenerationForSession(
 
   await expireRemoteReadCommandsForSession(sessionId);
 
-  if (options.regenerate) {
-    await prepareOrganizationRecommendationRegeneration(sessionId, {
-      confirmedReviewedDecisions: options.confirmedReviewedDecisions,
-    });
-  }
-
-  const scannedFiles = await prisma.scannedFile.findMany({
-    orderBy: {
-      relativePath: "asc",
-    },
-    select: {
-      id: true,
-      organizationSuggestions: {
-        orderBy: {
-          invalidatedAt: "desc",
-        },
-        select: {
-          id: true,
-        },
-        take: 1,
-        where: {
-          invalidatedAt: {
-            not: null,
-          },
-          recommendationGenerationVersion:
-            currentRecommendationGenerationVersion,
-        },
-      },
-      relativePath: true,
-    },
-    where: {
-      extractionStatus: {
-        not: "FAILED",
-      },
-      organizationSuggestions: {
-        none: {
-          invalidatedAt: null,
-          recommendationGenerationVersion:
-            currentRecommendationGenerationVersion,
-        },
-      },
-      processingStage: {
-        notIn: ["FAILED", "UNSUPPORTED"],
-      },
-      readingStatus: {
-        not: "FAILED",
-      },
-      readStatus: "SUPPORTED",
-      sessionId,
-    },
+  await prepareOrganizationRecommendationRegeneration(sessionId, {
+    confirmedReviewedDecisions: options.confirmedReviewedDecisions,
+    invalidateRecommendations: options.regenerate === true,
+    resetRemoteReads: true,
   });
-
-  const readCommands = await prisma.bridgeCommand.findMany({
-    orderBy: {
-      issuedAt: "desc",
-    },
-    where: {
-      bridgeDeviceId: library.bridgeDeviceId,
-      bridgeRootId: library.bridgeRootId,
-      commandType: "READ_FILE_TEMPORARILY",
-      connectedLibraryId: library.id,
-    },
-  });
-  const latestCommandByFileId = new Map<string, (typeof readCommands)[number]>();
-  const activeCommandFileIds = new Set<string>();
-  const now = new Date();
-
-  for (const command of readCommands) {
-    const scannedFileId = commandScannedFileId(command, sessionId);
-
-    if (!scannedFileId) {
-      continue;
-    }
-
-    if (!latestCommandByFileId.has(scannedFileId)) {
-      latestCommandByFileId.set(scannedFileId, command);
-    }
-
-    if (
-      activeReadCommandStatuses.includes(
-        command.status as (typeof activeReadCommandStatuses)[number],
-      ) &&
-      command.expiresAt > now
-    ) {
-      activeCommandFileIds.add(scannedFileId);
-    }
-  }
-
-  await prisma.$transaction([
-    prisma.scannedFile.updateMany({
-      data: {
-        extractedAt: null,
-        extractionErrorCategory: null,
-        extractionStatus: "EXTRACTING",
-        processedAt: now,
-        processingErrorCategory: null,
-        processingStage: "READING",
-        readingStatus: "NOT_READ",
-        scanError: null,
-        sourceUnavailableAt: null,
-        sourceUnavailableReason: null,
-      },
-      where: {
-        id: {
-          in: scannedFiles.map((file) => file.id),
-        },
-        sessionId,
-      },
-    }),
-    prisma.scanSession.update({
-      data: {
-        completedAt: null,
-        status: "READING",
-      },
-      where: {
-        id: sessionId,
-      },
-    }),
-  ]);
-
-  let queuedFiles = 0;
-  let alreadyQueuedFiles = 0;
-
-  for (const file of scannedFiles) {
-    if (activeCommandFileIds.has(file.id)) {
-      alreadyQueuedFiles += 1;
-      continue;
-    }
-
-    const previousCommand = latestCommandByFileId.get(file.id);
-    const generationBasis =
-      previousCommand?.commandId ??
-      file.organizationSuggestions[0]?.id ??
-      randomUUID();
-
-    await queueRemoteReadCommand({
-      bridgeDeviceId: library.bridgeDeviceId,
-      bridgeRootId: library.bridgeRootId,
-      connectedLibraryId: library.id,
-      expiresAt: new Date(now.getTime() + regenerationReadCommandLifetimeMs),
-      idempotencyKey: `recommendation-regeneration:${currentRecommendationGenerationVersion}:${sessionId}:${file.id}:${generationBasis}`,
-      processingPurpose: "RECOMMENDATION_REGENERATION",
-      recommendationGenerationVersion:
-        currentRecommendationGenerationVersion,
-      relativePath: file.relativePath,
-      scanSessionId: sessionId,
-      scannedFileId: file.id,
-    });
-    queuedFiles += 1;
-  }
+  const queuedFiles = await queueRemoteReads({ bridgeDeviceId: library.bridgeDeviceId, bridgeRootId: library.bridgeRootId,
+    connectedLibraryId: library.id, scanSessionId: sessionId });
+  const alreadyQueuedFiles = await prisma.bridgeCommand.count({ where: {
+    bridgeDeviceId: library.bridgeDeviceId, commandType: "READ_FILE_TEMPORARILY", payload: { path: ["scanSessionId"], equals: sessionId },
+    status: { in: [...activeReadCommandStatuses] }, expiresAt: { gt: new Date() },
+  } }) - queuedFiles;
+  await finalizeRemoteReadSessionIfComplete(sessionId);
 
   const progress = await getBridgeScanSessionProgress(sessionId);
 
@@ -726,11 +631,13 @@ async function finalizeRemoteReadSessionIfComplete(sessionId: string) {
 export async function expireRemoteReadCommandsForSession(
   sessionId: string,
   now = new Date(),
+  recoverObservations = true,
 ) {
   const prisma = getPrismaClient();
   const commands = await prisma.bridgeCommand.findMany({
     where: {
       commandType: "READ_FILE_TEMPORARILY",
+      payload: { path: ["scanSessionId"], equals: sessionId },
       expiresAt: {
         lte: now,
       },
@@ -748,6 +655,10 @@ export async function expireRemoteReadCommandsForSession(
     );
   });
 
+  if (recoverObservations) for (const deviceId of new Set(expiredCommands.map((command) => command.bridgeDeviceId))) {
+    await recoverAbandonedObservationFilesForDevice(deviceId, now);
+  }
+  let expired = 0;
   for (const command of expiredCommands) {
     const payload = objectValue(command.payload);
     const scannedFileId =
@@ -757,28 +668,37 @@ export async function expireRemoteReadCommandsForSession(
       continue;
     }
 
-    await prisma.bridgeCommand.update({
+    const currentCommand = await prisma.bridgeCommand.findUniqueOrThrow({ where: { commandId: command.commandId } });
+    if (!activeReadCommandStatuses.includes(currentCommand.status as typeof activeReadCommandStatuses[number])) continue;
+    const currentFile = await prisma.scannedFile.findUnique({ where: { id: scannedFileId } });
+    if (currentFile?.observationClaimedAt ||
+        ["READ", "EXAMINING", "OBSERVING"].includes(currentFile?.processingStage ?? "")) continue;
+    let settledFile;
+    try {
+      settledFile = await markRemoteReadFailure({ safeErrorCategory: "READ_COMMAND_TIMEOUT", scanSessionId: sessionId, scannedFileId });
+    } catch (error) {
+      if (error instanceof BridgeCloudError && error.code === "OBSERVATION_IN_PROGRESS") continue;
+      throw error;
+    }
+    const settled = settledFile && ["EXAMINED", "SUGGESTIONS_GENERATED", "RECOMMENDATIONS_READY"].includes(settledFile.processingStage);
+    await prisma.bridgeCommand.updateMany({
       data: {
         completedAt: now,
-        safeErrorCategory: "READ_COMMAND_TIMEOUT",
-        status: "EXPIRED",
+        safeErrorCategory: settled ? null : "READ_COMMAND_TIMEOUT",
+        status: settled ? "COMPLETED" : "EXPIRED",
       },
       where: {
-        commandId: command.commandId,
+        commandId: command.commandId, status: { in: [...activeReadCommandStatuses] },
       },
     });
-    await markRemoteReadFailure({
-      safeErrorCategory: "READ_COMMAND_TIMEOUT",
-      scanSessionId: sessionId,
-      scannedFileId,
-    });
+    expired++;
   }
 
   if (expiredCommands.length > 0) {
     await finalizeRemoteReadSessionIfComplete(sessionId);
   }
 
-  return expiredCommands.length;
+  return expired;
 }
 
 export async function queueRemoteReadRetryForScannedFile(scannedFileId: string) {
@@ -808,6 +728,9 @@ export async function queueRemoteReadRetryForScannedFile(scannedFileId: string) 
     );
   }
 
+  if (scannedFile.observationClaimedAt && scannedFile.observationClaimedAt.getTime() > Date.now() - observationLeaseMs) {
+    throw new BridgeCloudError("Observation preparation is still in progress. Retry later.", 503, "OBSERVATION_IN_PROGRESS");
+  }
   const library = scannedFile.scanSession.connectedFolder;
 
   if (!library.bridgeDeviceId) {
@@ -829,7 +752,7 @@ export async function queueRemoteReadRetryForScannedFile(scannedFileId: string) 
     );
   }
 
-  if (!library.isEnabled || library.status === "DISCONNECTED") {
+  if (!isCurrentReadableRoot(library)) {
     throw new BridgeCloudError(
       "Reconnect this folder before retrying this file.",
       409,
@@ -863,39 +786,31 @@ export async function queueRemoteReadRetryForScannedFile(scannedFileId: string) 
     );
   }
 
-  const activeCommand = await activeReadCommandForScannedFile({
-    bridgeDeviceId: library.bridgeDeviceId,
-    bridgeRootId: library.bridgeRootId,
-    connectedLibraryId: library.id,
-    scanSessionId: scannedFile.sessionId,
-    scannedFileId,
-  });
-
-  if (activeCommand) {
-    await markRetryQueued(scannedFileId, scannedFile.sessionId);
-    return queuedResult({
-      message: "The Bridge is already reading this file again.",
-      scanSessionId: scannedFile.sessionId,
-      scannedFileId,
-    });
-  }
-
-  const retryRequestedAt = new Date();
-
-  await markRetryQueued(scannedFileId, scannedFile.sessionId);
-  await queueRemoteReadCommand({
-    bridgeDeviceId: library.bridgeDeviceId,
-    bridgeRootId: library.bridgeRootId,
-    connectedLibraryId: library.id,
-    idempotencyKey: `read-file-retry:${scannedFile.sessionId}:${scannedFile.id}:${retryRequestedAt.getTime()}`,
-    relativePath: scannedFile.relativePath,
-    scanSessionId: scannedFile.sessionId,
-    scannedFileId: scannedFile.id,
+  const alreadyReading = await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "BridgeDevice" WHERE "bridgeDeviceId" = ${library.bridgeDeviceId} FOR SHARE`);
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "ConnectedFolder" WHERE id = ${library.id} FOR SHARE`);
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "ScanSession" WHERE id = ${scannedFile.sessionId} FOR UPDATE`);
+    await tx.$queryRaw(Prisma.sql`SELECT id FROM "ScannedFile" WHERE id = ${scannedFileId} FOR UPDATE`);
+    const current = await tx.scannedFile.findUniqueOrThrow({ where: { id: scannedFileId }, include: {
+      scanSession: { include: { connectedFolder: { include: { bridgeDevice: true } } } },
+    } });
+    const root = current.scanSession.connectedFolder;
+    if (!isCurrentReadableRoot(root) || root.bridgeDeviceId !== library.bridgeDeviceId || root.bridgeRootId !== library.bridgeRootId ||
+        !bridgeDeviceIsOnline(root.bridgeDevice)) throw new BridgeCloudError("This folder no longer authorizes the read retry.", 409, "ROOT_NOT_CONNECTED");
+    if (current.observationClaimedAt && current.observationClaimedAt.getTime() > Date.now() - observationLeaseMs)
+      throw new BridgeCloudError("Observation preparation is still in progress. Retry later.", 503, "OBSERVATION_IN_PROGRESS");
+    const active = await activeReadCommandForScannedFile({ bridgeDeviceId: root.bridgeDeviceId!, bridgeRootId: root.bridgeRootId!,
+      connectedLibraryId: root.id, scanSessionId: current.sessionId, scannedFileId }, tx);
+    if (!active) await queueRemoteReadCommand({ bridgeDeviceId: root.bridgeDeviceId!, bridgeRootId: root.bridgeRootId!,
+      connectedLibraryId: root.id, idempotencyKey: `read-file-retry:${current.sessionId}:${current.id}:${randomUUID()}`,
+      relativePath: current.relativePath, scanSessionId: current.sessionId, scannedFileId }, tx);
+    await markRetryQueued(scannedFileId, current.sessionId, tx);
+    return Boolean(active);
   });
 
   return queuedResult({
     message:
-      "The Librarian asked the Bridge to read this file again. This page will update when the Mac reports back.",
+      alreadyReading ? "The Bridge is already reading this file again." : "The Librarian asked the Bridge to read this file again. This page will update when the Mac reports back.",
     scanSessionId: scannedFile.sessionId,
     scannedFileId,
   });

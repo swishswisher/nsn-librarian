@@ -370,7 +370,7 @@ export async function scanConnectedLibrary(connectedLibraryId: string) {
 
   if (library.bridgeRootId) {
     try {
-      return await scanLocalBridgeRoot(library.bridgeRootId);
+      return { ...await scanLocalBridgeRoot(library.bridgeRootId), physicalInventoryGeneration: library.physicalInventoryGeneration, rootConnectionRevision: library.nativeConnectionRevision };
     } catch (error) {
       throw new BridgeScannerError(
         error instanceof Error
@@ -394,5 +394,5 @@ export async function scanConnectedLibrary(connectedLibraryId: string) {
     "scan files",
   );
 
-  return scanBridgeFolder(folderPath);
+  return { ...await scanBridgeFolder(folderPath), physicalInventoryGeneration: library.physicalInventoryGeneration, rootConnectionRevision: library.nativeConnectionRevision };
 }

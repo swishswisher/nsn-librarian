@@ -1,3 +1,5 @@
+import { preparePhysicalCommand, markPhysicalCommandDelivered, unfinishedPhysicalCommands, physicalCommandNeverStarted, markPhysicalCommandStarted } from "./command-journal";
+import { recoverBridgePhysicalActions } from "../../../../bridge-app/src/filesystem/operations";
 import {
   bridgeCommandIsExpired,
   createBridgeCommandReplayKey,
@@ -16,6 +18,7 @@ import { readBridgeRootFile } from "../../../../bridge-app/src/filesystem/reader
 import { scanBridgeRoot } from "../../../../bridge-app/src/filesystem/scanner";
 import {
   disconnectRoot,
+  getRoot,
   registerRootFromSelection,
   updateRoot,
 } from "../../../../bridge-app/src/main/registry";
@@ -246,11 +249,10 @@ async function loadReplayKeys() {
 
   try {
     const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed)
-      ? parsed.filter((item): item is string => typeof item === "string")
-      : [];
+    if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) throw new Error("Replay journal is corrupt.");
+    return parsed as string[];
   } catch {
-    return [];
+    throw new Error("The replay journal needs recovery; preserve its bytes.");
   }
 }
 
@@ -267,6 +269,14 @@ async function executeCommand(
   runtime: BridgeCommandRuntime,
 ) {
   const payload = payloadObject(command.payload);
+  if (command.bridgeRootId && !["REGISTER_ROOT", "SELECT_FOLDERS"].includes(command.commandType)) {
+    const root = await getRoot(command.bridgeRootId);
+    const context = payloadObject(command.authorizationContext);
+    const revision = context.rootConnectionRevision;
+    if (revision !== (root.connectionRevision ?? 0) && !(revision === undefined && !root.connectionRevision)) {
+      throw new BridgeAppError("This command belongs to an older folder connection.", "ROOT_CONNECTION_CHANGED", 409);
+    }
+  }
 
   switch (command.commandType) {
     case "SELECT_FOLDERS": {
@@ -316,6 +326,7 @@ async function executeCommand(
       return executeBridgePlanActions(
         requiredRootId(command),
         requiredExecutionActions(payload.actions),
+        typeof payloadObject(command.authorizationContext).rootConnectionRevision === "number" ? payloadObject(command.authorizationContext).rootConnectionRevision as number : 0,
       );
     case "PREVIEW_UNDO":
       return previewBridgeUndo(
@@ -326,6 +337,7 @@ async function executeCommand(
       return executeBridgeUndoActions(
         requiredRootId(command),
         requiredUndoActions(payload.actions),
+        typeof payloadObject(command.authorizationContext).rootConnectionRevision === "number" ? payloadObject(command.authorizationContext).rootConnectionRevision as number : 0,
       );
     case "RECONCILE_LIBRARY": {
       const rootId = requiredRootId(command);
@@ -429,7 +441,10 @@ export async function processPendingBridgeCommands(
 
   const { bridgeDeviceId } = identity;
   const deliveredReports = await flushPendingReports();
-  const commands = await fetchPendingBridgeCommands();
+  const historical = await unfinishedPhysicalCommands(bridgeDeviceId);
+  const historicalIds = new Set(historical.map((command) => command.commandId));
+  const fetched = await fetchPendingBridgeCommands().catch((error) => { if (historical.length) return []; throw error; });
+  const commands = [...new Map([...historical, ...fetched].map((command) => [command.commandId, command])).values()];
   const replayKeys = new Set(await loadReplayKeys());
   const pendingReports = new Set(
     (await loadBridgeCommandOutbox()).map((item) => item.report.commandId),
@@ -438,6 +453,8 @@ export async function processPendingBridgeCommands(
 
   for (const command of commands) {
     const replayKey = createBridgeCommandReplayKey(command);
+    const physical = command.commandType === "EXECUTE_PLAN" || command.commandType === "EXECUTE_UNDO";
+    const historicalPhysical = historicalIds.has(command.commandId);
 
     if (command.bridgeDeviceId !== bridgeDeviceId) {
       continue;
@@ -451,7 +468,7 @@ export async function processPendingBridgeCommands(
       continue;
     }
 
-    if (bridgeCommandIsExpired(command.expiresAt)) {
+    if (bridgeCommandIsExpired(command.expiresAt) && !historicalPhysical) {
       await rejectCommand(command, "COMMAND_EXPIRED", replayKey).catch(
         () => undefined,
       );
@@ -465,7 +482,7 @@ export async function processPendingBridgeCommands(
       continue;
     }
 
-    if (replayKeys.has(replayKey)) {
+    if (replayKeys.has(replayKey) && !physical) {
       await rejectCommand(
         command,
         "COMMAND_RECOVERY_REQUIRED",
@@ -474,27 +491,40 @@ export async function processPendingBridgeCommands(
       continue;
     }
 
-    // Persist the replay marker before acknowledgement or filesystem work. If
-    // the process stops mid-command, the command is never executed a second time.
-    await rememberReplayKey(replayKey);
-    replayKeys.add(replayKey);
-    await acknowledgeBridgeCommand(command.commandId);
+    if (physical) await preparePhysicalCommand(command, replayKeys.has(replayKey));
+    else { await rememberReplayKey(replayKey); replayKeys.add(replayKey); }
+    let admitted = false;
+    try { await acknowledgeBridgeCommand(command.commandId); admitted = true; }
+    catch (error) { if (!physical || !historicalPhysical) throw error; }
 
     let report: BridgeCommandReport;
 
     try {
-      const result = await executeCommand(command, runtime);
+      const payload = payloadObject(command.payload);
+      const neverStarted = physical && await physicalCommandNeverStarted(command);
+      // A successful new ACK does not prove an older command had no effect.
+      // Only exact PREPARED evidence can admit its first filesystem attempt.
+      const historicalOnly = physical && (!admitted || bridgeCommandIsExpired(command.expiresAt) ||
+        replayKeys.has(replayKey) || (historicalPhysical && !neverStarted));
+      if (physical && !historicalOnly) await markPhysicalCommandStarted(command);
+      const result = historicalOnly
+        ? await recoverBridgePhysicalActions(requiredRootId(command), command.commandType === "EXECUTE_PLAN"
+           ? requiredExecutionActions(payload.actions) : requiredUndoActions(payload.actions), command.commandType === "EXECUTE_UNDO", neverStarted)
+        : await executeCommand(command, runtime);
       report = {
         commandId: command.commandId,
         result: jsonSafe(result),
-        safeErrorCategory: null,
+        safeErrorCategory: payloadObject(jsonSafe(result)).status === "RECOVERY_REQUIRED" ? "COMMAND_RECOVERY_REQUIRED" : null,
         status: "COMPLETED",
       };
     } catch (error) {
+      const payload = payloadObject(command.payload);
+      const recovered = physical ? await recoverBridgePhysicalActions(requiredRootId(command), command.commandType === "EXECUTE_PLAN"
+        ? requiredExecutionActions(payload.actions) : requiredUndoActions(payload.actions), command.commandType === "EXECUTE_UNDO") : null;
       report = {
         commandId: command.commandId,
-        result: null,
-        safeErrorCategory:
+        result: recovered ? jsonSafe(recovered) : null,
+        safeErrorCategory: recovered?.status === "RECOVERY_REQUIRED" ? "COMMAND_RECOVERY_REQUIRED" :
           error instanceof BridgeAppError
             ? error.code
             : "BRIDGE_COMMAND_FAILED",
@@ -502,7 +532,10 @@ export async function processPendingBridgeCommands(
       };
     }
 
-    await submitPersistedReport(replayKey, report);
+    const delivered = await submitPersistedReport(replayKey, report);
+    if (physical && delivered && report.safeErrorCategory !== "COMMAND_RECOVERY_REQUIRED") {
+      await markPhysicalCommandDelivered(command); await rememberReplayKey(replayKey);
+    }
     reports.push(report);
   }
 

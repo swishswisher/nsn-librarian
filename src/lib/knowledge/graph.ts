@@ -1,4 +1,6 @@
-import type { Prisma } from "@prisma/client";
+import { Prisma, type KnowledgeObject as DatabaseKnowledgeObject, type KnowledgeRelationship as DatabaseKnowledgeRelationship } from "@prisma/client";
+import { lockAuthorityOwner, nextAuthorityTime } from "@/lib/db/authority";
+import { curatedMemorySql, eligibleMemoryObservationSql, memoryReviewAuthoritySql } from "@/lib/library/memory-provenance";
 
 import { getPrismaClient } from "@/lib/db/prisma";
 import {
@@ -41,8 +43,6 @@ import type {
   KnowledgeSourcePriority,
 } from "./types";
 
-const trustedMemoryStatus = "ACTIVE";
-const reviewedObservationStatuses = new Set(["APPROVED", "MODIFIED"]);
 const reviewedRecommendationStatuses = ["APPROVED", "MODIFIED"] as const;
 const usableNotebookStatuses = [
   "CURRENT",
@@ -53,6 +53,53 @@ const relationshipCandidateLimit = 4;
 const backfillLimit = 32;
 
 let backfillPromise: Promise<void> | null = null;
+
+// Curated graph merging changes multiple semantic owners. Shared admission lets
+// ordinary independent-owner review/backfill run concurrently; merge takes the
+// exclusive gate, then locks its owners in stable id order. This is not the
+// library-scale persistent Knowledge/publication graph.
+async function withKnowledgeAuthority<T>(work: (tx: Prisma.TransactionClient) => Promise<T>, exclusive = false): Promise<T> {
+  return getPrismaClient().$transaction(async (tx) => {
+    if (exclusive) await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended('curated-knowledge-authority', 0))::text`;
+    else await tx.$queryRaw`SELECT pg_advisory_xact_lock_shared(hashtextextended('curated-knowledge-authority', 0))::text`;
+    return work(tx);
+  }, { timeout: 30_000 });
+}
+
+async function graphSourceEligible(tx: Prisma.TransactionClient, key: string, sourceUpdatedAt?: Date) {
+  const [kind, id, decisionId] = key.split(":");
+  if (kind !== "memory" && kind !== "observation") return true; // Curated Notebook and organization history retain their separate history policy.
+  if (!id) return false;
+  const observations = kind === "memory" ? await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT DISTINCT sources.id FROM (
+      SELECT source."observationSessionId" AS id FROM "MemorySearchSource" source WHERE source."memoryEntryId" = ${id}
+      UNION ALL SELECT required.id FROM "MemoryEntry" memory,
+        LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(memory.evidence) = 'array' THEN memory.evidence ELSE '[]'::jsonb END) item,
+        LATERAL jsonb_array_elements_text(CASE WHEN item->>'kind' = 'MEMORY_PROVENANCE_REQUIRED'
+          AND jsonb_typeof(item->'sourceSessionIds') = 'array' THEN item->'sourceSessionIds' ELSE '[]'::jsonb END) required(id)
+        WHERE memory.id = ${id}
+    ) sources ORDER BY sources.id`) : [{ id }];
+  for (let offset = 0; offset < observations.length; offset += 500) await tx.$queryRaw(Prisma.sql`
+    SELECT id FROM "ObservationSession" WHERE id IN (${Prisma.join(observations.slice(offset, offset + 500).map((row) => row.id))}) ORDER BY id FOR SHARE`);
+  const roots = kind === "memory" ? await tx.$queryRaw<Array<{ id: string }>>`
+    SELECT DISTINCT "connectedLibraryId" AS id FROM "MemorySearchSource" WHERE "memoryEntryId" = ${id} ORDER BY id` :
+    await tx.$queryRaw<Array<{ id: string }>>`SELECT DISTINCT scan."connectedFolderId" AS id FROM "ScannedFile" file
+      JOIN "ScanSession" scan ON scan.id = file."sessionId" JOIN "ObservationSession" observation ON observation."libraryDocumentId" = file."libraryDocumentId"
+      WHERE observation.id = ${id} ORDER BY id`;
+  for (let offset = 0; offset < roots.length; offset += 500) await tx.$queryRaw(Prisma.sql`
+    SELECT id FROM "ConnectedFolder" WHERE id IN (${Prisma.join(roots.slice(offset, offset + 500).map((row) => row.id))}) ORDER BY id FOR SHARE`);
+  if (kind === "memory") {
+    await tx.$queryRaw`SELECT id FROM "MemoryEntry" WHERE id = ${id} FOR SHARE`;
+    return (await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT memory.id FROM "MemoryEntry" memory WHERE memory.id = ${id} AND (${curatedMemorySql})
+        AND ${sourceUpdatedAt ? Prisma.sql`memory."updatedAt" = (${sourceUpdatedAt.toISOString()}::timestamptz AT TIME ZONE 'UTC')` : Prisma.sql`true`}`)).length > 0;
+  }
+  return Boolean(decisionId && (await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT observation.id FROM "ObservationSession" observation WHERE observation.id = ${id} AND ${eligibleMemoryObservationSql}
+      AND ${decisionId} = (SELECT authority.id FROM "HumanDecision" authority
+        WHERE authority."observationSessionId" = observation.id AND ${memoryReviewAuthoritySql}
+        ORDER BY authority."createdAt" DESC, authority.id DESC LIMIT 1)`)).length);
+}
 
 type StoredKnowledgeObject = {
   approvedAt: Date | null;
@@ -108,15 +155,6 @@ type SourceObjectResult = {
   };
   sourceKey: string;
 };
-
-function isUniqueConstraintError(error: unknown) {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: string }).code === "P2002"
-  );
-}
 
 function objectStatusFrom(value: string): KnowledgeObjectStatus {
   if (
@@ -348,6 +386,7 @@ function objectDescription(name: string, source: KnowledgeSource) {
 
 function makeObjectDrafts(source: KnowledgeSource): KnowledgeObjectDraft[] {
   return extractKnowledgeCandidates(source.text).map((candidate) => ({
+    sourceUpdatedAt: source.sourceUpdatedAt,
     approvedAt: source.approvedAt,
     approvedBy: source.approvedBy,
     confidence: source.confidence,
@@ -364,10 +403,13 @@ function makeObjectDrafts(source: KnowledgeSource): KnowledgeObjectDraft[] {
   }));
 }
 
-async function upsertKnowledgeObject(draft: KnowledgeObjectDraft) {
-  const prisma = getPrismaClient();
+async function upsertKnowledgeObject(draft: KnowledgeObjectDraft, transaction?: Prisma.TransactionClient): Promise<DatabaseKnowledgeObject | null> {
+  if (!transaction) return withKnowledgeAuthority((tx) => upsertKnowledgeObject(draft, tx));
+  const prisma = transaction;
+  if (!await graphSourceEligible(prisma, draft.sourceKey, draft.sourceUpdatedAt)) return null;
   const normalizedName = normalizeKnowledgeName(draft.name);
-  const existing = await prisma.knowledgeObject.findUnique({
+  await prisma.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`graph-object:${draft.objectType}:${normalizedName}`}, 0))::text`;
+  let existing = await prisma.knowledgeObject.findUnique({
     where: {
       objectType_normalizedName: {
         normalizedName,
@@ -375,9 +417,13 @@ async function upsertKnowledgeObject(draft: KnowledgeObjectDraft) {
       },
     },
   });
+  if (existing) {
+    await lockAuthorityOwner(prisma, "KnowledgeObject", existing.id);
+    existing = await prisma.knowledgeObject.findUniqueOrThrow({ where: { id: existing.id } });
+    if (existing.normalizedName !== normalizedName || existing.objectType !== draft.objectType) existing = null;
+  }
 
   if (!existing) {
-    try {
       return await prisma.knowledgeObject.create({
         data: {
           approvedAt: draft.approvedAt ?? null,
@@ -396,13 +442,6 @@ async function upsertKnowledgeObject(draft: KnowledgeObjectDraft) {
           trustLevel: draft.trustLevel,
         },
       });
-    } catch (error) {
-      if (!isUniqueConstraintError(error)) {
-        throw error;
-      }
-
-      return upsertKnowledgeObject(draft);
-    }
   }
 
   const existingSourceKeys = Array.isArray(existing.sourceKeys)
@@ -411,8 +450,11 @@ async function upsertKnowledgeObject(draft: KnowledgeObjectDraft) {
   const alreadySawSource = existingSourceKeys.includes(draft.sourceKey);
   const sourceKeys = [...new Set([...existingSourceKeys, draft.sourceKey])];
   const existingEvidence = evidenceFromJson(existing.evidence);
+  const reviewed = Boolean(await prisma.knowledgeObjectRevision.findFirst({ where: { objectId: existing.id,
+    OR: [{ createdBy: { not: "System" } }, { createdBy: null }] }, select: { id: true } }));
+  const protectedAuthority = reviewed || existing.canonicalObjectId || ["REJECTED", "ARCHIVED"].includes(existing.status);
   const shouldElevate =
-    draft.status === "APPROVED" && existing.status !== "APPROVED";
+    !protectedAuthority && draft.status === "APPROVED" && existing.status !== "APPROVED";
   const status = shouldElevate ? "APPROVED" : existing.status;
   const trustLevel = shouldElevate ? "HUMAN_APPROVED" : existing.trustLevel;
   const confidence = safeConfidence(Math.max(existing.confidence, draft.confidence));
@@ -423,7 +465,7 @@ async function upsertKnowledgeObject(draft: KnowledgeObjectDraft) {
       approvedBy: shouldElevate ? (draft.approvedBy ?? "Deanne") : existing.approvedBy,
       confidence,
       description:
-        existing.description.length >= draft.description.length
+        reviewed || existing.description.length >= draft.description.length
           ? existing.description
           : draft.description,
       evidence: toJsonInput(mergeKnowledgeEvidence(existingEvidence, draft.evidence)),
@@ -449,23 +491,34 @@ async function upsertKnowledgeRelationship(
   sourceObjectId: string,
   targetObjectId: string,
   draft: KnowledgeRelationshipDraft,
-) {
+  transaction?: Prisma.TransactionClient,
+): Promise<DatabaseKnowledgeRelationship | null> {
   if (sourceObjectId === targetObjectId) {
     return null;
   }
 
-  const prisma = getPrismaClient();
+  if (!transaction) return withKnowledgeAuthority((tx) => upsertKnowledgeRelationship(sourceObjectId, targetObjectId, draft, tx));
+  const prisma = transaction;
+  if (!await graphSourceEligible(prisma, draft.sourceKey, draft.sourceUpdatedAt)) return null;
+  for (const id of [sourceObjectId, targetObjectId].sort()) await prisma.$queryRaw`SELECT id FROM "KnowledgeObject" WHERE id = ${id} FOR SHARE`;
+  const endpoints = await prisma.knowledgeObject.findMany({ where: { id: { in: [sourceObjectId, targetObjectId] },
+    canonicalObjectId: null, status: { notIn: ["REJECTED", "ARCHIVED"] } }, select: { id: true } });
+  if (endpoints.length !== 2) return null;
   const relationshipKey = relationshipKeyFor(
     sourceObjectId,
     targetObjectId,
     draft.relationshipType,
   );
-  const existing = await prisma.knowledgeRelationship.findUnique({
+  await prisma.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`graph-relationship:${relationshipKey}`}, 0))::text`;
+  let existing = await prisma.knowledgeRelationship.findUnique({
     where: { relationshipKey },
   });
+  if (existing) {
+    await lockAuthorityOwner(prisma, "KnowledgeRelationship", existing.id);
+    existing = await prisma.knowledgeRelationship.findUniqueOrThrow({ where: { id: existing.id } });
+  }
 
   if (!existing) {
-    try {
       return await prisma.knowledgeRelationship.create({
         data: {
           confidence: safeConfidence(draft.confidence),
@@ -480,18 +533,13 @@ async function upsertKnowledgeRelationship(
           trustLevel: draft.trustLevel,
         },
       });
-    } catch (error) {
-      if (!isUniqueConstraintError(error)) {
-        throw error;
-      }
-
-      return upsertKnowledgeRelationship(sourceObjectId, targetObjectId, draft);
-    }
   }
 
   const existingEvidence = evidenceFromJson(existing.evidence);
+  const reviewed = Boolean(await prisma.knowledgeRelationshipRevision.findFirst({ where: { relationshipId: existing.id,
+    OR: [{ createdBy: { not: "System" } }, { createdBy: null }] }, select: { id: true } }));
   const shouldElevate =
-    draft.status === "APPROVED" && existing.status !== "APPROVED";
+    !reviewed && !["REJECTED", "ARCHIVED"].includes(existing.status) && draft.status === "APPROVED" && existing.status !== "APPROVED";
 
   return prisma.knowledgeRelationship.update({
     data: {
@@ -499,7 +547,7 @@ async function upsertKnowledgeRelationship(
       confidence: safeConfidence(Math.max(existing.confidence, draft.confidence)),
       evidence: toJsonInput(mergeKnowledgeEvidence(existingEvidence, draft.evidence)),
       explanation:
-        existing.explanation.length >= draft.explanation.length
+        reviewed || existing.explanation.length >= draft.explanation.length
           ? existing.explanation
           : draft.explanation,
       provenanceSummary: existing.provenanceSummary.includes(draft.provenanceSummary)
@@ -521,6 +569,7 @@ async function createObjectsForSource(source: KnowledgeSource) {
     }
 
     const object = await upsertKnowledgeObject(draft);
+    if (!object) continue;
 
     objects.push({
       object: {
@@ -551,6 +600,7 @@ async function createRelationshipsForSource(
       }
 
       await upsertKnowledgeRelationship(sourceObject.object.id, targetObject.object.id, {
+        sourceUpdatedAt: source.sourceUpdatedAt,
         confidence: safeConfidence(source.confidence - 0.08),
         evidence: sourceEvidence(source),
         explanation:
@@ -817,6 +867,7 @@ async function createOrganizationHistoryRelationship({
   });
   const actionLabel = organizationActionLabel(relationshipType);
 
+  if (!sourceObject || !targetObject) return;
   await upsertKnowledgeRelationship(sourceObject.id, targetObject.id, {
     confidence: source.confidence,
     evidence: sourceEvidence(source),
@@ -981,15 +1032,18 @@ function preferenceTermsFromText(value: string) {
 
 async function backfillMemoryKnowledge() {
   const prisma = getPrismaClient();
+  const eligible = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT memory.id FROM "MemoryEntry" memory WHERE ${curatedMemorySql}
+    ORDER BY memory."updatedAt" DESC, memory.id DESC LIMIT ${backfillLimit}`);
   const entries = await prisma.memoryEntry.findMany({
-    orderBy: { updatedAt: "desc" },
-    take: backfillLimit,
-    where: { status: trustedMemoryStatus },
+    orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
+    where: { id: { in: eligible.map((entry) => entry.id) } },
   });
 
   for (const entry of entries) {
     const source: KnowledgeSource = {
       appearedIn: `Memory: ${entry.title}`,
+      sourceUpdatedAt: entry.updatedAt,
       approvedAt: entry.updatedAt,
       approvedBy: "Deanne",
       confidence: Math.max(entry.confidence, 0.72),
@@ -1011,10 +1065,13 @@ async function backfillMemoryKnowledge() {
       sourceKind: "MEMORY",
       sourcePriority: "HIGH",
       status: "APPROVED",
-      text: `${entry.title}. ${entry.description}. ${jsonToText(entry.evidence)}`,
+      // Evidence retains audit history and replaced machine wording. It does
+      // not add meaning beyond the approved, current Memory statement.
+      text: `${entry.title}. ${entry.description}`,
       trustLevel: "HUMAN_APPROVED",
     };
     const primary = await upsertKnowledgeObject({
+      sourceUpdatedAt: entry.updatedAt,
       approvedAt: entry.updatedAt,
       approvedBy: "Deanne",
       confidence: source.confidence,
@@ -1029,6 +1086,7 @@ async function backfillMemoryKnowledge() {
       status: "APPROVED",
       trustLevel: "HUMAN_APPROVED",
     });
+    if (!primary) continue;
     const objects = await createObjectsForSource(source);
 
     objects.unshift({
@@ -1046,6 +1104,7 @@ async function backfillMemoryKnowledge() {
 
       if (preference) {
         const preferred = await upsertKnowledgeObject({
+          sourceUpdatedAt: entry.updatedAt,
           approvedAt: entry.updatedAt,
           approvedBy: "Deanne",
           confidence: source.confidence,
@@ -1061,6 +1120,7 @@ async function backfillMemoryKnowledge() {
           trustLevel: "HUMAN_APPROVED",
         });
         const replaced = await upsertKnowledgeObject({
+          sourceUpdatedAt: entry.updatedAt,
           approvedAt: entry.updatedAt,
           approvedBy: "Deanne",
           confidence: source.confidence,
@@ -1076,7 +1136,9 @@ async function backfillMemoryKnowledge() {
           trustLevel: "HUMAN_APPROVED",
         });
 
+        if (!preferred || !replaced) continue;
         await upsertKnowledgeRelationship(preferred.id, replaced.id, {
+          sourceUpdatedAt: entry.updatedAt,
           confidence: source.confidence,
           evidence: sourceEvidence(source),
           explanation: `Deanne has repeatedly preferred "${preference.preferred}" over "${preference.replaced}" in reviewed decisions.`,
@@ -1128,6 +1190,14 @@ async function backfillNotebookKnowledge() {
 
 async function backfillObservationKnowledge() {
   const prisma = getPrismaClient();
+  const eligible = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT decision.id FROM "HumanDecision" decision JOIN "ObservationSession" observation
+      ON observation.id = decision."observationSessionId"
+    WHERE decision."decisionType" IN ('ACCEPT', 'MODIFY') AND ${eligibleMemoryObservationSql}
+      AND decision.id = (SELECT authority.id FROM "HumanDecision" authority
+        WHERE authority."observationSessionId" = observation.id AND ${memoryReviewAuthoritySql}
+        ORDER BY authority."createdAt" DESC, authority.id DESC LIMIT 1)
+    ORDER BY decision."createdAt" DESC, decision.id DESC LIMIT ${backfillLimit}`);
   const decisions = await prisma.humanDecision.findMany({
     include: {
       observationSession: {
@@ -1148,17 +1218,12 @@ async function backfillObservationKnowledge() {
         },
       },
     },
-    orderBy: { createdAt: "desc" },
-    take: backfillLimit,
-    where: { decisionType: { not: "REJECT" } },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    where: { id: { in: eligible.map((decision) => decision.id) } },
   });
 
   for (const decision of decisions) {
     const session = decision.observationSession;
-
-    if (!reviewedObservationStatuses.has(session.status)) {
-      continue;
-    }
 
     const scannedFile = session.libraryDocument.scannedFiles[0] ?? null;
     const source: KnowledgeSource = {
@@ -1178,12 +1243,11 @@ async function backfillObservationKnowledge() {
       sourceKind: "OBSERVATION",
       sourcePriority: "MEDIUM",
       status: "PROVISIONAL",
-      text: [
+      text: decision.decisionType === "MODIFY" ? decision.editedSuggestion ?? "" : [
         jsonToText(session.observations),
         jsonToText(session.interpretations),
         jsonToText(session.explanation),
         decision.note ?? "",
-        decision.editedSuggestion ?? "",
       ].join(" "),
       trustLevel: "PROVISIONAL",
     };
@@ -1392,18 +1456,29 @@ export async function cleanupWorkflowKnowledgeNoise() {
   );
 
   for (const object of noisyObjects) {
-    await prisma.$transaction(async (transaction) => {
+    await withKnowledgeAuthority(async (transaction) => {
+      await lockAuthorityOwner(transaction, "KnowledgeObject", object.id);
+      const current = await transaction.knowledgeObject.findUniqueOrThrow({ where: { id: object.id } });
+      if (current.canonicalObjectId || current.status === "ARCHIVED" || current.trustLevel === "HUMAN_APPROVED" ||
+          !isWorkflowKnowledgeName(current.name) || await transaction.knowledgeObjectRevision.findFirst({ where: { objectId: object.id,
+            OR: [{ createdBy: { not: "System" } }, { createdBy: null }] }, select: { id: true } })) return;
       const relationships = await transaction.knowledgeRelationship.findMany({
         select: {
           id: true,
           relationshipType: true,
           status: true,
+          trustLevel: true,
         },
         where: {
           OR: [{ sourceObjectId: object.id }, { targetObjectId: object.id }],
           status: { not: "ARCHIVED" },
         },
       });
+      for (const id of relationships.map((relationship) => relationship.id).sort()) await lockAuthorityOwner(transaction, "KnowledgeRelationship", id);
+      if (relationships.some((relationship) => relationship.trustLevel === "HUMAN_APPROVED")) return;
+      if (relationships.length && await transaction.knowledgeRelationshipRevision.findFirst({ where: {
+        relationshipId: { in: relationships.map((relationship) => relationship.id) },
+        OR: [{ createdBy: { not: "System" } }, { createdBy: null }] }, select: { id: true } })) return;
       const existingRevision =
         await transaction.knowledgeObjectRevision.findFirst({
           select: { id: true },
@@ -1428,7 +1503,7 @@ export async function cleanupWorkflowKnowledgeNoise() {
             createdBy: "System",
             note: "Archived because this looked like workflow or execution language, not knowledge Deanne approved.",
             objectId: object.id,
-            previousStatus: object.status,
+            previousStatus: current.status,
             revisedStatus: "ARCHIVED",
           },
         });
@@ -1843,15 +1918,16 @@ export async function getKnowledgeContextForRecommendations(
 }
 
 export async function approveKnowledgeObject(objectId: string) {
-  const prisma = getPrismaClient();
-
+  return objectAuthority(objectId, async (prisma, existing, createdAt) => {
   return prisma.knowledgeObject.update({
     data: {
-      approvedAt: new Date(),
+      approvedAt: createdAt,
       approvedBy: "Deanne",
       revisions: {
         create: {
           actionType: "APPROVE",
+          createdAt,
+          previousStatus: existing.status,
           createdBy: "Deanne",
           revisedStatus: "APPROVED",
         },
@@ -1861,16 +1937,18 @@ export async function approveKnowledgeObject(objectId: string) {
     },
     where: { id: objectId },
   });
+  });
 }
 
 export async function rejectKnowledgeObject(objectId: string, note?: string) {
-  const prisma = getPrismaClient();
-
+  return objectAuthority(objectId, async (prisma, existing, createdAt) => {
   return prisma.knowledgeObject.update({
     data: {
       revisions: {
         create: {
           actionType: "REJECT",
+          createdAt,
+          previousStatus: existing.status,
           createdBy: "Deanne",
           note,
           revisedStatus: "REJECTED",
@@ -1881,19 +1959,21 @@ export async function rejectKnowledgeObject(objectId: string, note?: string) {
     },
     where: { id: objectId },
   });
+  });
 }
 
 export async function keepKnowledgeObjectProvisional(
   objectId: string,
   note?: string,
 ) {
-  const prisma = getPrismaClient();
-
+  return objectAuthority(objectId, async (prisma, existing, createdAt) => {
   return prisma.knowledgeObject.update({
     data: {
       revisions: {
         create: {
           actionType: "KEEP_PROVISIONAL",
+          createdAt,
+          previousStatus: existing.status,
           createdBy: "Deanne",
           note,
           revisedStatus: "PROVISIONAL",
@@ -1903,6 +1983,7 @@ export async function keepKnowledgeObjectProvisional(
       trustLevel: "PROVISIONAL",
     },
     where: { id: objectId },
+  });
   });
 }
 
@@ -1919,15 +2000,7 @@ export async function reviseKnowledgeObject({
   objectId: string;
   objectType?: KnowledgeObjectType | null;
 }) {
-  const prisma = getPrismaClient();
-  const existing = await prisma.knowledgeObject.findUnique({
-    where: { id: objectId },
-  });
-
-  if (!existing) {
-    throw new Error("Knowledge item not found.");
-  }
-
+  return objectAuthority(objectId, async (prisma, existing, createdAt) => {
   const nextName = name?.trim() || existing.name;
   const nextType = objectType ?? (existing.objectType as KnowledgeObjectType);
   const normalizedName = normalizeKnowledgeName(nextName);
@@ -1941,6 +2014,7 @@ export async function reviseKnowledgeObject({
       revisions: {
         create: {
           actionType: "REVISE",
+          createdAt,
           createdBy: "Deanne",
           note,
           previousName: existing.name,
@@ -1952,17 +2026,19 @@ export async function reviseKnowledgeObject({
     },
     where: { id: objectId },
   });
+  });
 }
 
 export async function approveKnowledgeRelationship(relationshipId: string) {
-  const prisma = getPrismaClient();
-
+  return relationshipAuthority(relationshipId, async (prisma, existing, createdAt) => {
   return prisma.knowledgeRelationship.update({
     data: {
-      approvedAt: new Date(),
+      approvedAt: createdAt,
       revisions: {
         create: {
           actionType: "APPROVE",
+          createdAt,
+          previousStatus: existing.status,
           createdBy: "Deanne",
           revisedStatus: "APPROVED",
         },
@@ -1972,19 +2048,21 @@ export async function approveKnowledgeRelationship(relationshipId: string) {
     },
     where: { id: relationshipId },
   });
+  });
 }
 
 export async function rejectKnowledgeRelationship(
   relationshipId: string,
   note?: string,
 ) {
-  const prisma = getPrismaClient();
-
+  return relationshipAuthority(relationshipId, async (prisma, existing, createdAt) => {
   return prisma.knowledgeRelationship.update({
     data: {
       revisions: {
         create: {
           actionType: "REJECT",
+          createdAt,
+          previousStatus: existing.status,
           createdBy: "Deanne",
           note,
           revisedStatus: "REJECTED",
@@ -1995,19 +2073,21 @@ export async function rejectKnowledgeRelationship(
     },
     where: { id: relationshipId },
   });
+  });
 }
 
 export async function keepKnowledgeRelationshipProvisional(
   relationshipId: string,
   note?: string,
 ) {
-  const prisma = getPrismaClient();
-
+  return relationshipAuthority(relationshipId, async (prisma, existing, createdAt) => {
   return prisma.knowledgeRelationship.update({
     data: {
       revisions: {
         create: {
           actionType: "KEEP_PROVISIONAL",
+          createdAt,
+          previousStatus: existing.status,
           createdBy: "Deanne",
           note,
           revisedStatus: "PROVISIONAL",
@@ -2017,6 +2097,7 @@ export async function keepKnowledgeRelationshipProvisional(
       trustLevel: "PROVISIONAL",
     },
     where: { id: relationshipId },
+  });
   });
 }
 
@@ -2029,21 +2110,14 @@ export async function reviseKnowledgeRelationship({
   note?: string | null;
   relationshipId: string;
 }) {
-  const prisma = getPrismaClient();
-  const existing = await prisma.knowledgeRelationship.findUnique({
-    where: { id: relationshipId },
-  });
-
-  if (!existing) {
-    throw new Error("Knowledge relationship not found.");
-  }
-
+  return relationshipAuthority(relationshipId, async (prisma, existing, createdAt) => {
   return prisma.knowledgeRelationship.update({
     data: {
       explanation: explanation?.trim() || existing.explanation,
       revisions: {
         create: {
           actionType: "REVISE",
+          createdAt,
           createdBy: "Deanne",
           note,
           revisedExplanation: explanation?.trim() || existing.explanation,
@@ -2051,6 +2125,25 @@ export async function reviseKnowledgeRelationship({
       },
     },
     where: { id: relationshipId },
+  });
+  });
+}
+
+async function objectAuthority<T>(id: string, change: (tx: Prisma.TransactionClient, owner: DatabaseKnowledgeObject, createdAt: Date) => Promise<T>): Promise<T> {
+  return withKnowledgeAuthority(async (tx) => {
+    await lockAuthorityOwner(tx, "KnowledgeObject", id);
+    const owner = await tx.knowledgeObject.findUniqueOrThrow({ where: { id } });
+    if (owner.canonicalObjectId) throw new Error("Review the canonical knowledge item instead.");
+    const latest = await tx.knowledgeObjectRevision.findFirst({ where: { objectId: id }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] });
+    return change(tx, owner, await nextAuthorityTime(tx, latest?.createdAt));
+  });
+}
+async function relationshipAuthority<T>(id: string, change: (tx: Prisma.TransactionClient, owner: DatabaseKnowledgeRelationship, createdAt: Date) => Promise<T>): Promise<T> {
+  return withKnowledgeAuthority(async (tx) => {
+    await lockAuthorityOwner(tx, "KnowledgeRelationship", id);
+    const owner = await tx.knowledgeRelationship.findUniqueOrThrow({ where: { id } });
+    const latest = await tx.knowledgeRelationshipRevision.findFirst({ where: { relationshipId: id }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] });
+    return change(tx, owner, await nextAuthorityTime(tx, latest?.createdAt));
   });
 }
 
@@ -2067,9 +2160,8 @@ export async function mergeKnowledgeObject({
     throw new Error("Choose two different knowledge items to merge.");
   }
 
-  const prisma = getPrismaClient();
-
-  return prisma.$transaction(async (tx) => {
+  return withKnowledgeAuthority(async (tx) => {
+    for (const id of [canonicalObjectId, mergedObjectId].sort()) await lockAuthorityOwner(tx, "KnowledgeObject", id);
     const [canonical, merged] = await Promise.all([
       tx.knowledgeObject.findUnique({ where: { id: canonicalObjectId } }),
       tx.knowledgeObject.findUnique({ where: { id: mergedObjectId } }),
@@ -2078,6 +2170,11 @@ export async function mergeKnowledgeObject({
     if (!canonical || !merged) {
       throw new Error("Knowledge item not found.");
     }
+    if (canonical.canonicalObjectId || ["ARCHIVED", "REJECTED"].includes(canonical.status)) throw new Error("Choose a live canonical knowledge item as the merge target.");
+    if (merged.canonicalObjectId === canonicalObjectId) return canonical;
+    if (merged.canonicalObjectId) throw new Error("This knowledge item was already merged. Review its canonical item.");
+    const latestMergeRevision = await tx.knowledgeObjectRevision.findFirst({ where: { objectId: mergedObjectId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] });
+    const mergeAt = await nextAuthorityTime(tx, latestMergeRevision?.createdAt);
 
     await tx.knowledgeObjectMerge.upsert({
       create: {
@@ -2105,6 +2202,7 @@ export async function mergeKnowledgeObject({
         revisions: {
           create: {
             actionType: "MERGE_INTO",
+            createdAt: mergeAt,
             createdBy: "Deanne",
             note: reason,
             previousName: merged.name,
@@ -2128,6 +2226,7 @@ export async function mergeKnowledgeObject({
     });
 
     for (const relationship of relationships) {
+      await lockAuthorityOwner(tx, "KnowledgeRelationship", relationship.id);
       const nextSource =
         relationship.sourceObjectId === mergedObjectId
           ? canonicalObjectId
@@ -2142,7 +2241,8 @@ export async function mergeKnowledgeObject({
           data: {
             revisions: {
               create: {
-                actionType: "ARCHIVE_AFTER_MERGE",
+            actionType: "ARCHIVE_AFTER_MERGE",
+                createdAt: await nextAuthorityTime(tx, (await tx.knowledgeRelationshipRevision.findFirst({ where: { relationshipId: relationship.id }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }))?.createdAt),
                 createdBy: "Deanne",
                 note: "This relationship became internal to a merged knowledge item.",
                 revisedStatus: "ARCHIVED",
@@ -2166,22 +2266,34 @@ export async function mergeKnowledgeObject({
       });
 
       if (duplicate && duplicate.id !== relationship.id) {
+        await lockAuthorityOwner(tx, "KnowledgeRelationship", duplicate.id);
+        const sourceReview = await tx.knowledgeRelationshipRevision.findFirst({ where: { relationshipId: relationship.id,
+          OR: [{ createdBy: { not: "System" } }, { createdBy: null }] }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] });
+        const targetReview = await tx.knowledgeRelationshipRevision.findFirst({ where: { relationshipId: duplicate.id,
+          OR: [{ createdBy: { not: "System" } }, { createdBy: null }] }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] });
+        const preserveSource = sourceReview ? (!targetReview || sourceReview.createdAt > targetReview.createdAt ||
+          (sourceReview.createdAt.getTime() === targetReview.createdAt.getTime() && sourceReview.id > targetReview.id)) :
+          !targetReview && relationship.trustLevel === "HUMAN_APPROVED" && duplicate.trustLevel !== "HUMAN_APPROVED";
+        const loser = preserveSource ? duplicate : relationship;
+        const previousRevision = preserveSource ? targetReview : sourceReview;
         await tx.knowledgeRelationship.update({
           data: {
+            relationshipKey: preserveSource ? `archived-duplicate:${duplicate.id}:${nextKey}` : undefined,
             revisions: {
               create: {
                 actionType: "ARCHIVE_DUPLICATE_AFTER_MERGE",
+                createdAt: await nextAuthorityTime(tx, previousRevision?.createdAt),
                 createdBy: "Deanne",
-                note: "A canonical relationship already exists after the merge.",
+                note: "Duplicate archived while preserving the stronger/latest human relationship authority.",
                 revisedStatus: "ARCHIVED",
               },
             },
             status: "ARCHIVED",
             trustLevel: "EXCLUDED",
           },
-          where: { id: relationship.id },
+          where: { id: loser.id },
         });
-        continue;
+        if (!preserveSource) continue;
       }
 
       await tx.knowledgeRelationship.update({
@@ -2190,6 +2302,7 @@ export async function mergeKnowledgeObject({
           revisions: {
             create: {
               actionType: "MOVE_AFTER_MERGE",
+              createdAt: await nextAuthorityTime(tx, (await tx.knowledgeRelationshipRevision.findFirst({ where: { relationshipId: relationship.id }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }))?.createdAt),
               createdBy: "Deanne",
               note: "Relationship moved to the canonical knowledge item.",
             },
@@ -2202,7 +2315,7 @@ export async function mergeKnowledgeObject({
     }
 
     return canonical;
-  });
+  }, true);
 }
 
 export function trustedReasoningFilter(): Prisma.KnowledgeObjectWhereInput {
