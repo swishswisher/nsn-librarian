@@ -953,24 +953,28 @@ export async function getConnectedLibraries() {
     },
   });
   const libraryIds = libraries.map((library) => library.id);
-  const [attentionCounts, latestDetectedChanges] = await Promise.all([
+  const [attentionCounts, latestDetectedChanges, navigation, localHealth] = await Promise.all([
     attentionCountsByLibraryId(libraryIds),
     latestDetectedChangesByLibraryId(libraryIds),
+    connectedLibraryNavigation(libraryIds),
+    libraries.length ? getLocalBridgeHealth() : Promise.resolve(null),
   ]);
-  const navigation = await connectedLibraryNavigation(libraryIds);
+  const localReady = Boolean(localHealth?.ok && localHealth.status === "BRIDGE_READY");
+  // A request-local snapshot, never a cross-request cache of permissions or liveness.
+  const devices = !localReady && libraries.some((library) => library.bridgeDeviceId)
+    ? await listBridgeDevices().catch(() => [])
+    : [];
+  const onlineDeviceIds = new Set(devices.filter((device) => bridgeDeviceIsOnline(device)).map((device) => device.bridgeDeviceId));
 
-  return Promise.all(
-    libraries.map(async (library) =>
-      withConnectedLibraryNavigation(
-        librarySummary(
-          library,
-          attentionCounts.get(library.id) ?? 0,
-          (await bridgeReachability(library.bridgeDeviceId)) &&
-            Boolean(library.bridgeRootId),
-          latestDetectedChanges.get(library.id) ?? null,
-        ),
-        navigation.get(library.id),
+  return libraries.map((library) =>
+    withConnectedLibraryNavigation(
+      librarySummary(
+        library,
+        attentionCounts.get(library.id) ?? 0,
+        (localReady || Boolean(library.bridgeDeviceId && onlineDeviceIds.has(library.bridgeDeviceId))) && Boolean(library.bridgeRootId),
+        latestDetectedChanges.get(library.id) ?? null,
       ),
+      navigation.get(library.id),
     ),
   );
 }

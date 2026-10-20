@@ -1711,15 +1711,20 @@ export async function getMonitoringDashboardData(): Promise<BridgeMonitoringDash
     }
   }
 
-  const folderSummaries: BridgeMonitoringFolderSummary[] = await Promise.all(
-    folders.map(async (folder) => {
-      const eventCounts = await prisma.monitoringEvent.groupBy({
-        by: ["processingStatus"],
-        _count: true,
-        where: {
-          connectedFolderId: folder.id,
-        },
-      });
+  // One aggregate for all displayed folders instead of one round trip per folder.
+  const folderEventGroups = folders.length === 0 ? [] : await prisma.monitoringEvent.groupBy({
+    by: ["connectedFolderId", "processingStatus"],
+    _count: true,
+    where: { connectedFolderId: { in: folders.map((folder) => folder.id) } },
+  });
+  const groupsByFolder = new Map<string, typeof folderEventGroups>();
+  for (const group of folderEventGroups) {
+    const groups = groupsByFolder.get(group.connectedFolderId) ?? [];
+    groups.push(group);
+    groupsByFolder.set(group.connectedFolderId, groups);
+  }
+  const folderSummaries: BridgeMonitoringFolderSummary[] = folders.map((folder) => {
+      const eventCounts = groupsByFolder.get(folder.id) ?? [];
       const counts = {
         attentionEvents: 0,
         completedEvents: 0,
@@ -1771,8 +1776,7 @@ export async function getMonitoringDashboardData(): Promise<BridgeMonitoringDash
         stoppedAt: folder.monitoringStoppedAt?.toISOString() ?? null,
         watchingAppearsStopped,
       };
-    }),
-  );
+    });
 
   return {
     folders: folderSummaries,

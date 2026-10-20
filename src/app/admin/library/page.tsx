@@ -1,5 +1,6 @@
 import Link from "next/link";
-import type { ReactNode } from "react";
+import { Suspense, type ReactNode } from "react";
+import { LibraryLoading } from "@/components/library/LibraryLoading";
 
 import { BridgeScanControl } from "@/components/library/BridgeScanControl";
 import { LibraryShell } from "@/components/library/LibraryShell";
@@ -21,7 +22,7 @@ import {
 import { getLocalBridgeHealth } from "@/lib/bridge/local-bridge-client";
 import { getKnowledgeHomepagePreview } from "@/lib/knowledge/queries";
 import {
-  getLibraryDocuments,
+  getLibraryDocumentCount,
   getReviewQueueItems,
 } from "@/lib/library/data";
 import { getNotebookHomepagePreview } from "@/lib/library/notebook";
@@ -634,27 +635,31 @@ function SectionTitle({
   );
 }
 
+async function HomeNotebookPreview() {
+  return <NotebookPreview preview={await getNotebookHomepagePreview()} />;
+}
+
+async function HomeKnowledgePreview() {
+  return <KnowledgePreview preview={await getKnowledgeHomepagePreview()} />;
+}
+
 export default async function LibraryAdminPage() {
   const [
     scanSessions,
-    libraryItems,
+    libraryItemCount,
     reviewQueueItems,
     currentPlan,
     activeScanProgress,
-    notebookPreview,
-    knowledgePreview,
     monitoringDashboard,
     connectedLibraries,
     localBridgeHealth,
     cloudBridgeStatus,
   ] = await Promise.all([
     getBridgeScanSessions(10),
-    getLibraryDocuments(),
+    getLibraryDocumentCount(),
     getReviewQueueItems(),
     getCurrentOrganizationPlanForHomepage(),
     getActiveBridgeScanSessionProgress(),
-    getNotebookHomepagePreview(),
-    getKnowledgeHomepagePreview(),
     getMonitoringDashboardData(),
     getConnectedLibraries(),
     getLocalBridgeHealth(),
@@ -772,14 +777,14 @@ export default async function LibraryAdminPage() {
           <SectionTitle subtitle="The Librarian's reflective record of what changed, what matters, and what still needs Deanne's eye.">
             <span id="notebook-heading">Notebook</span>
           </SectionTitle>
-          <NotebookPreview preview={notebookPreview} />
+          <Suspense fallback={<LibraryLoading label="Loading Notebook…" />}><HomeNotebookPreview /></Suspense>
         </section>
 
         <section className="grid min-w-0 gap-4" aria-labelledby="knowledge-heading">
           <SectionTitle subtitle="A concise view of topics, concepts, and frameworks the Librarian is beginning to connect across the library.">
             <span id="knowledge-heading">Topics the Librarian is noticing</span>
           </SectionTitle>
-          <KnowledgePreview preview={knowledgePreview} />
+          <Suspense fallback={<LibraryLoading label="Loading Knowledge…" />}><HomeKnowledgePreview /></Suspense>
         </section>
 
         <section className="grid min-w-0 gap-4" aria-labelledby="library-heading">
@@ -866,8 +871,8 @@ export default async function LibraryAdminPage() {
               label="Review Knowledge"
             />
             <LibraryEntry
-              description={`${libraryItems.length} library item${
-                libraryItems.length === 1 ? "" : "s"
+              description={`${libraryItemCount} library item${
+                libraryItemCount === 1 ? "" : "s"
               } known to the Librarian.`}
               href="/admin/library/memory"
               label="View Memory"

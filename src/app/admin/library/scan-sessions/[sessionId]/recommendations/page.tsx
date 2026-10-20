@@ -52,10 +52,10 @@ export default async function RecommendationsPage({
     notFound();
   }
 
-  const notebookReflection = await getNotebookEntryForScanSession(data.session.id);
-  const topicsBySuggestionId = await getKnowledgeContextForRecommendations(
-    data.suggestions.map((suggestion) => suggestion.id),
-  );
+  const [notebookReflection, topicsBySuggestionId] = await Promise.all([
+    getNotebookEntryForScanSession(data.session.id),
+    getKnowledgeContextForRecommendations(data.suggestions.map((suggestion) => suggestion.id)),
+  ]);
   const recommendationCounts = organizationSuggestionCounts(data.suggestions);
   const hasRecommendations = recommendationCounts.total > 0;
   const hasActiveRecommendations =
