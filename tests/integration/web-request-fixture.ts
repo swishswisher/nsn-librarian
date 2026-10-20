@@ -44,6 +44,13 @@ export async function webRequest(pathname: string, authenticated = true, questio
   assert.notEqual(response.status, 500, `Local web request failed: ${output}`);
   return response;
 }
-export const accessMemory = (authenticated = true) => webRequest("/admin/library/memory", authenticated);
+export async function accessMemory(authenticated = true) {
+  const response = await webRequest("/admin/library/memory", authenticated);
+  // A loading boundary sends headers before the page's recovery work finishes.
+  // These callers assert durable state after a completed visit, not first byte.
+  // Drain a clone so callers can still inspect the original HTML response.
+  await response.clone().arrayBuffer();
+  return response;
+}
 export const accessSearch = (query = "cobalt", authenticated = true) => webRequest(`/api/library/search?q=${encodeURIComponent(query)}`, authenticated);
 export const accessAsk = () => webRequest("/api/library/ask", true, "What does Memory say about cobalt?");
