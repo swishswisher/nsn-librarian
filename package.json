@@ -29,7 +29,8 @@
     "db:deploy": "prisma migrate deploy",
     "db:status": "prisma migrate status",
     "db:migrate": "prisma migrate dev",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "test:performance": "node --test --test-concurrency=1 --import tsx tests/integration/page-loading-performance.test.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",

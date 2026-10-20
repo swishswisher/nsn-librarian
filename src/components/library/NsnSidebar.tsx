@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { NavigationPending } from "@/components/library/NavigationPending";
 
 export type LibrarySection =
   | "overview"
@@ -78,7 +79,7 @@ export function NsnSidebar({ active }: NsnSidebarProps) {
                     ].join(" ")}
                     href={item.href}
                   >
-                    {item.label}
+                    {item.label}<NavigationPending />
                   </Link>
                 </li>
               );

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { NavigationPending } from "@/components/library/NavigationPending";
 import { usePathname, useRouter } from "next/navigation";
 
 const primaryLinks = [
@@ -72,7 +73,7 @@ export function LibraryQuickNav() {
               href={item.href}
               key={item.href}
             >
-              {item.label}
+              {item.label}<NavigationPending />
             </Link>
           );
         })}
@@ -99,7 +100,7 @@ export function LibraryQuickNav() {
               href={item.href}
               key={item.href}
             >
-              {item.label}
+              {item.label}<NavigationPending />
             </Link>
           );
         })}

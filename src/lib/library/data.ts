@@ -178,3 +178,7 @@ export async function getMigrationQueueRows(): Promise<MigrationQueueRow[]> {
     status: item.status,
   }));
 }
+
+export async function getLibraryDocumentCount(): Promise<number> {
+  return getPrismaClient().libraryDocument.count();
+}
