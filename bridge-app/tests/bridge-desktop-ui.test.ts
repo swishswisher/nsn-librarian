@@ -5,7 +5,7 @@ import vm from "node:vm";
 
 import { bridgeRendererHtml } from "../../apps/bridge/src/main/renderer-html";
 
-type EventHandler = (event: { preventDefault: () => void }) => unknown;
+type EventHandler = (event: { preventDefault: () => void; key?: string }) => unknown;
 
 class FakeElement {
   children: FakeElement[] = [];
@@ -15,6 +15,9 @@ class FakeElement {
   hidden = false;
   textContent = "";
   value = "";
+  tabIndex = -1;
+  dataset: Record<string, string> = {};
+  attributes: Record<string, string> = {};
 
   private readonly listeners = new Map<string, EventHandler[]>();
 
@@ -27,6 +30,8 @@ class FakeElement {
   appendChild(child: FakeElement) {
     this.children.push(child);
   }
+
+  setAttribute(name: string, value: string) { this.attributes[name] = value; }
 
   removeAttribute(name: string) {
     if (name === "value") {
@@ -42,9 +47,9 @@ class FakeElement {
     this.focused = true;
   }
 
-  async dispatch(type: string) {
+  async dispatch(type: string, key?: string) {
     for (const handler of this.listeners.get(type) ?? []) {
-      await handler({ preventDefault: () => undefined });
+      await handler({ preventDefault: () => undefined, key });
     }
   }
 }
@@ -100,6 +105,8 @@ async function createRendererHarness(options: {
   statusOverride?: () => Promise<Record<string, unknown>>;
 } = {}): Promise<RendererHarness> {
   const ids = [
+    "foldersTab", "connectionTab", "updatesTab",
+    "foldersView", "connectionView", "updatesView",
     "chooseButton",
     "connectButton",
     "cancelUpdateButton",
@@ -131,6 +138,11 @@ async function createRendererHarness(options: {
   const elements = Object.fromEntries(
     ids.map((id) => [id, new FakeElement(id)]),
   ) as Record<string, FakeElement>;
+  for (const name of ["folders", "connection", "updates"]) {
+    elements[`${name}Tab`].dataset.bridgeTab = name;
+    elements[`${name}View`].dataset.bridgeView = name;
+    elements[`${name}View`].hidden = name !== "folders";
+  }
   const pairWithCodeCalls: string[] = [];
   const connectSelectedFoldersCalls: unknown[][] = [];
   const disconnectFolderCalls: string[] = [];
@@ -145,6 +157,7 @@ async function createRendererHarness(options: {
   let statusChangedSubscriptionRemoved = false;
   let updateStatusSubscriptionRemoved = false;
   const document = {
+    querySelectorAll: (selector: string) => ["folders", "connection", "updates"].map(name => elements[`${name}${selector === "[data-bridge-tab]" ? "Tab" : "View"}`]),
     createElement: (tagName: string) => new FakeElement(tagName),
     getElementById: (id: string) => {
       elements[id] ??= new FakeElement(id);
@@ -1276,5 +1289,51 @@ describe("Bridge desktop app lifecycle", () => {
     assert.equal(buildJob.includes("GH_TOKEN:"), false);
     assert.match(workflow, /^  publish-macos:/mu);
     assert.match(workflow, /uses: softprops\/action-gh-release@v2/u);
+  });
+});
+
+
+describe("Bridge presentation tabs", () => {
+  it("keeps pairing input and handlers intact across tab changes and status refresh", async () => {
+    const harness = await createRendererHarness();
+    const { elements } = harness;
+    assert.equal(elements.connectionView.hidden, false);
+    elements.pairingCodeInput.value = "NSN-KEEP";
+    await elements.updatesTab.dispatch("click");
+    await harness.triggerStatusChanged();
+    assert.equal(elements.updatesView.hidden, false);
+    assert.equal(elements.connectionView.hidden, true);
+    await elements.connectionTab.dispatch("click");
+    assert.equal(elements.pairingCodeInput.value, "NSN-KEEP");
+    await elements.pairingForm.dispatch("submit");
+    assert.deepEqual(harness.pairWithCodeCalls, ["NSN-KEEP"]);
+  });
+
+  it("supports keyboard tab navigation without invoking folder actions", async () => {
+    const harness = await createRendererHarness({ pairedInitially: true });
+    const { elements } = harness;
+    await elements.foldersTab.dispatch("keydown", "ArrowRight");
+    assert.equal(elements.connectionTab.attributes["aria-selected"], "true");
+    assert.equal(elements.connectionTab.tabIndex, 0);
+    assert.equal(elements.connectionTab.focused, true);
+    await elements.connectionTab.dispatch("keydown", "End");
+    assert.equal(elements.updatesView.hidden, false);
+    await elements.updatesTab.dispatch("keydown", "Home");
+    assert.equal(elements.foldersView.hidden, false);
+    assert.deepEqual(harness.connectSelectedFoldersCalls(), []);
+    assert.deepEqual(harness.disconnectFolderCalls(), []);
+    assert.deepEqual(harness.pairWithCodeCalls, []);
+  });
+
+  it("keeps update state when its panel is hidden and reopened", async () => {
+    const harness = await createRendererHarness({ pairedInitially: true });
+    await harness.triggerUpdateStatus({ state: "READY_TO_OPEN", currentVersion: "0.1.0", latestVersion: "0.1.1", releaseNotes: [] });
+    await harness.elements.updatesTab.dispatch("click");
+    assert.equal(harness.elements.openUpdateButton.hidden, false);
+    await harness.elements.foldersTab.dispatch("click");
+    await harness.elements.updatesTab.dispatch("click");
+    assert.equal(harness.elements.openUpdateButton.hidden, false);
+    await harness.elements.openUpdateButton.dispatch("click");
+    assert.equal(harness.openDownloadedUpdateCalls(), 1);
   });
 });

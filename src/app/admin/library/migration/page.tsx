@@ -20,7 +20,7 @@ export default async function LibraryMigrationPage() {
           title="Organization Plans"
         >
           <Link
-            className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-gold)] bg-[var(--nsn-warm-beige)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sand)] [overflow-wrap:anywhere]"
+            className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sage-mist)] [overflow-wrap:anywhere]"
             href={getOrganizationPlanSessionSelectorRoute()}
           >
             Choose a Scan Session to Build a Plan

@@ -37,7 +37,7 @@ export default async function KnowledgePage() {
         <NsnPageHeader
           description="The Knowledge Graph tracks recurring topics, frameworks, concepts, and relationships across the library. Only approved knowledge becomes trusted."
           eyebrow="Knowledge Graph"
-          title="Topic Intelligence"
+          title="Knowledge"
         >
           <Link
             className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-teal)] bg-[var(--nsn-teal)] px-4 text-center text-sm font-semibold text-[var(--nsn-white)] transition hover:bg-[var(--nsn-teal-dark)]"

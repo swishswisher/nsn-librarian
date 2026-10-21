@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import Link from "next/link";
 
 type NsnPageHeaderProps = {
   eyebrow?: string;
@@ -16,14 +17,12 @@ export function NsnPageHeader({
   children,
 }: NsnPageHeaderProps) {
   return (
-    <header className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+    <header className="nsn-page-heading flex flex-col gap-4">
       <div className="max-w-3xl">
         {eyebrow ? (
-          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--nsn-teal)]">
-            {eyebrow}
-          </p>
+          <nav aria-label="Breadcrumb" className="nsn-breadcrumb"><Link href="/admin/library">Home</Link><span aria-hidden="true">/</span><span>{eyebrow}</span></nav>
         ) : null}
-        <h1 className="nsn-display mt-2 text-4xl text-[var(--nsn-navy)]">
+        <h1 className="nsn-display mt-5 text-[28px] sm:text-[32px] text-[var(--nsn-navy)]">
           {title}
         </h1>
         {subtitle ? (
@@ -32,12 +31,12 @@ export function NsnPageHeader({
           </p>
         ) : null}
         {description ? (
-          <p className="mt-4 max-w-2xl text-sm leading-7 text-[var(--nsn-slate)]">
+          <p className="mt-2 max-w-3xl text-base leading-7 text-[var(--nsn-slate)]">
             {description}
           </p>
         ) : null}
       </div>
-      {children ? <div className="w-full sm:w-auto lg:shrink-0">{children}</div> : null}
+      {children ? <div className="w-full">{children}</div> : null}
     </header>
   );
 }

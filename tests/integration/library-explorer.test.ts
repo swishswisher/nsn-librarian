@@ -322,7 +322,7 @@ describe("Library folder explorer", () => {
       "utf8",
     );
 
-    assert.match(pageSource, /title="My Library"/);
+    assert.match(pageSource, /title="Library"/);
     assert.doesNotMatch(pageSource, /DocumentTable/);
     assert.doesNotMatch(explorerSource, />\s*My Library\s*</);
   });

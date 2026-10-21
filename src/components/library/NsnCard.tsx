@@ -6,8 +6,8 @@ type NsnCardProps = ComponentPropsWithoutRef<"article"> & {
 
 const toneClasses: Record<NonNullable<NsnCardProps["tone"]>, string> = {
   plain: "bg-[var(--nsn-card)]",
-  aqua: "bg-[linear-gradient(135deg,var(--nsn-soft-aqua),var(--nsn-sage-mist))]",
-  sand: "bg-[linear-gradient(135deg,var(--nsn-card),var(--nsn-sand))]",
+  aqua: "bg-[var(--nsn-sage-mist)]",
+  sand: "bg-[var(--nsn-sand)]",
 };
 
 export function NsnCard({
@@ -18,7 +18,7 @@ export function NsnCard({
 }: NsnCardProps) {
   return (
     <article
-      className={["nsn-card p-5", toneClasses[tone], className].join(" ")}
+      className={["nsn-card p-5 sm:p-6", toneClasses[tone], className].join(" ")}
       {...props}
     >
       {children}

@@ -30,7 +30,7 @@ export function TaxonomyPreview() {
         </p>
       </div>
 
-      <div className="grid gap-3 lg:grid-cols-2">
+      <div className="grid items-start gap-3 lg:grid-cols-2">
         {nsnTaxonomy.map((node) => (
           <NsnCard key={node.slug}>
             <h3 className="font-semibold text-[var(--nsn-navy)]">

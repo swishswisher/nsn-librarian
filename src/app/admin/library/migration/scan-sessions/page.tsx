@@ -116,7 +116,7 @@ export default async function OrganizationPlanScanSessionSelectorPage() {
           subtitle={`${data.totalCompletedSessions} completed scan session${
             data.totalCompletedSessions === 1 ? "" : "s"
           } available`}
-          title="Choose a Scan Session to Build a Plan"
+          title="Choose a scan"
         >
           <Link className={secondaryLinkClass} href={getOrganizationPlansRoute()}>
             Back to Organization Plans

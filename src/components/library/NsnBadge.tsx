@@ -40,7 +40,7 @@ export function NsnBadge({
   return (
     <span
       className={[
-        "inline-flex w-fit max-w-full items-center whitespace-normal rounded-md border px-2.5 py-1 text-left text-xs font-semibold uppercase break-words [overflow-wrap:anywhere]",
+        "inline-flex w-fit max-w-full items-center whitespace-normal rounded-md border px-2.5 py-1 text-left text-xs font-medium break-words [overflow-wrap:anywhere]",
         toneClasses[tone],
         className,
       ].join(" ")}

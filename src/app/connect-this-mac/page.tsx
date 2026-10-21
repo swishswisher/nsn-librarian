@@ -15,7 +15,7 @@ export default function ConnectThisMacPage() {
 
         <header className="grid min-w-0 gap-4 rounded-xl border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] px-4 py-6 sm:px-6 lg:px-8">
           <NsnBadge tone="approved">Secure pairing</NsnBadge>
-          <h1 className="nsn-display break-words text-4xl leading-tight [overflow-wrap:anywhere] sm:text-5xl">
+          <h1 className="nsn-display break-words text-[28px] leading-[1.45] [overflow-wrap:anywhere] sm:text-[32px]">
             Connect This Mac
           </h1>
           <p className="max-w-3xl break-words text-base leading-8 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
@@ -29,7 +29,7 @@ export default function ConnectThisMacPage() {
         </NsnCard>
 
         <NsnCard className="grid min-w-0 gap-3" tone="aqua">
-          <h2 className="nsn-display text-2xl">What pairing does</h2>
+          <h2 className="text-[22px] font-semibold">What pairing does</h2>
           <ul className="grid min-w-0 gap-2 text-sm leading-7 text-[var(--nsn-slate)]">
             <li>It registers this Mac as a paired Bridge device.</li>
             <li>It does not grant access to any folder by itself.</li>

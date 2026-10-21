@@ -5,9 +5,9 @@ type NsnEmptyStateProps = {
 
 export function NsnEmptyState({ title, description }: NsnEmptyStateProps) {
   return (
-    <div className="nsn-card bg-[var(--nsn-card)] p-6 text-center">
+    <div className="nsn-card bg-[var(--nsn-card)] p-6 text-left">
       <h3 className="nsn-display text-xl text-[var(--nsn-navy)]">{title}</h3>
-      <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-[var(--nsn-slate)]">
+      <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--nsn-slate)]">
         {description}
       </p>
     </div>

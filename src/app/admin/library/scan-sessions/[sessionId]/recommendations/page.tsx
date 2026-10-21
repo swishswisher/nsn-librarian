@@ -95,12 +95,12 @@ export default async function RecommendationsPage({
           subtitle={`${data.session.folderDisplayName}. Started ${formatScanDate(
             data.session.startedAt,
           )}.`}
-          title="Review the Librarian's Recommendations"
+          title="Scan Recommendations"
         >
           <div className="flex w-full flex-col gap-3 sm:w-auto sm:flex-row">
             {notebookReflection ? (
               <Link
-                className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-gold)] bg-[var(--nsn-warm-beige)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sand)]"
+                className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sage-mist)]"
                 href={getNotebookEntryRoute(notebookReflection.id)}
               >
                 Notebook Context

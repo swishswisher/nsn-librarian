@@ -73,7 +73,7 @@ export default async function ScanSessionsPage() {
         <NsnPageHeader
           description="Each scan session records what the Librarian found, examined, and recommended. The local folder remains the source of truth."
           eyebrow="Scan Sessions"
-          title="Scan Sessions"
+          title="Scan History"
         />
 
         <div className="grid gap-6 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">

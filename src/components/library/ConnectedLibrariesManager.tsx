@@ -1184,7 +1184,7 @@ export function ConnectedLibrariesManager({
                   ? "Bridge not paired"
                   : "Bridge unavailable"}
             </NsnBadge>
-            <h2 className="nsn-display mt-3 break-words text-2xl text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+            <h2 className="mt-3 break-words text-[22px] font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
               {bridgeHealth.ok
                 ? activeLibraries.length === 0
                   ? "Choose the folders you would like the Librarian to understand."
@@ -1233,6 +1233,7 @@ export function ConnectedLibrariesManager({
             </NsnButton>
           </div>
         </div>
+        <details className="nsn-secondary-detail mt-4"><summary>Connection summary</summary>
         <div className="mt-4 grid min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <div>
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--nsn-warm-gray)]">
@@ -1267,6 +1268,7 @@ export function ConnectedLibrariesManager({
             </p>
           </div>
         </div>
+        </details>
       </NsnCard>
 
       {selectionBasket.length > 0 ? (
@@ -1274,7 +1276,7 @@ export function ConnectedLibrariesManager({
           <div className="grid min-w-0 gap-5">
             <div className="min-w-0">
               <NsnBadge tone="pending">Review selected folders</NsnBadge>
-              <h2 className="nsn-display mt-3 break-words text-2xl text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+              <h2 className="mt-3 break-words text-[22px] font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
                 Review Selected Folders
               </h2>
               <p className="mt-2 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
@@ -1617,11 +1619,13 @@ export function ConnectedLibrariesManager({
         </p>
       ) : null}
 
+      <details className="nsn-secondary-detail"><summary>Manage multiple folders</summary>
       <ConnectedLibraryBatchPanel
         currentLibraries={currentLibraries}
         onLibraryChanged={replaceLibrary}
         permissionGroups={permissionGroups}
       />
+      </details>
 
       <div className="grid min-w-0 gap-6">
         {[
@@ -1679,7 +1683,7 @@ export function ConnectedLibrariesManager({
 
           return (
             <NsnCard
-              className="min-w-0 scroll-mt-6"
+              className="nsn-connection-row min-w-0 scroll-mt-6"
               id={`connected-library-${library.id}`}
               key={library.id}
             >
@@ -1689,7 +1693,7 @@ export function ConnectedLibrariesManager({
                     <NsnBadge tone={statusTone(library)}>
                       {statusLabel(library)}
                     </NsnBadge>
-                    <h3 className="nsn-display mt-3 break-words text-2xl text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+                    <h3 className="mt-3 break-words text-[22px] font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
                       {library.displayName}
                     </h3>
                     <p className="mt-2 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
@@ -1709,6 +1713,8 @@ export function ConnectedLibrariesManager({
                   </p>
                 ) : null}
 
+                <details className="nsn-connection-details"><summary>View details and controls</summary>
+                  <div className="grid min-w-0 gap-5 pt-4">
                 <div className="grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-4">
                   <div>
                     <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--nsn-warm-gray)]">
@@ -2032,7 +2038,7 @@ export function ConnectedLibrariesManager({
                   </Link>
                   {library.latestOrganizationPlanSessionId ? (
                     <Link
-                      className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-gold)] bg-[var(--nsn-warm-beige)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sand)]"
+                      className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sage-mist)]"
                       href={getOrganizationPlanRoute(
                         library.latestOrganizationPlanSessionId,
                       )}
@@ -2045,7 +2051,7 @@ export function ConnectedLibrariesManager({
                         No Organization Plan has been saved for the latest completed scan yet.
                       </p>
                       <Link
-                        className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-gold)] bg-[var(--nsn-warm-beige)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sand)]"
+                        className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sage-mist)]"
                         href={getOrganizationPlanRoute(
                           library.latestScanSessionId,
                         )}
@@ -2073,6 +2079,8 @@ export function ConnectedLibrariesManager({
                     </>
                   )}
                 </div>
+                  </div>
+                </details>
               </div>
             </NsnCard>
           );
