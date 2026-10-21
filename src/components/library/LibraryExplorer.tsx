@@ -377,7 +377,7 @@ function FileRow({
   return (
     <article
       className={[
-        "min-w-0 rounded-lg border bg-[var(--nsn-card)] p-3 shadow-[0_10px_24px_rgb(31_42_68_/_0.04)]",
+        "nsn-file-row min-w-0 border-b px-1 py-5",
         isHighlighted
           ? "border-[var(--nsn-teal)] ring-2 ring-[var(--nsn-soft-aqua)]"
           : "border-[var(--nsn-border)]",
@@ -413,6 +413,7 @@ function FileRow({
         </div>
       </div>
 
+      <details className="nsn-file-metadata"><summary>File details</summary>
       <dl className="mt-3 grid min-w-0 gap-2 text-sm text-[var(--nsn-slate)] sm:grid-cols-3">
         <div className="min-w-0">
           <dt className="font-semibold text-[var(--nsn-navy)]">Size</dt>
@@ -431,6 +432,7 @@ function FileRow({
           </dd>
         </div>
       </dl>
+      </details>
     </article>
   );
 }
@@ -470,7 +472,7 @@ function FolderNode({
 
   return (
     <details
-      className="min-w-0 rounded-lg border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-3"
+      className="nsn-folder-node min-w-0 border-t border-[var(--nsn-border)] pt-3"
       open={activeRefinement || depth === 0}
     >
       <summary className="cursor-pointer list-none rounded-md outline-none focus-visible:ring-2 focus-visible:ring-[var(--nsn-soft-aqua)]">
@@ -588,7 +590,7 @@ function RootSection({
   return (
     <section
       aria-labelledby={`library-root-${root.id}`}
-      className="min-w-0 rounded-lg border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-4 shadow-[0_16px_36px_rgb(31_42_68_/_0.06)]"
+      className="min-w-0 rounded-lg bg-[var(--nsn-card)] p-5 sm:p-6"
     >
       <div className="grid min-w-0 gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
         <div className="min-w-0">
@@ -753,12 +755,12 @@ export function LibraryExplorer({
   }
 
   return (
-    <section aria-labelledby="library-explorer-heading" className="min-w-0">
+    <section aria-labelledby="library-explorer-heading" className="nsn-library-explorer min-w-0">
       <div className="grid min-w-0 gap-4">
         <div className="flex min-w-0 flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
           <div className="min-w-0">
             <h2
-              className="nsn-display text-2xl text-[var(--nsn-navy)]"
+              className="sr-only"
               id="library-explorer-heading"
             >
               Folder Explorer
@@ -854,7 +856,7 @@ export function LibraryExplorer({
           </div> : null}
         </div>
 
-        <AskLibrarianPanel />
+        <details className="nsn-ask-disclosure"><summary>Ask your library</summary><AskLibrarianPanel /></details>
 
         {hasSearchQuery ? (
           <div aria-live="polite" className="grid min-w-0 gap-3">
@@ -864,7 +866,7 @@ export function LibraryExplorer({
               <NsnEmptyState title="No matching library items" description="Try a file name, subject, client, or project." />
             ) : null}
             {searchState === "READY" ? searchResults.map((result) => (
-              <article className="min-w-0 rounded-lg border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-4" key={result.id}>
+              <article className="nsn-file-row min-w-0 border-b border-[var(--nsn-border)] py-5" key={result.id}>
                 <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0">
                     <p className="break-words text-xs font-semibold text-[var(--nsn-teal)] [overflow-wrap:anywhere]">{result.rootName}</p>

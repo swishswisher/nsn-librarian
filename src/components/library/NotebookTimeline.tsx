@@ -299,8 +299,8 @@ export function NotebookEntryCard({
   return (
     <article
       className={[
-        "grid min-w-0 gap-4 rounded-lg border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-4 shadow-[0_14px_34px_rgb(31_42_68_/_0.05)] sm:p-5",
-        featured ? "border-[var(--nsn-gold)] bg-[linear-gradient(135deg,var(--nsn-card),var(--nsn-sand))]" : "",
+        "nsn-notebook-entry grid min-w-0 gap-4 rounded-lg bg-[var(--nsn-card)] p-5 sm:p-6",
+        featured ? "nsn-notebook-featured" : "",
       ].join(" ")}
     >
       <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
@@ -314,7 +314,7 @@ export function NotebookEntryCard({
               <NsnBadge tone="approved">Approved for Memory review</NsnBadge>
             ) : null}
           </div>
-          <h3 className="nsn-display mt-3 break-words text-2xl leading-8 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+          <h3 className="mt-3 break-words text-[22px] font-semibold leading-8 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
             {entry.title}
           </h3>
           <p className="mt-2 break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
@@ -326,13 +326,13 @@ export function NotebookEntryCard({
         </p>
       </div>
 
-      <p className="break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+      <p className="nsn-reading break-words text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
         {entry.body}
       </p>
 
-      <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
+      <div className="flex min-w-0 flex-wrap items-end justify-between gap-4">
         <SourceLinks entry={entry} />
-        <div className="grid min-w-0 gap-2 sm:grid-cols-2 lg:min-w-52 lg:grid-cols-1">
+        <div className="flex min-w-0 flex-wrap items-start gap-2">
           <Link
             className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-teal)] bg-[var(--nsn-teal)] px-4 text-center text-sm font-semibold text-[var(--nsn-white)] transition hover:bg-[var(--nsn-teal-dark)]"
             href={`/admin/library/notebook/${encodeURIComponent(entry.id)}`}
@@ -412,10 +412,10 @@ export function LivingNotebook({
 
   return (
     <section className="grid min-w-0 gap-6" aria-labelledby="living-notebook">
-      <div className="grid gap-4 rounded-lg border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-4 lg:grid-cols-[minmax(0,1fr)_minmax(17rem,0.38fr)] lg:items-end">
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(17rem,0.38fr)] xl:items-end">
         <div className="min-w-0">
           <h2
-            className="nsn-display text-2xl text-[var(--nsn-navy)]"
+            className="sr-only"
             id="living-notebook"
           >
             Notebook Filters
@@ -490,11 +490,13 @@ export function LivingNotebook({
             entries={recentLearning}
             title="Recent Learning"
           />
+          <details className="nsn-secondary-detail"><summary>Earlier entries and archive</summary>
           <NotebookSection
             description="All Notebook entries remain available here. Archiving removes an entry from Current Reflections only."
             entries={archiveEntries.slice(0, 8)}
             title="Archive"
           />
+          </details>
         </>
       )}
     </section>
@@ -543,7 +545,7 @@ export function NotebookEntryDetailView({
                 {entry.requiresAttention ? "Needs attention" : statusLabel(entry)}
               </NsnBadge>
             </div>
-            <h1 className="nsn-display mt-3 break-words text-4xl leading-tight text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+            <h1 className="nsn-display mt-3 break-words text-[28px] sm:text-[32px] leading-tight text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
               {entry.title}
             </h1>
             <p className="mt-3 break-words text-base leading-8 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
@@ -556,12 +558,12 @@ export function NotebookEntryDetailView({
         </div>
       </NsnCard>
 
-      <div className="grid min-w-0 gap-5 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)]">
+      <div className="grid min-w-0 gap-6">
         <section className="grid min-w-0 gap-4 rounded-lg border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-4 sm:p-5">
           <h2 className="nsn-display text-2xl text-[var(--nsn-navy)]">
             Reflection
           </h2>
-          <p className="break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
+          <p className="nsn-reading break-words text-[19px] leading-8 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
             {entry.body}
           </p>
           <div className="rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-4">

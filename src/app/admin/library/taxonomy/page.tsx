@@ -10,7 +10,7 @@ export default function LibraryTaxonomyPage() {
         <NsnPageHeader
           description="Settings and the Library Map will guide how the Librarian understands approved library locations over time."
           eyebrow="Settings"
-          title="Settings"
+          title="Library Map"
         >
           <NsnButton disabled type="button" variant="secondary">
             Settings Editing Coming Later

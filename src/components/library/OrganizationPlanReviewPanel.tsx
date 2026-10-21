@@ -1828,7 +1828,7 @@ export function OrganizationPlanReviewPanel({
         aria-live="polite"
         className="sticky top-3 z-10"
       >
-        <NsnCard className="min-w-0 shadow-sm">
+        <NsnCard className="min-w-0 shadow-none">
           <div className="grid min-w-0 gap-4">
             <div>
               <h2 className="text-sm font-semibold text-[var(--nsn-navy)]">

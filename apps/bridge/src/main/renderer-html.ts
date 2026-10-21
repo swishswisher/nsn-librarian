@@ -1,3 +1,5 @@
+import { bridgeInterFont } from "./bridge-font";
+
 export function bridgeRendererHtml() {
   return `<!doctype html>
 <html lang="en">
@@ -5,235 +7,153 @@ export function bridgeRendererHtml() {
     <meta charset="utf-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src https:;"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:; img-src data:; connect-src https:;"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NSN Bridge</title>
     <style>
-      :root {
-        color-scheme: light;
-        --bg: #f7f1e8;
-        --card: #fffaf2;
-        --border: #ddcfc0;
-        --ink: #17313b;
-        --muted: #5d6b70;
-        --teal: #17706f;
-        --teal-dark: #0f5554;
-        --warning: #8a5a1f;
-        --danger: #8b3131;
-      }
-      * { box-sizing: border-box; }
-      body {
-        margin: 0;
-        min-width: 320px;
-        background: var(--bg);
-        color: var(--ink);
-        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      }
-      main { display: grid; gap: 16px; padding: 20px; }
-      header, section {
-        min-width: 0;
-        border: 1px solid var(--border);
-        border-radius: 8px;
-        background: var(--card);
-        padding: 16px;
-      }
-      h1, h2, p { margin: 0; overflow-wrap: anywhere; }
-      h1 { font-size: clamp(28px, 6vw, 44px); line-height: 1.08; }
-      h2 { font-size: 18px; }
-      p { color: var(--muted); line-height: 1.6; }
-      .actions, .folder-list, .status-grid { display: grid; gap: 10px; }
-      .pairing-form {
-        display: grid;
-        gap: 10px;
-        margin-top: 12px;
-      }
-      .pairing-form[hidden] { display: none; }
-      .field { display: grid; gap: 6px; }
-      label {
-        color: var(--ink);
-        font-size: 13px;
-        font-weight: 800;
-      }
-      input {
-        min-height: 44px;
-        width: 100%;
-        border: 1px solid var(--border);
-        border-radius: 6px;
-        background: white;
-        color: var(--ink);
-        font: inherit;
-        padding: 10px 12px;
-      }
-      input:disabled { cursor: not-allowed; opacity: 0.55; }
-      .notice {
-        min-height: 24px;
-        color: var(--muted);
-        font-size: 13px;
-        line-height: 1.5;
-      }
-      .notice.error { color: var(--danger); }
-      button {
-        min-height: 44px;
-        width: 100%;
-        border: 1px solid var(--border);
-        border-radius: 6px;
-        background: white;
-        color: var(--ink);
-        cursor: pointer;
-        font: inherit;
-        font-weight: 700;
-        padding: 10px 14px;
-      }
-      button.primary { border-color: var(--teal); background: var(--teal); color: white; }
-      button:hover { border-color: var(--teal-dark); }
-      button:disabled { cursor: not-allowed; opacity: 0.55; }
-      .badge {
-        display: inline-flex;
-        width: fit-content;
-        border: 1px solid var(--border);
-        border-radius: 6px;
-        background: #edf6f4;
-        color: var(--teal-dark);
-        font-size: 12px;
-        font-weight: 800;
-        letter-spacing: 0.04em;
-        padding: 5px 8px;
-        text-transform: uppercase;
-      }
-      .badge.warning { background: #fff2db; color: var(--warning); }
-      .folder {
-        border: 1px solid var(--border);
-        border-radius: 6px;
-        display: grid;
-        gap: 4px;
-        padding: 10px;
-      }
-      .folder strong { overflow-wrap: anywhere; }
-      .folder small { color: var(--muted); overflow-wrap: anywhere; }
-      .folder-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
-      .folder-group-label {
-        color: var(--muted);
-        font-size: 12px;
-        font-weight: 800;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-      }
-      button.danger { border-color: #d9b8b8; color: var(--danger); }
-      .update-panel { display: grid; gap: 10px; }
-      .update-notes, .update-steps {
-        display: grid;
-        gap: 6px;
-        margin: 0;
-        padding-left: 18px;
-        color: var(--muted);
-        line-height: 1.5;
-      }
-      .update-notes:empty, .update-steps[hidden] { display: none; }
-      .update-notes li, .update-steps li { overflow-wrap: anywhere; }
-      .update-progress {
-        border: 1px solid var(--border);
-        border-radius: 6px;
-        display: grid;
-        gap: 6px;
-        padding: 10px;
-      }
-      .update-progress[hidden] { display: none; }
-      .update-progress progress { width: 100%; }
-      .update-progress small { color: var(--muted); overflow-wrap: anywhere; }
-      @media (min-width: 720px) {
-        main { padding: 28px; }
-        .actions, .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        button { width: fit-content; }
-      }
+      @font-face { font-family: Inter; src: url('${bridgeInterFont}') format('woff2'); font-style: normal; font-weight: 100 900; font-display: swap; }
+      :root { color-scheme: light; --bg:#F6F2EA; --card:#FFFDF8; --border:#DDD2C4; --ink:#1F2A44; --muted:#596373; --teal:#2F7F76; --teal-dark:#245F59; --warning:#76591F; --danger:#934A4A; --soft:#E6F2EF; }
+      * { box-sizing:border-box; }
+      [hidden] { display:none !important; }
+      body { margin:0; min-width:320px; background:var(--bg); color:var(--ink); font-family:Inter,system-ui,-apple-system,sans-serif; font-size:16px; line-height:1.45; }
+      main { width:100%; max-width:1200px; margin:0 auto; }
+      h1,h2,h3,p { margin:0; overflow-wrap:anywhere; }
+      h1,h2 { font-size:22px; line-height:1.45; font-weight:600; }
+      h3 { font-size:16px; font-weight:600; }
+      p { color:var(--muted); }
+      .app-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:20px; padding:24px 32px 20px; background:var(--card); }
+      .brand { display:grid; gap:8px; min-width:0; }
+      .brand p { font-size:13px; max-width:640px; }
+      .tabs { display:flex; flex-wrap:wrap; gap:8px; padding:0 32px 16px; background:var(--card); border-bottom:1px solid var(--border); }
+      .tabs button { border-color:transparent; background:transparent; }
+      .tabs button[aria-selected="true"] { background:var(--teal); color:white; }
+      .view { padding:32px; display:grid; gap:24px; }
+      .page-heading { display:grid; gap:8px; }
+      .actions,.folder-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+      .folder-list { display:grid; gap:16px; }
+      .surface { padding:24px; background:var(--card); border-radius:10px; display:grid; gap:20px; }
+      .connection-controls:has(#pairButton[hidden]):has(#pairingForm[hidden]) { display:none; }
+      .pairing-form { display:grid; gap:20px; }
+      .field { display:grid; gap:8px; max-width:440px; }
+      label { font-size:14px; font-weight:600; }
+      input { min-height:48px; min-width:0; width:100%; padding:12px 16px; border:1px solid var(--border); border-radius:8px; background:white; color:var(--ink); font:inherit; }
+      button { min-height:44px; max-width:100%; padding:12px 16px; border:1px solid var(--border); border-radius:8px; background:var(--card); color:var(--ink); font-family:inherit; font-size:14px; font-weight:600; line-height:1.45; cursor:pointer; overflow-wrap:anywhere; }
+      button.primary { border-color:var(--teal); background:var(--teal); color:white; }
+      button.quiet { border-color:transparent; background:transparent; }
+      button:hover:not(:disabled) { border-color:var(--teal); background:var(--soft); color:var(--teal-dark); }
+      button.primary:hover:not(:disabled) { background:var(--teal-dark); color:white; }
+      button:disabled,input:disabled { cursor:not-allowed; opacity:.55; }
+      button:focus-visible,input:focus-visible { outline:2px solid var(--teal-dark); outline-offset:3px; }
+      .badge { display:inline-flex; width:fit-content; font-size:12px; font-weight:500; color:var(--teal-dark); background:var(--soft); border-radius:4px; padding:4px 8px; }
+      .badge.warning { color:var(--warning); background:#f5edda; }
+      .folder { display:grid; gap:8px; padding:20px; border:0; border-radius:8px; background:var(--card); }
+      .folder strong { font-size:14px; font-weight:600; overflow-wrap:anywhere; }
+      .folder small { color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+      .folder-actions { margin-top:4px; }
+      .folder-group-label { color:var(--muted); font-size:12px; letter-spacing:.04em; text-transform:uppercase; }
+      button.danger { color:var(--danger); border-color:transparent; background:transparent; }
+      button.danger:hover:not(:disabled) { color:var(--danger); border-color:var(--danger); background:var(--card); }
+      .watching-note { color:var(--muted); font-size:13px; }
+      .update-panel { display:grid; gap:20px; }
+      .update-notes,.update-steps { display:grid; gap:12px; margin:0; padding-left:22px; color:var(--muted); }
+      .update-notes:empty { display:none; }
+      .update-notes li,.update-steps li { overflow-wrap:anywhere; }
+      .update-progress { display:grid; gap:12px; }
+      .update-progress progress { width:100%; height:8px; accent-color:var(--teal); }
+      .update-progress small { color:var(--muted); overflow-wrap:anywhere; }
+      .app-footer { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; margin:0 32px; padding:16px 0 24px; border-top:1px solid var(--border); }
+      .app-footer > div { flex:1; min-width:200px; }
+      .app-footer h2 { font-size:12px; color:var(--muted); font-weight:500; }
+      .notice { min-height:20px; margin-top:4px; color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+      .notice.error { color:var(--danger); }
+      .hint { border-radius:10px; padding:20px; background:var(--soft); font-size:13px; }
+      @media(max-width:639px) { .app-header { padding:20px; } .tabs { padding-inline:20px; } .view { padding:24px 20px; } .surface { padding:20px; } .app-footer { margin-inline:20px; } .actions { align-items:stretch; } .actions button { flex:1 1 auto; } h1,h2 { font-size:20px; } }
+      @media(prefers-reduced-motion:reduce) { * { scroll-behavior:auto !important; } }
     </style>
   </head>
   <body>
     <main>
-      <header>
-        <span class="badge warning" id="statusBadge">Starting Bridge</span>
-        <h1>NSN Bridge</h1>
-        <p id="stateCopy">Checking this Mac's connection to NSN Librarian.</p>
-      </header>
-
-      <section>
-        <h2>Connection</h2>
-        <p id="connectionCopy">The Bridge works only with folders Deanne explicitly chooses.</p>
-        <div class="actions">
-          <button class="primary" id="pairButton" hidden>Pair This Mac</button>
-          <button id="openWebButton">Open NSN Librarian</button>
+      <header class="app-header">
+        <div class="brand">
+          <h1>NSN Bridge</h1>
+          <span class="badge warning" id="statusBadge">Starting Bridge</span>
+          <p id="stateCopy">Checking this Mac's connection to NSN Librarian.</p>
         </div>
-        <form class="pairing-form" id="pairingForm" hidden>
-          <div class="field">
-            <label for="pairingCodeInput">Pairing code</label>
-            <input
-              id="pairingCodeInput"
-              name="pairingCode"
-              type="text"
-              autocomplete="off"
-              spellcheck="false"
-              maxlength="16"
-            />
-          </div>
-          <div class="actions">
-            <button class="primary" id="pairSubmitButton" type="submit">Pair This Mac</button>
-            <button id="pairCancelButton" type="button">Cancel</button>
-          </div>
-        </form>
-      </section>
-
-      <section>
-        <h2>Connected Folders</h2>
-        <p>Choose folders through the native macOS picker. Each connected folder can be paused or resumed independently.</p>
+        <button id="openWebButton">Open NSN Librarian</button>
+      </header>
+      <nav class="tabs" role="tablist" aria-label="Bridge views">
+        <button id="foldersTab" type="button" role="tab" aria-selected="true" aria-controls="foldersView" data-bridge-tab="folders">Folders</button>
+        <button id="connectionTab" type="button" role="tab" aria-selected="false" aria-controls="connectionView" tabindex="-1" data-bridge-tab="connection">Connection</button>
+        <button id="updatesTab" type="button" role="tab" aria-selected="false" aria-controls="updatesView" tabindex="-1" data-bridge-tab="updates">Updates</button>
+      </nav>
+      <section class="view" id="foldersView" role="tabpanel" aria-labelledby="foldersTab" data-bridge-view="folders">
+        <div class="page-heading"><h2>Connected folders</h2><p>Bridge only works with folders you explicitly choose.</p></div>
         <div class="actions">
-          <button id="chooseButton">Choose Folders</button>
+          <button class="primary" id="chooseButton">Choose Folders</button>
           <button id="connectButton" disabled>Connect Selected Folders</button>
+          <button class="quiet" id="pauseButton">Pause All Folders</button>
+          <button class="quiet" id="resumeButton">Resume All Eligible Folders</button>
         </div>
         <div class="folder-list" id="folderList"></div>
+        <p class="watching-note" id="watchingCopy">Watching remains read-only. File changes still require an approved plan.</p>
       </section>
-
-      <section>
-        <h2>Watching</h2>
-        <p id="watchingCopy">Watching remains read-only. File changes still require an approved plan.</p>
-        <div class="actions">
-          <button id="pauseButton">Pause All Folders</button>
-          <button id="resumeButton">Resume All Eligible Folders</button>
+      <section class="view" id="connectionView" role="tabpanel" aria-labelledby="connectionTab" data-bridge-view="connection" hidden>
+        <div class="page-heading"><h2>Connection</h2><p id="connectionCopy">The Bridge works only with folders Deanne explicitly chooses.</p></div>
+        <div class="surface connection-controls">
+          <div class="actions"><button class="primary" id="pairButton" hidden>Pair This Mac</button></div>
+          <form class="pairing-form" id="pairingForm" hidden>
+            <div class="field"><label for="pairingCodeInput">Pairing code</label><input id="pairingCodeInput" name="pairingCode" type="text" autocomplete="off" spellcheck="false" maxlength="16" placeholder="Enter your pairing code" /></div>
+            <div class="actions"><button class="primary" id="pairSubmitButton" type="submit">Pair This Mac</button><button id="pairCancelButton" type="button">Cancel</button></div>
+          </form>
         </div>
+        <p class="hint">Original files remain on your Mac. You choose which folders Bridge may access.</p>
       </section>
-
-      <section>
-        <h2>Recent Activity</h2>
-        <p class="notice" id="notice">The Bridge is ready.</p>
-      </section>
-
-      <section>
-        <h2>Updates</h2>
-        <div class="update-panel">
-          <span class="badge warning" id="updateBadge">Not checked</span>
-          <p id="updateCopy">NSN Bridge can check for a verified update.</p>
-          <div class="update-progress" id="updateProgress" hidden>
-            <progress id="updateProgressBar" max="100" value="0"></progress>
-            <small id="updateProgressCopy">Waiting to download.</small>
+      <section class="view" id="updatesView" role="tabpanel" aria-labelledby="updatesTab" data-bridge-view="updates" hidden>
+        <div class="page-heading"><h2>Updates</h2><p>Keep Bridge up to date on this Mac.</p></div>
+        <div class="surface">
+          <div class="update-panel">
+            <span class="badge warning" id="updateBadge">Not checked</span>
+            <p id="updateCopy">NSN Bridge can check for a verified update.</p>
+            <div class="update-progress" id="updateProgress" hidden><progress id="updateProgressBar" max="100" value="0"></progress><small id="updateProgressCopy">Waiting to download.</small></div>
+            <ul class="update-notes" id="updateNotes"></ul>
+            <ol class="update-steps" id="updateSteps" hidden>
+              <li>Quit NSN Bridge.</li><li>Drag NSN Bridge to Applications.</li><li>Choose Replace if macOS asks.</li><li>Open NSN Bridge again.</li><li>If macOS blocks the unsigned build, use System Settings -&gt; Privacy &amp; Security -&gt; Open Anyway.</li>
+            </ol>
           </div>
-          <ul class="update-notes" id="updateNotes"></ul>
-          <ol class="update-steps" id="updateSteps" hidden>
-            <li>Quit NSN Bridge.</li>
-            <li>Drag NSN Bridge to Applications.</li>
-            <li>Choose Replace if macOS asks.</li>
-            <li>Open NSN Bridge again.</li>
-            <li>If macOS blocks the unsigned build, use System Settings -&gt; Privacy &amp; Security -&gt; Open Anyway.</li>
-          </ol>
-        </div>
-        <div class="actions">
-          <button id="updatesButton">Check for Updates</button>
-          <button class="primary" id="downloadUpdateButton" hidden>Download Update</button>
-          <button class="primary" id="openUpdateButton" hidden>Open Update</button>
-          <button id="cancelUpdateButton" hidden>Cancel / Remove Download</button>
-          <button id="quitButton">Quit Bridge</button>
+          <div class="actions">
+            <button id="updatesButton">Check for Updates</button><button class="primary" id="downloadUpdateButton" hidden>Download Update</button><button class="primary" id="openUpdateButton" hidden>Open Update</button><button id="cancelUpdateButton" hidden>Cancel / Remove Download</button>
+          </div>
         </div>
       </section>
+      <footer class="app-footer"><div><h2>Recent Activity</h2><p class="notice" id="notice" role="status" aria-live="polite">The Bridge is ready.</p></div><button class="quiet" id="quitButton">Quit Bridge</button></footer>
     </main>
     <script>
+      let bridgeViewChosen = false;
+      function selectBridgeView(name, focusTab = false) {
+        if (typeof document.querySelectorAll !== "function") return;
+        document.querySelectorAll("[data-bridge-view]").forEach(panel => { panel.hidden = panel.dataset.bridgeView !== name; });
+        document.querySelectorAll("[data-bridge-tab]").forEach(tab => {
+          const active = tab.dataset.bridgeTab === name;
+          tab.setAttribute("aria-selected", String(active));
+          tab.tabIndex = active ? 0 : -1;
+          if (active && focusTab) tab.focus();
+        });
+      }
+      if (typeof document.querySelectorAll === "function") {
+        const viewTabs = Array.from(document.querySelectorAll("[data-bridge-tab]"));
+        viewTabs.forEach((tab, index) => {
+          tab.addEventListener("click", () => { bridgeViewChosen = true; selectBridgeView(tab.dataset.bridgeTab); });
+          tab.addEventListener("keydown", event => {
+            const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
+            if (!keys.includes(event.key)) return;
+            event.preventDefault(); bridgeViewChosen = true;
+            const next = event.key === "Home" ? 0 : event.key === "End" ? viewTabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + viewTabs.length) % viewTabs.length;
+            selectBridgeView(viewTabs[next].dataset.bridgeTab, true);
+          });
+        });
+      }
+
       const selectedFolders = [];
       let connectedRoots = [];
       const folderList = document.getElementById("folderList");
@@ -349,6 +269,7 @@ export function bridgeRendererHtml() {
       }
 
       function showPairingForm(shouldFocus) {
+        if (shouldFocus || !bridgeViewChosen) selectBridgeView("connection");
         pairingFormDismissed = false;
         pairingFormOpen = true;
         pairingForm.hidden = false;
@@ -842,6 +763,7 @@ export function bridgeRendererHtml() {
               showPairingForm(false);
             }
           }
+          document.getElementById("connectionCopy").textContent = stateCopy.textContent;
           watchingCopy.textContent = watchingCount > 0
             ? "Watching " + watchingCount + " connected folder" + (watchingCount === 1 ? ". Use each folder card above to pause or resume it independently." : "s. Use each folder card above to pause or resume them independently.")
             : "No folder is actively watching. Resume an eligible connected folder from its card above.";
@@ -855,6 +777,7 @@ export function bridgeRendererHtml() {
           statusBadge.textContent = "Starting Bridge";
           statusBadge.className = "badge warning";
           stateCopy.textContent = "Checking this Mac's connection to NSN Librarian.";
+          document.getElementById("connectionCopy").textContent = stateCopy.textContent;
           showNotice("The Bridge could not refresh its local status.", true);
           return null;
         }

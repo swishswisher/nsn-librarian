@@ -14,7 +14,7 @@ export default async function BridgeMonitoringPage() {
         <NsnPageHeader
           description="Continuous monitoring keeps the Librarian aware of local folder changes. It records metadata, prepares provisional review material, and leaves every decision with Deanne."
           eyebrow="Bridge Monitoring"
-          title="Bridge Monitoring"
+          title="Monitoring"
         />
 
         <BridgeMonitoringDashboard initialDashboard={dashboard} />

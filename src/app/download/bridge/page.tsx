@@ -104,7 +104,7 @@ export default async function BridgeDownloadPage() {
             <NsnBadge tone="pending">Unsigned internal build</NsnBadge>
           </div>
           <div className="grid min-w-0 gap-3">
-            <h1 className="nsn-display break-words text-4xl leading-tight [overflow-wrap:anywhere] sm:text-5xl">
+            <h1 className="nsn-display break-words text-[28px] leading-[1.45] [overflow-wrap:anywhere] sm:text-[32px]">
               NSN Bridge for Mac
             </h1>
             <p className="max-w-3xl break-words text-base leading-8 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
@@ -182,7 +182,7 @@ export default async function BridgeDownloadPage() {
 
         <section className="grid min-w-0 gap-4 md:grid-cols-2">
           <NsnCard className="grid min-w-0 gap-3">
-            <h2 className="nsn-display text-2xl">Installation</h2>
+            <h2 className="text-[22px] font-semibold">Installation</h2>
             <ol className="grid min-w-0 gap-2 text-sm leading-7 text-[var(--nsn-slate)]">
               <li>1. Download the build matching this Mac.</li>
               <li>2. Open the DMG and drag NSN Bridge into Applications.</li>
@@ -198,7 +198,7 @@ export default async function BridgeDownloadPage() {
           </NsnCard>
 
           <NsnCard className="grid min-w-0 gap-3">
-            <h2 className="nsn-display text-2xl">Privacy</h2>
+            <h2 className="text-[22px] font-semibold">Privacy</h2>
             <ul className="grid min-w-0 gap-2 text-sm leading-7 text-[var(--nsn-slate)]">
               {manifest.privacySummary.map((item) => (
                 <li className="break-words [overflow-wrap:anywhere]" key={item}>
@@ -211,7 +211,7 @@ export default async function BridgeDownloadPage() {
 
         <section className="grid min-w-0 gap-4 md:grid-cols-2">
           <NsnCard className="grid min-w-0 gap-3">
-            <h2 className="nsn-display text-2xl">System Requirements</h2>
+            <h2 className="text-[22px] font-semibold">System Requirements</h2>
             <ul className="grid min-w-0 gap-2 text-sm leading-7 text-[var(--nsn-slate)]">
               {manifest.systemRequirements.map((item) => (
                 <li className="break-words [overflow-wrap:anywhere]" key={item}>
@@ -222,7 +222,7 @@ export default async function BridgeDownloadPage() {
           </NsnCard>
 
           <NsnCard className="grid min-w-0 gap-3">
-            <h2 className="nsn-display text-2xl">Troubleshooting</h2>
+            <h2 className="text-[22px] font-semibold">Troubleshooting</h2>
             <p className="break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
               If folder access is lost, open the Bridge and choose the folder
               again through Finder. The Librarian never guesses a local path.
@@ -236,7 +236,7 @@ export default async function BridgeDownloadPage() {
         </section>
 
         <NsnCard className="grid min-w-0 gap-3">
-          <h2 className="nsn-display text-2xl">Release Notes</h2>
+          <h2 className="text-[22px] font-semibold">Release Notes</h2>
           <ul className="grid min-w-0 gap-2 text-sm leading-7 text-[var(--nsn-slate)]">
             {manifest.releaseNotes.map((item) => (
               <li className="break-words [overflow-wrap:anywhere]" key={item}>

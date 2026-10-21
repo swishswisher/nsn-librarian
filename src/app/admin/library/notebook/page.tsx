@@ -65,9 +65,9 @@ export default async function LibraryNotebookPage() {
     <LibraryShell active="notebook">
       <div className="grid gap-8">
         <NsnPageHeader
-          description="The Librarian's reflective record of what was noticed, what changed, what was learned, and what still needs Deanne's attention."
+          description="Reflections and connections from your library."
           eyebrow="Notebook"
-          title="The Living Notebook"
+          title="Notebook"
         >
           <Link
             className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sage-mist)]"
@@ -77,7 +77,7 @@ export default async function LibraryNotebookPage() {
           </Link>
         </NsnPageHeader>
 
-        <TodaysNotebook digest={notebook.digest} />
+        <details className="nsn-secondary-detail"><summary>Today’s Notebook · summary</summary><TodaysNotebook digest={notebook.digest} /></details>
 
         <LivingNotebook
           archiveEntries={notebook.archiveEntries}

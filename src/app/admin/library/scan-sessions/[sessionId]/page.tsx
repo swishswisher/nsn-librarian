@@ -160,7 +160,7 @@ export default async function ScanSessionDetailPage({
               Review Recommendations
             </Link>
             <Link
-              className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-gold)] bg-[var(--nsn-warm-beige)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sand)]"
+              className="inline-flex min-h-11 max-w-full items-center justify-center rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] px-4 text-center text-sm font-semibold text-[var(--nsn-navy)] transition hover:bg-[var(--nsn-sage-mist)]"
               href={getOrganizationPlanRoute(session.id)}
             >
               View Organization Plan
@@ -190,7 +190,7 @@ export default async function ScanSessionDetailPage({
 
         <section
           aria-label="Scan session summary"
-          className="grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-9"
+          className="nsn-metrics"
         >
           <NsnCard className="min-w-0">
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--nsn-warm-gray)]">
@@ -217,6 +217,7 @@ export default async function ScanSessionDetailPage({
           <SummaryTile label="Remaining" value={remainingFiles} />
         </section>
 
+        <details className="nsn-secondary-detail"><summary>AI observation usage</summary>
         <section className="min-w-0 space-y-2 text-sm text-[var(--nsn-slate)]">
           <h2 className="font-semibold text-[var(--nsn-navy)]">AI observation usage</h2>
           <p className="break-words [overflow-wrap:anywhere]">
@@ -232,6 +233,7 @@ export default async function ScanSessionDetailPage({
             </p>
           ) : null}
         </section>
+        </details>
 
         <ScanSessionAutoRefresh
           initialStatus={session.status}
@@ -257,9 +259,10 @@ export default async function ScanSessionDetailPage({
           </NsnCard>
         ) : null}
 
+        <details className="nsn-secondary-detail"><summary>Organization recommendation summary</summary>
         <section
           aria-label="Organization recommendation summary"
-          className="grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-8"
+          className="nsn-metrics"
         >
           <SummaryTile
             label="Files Examined"
@@ -291,6 +294,7 @@ export default async function ScanSessionDetailPage({
             value={session.organizationSummary.leftUnchanged}
           />
         </section>
+        </details>
 
         <ScannedFilesPanel files={session.scannedFiles} scanSessionId={session.id} />
       </div>

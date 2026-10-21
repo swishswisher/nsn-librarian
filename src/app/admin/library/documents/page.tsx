@@ -26,8 +26,8 @@ export default async function LibraryDocumentsPage({
       <div className="grid gap-8">
         <NsnPageHeader
           description="Browse connected roots, folders, and scanned files without changing anything on the Mac."
-          eyebrow="Connected Libraries"
-          title="My Library"
+          eyebrow="Your workspace"
+          title="Library"
         />
 
         <LibraryExplorer

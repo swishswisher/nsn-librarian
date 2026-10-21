@@ -76,7 +76,7 @@ export function ReviewQueue({ items }: ReviewQueueProps) {
     <section aria-labelledby="review-queue-heading">
       <div className="mb-4">
         <h2
-          className="nsn-display text-2xl text-[var(--nsn-navy)]"
+          className="sr-only"
           id="review-queue-heading"
         >
           Recommendations
@@ -97,7 +97,7 @@ export function ReviewQueue({ items }: ReviewQueueProps) {
 
       <div className="grid gap-3">
         {filteredItems.map((item) => (
-          <NsnCard key={item.id}>
+          <NsnCard className="nsn-review-row" key={item.id}>
             <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
               <div className="min-w-0">
                 <div className="flex flex-wrap gap-2">

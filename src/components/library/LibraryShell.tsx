@@ -1,8 +1,9 @@
 import { Suspense, type ReactNode } from "react";
 
 import type { NsnBadgeTone } from "@/components/library/NsnBadge";
-import { LibraryQuickNav } from "@/components/library/LibraryQuickNav";
-import { NsnSidebar, type LibrarySection } from "@/components/library/NsnSidebar";
+import { LibraryAccount } from "@/components/library/LibraryAccount";
+import { MobileLibraryMenu } from "@/components/library/MobileLibraryMenu";
+import { NsnSidebar, LibraryNavigation, type LibrarySection } from "@/components/library/NsnSidebar";
 import { getBridgeCloudStatus } from "@/lib/bridge/cloud-coordinator";
 import { effectiveBridgeHealth } from "@/lib/bridge/effective-health";
 import { bridgeHomeHealthDisplay } from "@/lib/bridge/home-health";
@@ -58,30 +59,21 @@ async function ResolvedBridgeStatus({ bridgeLabel, bridgeTone }: Pick<LibraryShe
 
 export function LibraryShell({ active, bridgeLabel, bridgeTone, children }: LibraryShellProps) {
   return (
-    <main className="min-h-screen bg-[var(--nsn-cream)] text-[var(--nsn-navy)] lg:grid lg:grid-cols-[280px_minmax(0,1fr)]">
+    <main className="nsn-shell" data-section={active}>
+      <a className="nsn-skip-link" href="#library-content">Skip to content</a>
       <NsnSidebar active={active} />
-
-      <section className="min-w-0">
-        <div className="border-b border-[var(--nsn-border)] bg-[var(--nsn-card)] px-4 py-4 sm:px-6 lg:px-8">
-          <div className="mx-auto grid max-w-7xl gap-3">
-            <div className="flex items-center justify-between gap-4">
-              <Suspense fallback={<BridgeStatus label="Checking connection…" />}>
-                <ResolvedBridgeStatus bridgeLabel={bridgeLabel} bridgeTone={bridgeTone} />
-              </Suspense>
-              <div
-                aria-hidden="true"
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[var(--nsn-border)] bg-[var(--nsn-soft-aqua)] text-xs font-semibold text-[var(--nsn-teal-dark)]"
-              >
-                N
-              </div>
-            </div>
-            <LibraryQuickNav />
+      <section className="nsn-workspace">
+        <header className="nsn-workspace-header">
+          <span className="nsn-workspace-title"><span className="sm:hidden">NSN</span><span className="hidden sm:inline">Deanne’s workspace</span></span>
+          <div className="nsn-header-tools">
+            <Suspense fallback={<BridgeStatus label="Checking connection…" />}>
+              <ResolvedBridgeStatus bridgeLabel={bridgeLabel} bridgeTone={bridgeTone} />
+            </Suspense>
+            <Suspense fallback={null}><LibraryAccount /></Suspense>
+            <MobileLibraryMenu><LibraryNavigation active={active} /></MobileLibraryMenu>
           </div>
-        </div>
-
-        <div className="mx-auto w-full max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-          {children}
-        </div>
+        </header>
+        <div className="nsn-page-content" id="library-content" tabIndex={-1}>{children}</div>
       </section>
     </main>
   );

@@ -384,7 +384,7 @@ function AttentionCard({ task }: { task: AttentionTask }) {
 
 function LibraryEntry({ children, description, href, label }: LibraryEntryProps) {
   const content = (
-    <div className="grid min-w-0 gap-2 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-4 transition hover:bg-[var(--nsn-sage-mist)]">
+    <div className="grid min-w-0 gap-2 border-b border-[var(--nsn-border)] p-4 transition hover:bg-[var(--nsn-sage-mist)]">
       <p className="break-words font-semibold text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
         {label}
       </p>
@@ -423,7 +423,7 @@ function ActivityTimeline({ items }: { items: ActivityItem[] }) {
       {items.map((item) => (
         <li key={item.id}>
           <Link
-            className="grid min-w-0 gap-2 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-card)] p-4 transition hover:bg-[var(--nsn-sage-mist)] sm:grid-cols-[auto_minmax(0,1fr)] sm:items-start"
+            className="grid min-w-0 gap-2 border-b border-[var(--nsn-border)] p-4 transition hover:bg-[var(--nsn-sage-mist)] sm:grid-cols-[auto_minmax(0,1fr)] sm:items-start"
             href={item.href}
           >
             <NsnBadge tone={item.tone}>{formatShortDate(item.at)}</NsnBadge>
@@ -585,7 +585,7 @@ function KnowledgePreview({ preview }: { preview: KnowledgeHomepagePreview }) {
 
   return (
     <NsnCard className="min-w-0">
-      <div className="grid min-w-0 gap-4 md:grid-cols-2">
+      <div className="grid min-w-0 gap-4">
         {items.slice(0, 4).map(({ badge, description, item }) => (
           <Link
             className="grid min-w-0 gap-2 rounded-md border border-[var(--nsn-border)] bg-[var(--nsn-cream)] p-4 transition hover:bg-[var(--nsn-sage-mist)]"
@@ -623,7 +623,7 @@ function SectionTitle({
 }) {
   return (
     <div className="min-w-0">
-      <h2 className="nsn-display break-words text-3xl leading-10 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
+      <h2 className="break-words text-[22px] font-semibold leading-8 text-[var(--nsn-navy)] [overflow-wrap:anywhere]">
         {children}
       </h2>
       {subtitle ? (
@@ -726,29 +726,15 @@ export default async function LibraryAdminPage() {
 
   return (
     <LibraryShell active="overview" bridgeLabel={bridgeLabel} bridgeTone={bridgeTone}>
-      <div className="grid min-w-0 gap-10">
-        <header className="grid min-w-0 gap-5 rounded-xl border border-[var(--nsn-soft-aqua)] bg-[var(--nsn-sage-mist)] px-4 py-6 sm:px-6 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start lg:px-8">
-          <div className="min-w-0">
-            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--nsn-teal-dark)]">
-              NSN Librarian
-            </p>
-            <h1 className="nsn-display mt-3 break-words text-4xl leading-tight text-[var(--nsn-navy)] [overflow-wrap:anywhere] sm:text-5xl">
-              Welcome back, Deanne.
-            </h1>
-            <p className="mt-4 max-w-3xl break-words text-base leading-8 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-              Your library is in order. Here is what needs your attention.
-            </p>
-            <p className="mt-3 max-w-3xl break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
-              The machine suggests. Deanne decides. Nothing moves without
-              approval.
-            </p>
-          </div>
-          <NsnBadge tone={bridgeTone}>{bridgeLabel}</NsnBadge>
+      <div className="nsn-home">
+        <header className="nsn-home-intro">
+          <h1 className="nsn-display">Welcome back, Deanne.</h1>
+          <p>Your library, with a little more clarity.</p>
         </header>
 
-        <section className="grid min-w-0 gap-4" aria-labelledby="attention-heading">
+        <section className="nsn-home-attention grid min-w-0 gap-4" aria-labelledby="attention-heading">
           <SectionTitle subtitle="Only current work that needs a human decision appears here.">
-            <span id="attention-heading">Needs Your Attention</span>
+            <span id="attention-heading">Ready for your review</span>
           </SectionTitle>
           {attentionTasks.length > 0 ? (
             <div className="grid min-w-0 gap-4 lg:grid-cols-2">
@@ -765,28 +751,34 @@ export default async function LibraryAdminPage() {
             </NsnCard>
           )}
         </section>
-
-        <section className="grid min-w-0 gap-4" aria-labelledby="activity-heading">
-          <SectionTitle subtitle="A calm record of what the Librarian has recently examined, prepared, organized, or restored.">
-            <span id="activity-heading">Recent Library Activity</span>
-          </SectionTitle>
-          <ActivityTimeline items={recentActivity} />
-        </section>
-
+        <div className="nsn-home-feature">
         <section className="grid min-w-0 gap-4" aria-labelledby="notebook-heading">
-          <SectionTitle subtitle="The Librarian's reflective record of what changed, what matters, and what still needs Deanne's eye.">
+          <SectionTitle>
             <span id="notebook-heading">Notebook</span>
           </SectionTitle>
           <Suspense fallback={<LibraryLoading label="Loading Notebook…" />}><HomeNotebookPreview /></Suspense>
         </section>
-
+        <section aria-label="Quick access" className="nsn-home-quicklinks">
+          <h2>Pick up where you left off</h2>
+          <Link className="nsn-menu-trigger" href="/admin/library/documents">Browse your library</Link>
+          <Link className="nsn-menu-trigger" href={getConnectedLibrariesRoute()}>Connected libraries</Link>
+          <p className="text-sm text-[var(--nsn-slate)]">Original files stay on your Mac.</p>
+        </section>
+        </div>
+        <section className="nsn-home-activity grid min-w-0 gap-4" aria-labelledby="activity-heading">
+          <SectionTitle subtitle="A calm record of what the Librarian has recently examined, prepared, organized, or restored.">
+            <span id="activity-heading">Recent work</span>
+          </SectionTitle>
+          <ActivityTimeline items={recentActivity} />
+        </section>
+        <details className="nsn-secondary-detail"><summary>More from your library · Knowledge, tools and Bridge details</summary>
+          <div className="grid gap-8 pt-4">
         <section className="grid min-w-0 gap-4" aria-labelledby="knowledge-heading">
           <SectionTitle subtitle="A concise view of topics, concepts, and frameworks the Librarian is beginning to connect across the library.">
             <span id="knowledge-heading">Topics the Librarian is noticing</span>
           </SectionTitle>
           <Suspense fallback={<LibraryLoading label="Loading Knowledge…" />}><HomeKnowledgePreview /></Suspense>
         </section>
-
         <section className="grid min-w-0 gap-4" aria-labelledby="library-heading">
           <SectionTitle subtitle="Start with the next useful action, not a technical dashboard.">
             <span id="library-heading">Your Library</span>
@@ -879,7 +871,6 @@ export default async function LibraryAdminPage() {
             />
           </div>
         </section>
-
         <section className="grid min-w-0 gap-4" aria-labelledby="bridge-heading">
           <SectionTitle subtitle="The Bridge is the path between local files and approved organization work.">
             <span id="bridge-heading">Bridge Status</span>
@@ -940,6 +931,8 @@ export default async function LibraryAdminPage() {
             </div>
           </NsnCard>
         </section>
+          </div>
+        </details>
       </div>
     </LibraryShell>
   );

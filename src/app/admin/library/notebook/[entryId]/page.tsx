@@ -31,7 +31,7 @@ export default async function NotebookEntryDetailPage({
         <NsnPageHeader
           description="A focused view of the reflection, its provenance, related work, and Deanne's responses."
           eyebrow="Notebook Reflection"
-          title="Reflection Detail"
+          title="Notebook Entry"
         >
           <div className="flex w-full flex-col gap-3 sm:w-auto sm:flex-row">
             <Link

@@ -2,6 +2,7 @@ import { LibraryShell } from "@/components/library/LibraryShell";
 import { NsnPageHeader } from "@/components/library/NsnPageHeader";
 import { NsnCard } from "@/components/library/NsnCard";
 import { OrganizationSuggestionsReviewPanel } from "@/components/library/OrganizationSuggestionsReviewPanel";
+import { NsnTabs } from "@/components/library/NsnTabs";
 import { ReviewQueue } from "@/components/library/ReviewQueue";
 import { getOrganizationSuggestionsForConnectedLibraries } from "@/lib/bridge/organization-suggestions";
 import { getKnowledgeContextForRecommendations } from "@/lib/knowledge/queries";
@@ -34,12 +35,12 @@ export default async function LibraryReviewPage() {
         <NsnPageHeader
           description="Review what the Librarian noticed before anything becomes trusted Memory. The machine suggests. Deanne decides."
           eyebrow="Recommendations"
-          title="Review the Librarian's Recommendations"
+          title="Recommendations"
         />
 
-        <ReviewQueue items={reviewQueueItems} />
-
-        <NsnCard tone="aqua">
+        <NsnTabs label="Recommendation type" tabs={[
+          { label: "Observations", content: <ReviewQueue items={reviewQueueItems} /> },
+          { label: "File organization", content: <div className="grid gap-6"><NsnCard tone="aqua">
           <p className="break-words text-sm leading-7 text-[var(--nsn-slate)] [overflow-wrap:anywhere]">
             Organization recommendations remain folder-specific. Use the library
             filters to review one connected folder at a time, or All to compare
@@ -58,7 +59,8 @@ export default async function LibraryReviewPage() {
           libraryOptions={organizationRecommendations.libraries}
           suggestions={organizationRecommendations.suggestions}
           topicsBySuggestionId={topicsBySuggestionId}
-        />
+        /></div> },
+        ]} />
       </div>
     </LibraryShell>
   );

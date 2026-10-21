@@ -40,21 +40,17 @@ export default async function LoginPage({
 
   return (
     <main className="relative flex min-h-screen items-center justify-center overflow-hidden px-5 py-12">
-      <div
-        aria-hidden="true"
-        className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(214,238,233,0.95),transparent_42%),radial-gradient(circle_at_bottom_right,rgba(233,217,184,0.7),transparent_38%)]"
-      />
 
-      <section className="nsn-card relative z-10 w-full max-w-md p-7 sm:p-9">
-        <div className="mb-8 text-center">
-          <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-full border border-[var(--nsn-border)] bg-[var(--nsn-sage-mist)] text-xl font-semibold text-[var(--nsn-teal-dark)]">
+      <section className="nsn-card relative z-10 w-full max-w-[520px] p-7 sm:p-12">
+        <div className="mb-8 text-left">
+          <div className="mb-5 text-sm font-semibold text-[var(--nsn-teal-dark)]">
             NSN
           </div>
           <p className="mb-2 text-xs font-bold uppercase tracking-[0.24em] text-[var(--nsn-teal)]">
-            Private Librarian
+            NSN / LIBRARIAN
           </p>
           <h1 className="nsn-display text-3xl text-[var(--nsn-navy)]">
-            Welcome back
+            A thoughtful home for your library.
           </h1>
           <p className="mt-3 text-sm leading-6 text-[var(--nsn-slate)]">
             Continue with one of the two approved Google accounts. NSN does not
@@ -82,7 +78,7 @@ export default async function LoginPage({
         ) : null}
 
         <a
-          className="flex w-full items-center justify-center gap-3 rounded-lg border border-[var(--nsn-border)] bg-white px-4 py-3 text-sm font-bold text-[var(--nsn-navy)] shadow-sm transition hover:border-[var(--nsn-teal)] hover:bg-[var(--nsn-sage-mist)] focus:outline-none focus:ring-2 focus:ring-[var(--nsn-teal)] focus:ring-offset-2"
+          className="flex w-full items-center justify-center gap-3 rounded-lg border border-[var(--nsn-teal)] bg-[var(--nsn-teal)] px-4 py-3 text-sm font-semibold text-white transition hover:border-[var(--nsn-teal)] hover:bg-[var(--nsn-teal-dark)] focus:outline-none focus:ring-2 focus:ring-[var(--nsn-teal)] focus:ring-offset-2"
           href={googleSignInUrl}
         >
           <svg
