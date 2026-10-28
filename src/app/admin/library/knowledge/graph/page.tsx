@@ -1,3 +1,4 @@
+import { KnowledgeRefreshStatus } from "@/components/library/KnowledgeRefreshStatus";
 import Link from "next/link";
 
 import { KnowledgeGraphExplorer } from "@/components/library/KnowledgeGraphExplorer";
@@ -13,6 +14,7 @@ export default async function KnowledgeGraphPage() {
 
   return (
     <LibraryShell active="knowledge">
+      <KnowledgeRefreshStatus />
       <div className="grid min-w-0 gap-8">
         <NsnPageHeader
           description="Explore first-degree relationships without loading the entire library at once. A readable list is always available alongside the structured view."

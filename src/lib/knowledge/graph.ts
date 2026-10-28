@@ -1626,8 +1626,8 @@ const relationshipSelect = {
   trustLevel: true,
 } satisfies Prisma.KnowledgeRelationshipSelect;
 
-export async function getKnowledgeReviewPageData(): Promise<KnowledgeReviewPageData> {
-  await ensureKnowledgeGraphBackfill();
+export async function getKnowledgeReviewPageData(refresh = true): Promise<KnowledgeReviewPageData> {
+  if (refresh) await ensureKnowledgeGraphBackfill();
   const prisma = getPrismaClient();
   const [objects, relationships, mergeTargets] = await Promise.all([
     prisma.knowledgeObject.findMany({
@@ -1657,8 +1657,8 @@ export async function getKnowledgeReviewPageData(): Promise<KnowledgeReviewPageD
   };
 }
 
-export async function getKnowledgeGraphPageData(): Promise<KnowledgeGraphPageData> {
-  await ensureKnowledgeGraphBackfill();
+export async function getKnowledgeGraphPageData(refresh = true): Promise<KnowledgeGraphPageData> {
+  if (refresh) await ensureKnowledgeGraphBackfill();
   const prisma = getPrismaClient();
   const [objects, relationships] = await Promise.all([
     prisma.knowledgeObject.findMany({
@@ -1681,8 +1681,8 @@ export async function getKnowledgeGraphPageData(): Promise<KnowledgeGraphPageDat
   };
 }
 
-export async function getKnowledgeHomepagePreview(): Promise<KnowledgeHomepagePreview> {
-  await ensureKnowledgeGraphBackfill();
+export async function getKnowledgeHomepagePreview(refresh = true): Promise<KnowledgeHomepagePreview> {
+  if (refresh) await ensureKnowledgeGraphBackfill();
   const prisma = getPrismaClient();
   const [growingTopic, newlyApproved, needsReview, crossFileTopic] =
     await Promise.all([
@@ -1759,8 +1759,9 @@ function sourceLinksFromEvidence(
 
 export async function getKnowledgeTopicPageData(
   topicId: string,
+  refresh = true,
 ): Promise<KnowledgeTopicPageData | null> {
-  await ensureKnowledgeGraphBackfill();
+  if (refresh) await ensureKnowledgeGraphBackfill();
   const prisma = getPrismaClient();
   const object = await prisma.knowledgeObject.findUnique({
     include: {
@@ -1837,8 +1838,9 @@ export async function getKnowledgeTopicPageData(
 
 export async function getRelatedKnowledgeForNotebookEntry(
   entryId: string,
+  refresh = true,
 ): Promise<KnowledgeReference[]> {
-  await ensureKnowledgeGraphBackfill();
+  if (refresh) await ensureKnowledgeGraphBackfill();
   const prisma = getPrismaClient();
   const objects = await prisma.knowledgeObject.findMany({
     orderBy: [{ status: "asc" }, { confidence: "desc" }],
@@ -1869,12 +1871,13 @@ export async function getRelatedKnowledgeForNotebookEntry(
 
 export async function getKnowledgeContextForRecommendations(
   suggestionIds: string[],
+  refresh = true,
 ) {
   if (suggestionIds.length === 0) {
     return {};
   }
 
-  await ensureKnowledgeGraphBackfill();
+  if (refresh) await ensureKnowledgeGraphBackfill();
   const prisma = getPrismaClient();
   const objects = await prisma.knowledgeObject.findMany({
     orderBy: [{ status: "asc" }, { confidence: "desc" }],

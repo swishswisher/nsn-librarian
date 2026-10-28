@@ -1,3 +1,4 @@
+import { createHeartbeatLoop } from "./heartbeat-loop";
 import type { Server } from "node:http";
 import path from "node:path";
 
@@ -482,7 +483,7 @@ export async function startElectronBridgeApp() {
     return choice.response === 1;
   }
 
-  async function recoverCloudConnection(forceRootSync = false) {
+  const heartbeat = createHeartbeatLoop(async () => {
     const identity = await getCompletePairedBridgeIdentity();
 
     if (!bridgeIdentityCanAuthenticate(identity)) {
@@ -493,13 +494,7 @@ export async function startElectronBridgeApp() {
       );
       sendBridgeStatusChanged("authentication-unavailable");
 
-      return {
-        ok: false,
-        safeErrorCategory:
-          identity.status === "UNAVAILABLE" || identity.status === "UNUSABLE"
-            ? identity.safeErrorCategory
-            : "PAIRING_INCOMPLETE",
-      };
+      return false;
     }
 
     try {
@@ -510,12 +505,13 @@ export async function startElectronBridgeApp() {
       cloudState.recordHeartbeatFailure(error);
       sendBridgeStatusChanged("heartbeat-failure");
 
-      return {
-        ok: false,
-        safeErrorCategory: safeCloudErrorCategory(error),
-      };
+      return false;
     }
+    return true;
+  });
 
+  async function recoverCloudConnection(forceRootSync = false) {
+    if (!(await heartbeat.check())) return { ok: false };
     return syncLocalRoots(forceRootSync);
   }
 
@@ -529,7 +525,7 @@ export async function startElectronBridgeApp() {
     try {
       const recovery = await recoverCloudConnection(false);
 
-      if (!recovery.ok) {
+      if (!recovery.ok && cloudState.getState().cloudConnectionState !== "ROOT_SYNC_FAILED") {
         return [];
       }
 
@@ -741,6 +737,7 @@ export async function startElectronBridgeApp() {
   createMainWindow();
 
   const watcherRestore = restorePersistedBridgeWatchers().catch(() => undefined);
+  heartbeat.start();
   const immediateReconnect = recoverCloudConnection(false).catch(() => undefined);
 
   void Promise.all([watcherRestore, immediateReconnect])
@@ -758,6 +755,7 @@ export async function startElectronBridgeApp() {
   electron.app.on("before-quit", () => {
     isQuitting = true;
     clearCommandPollTimer();
+    heartbeat.stop();
     clearInterval(updateCheckInterval);
     localServer?.close();
   });
