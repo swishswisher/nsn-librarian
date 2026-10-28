@@ -102,6 +102,9 @@ jobs:
       - name: Test human auth
         run: npm run test:auth
 
+      - name: Test navigation query budgets
+        run: npm run test:performance
+
       - name: Test protocol
         run: npm run test:protocol
 
@@ -128,6 +131,11 @@ jobs:
 
       - name: Build web
         run: npm run build:web
+
+      - name: Test all production page routes
+        env:
+          NSN_TEST_WEB_MODE: production
+        run: node --test --test-concurrency=1 --import tsx tests/integration/navigation-routes.test.ts
 
       - name: Type-check Bridge
         run: npm run build:bridge

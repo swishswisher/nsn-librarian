@@ -65,6 +65,7 @@ function cloudConnectionStateForCategory(
 }
 
 export function createBridgeCloudState(now: () => Date = () => new Date()) {
+  let pendingRootSyncError: string | null = null;
   let state: BridgeCloudRuntimeState = {
     cloudConnectionState: "UNKNOWN",
     lastSuccessfulHeartbeatAt: null,
@@ -106,13 +107,14 @@ export function createBridgeCloudState(now: () => Date = () => new Date()) {
     recordHeartbeatSuccess() {
       state = {
         ...state,
-        cloudConnectionState: "ONLINE",
+        cloudConnectionState: pendingRootSyncError ? "ROOT_SYNC_FAILED" : "ONLINE",
         lastSuccessfulHeartbeatAt: nowIso(now),
-        latestSafeCloudErrorCategory: null,
+        latestSafeCloudErrorCategory: pendingRootSyncError,
       };
     },
     recordRootSyncFailure(error: unknown) {
       const safeErrorCategory = safeCloudErrorCategory(error);
+      pendingRootSyncError = safeErrorCategory;
       const cloudConnectionState =
         cloudConnectionStateForCategory(safeErrorCategory);
 
@@ -126,6 +128,7 @@ export function createBridgeCloudState(now: () => Date = () => new Date()) {
       };
     },
     recordRootSyncSuccess() {
+      pendingRootSyncError = null;
       state = {
         ...state,
         cloudConnectionState: "ONLINE",

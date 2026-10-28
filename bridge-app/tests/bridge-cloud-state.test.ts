@@ -8,6 +8,31 @@ import {
 } from "../../apps/bridge/src/main/cloud-state";
 
 describe("Bridge cloud runtime state", () => {
+  it("does not clear a pending folder sync when only heartbeat succeeds", () => {
+    const state = createBridgeCloudState();
+    state.recordHeartbeatSuccess();
+    state.recordRootSyncFailure(new BridgeAppError("temporary failure", "SERVER_ERROR", 503));
+    for (let i = 0; i < 5; i++) {
+      state.recordHeartbeatSuccess();
+      assert.equal(state.getState().cloudConnectionState, "ROOT_SYNC_FAILED");
+      assert.equal(state.getState().latestSafeCloudErrorCategory, "SERVER_ERROR");
+    }
+    state.recordHeartbeatFailure(new Error("network lost"));
+    assert.equal(state.getState().cloudConnectionState, "NETWORK_UNAVAILABLE");
+    state.recordHeartbeatSuccess();
+    assert.equal(state.getState().cloudConnectionState, "ROOT_SYNC_FAILED");
+    state.recordRootSyncSuccess();
+    assert.equal(state.getState().cloudConnectionState, "ONLINE");
+    assert.equal(state.getState().latestSafeCloudErrorCategory, null);
+  });
+
+  it("still exposes revoked authentication immediately while folder sync is pending", () => {
+    const state = createBridgeCloudState();
+    state.recordRootSyncFailure(new Error("sync failed"));
+    state.recordHeartbeatFailure(new BridgeAppError("denied", "BRIDGE_AUTH_REJECTED", 401));
+    assert.equal(state.getState().cloudConnectionState, "AUTH_UNAVAILABLE");
+    assert.equal(state.getState().latestSafeCloudErrorCategory, "BRIDGE_AUTH_REJECTED");
+  });
   it("records heartbeat success as online with a safe timestamp", () => {
     const cloudState = createBridgeCloudState(
       () => new Date("2026-08-19T10:00:00.000Z"),

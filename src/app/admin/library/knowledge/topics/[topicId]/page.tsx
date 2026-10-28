@@ -1,3 +1,4 @@
+import { KnowledgeRefreshStatus } from "@/components/library/KnowledgeRefreshStatus";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
@@ -216,6 +217,7 @@ export default async function KnowledgeTopicPage({ params }: TopicPageProps) {
 
   return (
     <LibraryShell active="knowledge">
+      <KnowledgeRefreshStatus />
       <div className="grid min-w-0 gap-8">
         <NsnPageHeader
           description="A topic page shows what the Librarian noticed, where it appears, and what Deanne has reviewed."

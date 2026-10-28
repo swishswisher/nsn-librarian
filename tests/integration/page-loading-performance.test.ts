@@ -1,3 +1,4 @@
+import "next/dist/server/node-environment-baseline";
 import assert from "node:assert/strict";
 import { afterEach, mock, test } from "node:test";
 import type { PrismaClient } from "@prisma/client";
@@ -108,47 +109,58 @@ test("Connected Libraries shares health lookups but refreshes device liveness on
   assert.equal(deviceRead.mock.callCount(), 2);
 });
 
-test("shared shell streams content before a delayed Bridge check completes", { timeout: 5000 }, async () => {
+test("shared shell renders without starting a per-route Bridge request", { timeout: 5000 }, async () => {
   const { createElement } = await import("react");
   const { renderToPipeableStream } = await import("react-dom/server");
   const { PassThrough } = await import("node:stream");
   const { AppRouterContext } = await import("next/dist/shared/lib/app-router-context.shared-runtime");
   const { PathnameContext } = await import("next/dist/shared/lib/hooks-client-context.shared-runtime");
   const { LibraryShell } = await import("../../src/components/library/LibraryShell");
-  let release!: () => void;
-  const waiting = new Promise<void>((resolve) => { release = resolve; });
-  mock.method(globalThis, "fetch", async () => {
-    await waiting;
-    throw new Error("Loopback unavailable");
-  });
-  mock.method(prisma.bridgeDevice, "findMany", async () => []);
-  mock.method(prisma.connectedLibrary, "findMany", async () => []);
+  const network = mock.method(globalThis, "fetch", async () => { throw new Error("No per-route health request allowed"); });
   const noop = () => {};
   const tree = createElement(AppRouterContext.Provider, { value: {
-    back: noop, forward: noop, refresh: noop,
-    push: noop, replace: noop, prefetch: noop,
+    back: noop, forward: noop, refresh: noop, push: noop, replace: noop, prefetch: noop,
   } }, createElement(PathnameContext.Provider, { value: "/admin/library/history" },
     createElement(LibraryShell, { active: "history", children: "History is ready" })));
   let output = "";
   const destination = new PassThrough();
   destination.on("data", (chunk) => { output += chunk.toString(); });
-  let rendering: ReturnType<typeof renderToPipeableStream> | undefined;
-  try {
-    await new Promise<void>((resolve, reject) => {
-      rendering = renderToPipeableStream(tree, {
-        onShellReady() { rendering!.pipe(destination); resolve(); },
-        onShellError: reject,
-        onError: reject,
-      });
+  const { workUnitAsyncStorage } = await import("next/dist/server/app-render/work-unit-async-storage.external");
+  const { workAsyncStorage } = await import("next/dist/server/app-render/work-async-storage.external");
+  const workStore = { route: "/admin/library/history" } as Parameters<typeof workAsyncStorage.run>[0];
+  const requestStore = { type: "request", phase: "render", cookies: { get: () => undefined } } as unknown as Parameters<typeof workUnitAsyncStorage.run>[0];
+  await workAsyncStorage.run(workStore, () => workUnitAsyncStorage.run(requestStore, () => new Promise<void>((resolve, reject) => {
+    const rendering = renderToPipeableStream(tree, {
+      onShellReady() { rendering.pipe(destination); }, onShellError: reject, onError: reject,
     });
-    assert.match(output, /History is ready/);
-    assert.match(output, /Checking connection/);
-    assert.doesNotMatch(output, /Bridge: <!-- -->Bridge not connected/);
-    release();
-    await new Promise<void>((resolve) => destination.on("end", resolve));
-    assert.match(output, /Bridge not connected|Bridge unavailable|Bridge not paired|Bridge offline|Download Bridge/i);
-  } finally {
-    release();
-    rendering?.abort();
-  }
+    destination.on("end", resolve);
+  })));
+  assert.match(output, /History is ready/);
+  assert.match(output, /Checking connection/);
+  assert.equal(network.mock.callCount(), 0);
+});
+
+test("lightweight Bridge indicator reads devices only and does not probe loopback", async () => {
+  const { GET } = await import("../../src/app/api/bridge/status/route");
+  const read = mock.method(prisma.bridgeDevice, "findMany", async () => []);
+  const network = mock.method(globalThis, "fetch", async () => { throw new Error("No loopback"); });
+  const response = await GET(new Request("https://example.test/api/bridge/status?view=indicator"));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, label: "Bridge not paired", tone: "pending" });
+  assert.equal(read.mock.callCount(), 1);
+  assert.equal(network.mock.callCount(), 0);
+});
+
+test("page Knowledge reads do not start graph backfill writes", async () => {
+  const { getKnowledgeReviewPageData, getKnowledgeGraphPageData } = await import("../../src/lib/knowledge/queries");
+  const extended = prisma as unknown as Record<string, unknown>;
+  let objectReads = 0, relationshipReads = 0;
+  extended.knowledgeObject = { findMany: async () => { objectReads++; return []; } };
+  extended.knowledgeRelationship = { findMany: async () => { relationshipReads++; return []; } };
+  // No raw SQL/transaction/backfill methods exist on this boundary. Any eager
+  // regeneration fails, instead of silently letting a slow render pass.
+  assert.deepEqual(await getKnowledgeReviewPageData(), { objects: [], relationships: [], mergeTargets: [] });
+  assert.deepEqual(await getKnowledgeGraphPageData(), { objects: [], relationships: [] });
+  assert.equal(objectReads, 3);
+  assert.equal(relationshipReads, 2);
 });

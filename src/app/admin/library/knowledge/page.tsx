@@ -1,3 +1,4 @@
+import { KnowledgeRefreshStatus } from "@/components/library/KnowledgeRefreshStatus";
 import Link from "next/link";
 
 import { DocumentRelationshipReviewControls } from "@/components/library/DocumentRelationshipReviewControls";
@@ -33,6 +34,7 @@ export default async function KnowledgePage() {
 
   return (
     <LibraryShell active="knowledge">
+      <KnowledgeRefreshStatus />
       <div className="grid min-w-0 gap-8">
         <NsnPageHeader
           description="The Knowledge Graph tracks recurring topics, frameworks, concepts, and relationships across the library. Only approved knowledge becomes trusted."
